@@ -244,6 +244,16 @@ pub struct TransactionManager {
     /// source of truth for visibility lookups (`XidStatusOracle`) and
     /// recovery.
     in_progress: parking_lot::Mutex<std::collections::BTreeSet<Xid>>,
+    /// Subtransaction → top-level (parent) XID map, PostgreSQL's
+    /// `pg_subtrans`. Populated on `begin_savepoint` and consulted by the
+    /// [`XidStatusOracle`] so a *foreign* backend resolves a subtransaction
+    /// to its parent's terminal status rather than to the subxid's own CLOG
+    /// entry. This is what keeps a `RELEASE`d-but-parent-still-open subxid
+    /// invisible to other backends (no cross-transaction dirty read) and
+    /// makes the parent's single commit/abort transition the only boundary a
+    /// concurrent reader can observe (no torn read). Entries are removed when
+    /// the subxid resolves (rolled back, or folded at parent commit/abort).
+    subxid_parent: DashMap<Xid, Xid>,
     /// Optional SSI conflict tracker. Present only when the server is
     /// configured to support [`IsolationLevel::Serializable`] isolation.
     /// `None` causes Serializable to alias `RepeatableRead` (the pre-v0.4
@@ -275,6 +285,7 @@ impl TransactionManager {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            subxid_parent: DashMap::new(),
             ssi: None,
             lock_manager: Arc::new(LockManager::new()),
         }
@@ -292,6 +303,7 @@ impl TransactionManager {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            subxid_parent: DashMap::new(),
             ssi: Some(ssi),
             lock_manager: Arc::new(LockManager::new()),
         }
@@ -448,16 +460,18 @@ impl TransactionManager {
     pub fn commit(&self, txn: Transaction) -> Result<(), TxnError> {
         let xid = txn.xid;
         let isolation = txn.isolation;
-        self.terminate(xid, XidStatus::Committed)?;
 
-        // Fold all still-open subtransactions (live on the stack +
-        // released-but-not-yet-folded) into the parent's terminal status.
-        // Without this, a savepoint write whose subxid never resolved
-        // would dangle `InProgress` forever and stay invisible to later /
-        // other transactions even though the parent committed. Rolled-back
-        // subxids are already `Aborted` and are not in these sets, so they
-        // correctly stay aborted.
-        self.fold_subxids(&txn.subtxn_stack, XidStatus::Committed);
+        // Fold the parent and all its still-open subtransactions (live on
+        // the stack + released-but-not-yet-folded) into `Committed` as one
+        // atomic step. Removing the parent and every subxid from the
+        // `in_progress` mirror under a single lock means a concurrent
+        // `build_snapshot` (which takes the same lock) samples either the
+        // whole transaction family as in-progress or none of it — never a
+        // partial state. This is what makes the commit appear atomic to
+        // other backends (no torn read where the parent looks committed but
+        // a subxid still reads in-progress). Rolled-back subxids are already
+        // `Aborted` and absent from the fold set, so they stay aborted.
+        self.terminate_with_subxids(xid, &txn.subtxn_stack, XidStatus::Committed)?;
 
         // Release all row-level and relation-level locks.
         self.lock_manager.release_all(xid);
@@ -477,8 +491,14 @@ impl TransactionManager {
                     // The SSI manager marked us committed before detecting the
                     // cycle; we must immediately abort to restore consistency.
                     // Flip the CLOG entry back to Aborted using the force path
-                    // since the entry is now Committed, not InProgress.
+                    // since the entry is now Committed, not InProgress. Force
+                    // the folded subxids back to Aborted too so a savepoint
+                    // write does not survive a serialization-failure rollback.
                     self.force_abort(xid);
+                    for sub_xid in txn.subtxn_stack.own_live_subxids_sorted() {
+                        self.force_abort(sub_xid);
+                        self.subxid_parent.remove(&sub_xid);
+                    }
                     ssi.abort(xid);
                     return Err(TxnError::SerializationFailure { victim, detail });
                 }
@@ -499,13 +519,14 @@ impl TransactionManager {
     pub fn abort(&self, txn: Transaction) -> Result<(), TxnError> {
         let xid = txn.xid;
         let isolation = txn.isolation;
-        self.terminate(xid, XidStatus::Aborted)?;
 
-        // Fold all still-open subtransactions into `Aborted` alongside the
-        // parent. Subxids already rolled back are `Aborted` and absent
-        // from these sets; folding the remainder keeps the whole
-        // transaction-family terminal so no subxid dangles `InProgress`.
-        self.fold_subxids(&txn.subtxn_stack, XidStatus::Aborted);
+        // Fold the parent and all its still-open subtransactions into
+        // `Aborted` atomically (see [`Self::commit`] for the atomicity
+        // rationale). This also re-aborts any subxid that was RELEASEd but
+        // never folded — which, now that RELEASE keeps the subxid
+        // `InProgress`, correctly makes a released-then-parent-aborted
+        // subtransaction's writes vanish for everyone.
+        self.terminate_with_subxids(xid, &txn.subtxn_stack, XidStatus::Aborted)?;
 
         // Release all row-level and relation-level locks.
         self.lock_manager.release_all(xid);
@@ -520,27 +541,73 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Fold every still-open subtransaction of `stack` into `status`
-    /// (`Committed` at top-level commit, `Aborted` at top-level abort).
+    /// Terminate the parent `xid` together with every still-open
+    /// subtransaction of `stack`, transitioning them all to `status`
+    /// (`Committed` at top-level commit, `Aborted` at top-level abort) as
+    /// one atomic step with respect to snapshot observers.
     ///
-    /// "Still open" means live on the savepoint stack or merged-up
-    /// (released, parent was still open). Each such subxid is transitioned
-    /// `InProgress → status` exactly once and removed from the in-progress
-    /// mirror; a subxid not currently `InProgress` (already terminal) is
-    /// left untouched. This is PostgreSQL's atomic sub-transaction fold-up
-    /// at parent resolution.
-    fn fold_subxids(&self, stack: &SubtxnManager, status: XidStatus) {
-        // `own_live_subxids_sorted` is already the union of the live stack
-        // and the merged-up set, sorted and de-duplicated.
+    /// "Still open" subtransactions are those live on the savepoint stack or
+    /// merged-up (released, parent still open). Rolled-back subxids are
+    /// already terminal and absent from the fold set, so they are untouched.
+    ///
+    /// Atomicity: the CLOG entries are flipped first (the parent must be
+    /// `InProgress`; idempotency is enforced exactly as in [`Self::terminate`]),
+    /// then the parent and all folded subxids are removed from the
+    /// `in_progress` mirror under a **single** lock acquisition. Because
+    /// [`Self::build_snapshot`] takes the same lock to sample `xip`, a
+    /// concurrent reader observes the whole transaction family as in-progress
+    /// or none of it — never the parent committed while a subxid still reads
+    /// in-progress. The `subxid_parent` links are dropped last, after the
+    /// subxids carry their own terminal CLOG status.
+    fn terminate_with_subxids(
+        &self,
+        xid: Xid,
+        stack: &SubtxnManager,
+        status: XidStatus,
+    ) -> Result<(), TxnError> {
+        // Validate + flip the parent first. This preserves the
+        // commit-at-most-once invariant: exactly one caller observes the
+        // parent `InProgress` and wins the transition.
+        {
+            let Some(mut entry) = self.clog.get_mut(&xid) else {
+                return Err(TxnError::Unknown { xid });
+            };
+            match *entry.value() {
+                XidStatus::InProgress => *entry.value_mut() = status,
+                other => return Err(TxnError::AlreadyTerminated { xid, status: other }),
+            }
+        }
+
+        // `own_live_subxids_sorted` is the union of the live stack and the
+        // merged-up set, sorted and de-duplicated. Flip each subxid's CLOG
+        // entry that is still `InProgress`, collecting the ones we folded so
+        // we can remove them from the mirror atomically with the parent.
+        let mut folded: Vec<Xid> = Vec::new();
         for sub_xid in stack.own_live_subxids_sorted() {
             if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
                 if matches!(*entry.value(), XidStatus::InProgress) {
                     *entry.value_mut() = status;
-                    drop(entry);
-                    self.in_progress.lock().remove(&sub_xid);
+                    folded.push(sub_xid);
                 }
             }
         }
+
+        // Remove the parent + every folded subxid from the in-progress
+        // mirror in one critical section: snapshots see all or nothing.
+        {
+            let mut active = self.in_progress.lock();
+            active.remove(&xid);
+            for sub_xid in &folded {
+                active.remove(sub_xid);
+            }
+        }
+
+        // The subxids now carry their own terminal status; drop their parent
+        // links so the oracle reads the terminal status directly.
+        for sub_xid in &folded {
+            self.subxid_parent.remove(sub_xid);
+        }
+        Ok(())
     }
 
     /// Current oldest in-progress XID.
@@ -702,6 +769,7 @@ impl TransactionManager {
     /// The new subxid is recorded in the CLOG as `InProgress` immediately so
     /// that visibility rules can apply to subtransaction writes.
     pub fn begin_savepoint(&self, txn: &mut Transaction, name: &str) -> Subtxn {
+        let parent_xid = txn.xid;
         let subtxn = txn.subtxn_stack.savepoint(
             name,
             || {
@@ -709,6 +777,9 @@ impl TransactionManager {
                 let sub_xid = Xid::new(raw);
                 self.clog.insert(sub_xid, XidStatus::InProgress);
                 self.in_progress.lock().insert(sub_xid);
+                // Record the subxid → parent link so a foreign reader
+                // resolves this subtransaction to the parent's fate.
+                self.subxid_parent.insert(sub_xid, parent_xid);
                 sub_xid
             },
             txn.current_command,
@@ -753,7 +824,10 @@ impl TransactionManager {
         let aborted_xids = txn.subtxn_stack.rollback_to(name)?;
         for &sub_xid in &aborted_xids {
             // Transition InProgress → Aborted.  If the entry is missing
-            // (programming error) the transition is a no-op.
+            // (programming error) the transition is a no-op. A subxid that
+            // was previously RELEASEd is still `InProgress` (RELEASE no
+            // longer flips it), so a ROLLBACK TO an outer savepoint can
+            // correctly abort it here.
             if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
                 if matches!(*entry.value(), XidStatus::InProgress) {
                     *entry.value_mut() = XidStatus::Aborted;
@@ -761,6 +835,9 @@ impl TransactionManager {
                     self.in_progress.lock().remove(&sub_xid);
                 }
             }
+            // The subxid is now terminal (Aborted) on its own; drop its
+            // parent link so the oracle reads the terminal status directly.
+            self.subxid_parent.remove(&sub_xid);
             // Track the rollback locally so the snapshot's visibility
             // predicate forces tuples written by this savepoint invisible
             // even before the CLOG abort is observed.
@@ -789,20 +866,21 @@ impl TransactionManager {
         name: &str,
     ) -> Result<Xid, SavepointError> {
         let sub_xid = txn.subtxn_stack.release(name)?;
-        // Mark the subtransaction as committed so MVCC visibility picks it up.
-        if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
-            if matches!(*entry.value(), XidStatus::InProgress) {
-                *entry.value_mut() = XidStatus::Committed;
-                drop(entry);
-                self.in_progress.lock().remove(&sub_xid);
-            }
-        }
-        // The released subxid left the stack but is merged up into the
-        // parent: keep treating it as *self* until the top-level
-        // transaction resolves (PostgreSQL's "current transaction"
-        // semantics). `own_live_subxids_sorted` includes the merged-up
-        // set, so the snapshot patch below keeps the row visible to the
-        // owning backend even under a frozen RR/SSI snapshot.
+        // RELEASE must NOT publish the subtransaction as independently
+        // committed. PostgreSQL merges a released subxact into its parent;
+        // its effective commit is gated on the parent. We therefore leave
+        // the subxid `InProgress` in the CLOG and in the `in_progress`
+        // mirror, so a *foreign* backend either samples it into its `xip`
+        // (invisible) or resolves it through the `subxid_parent` map to the
+        // still-in-progress parent (also invisible). Flipping it `Committed`
+        // here was a cross-transaction dirty read: another backend saw the
+        // released-but-uncommitted row, and if the parent later aborted the
+        // subxid stayed `Committed` forever.
+        //
+        // The owning backend keeps treating the released subxid as *self*
+        // via `merged_up` → `own_live_subxids`, so its own reads still see
+        // the row. At top-level commit/abort the subxid is folded with the
+        // parent.
         txn.subtxn_stack.record_merged_up(sub_xid);
         self.sync_snapshot_subxids(txn);
         Ok(sub_xid)
@@ -1082,9 +1160,31 @@ impl XidStatusOracle for TransactionManager {
         if xid == Xid::BOOTSTRAP {
             return XidStatus::Committed;
         }
-        self.clog
+        let own = self
+            .clog
             .get(&xid)
-            .map_or(XidStatus::InProgress, |entry| *entry.value())
+            .map_or(XidStatus::InProgress, |entry| *entry.value());
+        // Subtransaction resolution (PostgreSQL's
+        // `SubTransGetTopmostTransaction` + `TransactionIdDidCommit`): while a
+        // subxid's own CLOG entry is still `InProgress`, its effective fate is
+        // its parent's. This keeps a RELEASEd-but-parent-still-open subxid
+        // invisible to other backends (the parent is in progress) and makes
+        // the parent's single commit/abort transition the only observable
+        // boundary. Once the subxid is folded at parent resolution its own
+        // entry is terminal and is returned directly (no map lookup).
+        if matches!(own, XidStatus::InProgress)
+            && let Some(parent) = self.subxid_parent.get(&xid)
+        {
+            let parent = *parent.value();
+            // One level of indirection suffices: savepoints always map
+            // directly to the top-level parent (`begin_savepoint` records
+            // `txn.xid`), never to another subxid.
+            return self
+                .clog
+                .get(&parent)
+                .map_or(XidStatus::InProgress, |entry| *entry.value());
+        }
+        own
     }
 }
 
@@ -1649,36 +1749,118 @@ mod tests {
         // both become Committed; a rolled-back one stays Aborted.
         let mgr = TransactionManager::new();
         let mut t = mgr.begin(IsolationLevel::ReadCommitted);
+        let parent = t.xid;
         let live = mgr.begin_savepoint(&mut t, "live").xid;
         let released = mgr.begin_savepoint(&mut t, "rel").xid;
         mgr.release_savepoint(&mut t, "rel").unwrap();
         let rolled = mgr.begin_savepoint(&mut t, "rb").xid;
         mgr.rollback_to_savepoint(&mut t, "rb").unwrap();
 
-        // Pre-commit: live still in progress, released already committed,
-        // rolled-back aborted.
+        // Pre-commit, parent still open: live and released both resolve via
+        // the subxid → parent map to the parent's InProgress status. RELEASE
+        // must NOT publish the subxid as independently committed (that was a
+        // cross-transaction dirty read). The rolled-back subxid is Aborted.
         assert_eq!(mgr.status(live), XidStatus::InProgress);
-        assert_eq!(mgr.status(released), XidStatus::Committed);
+        assert_eq!(
+            mgr.status(released),
+            XidStatus::InProgress,
+            "a released-but-parent-open subxid resolves to the parent (still in progress)",
+        );
+        assert_eq!(mgr.status(parent), XidStatus::InProgress);
         assert_eq!(mgr.status(rolled), XidStatus::Aborted);
 
         mgr.commit(t).unwrap();
         assert_eq!(mgr.status(live), XidStatus::Committed, "live folded up");
-        assert_eq!(mgr.status(released), XidStatus::Committed);
+        assert_eq!(
+            mgr.status(released),
+            XidStatus::Committed,
+            "released subxid becomes committed once the parent commits",
+        );
         assert_eq!(
             mgr.status(rolled),
             XidStatus::Aborted,
             "rolled-back subxid stays aborted across parent commit"
         );
         assert!(!mgr.is_in_progress(live));
+        assert!(!mgr.is_in_progress(released));
 
-        // Abort path: the live subxid is folded to Aborted.
+        // Abort path: a live subxid AND a released-but-parent-open subxid are
+        // both folded to Aborted, so a released-then-parent-aborted
+        // subtransaction's writes vanish for everyone.
         let mgr2 = TransactionManager::new();
         let mut t2 = mgr2.begin(IsolationLevel::ReadCommitted);
         let live2 = mgr2.begin_savepoint(&mut t2, "live2").xid;
+        let released2 = mgr2.begin_savepoint(&mut t2, "rel2").xid;
+        mgr2.release_savepoint(&mut t2, "rel2").unwrap();
         assert_eq!(mgr2.status(live2), XidStatus::InProgress);
+        assert_eq!(mgr2.status(released2), XidStatus::InProgress);
         mgr2.abort(t2).unwrap();
         assert_eq!(mgr2.status(live2), XidStatus::Aborted, "live folded down");
+        assert_eq!(
+            mgr2.status(released2),
+            XidStatus::Aborted,
+            "released subxid is aborted when the parent aborts (no leak)",
+        );
         assert!(!mgr2.is_in_progress(live2));
+        assert!(!mgr2.is_in_progress(released2));
+    }
+
+    /// A released-but-parent-open subxid resolves to its parent's status
+    /// for a *foreign* observer (the oracle), so RELEASE cannot leak its
+    /// writes across transactions. Once the parent aborts, the released
+    /// subxid reads Aborted (it never independently committed).
+    #[test]
+    fn release_does_not_publish_subxid_until_parent_resolves() {
+        let mgr = TransactionManager::new();
+        let mut t = mgr.begin(IsolationLevel::ReadCommitted);
+        let released = mgr.begin_savepoint(&mut t, "s1").xid;
+        mgr.release_savepoint(&mut t, "s1").unwrap();
+
+        // Foreign observer: the subxid is still in progress (parent open).
+        assert_eq!(mgr.status(released), XidStatus::InProgress);
+        assert!(
+            mgr.is_in_progress(released),
+            "released subxid stays in the in-progress mirror while the parent is open",
+        );
+
+        // Parent aborts → the released subxid is folded to Aborted, never
+        // having been independently committed.
+        mgr.abort(t).unwrap();
+        assert_eq!(
+            mgr.status(released),
+            XidStatus::Aborted,
+            "released subxid follows the parent to Aborted (no cross-txn leak)",
+        );
+    }
+
+    /// ROLLBACK TO an outer savepoint must discard subtransactions started
+    /// after it even if they were already RELEASEd — `merged_up` is pruned.
+    #[test]
+    fn rollback_to_outer_discards_released_inner_subxid() {
+        let mgr = TransactionManager::new();
+        let mut t = mgr.begin(IsolationLevel::ReadCommitted);
+        let outer = mgr.begin_savepoint(&mut t, "outer").xid;
+        let inner = mgr.begin_savepoint(&mut t, "inner").xid;
+        mgr.release_savepoint(&mut t, "inner").unwrap();
+
+        // ROLLBACK TO outer drains the stack down to (and including) outer
+        // and prunes the merged-up inner subxid, marking both aborted.
+        let aborted = mgr.rollback_to_savepoint(&mut t, "outer").unwrap();
+        assert!(aborted.contains(&outer));
+        assert!(
+            aborted.contains(&inner),
+            "released inner subxid must be discarded by ROLLBACK TO outer",
+        );
+        assert_eq!(mgr.status(inner), XidStatus::Aborted);
+        assert_eq!(mgr.status(outer), XidStatus::Aborted);
+        assert!(
+            !t.subtxn_stack.merged_up_sorted().contains(&inner),
+            "inner must be pruned from merged_up so it is never folded committed",
+        );
+
+        // After commit the discarded inner subxid stays aborted.
+        mgr.commit(t).unwrap();
+        assert_eq!(mgr.status(inner), XidStatus::Aborted);
     }
 
     /// RR/SSI: savepoint control patches the frozen snapshot's subxid sets

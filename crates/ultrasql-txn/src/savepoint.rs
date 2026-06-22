@@ -184,11 +184,37 @@ impl SubtxnManager {
                     name: name.to_owned(),
                 })?;
 
+        // The target savepoint's own subxid is the low-water mark for
+        // "opened at or after this savepoint": subxids are allocated in
+        // strictly increasing order, so every subtransaction started at or
+        // after the target — whether still live on the stack or already
+        // RELEASEd into `merged_up` — has a subxid `>=` this value.
+        let cutoff = stack[pos].xid;
+
         // Drain from `pos` to the end.  The entry at `pos` itself is also
         // removed — after rollback the savepoint no longer exists and must be
         // re-established via another `SAVEPOINT name` if needed.
-        let removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
+        let mut removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
         drop(stack);
+
+        // Prune `merged_up`: a subtransaction that was RELEASEd *after* the
+        // target savepoint must still be discarded by ROLLBACK TO (PostgreSQL
+        // discards every subxact started after the named savepoint, released
+        // or not). `merged_up` grows monotonically on RELEASE and is never
+        // otherwise pruned, so without this an inner released savepoint's
+        // writes would survive a rollback to an outer savepoint — and be
+        // folded `Committed` at top-level commit. Move every merged-up subxid
+        // `>= cutoff` into the rolled-back set so it becomes invisible and is
+        // never folded up.
+        {
+            let mut merged = self.merged_up.lock();
+            let pruned: Vec<Xid> = merged.iter().copied().filter(|x| *x >= cutoff).collect();
+            for x in &pruned {
+                merged.remove(x);
+            }
+            drop(merged);
+            removed.extend(pruned);
+        }
         Ok(removed)
     }
 
@@ -479,6 +505,59 @@ mod tests {
         // First "dup" still exists.
         let snap = mgr.stack_snapshot();
         assert_eq!(snap[0].xid, xid(60));
+    }
+
+    // ── rollback_to prunes released (merged-up) inner subxids ───────────────
+
+    #[test]
+    fn rollback_to_prunes_released_inner_subxids() {
+        let mgr = SubtxnManager::new(xid(1));
+        let mut alloc = make_alloc(80);
+
+        let outer = mgr.savepoint("outer", &mut alloc, cid(0)).xid; // xid 80
+        let inner = mgr.savepoint("inner", &mut alloc, cid(1)).xid; // xid 81
+        // Release inner: it leaves the stack and joins merged_up. (The
+        // transaction manager records the merged-up xid; mirror that here.)
+        let released = mgr.release("inner").unwrap();
+        assert_eq!(released, inner);
+        mgr.record_merged_up(inner);
+        assert!(mgr.merged_up_sorted().contains(&inner));
+
+        // Rolling back to outer must discard outer AND the released inner.
+        let removed = mgr.rollback_to("outer").unwrap();
+        assert!(removed.contains(&outer));
+        assert!(
+            removed.contains(&inner),
+            "released inner subxid (>= outer's xid) must be discarded by ROLLBACK TO outer",
+        );
+        assert!(
+            !mgr.merged_up_sorted().contains(&inner),
+            "inner must be pruned from merged_up",
+        );
+        assert!(
+            !mgr.own_live_subxids_sorted().contains(&inner),
+            "inner must no longer be treated as self",
+        );
+    }
+
+    #[test]
+    fn rollback_to_keeps_released_subxids_older_than_target() {
+        let mgr = SubtxnManager::new(xid(1));
+        let mut alloc = make_alloc(90);
+
+        // Release an *earlier* savepoint, then set a later one and roll back
+        // to it: the earlier released subxid (xid < target) must survive.
+        let early = mgr.savepoint("early", &mut alloc, cid(0)).xid; // xid 90
+        mgr.release("early").unwrap();
+        mgr.record_merged_up(early);
+        let target = mgr.savepoint("target", &mut alloc, cid(1)).xid; // xid 91
+        let removed = mgr.rollback_to("target").unwrap();
+        assert!(removed.contains(&target));
+        assert!(
+            !removed.contains(&early),
+            "a released subxid older than the rollback target must survive",
+        );
+        assert!(mgr.merged_up_sorted().contains(&early));
     }
 
     #[test]
