@@ -389,9 +389,22 @@ where
         //   Utf8 columns lack the `with_nulls` / `from_parts`
         //   constructors `slice_column` would need, and the bench
         //   workloads never hit them on a cached path anyway.
+        // - The scanning snapshot must carry NO own subtransaction
+        //   (savepoint) context. The shared `ColumnCache` is keyed only
+        //   by relation version, which `ROLLBACK TO SAVEPOINT` does not
+        //   bump (it changes visibility without a heap mutation). A scan
+        //   whose snapshot sees savepoint-local rows (own live or
+        //   rolled-back subxids) must therefore neither read the cache
+        //   (it would miss its own savepoint writes) nor publish to it
+        //   (it would leak transaction-local rows to other snapshots).
+        //   Both subxid sets are empty for the common no-savepoint case,
+        //   so this is a zero-cost guard on the hot path.
+        let no_own_subxids = snapshot_box.own_live_subxids().is_empty()
+            && snapshot_box.own_rolled_back_subxids().is_empty();
         let cache_eligible = allow_cache
             && start_block == 0
             && !with_tids
+            && no_own_subxids
             && schema_all_fixed_numeric(codec.schema());
         let cache_read = if cache_eligible {
             heap.column_cache

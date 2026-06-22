@@ -405,6 +405,12 @@ where
                     return Err(e);
                 } else {
                     self.state.note_commit_for_gc();
+                    // Commit changed cross-transaction visibility for these
+                    // relations without a heap mutation; drop any version-
+                    // stamped column-cache entry a concurrent reader built
+                    // during the in-flight window so it rebuilds from the
+                    // now-committed state.
+                    self.invalidate_column_cache_for_tables(&modified_tables);
                     if let Err(e) =
                         self.maintain_aggregating_indexes_for_tables_after_commit(&modified_tables)
                     {
@@ -445,6 +451,11 @@ where
                     )));
                 }
                 let durable_abort_marker = !self.pending_table_modifications.is_empty();
+                let modified_tables = self
+                    .pending_table_modifications
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 if let Err(e) = self.state.abort_transaction(
                     txn,
                     durable_abort_marker,
@@ -453,6 +464,7 @@ where
                     self.clear_pending_dml_effects();
                     return Err(e);
                 }
+                self.invalidate_column_cache_for_tables(&modified_tables);
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
                 Ok(SelectResult {
@@ -496,6 +508,11 @@ where
                 // Recovery treats WAL-observed, non-prepared XIDs with no
                 // commit record as aborted, so ordinary explicit rollback does
                 // not need a synchronous abort marker.
+                let modified_tables = self
+                    .pending_table_modifications
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 if let Err(e) = self
                     .state
                     .abort_transaction(txn, false, "explicit ROLLBACK")
@@ -503,6 +520,10 @@ where
                     self.clear_pending_dml_effects();
                     return Err(e);
                 }
+                // Abort made the transaction's writes vanish for everyone
+                // without a heap mutation; invalidate the stale column
+                // cache for the relations it touched.
+                self.invalidate_column_cache_for_tables(&modified_tables);
                 self.clear_pending_dml_effects();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
