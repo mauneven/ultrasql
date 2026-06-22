@@ -520,3 +520,143 @@ async fn ntile_buckets_rows_evenly() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn window_call_nested_in_coalesce_evaluates() {
+    // Regression: a window call nested inside COALESCE must plan and
+    // evaluate (previously failed with 'column not found: $wn_0').
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    seed_input_table(&client).await;
+
+    let rows = client
+        .query(
+            "SELECT grp, val, \
+                COALESCE(sum(val) OVER (PARTITION BY grp ORDER BY val), 0) \
+             FROM wn_input ORDER BY grp, val",
+            &[],
+        )
+        .await
+        .expect("coalesce-of-window query");
+    // Running sum per partition, coalesced (never NULL here).
+    let observed: Vec<(i32, i32, i64)> = rows
+        .iter()
+        .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1), r.get::<_, i64>(2)))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (1, 10, 10),
+            (1, 20, 30),
+            (1, 30, 60),
+            (2, 50, 50),
+            (2, 75, 125),
+            (2, 100, 225),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn window_call_nested_in_case_evaluates() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    seed_input_table(&client).await;
+
+    let rows = client
+        .query(
+            "SELECT grp, val, \
+                CASE WHEN val > 20 THEN row_number() OVER (PARTITION BY grp ORDER BY val) \
+                     ELSE 0 END \
+             FROM wn_input ORDER BY grp, val",
+            &[],
+        )
+        .await
+        .expect("case-of-window query");
+    let observed: Vec<(i32, i32, i64)> = rows
+        .iter()
+        .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1), r.get::<_, i64>(2)))
+        .collect();
+    // row_number per partition is 1,2,3; gated to 0 where val <= 20.
+    assert_eq!(
+        observed,
+        vec![
+            (1, 10, 0),
+            (1, 20, 0),
+            (1, 30, 3),
+            (2, 50, 1),
+            (2, 75, 2),
+            (2, 100, 3),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn two_window_calls_nested_in_one_expression_evaluate() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    seed_input_table(&client).await;
+
+    let rows = client
+        .query(
+            "SELECT grp, val, \
+                COALESCE(rank() OVER (PARTITION BY grp ORDER BY val) \
+                       + dense_rank() OVER (PARTITION BY grp ORDER BY val), 0) \
+             FROM wn_input ORDER BY grp, val",
+            &[],
+        )
+        .await
+        .expect("two-windows-in-one-expr query");
+    let observed: Vec<(i32, i32, i64)> = rows
+        .iter()
+        .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1), r.get::<_, i64>(2)))
+        .collect();
+    // No ties: rank == dense_rank == position, so the sum is 2,4,6.
+    assert_eq!(
+        observed,
+        vec![
+            (1, 10, 2),
+            (1, 20, 4),
+            (1, 30, 6),
+            (2, 50, 2),
+            (2, 75, 4),
+            (2, 100, 6),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn nested_window_in_window_is_rejected_with_42p20() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    seed_input_table(&client).await;
+
+    let err = client
+        .simple_query("SELECT row_number() OVER (ORDER BY (rank() OVER ())) FROM wn_input")
+        .await
+        .expect_err("window-in-window must be rejected");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42P20")
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn aggregate_of_window_is_rejected_with_42p20() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    seed_input_table(&client).await;
+
+    let err = client
+        .simple_query("SELECT sum(count(*) OVER ()) FROM wn_input")
+        .await
+        .expect_err("aggregate-of-window must be rejected");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42P20")
+    );
+
+    shutdown(client, server_handle).await;
+}

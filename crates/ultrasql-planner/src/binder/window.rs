@@ -19,6 +19,8 @@ use ultrasql_parser::ast::{
     SortDirection, UnaryOp, WindowFrame, WindowSpec,
 };
 
+use super::aggregate::is_aggregate_name;
+
 use crate::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
@@ -43,30 +45,50 @@ use super::expr_bind::bind_expr_with_ctes;
 /// `rewritten_projection` against the resulting schema.
 pub(super) fn extract_window_calls(
     projection: &[ultrasql_parser::ast::SelectItem],
-) -> (Vec<ultrasql_parser::ast::SelectItem>, Vec<WindowExtraction>) {
+) -> Result<(Vec<ultrasql_parser::ast::SelectItem>, Vec<WindowExtraction>), PlanError> {
     let mut extractions: Vec<WindowExtraction> = Vec::new();
     let rewritten: Vec<ultrasql_parser::ast::SelectItem> = projection
         .iter()
         .map(|item| match item {
             ultrasql_parser::ast::SelectItem::Expr { expr, alias, span } => {
-                let rewritten_expr = rewrite_expr(expr, &mut extractions);
-                ultrasql_parser::ast::SelectItem::Expr {
+                let rewritten_expr = rewrite_expr(expr, &mut extractions)?;
+                Ok(ultrasql_parser::ast::SelectItem::Expr {
                     expr: rewritten_expr,
                     alias: alias.clone(),
                     span: *span,
-                }
+                })
             }
-            other => other.clone(),
+            other => Ok(other.clone()),
         })
-        .collect();
-    (rewritten, extractions)
+        .collect::<Result<_, PlanError>>()?;
+    Ok((rewritten, extractions))
 }
 
-/// Recursively walk `expr`. If it is a window call, replace it with a
-/// `Column` ref to the synthetic output name and push an extraction;
-/// otherwise recurse into children so a nested window call inside a
-/// `CASE` arm or a binary op is still discovered.
-fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
+/// Recursively walk `expr`, lifting every top-level window call. A window
+/// call is replaced with an [`Expr::Column`] reference to its synthetic
+/// `"$wn_N"` output name and pushed as a [`WindowExtraction`]; the
+/// recursion then descends into *every* value-expression child position
+/// so a window call nested inside a function argument, `CASE` arm,
+/// `COALESCE`, cast, `IN` list, `BETWEEN` bound, array/row constructor,
+/// etc. is discovered exactly as a top-level one is.
+///
+/// Three boundaries are enforced so the lift stays correct (each mirrors
+/// PostgreSQL):
+///
+/// * **No window-in-window.** When a window call is lifted, the recursion
+///   does **not** descend into its own arguments or `OVER (...)` spec —
+///   those bind as part of the window definition, not as separate
+///   `$wn_N` columns. But a window call *appearing inside* that
+///   argument/spec is illegal and is rejected here (PG 42P20, "window
+///   function calls cannot be nested").
+/// * **No aggregate-of-window.** A plain aggregate call (`sum(x)` with no
+///   `OVER`) whose argument subtree contains a window call is illegal in
+///   PostgreSQL (you cannot aggregate a window result) and is rejected.
+/// * **Subquery isolation.** Window calls inside a subquery belong to that
+///   subquery's own SELECT, so the recursion stops at every subquery
+///   boundary (`Subquery`, `Exists`, `InSubquery`, `Any`, `All`). They
+///   are left untouched and bound when the subquery itself is planned.
+fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Result<Expr, PlanError> {
     match expr {
         Expr::Call {
             name,
@@ -76,6 +98,16 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
             span,
             ..
         } => {
+            // This *is* a window call: a window function may not contain
+            // another window function in its own arguments, PARTITION BY,
+            // ORDER BY, or frame offsets, nor an aggregate that contains
+            // one. Reject before lifting; do NOT recurse into these — they
+            // are bound as part of the window spec.
+            for arg in args {
+                reject_nested_window(arg)?;
+            }
+            reject_nested_window_in_spec(spec)?;
+
             let output_name = format!("$wn_{}", out.len());
             out.push(WindowExtraction {
                 name: name.clone(),
@@ -84,7 +116,7 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
                 spec: spec.clone(),
                 output_name: output_name.clone(),
             });
-            Expr::Column {
+            Ok(Expr::Column {
                 name: ObjectName {
                     parts: vec![Identifier {
                         value: output_name,
@@ -93,38 +125,387 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
                     }],
                     span: *span,
                 },
+            })
+        }
+        // A non-window call: scalar function (fine to wrap a window call)
+        // or a plain aggregate (which may NOT aggregate a window result).
+        Expr::Call {
+            name,
+            args,
+            distinct,
+            within_group,
+            over: None,
+            span,
+        } => {
+            let func_name = name.parts.last().map_or("", |p| p.value.as_str());
+            if is_aggregate_name(func_name) && args.iter().any(expr_contains_window_call) {
+                return Err(PlanError::InvalidWindowFrame(
+                    "aggregate function calls cannot contain window function calls".to_string(),
+                ));
             }
+            let args = rewrite_exprs(args, out)?;
+            Ok(Expr::Call {
+                name: name.clone(),
+                args,
+                distinct: *distinct,
+                within_group: within_group.clone(),
+                over: None,
+                span: *span,
+            })
         }
         Expr::Binary {
             op,
             left,
             right,
             span,
-        } => Expr::Binary {
+        } => Ok(Expr::Binary {
             op: *op,
-            left: Box::new(rewrite_expr(left, out)),
-            right: Box::new(rewrite_expr(right, out)),
+            left: Box::new(rewrite_expr(left, out)?),
+            right: Box::new(rewrite_expr(right, out)?),
             span: *span,
-        },
-        Expr::Unary { op, expr, span } => Expr::Unary {
+        }),
+        Expr::Unary { op, expr, span } => Ok(Expr::Unary {
             op: *op,
-            expr: Box::new(rewrite_expr(expr, out)),
+            expr: Box::new(rewrite_expr(expr, out)?),
             span: *span,
-        },
+        }),
         Expr::Collate {
             expr,
             collation,
             span,
-        } => Expr::Collate {
-            expr: Box::new(rewrite_expr(expr, out)),
+        } => Ok(Expr::Collate {
+            expr: Box::new(rewrite_expr(expr, out)?),
             collation: collation.clone(),
             span: *span,
-        },
-        // Other shapes do not contain window calls in practice; leave
-        // them untouched. The binder will fail with a useful error if a
-        // window call appears in a context this rewriter does not
-        // recognise.
-        other => other.clone(),
+        }),
+        Expr::IsNull {
+            expr,
+            negated,
+            span,
+        } => Ok(Expr::IsNull {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            negated: *negated,
+            span: *span,
+        }),
+        Expr::Paren { expr, span } => Ok(Expr::Paren {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            span: *span,
+        }),
+        Expr::ArrayLiteral { elements, span } => Ok(Expr::ArrayLiteral {
+            elements: rewrite_exprs(elements, out)?,
+            span: *span,
+        }),
+        Expr::Cast { expr, target, span } => Ok(Expr::Cast {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            target: target.clone(),
+            span: *span,
+        }),
+        Expr::PostfixCast { expr, target, span } => Ok(Expr::PostfixCast {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            target: target.clone(),
+            span: *span,
+        }),
+        Expr::InList {
+            expr,
+            items,
+            negated,
+            span,
+        } => Ok(Expr::InList {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            items: rewrite_exprs(items, out)?,
+            negated: *negated,
+            span: *span,
+        }),
+        Expr::AnyArray {
+            expr,
+            op,
+            array,
+            span,
+        } => Ok(Expr::AnyArray {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            op: *op,
+            array: Box::new(rewrite_expr(array, out)?),
+            span: *span,
+        }),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            span,
+        } => {
+            let operand = match operand {
+                Some(op) => Some(Box::new(rewrite_expr(op, out)?)),
+                None => None,
+            };
+            let branches = branches
+                .iter()
+                .map(|(when, then)| Ok((rewrite_expr(when, out)?, rewrite_expr(then, out)?)))
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            let else_expr = match else_expr {
+                Some(e) => Some(Box::new(rewrite_expr(e, out)?)),
+                None => None,
+            };
+            Ok(Expr::Case {
+                operand,
+                branches,
+                else_expr,
+                span: *span,
+            })
+        }
+        Expr::Coalesce { args, span } => Ok(Expr::Coalesce {
+            args: rewrite_exprs(args, out)?,
+            span: *span,
+        }),
+        Expr::Greatest { args, span } => Ok(Expr::Greatest {
+            args: rewrite_exprs(args, out)?,
+            span: *span,
+        }),
+        Expr::Least { args, span } => Ok(Expr::Least {
+            args: rewrite_exprs(args, out)?,
+            span: *span,
+        }),
+        Expr::NullIf { a, b, span } => Ok(Expr::NullIf {
+            a: Box::new(rewrite_expr(a, out)?),
+            b: Box::new(rewrite_expr(b, out)?),
+            span: *span,
+        }),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+            symmetric,
+            span,
+        } => Ok(Expr::Between {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            low: Box::new(rewrite_expr(low, out)?),
+            high: Box::new(rewrite_expr(high, out)?),
+            negated: *negated,
+            symmetric: *symmetric,
+            span: *span,
+        }),
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+            span,
+        } => Ok(Expr::IsDistinctFrom {
+            left: Box::new(rewrite_expr(left, out)?),
+            right: Box::new(rewrite_expr(right, out)?),
+            negated: *negated,
+            span: *span,
+        }),
+        Expr::IsBoolean {
+            expr,
+            value,
+            is_unknown,
+            negated,
+            span,
+        } => Ok(Expr::IsBoolean {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            value: *value,
+            is_unknown: *is_unknown,
+            negated: *negated,
+            span: *span,
+        }),
+        Expr::ArraySubscript { expr, index, span } => Ok(Expr::ArraySubscript {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            index: Box::new(rewrite_expr(index, out)?),
+            span: *span,
+        }),
+        Expr::ArraySlice {
+            expr,
+            lower,
+            upper,
+            span,
+        } => Ok(Expr::ArraySlice {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            lower: match lower {
+                Some(e) => Some(Box::new(rewrite_expr(e, out)?)),
+                None => None,
+            },
+            upper: match upper {
+                Some(e) => Some(Box::new(rewrite_expr(e, out)?)),
+                None => None,
+            },
+            span: *span,
+        }),
+        Expr::AtTimeZone { expr, zone, span } => Ok(Expr::AtTimeZone {
+            expr: Box::new(rewrite_expr(expr, out)?),
+            zone: Box::new(rewrite_expr(zone, out)?),
+            span: *span,
+        }),
+        Expr::Overlaps {
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+            span,
+        } => Ok(Expr::Overlaps {
+            left_start: Box::new(rewrite_expr(left_start, out)?),
+            left_end: Box::new(rewrite_expr(left_end, out)?),
+            right_start: Box::new(rewrite_expr(right_start, out)?),
+            right_end: Box::new(rewrite_expr(right_end, out)?),
+            span: *span,
+        }),
+        Expr::Row { fields, span } => Ok(Expr::Row {
+            fields: rewrite_exprs(fields, out)?,
+            span: *span,
+        }),
+        // Subquery boundaries: a window call inside a subquery belongs to
+        // that subquery's own SELECT and is bound when it is planned. Do
+        // NOT lift it into the outer query's window pass. The `expr`
+        // operand of an `IN`/`ANY`/`ALL` subquery test is part of the
+        // OUTER query, so it would be eligible — but PostgreSQL forbids a
+        // window call in the left operand of `x IN (subquery)` only via
+        // the same value-context rules already covered elsewhere; here we
+        // leave these nodes whole rather than partially rewriting the
+        // outer operand, matching prior behaviour (no regression: these
+        // shapes never lifted before either).
+        Expr::Subquery { .. }
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Any { .. }
+        | Expr::All { .. }
+        // Leaves with no value-expression children.
+        | Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter { .. } => Ok(expr.clone()),
+        // `Expr` is `#[non_exhaustive]`. Every variant that exists today
+        // is handled above; a future child-bearing variant reaches here
+        // and is left whole (no lift) — the binder then surfaces a clear
+        // error if it holds a window call, exactly as the pre-fix code
+        // did for unrecognised shapes.
+        _ => Ok(expr.clone()),
+    }
+}
+
+/// Map [`rewrite_expr`] over a slice, threading the extraction buffer and
+/// any [`PlanError`] from an illegal nesting.
+fn rewrite_exprs(exprs: &[Expr], out: &mut Vec<WindowExtraction>) -> Result<Vec<Expr>, PlanError> {
+    exprs.iter().map(|e| rewrite_expr(e, out)).collect()
+}
+
+/// Reject a window call appearing anywhere inside a window call's own
+/// argument subtree (illegal window-in-window nesting). The check does
+/// not cross subquery boundaries.
+fn reject_nested_window(expr: &Expr) -> Result<(), PlanError> {
+    if expr_contains_window_call(expr) {
+        return Err(PlanError::InvalidWindowFrame(
+            "window function calls cannot be nested".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a window call appearing inside a window spec's PARTITION BY,
+/// ORDER BY, or frame-offset sub-expressions.
+fn reject_nested_window_in_spec(spec: &WindowSpec) -> Result<(), PlanError> {
+    for e in &spec.partition_by {
+        reject_nested_window(e)?;
+    }
+    for item in &spec.order_by {
+        reject_nested_window(&item.expr)?;
+    }
+    if let Some(frame) = &spec.frame {
+        for bound in [&frame.start, &frame.end] {
+            match bound {
+                FrameBound::Preceding(e) | FrameBound::Following(e) => reject_nested_window(e)?,
+                FrameBound::UnboundedPreceding
+                | FrameBound::CurrentRow
+                | FrameBound::UnboundedFollowing => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `true` if `expr` contains a window call (`Expr::Call { over: Some,
+/// .. }`) anywhere in its value-expression subtree. Does NOT descend into
+/// subquery boundaries (a window call there belongs to the subquery) nor
+/// into a found window call's own `OVER (...)` spec.
+fn expr_contains_window_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { over: Some(_), .. } => true,
+        Expr::Call { args, .. } => args.iter().any(expr_contains_window_call),
+        Expr::Binary { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            expr_contains_window_call(left) || expr_contains_window_call(right)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Paren { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::PostfixCast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsBoolean { expr, .. } => expr_contains_window_call(expr),
+        Expr::Coalesce { args, .. }
+        | Expr::Greatest { args, .. }
+        | Expr::Least { args, .. }
+        | Expr::ArrayLiteral { elements: args, .. }
+        | Expr::Row { fields: args, .. } => args.iter().any(expr_contains_window_call),
+        Expr::NullIf { a, b, .. } => expr_contains_window_call(a) || expr_contains_window_call(b),
+        Expr::AnyArray { expr, array, .. } => {
+            expr_contains_window_call(expr) || expr_contains_window_call(array)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_window_call)
+                || branches.iter().any(|(when, then)| {
+                    expr_contains_window_call(when) || expr_contains_window_call(then)
+                })
+                || else_expr.as_deref().is_some_and(expr_contains_window_call)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_window_call(expr)
+                || expr_contains_window_call(low)
+                || expr_contains_window_call(high)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_window_call(expr) || items.iter().any(expr_contains_window_call)
+        }
+        Expr::ArraySubscript { expr, index, .. } => {
+            expr_contains_window_call(expr) || expr_contains_window_call(index)
+        }
+        Expr::ArraySlice {
+            expr, lower, upper, ..
+        } => {
+            expr_contains_window_call(expr)
+                || lower.as_deref().is_some_and(expr_contains_window_call)
+                || upper.as_deref().is_some_and(expr_contains_window_call)
+        }
+        Expr::AtTimeZone { expr, zone, .. } => {
+            expr_contains_window_call(expr) || expr_contains_window_call(zone)
+        }
+        Expr::Overlaps {
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+            ..
+        } => {
+            expr_contains_window_call(left_start)
+                || expr_contains_window_call(left_end)
+                || expr_contains_window_call(right_start)
+                || expr_contains_window_call(right_end)
+        }
+        // Subquery boundaries and leaves: do not descend.
+        Expr::Subquery { .. }
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Any { .. }
+        | Expr::All { .. }
+        | Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter { .. } => false,
+        // `Expr` is `#[non_exhaustive]`: a future variant is conservatively
+        // treated as containing no window call (it cannot today).
+        _ => false,
     }
 }
 

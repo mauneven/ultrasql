@@ -937,7 +937,7 @@ fn bind_select_body(
     // the existing aggregate detection and projection binding paths
     // see a normal scalar projection.
     let (projection_after_window, window_extractions) =
-        window::extract_window_calls(&select.projection);
+        window::extract_window_calls(&select.projection)?;
     let select_for_binding = if window_extractions.is_empty() {
         select.clone()
     } else {

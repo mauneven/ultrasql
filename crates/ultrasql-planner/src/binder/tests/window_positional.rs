@@ -409,6 +409,161 @@ fn rejects_distinct_window_function_calls() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Window calls nested inside value expressions (function args, CASE,
+// COALESCE, cast, IN list, BETWEEN, ...) must be lifted into their own
+// `$wn_N` column, exactly as a top-level window call is. PostgreSQL accepts
+// a window function anywhere a value expression is allowed.
+// -----------------------------------------------------------------------
+
+/// Count how many `$wn_N` Window operators a plan stacks.
+fn count_window_funcs(plan: &LogicalPlan) -> usize {
+    let mut funcs = Vec::new();
+    collect_window_funcs(plan, &mut funcs);
+    funcs.len()
+}
+
+#[test]
+fn window_call_nested_in_coalesce_is_lifted() {
+    let plan = parse_bind_ok("SELECT COALESCE(sum(score) OVER (ORDER BY id), 0) FROM users");
+    assert_eq!(
+        count_window_funcs(&plan),
+        1,
+        "the window call inside COALESCE must be lifted into one Window node"
+    );
+    let dump = plan.display(0);
+    assert!(dump.contains("$wn_0"), "synthetic column emitted: {dump}");
+}
+
+#[test]
+fn window_call_nested_in_case_is_lifted() {
+    let plan = parse_bind_ok(
+        "SELECT CASE WHEN id > 1 THEN row_number() OVER (ORDER BY id) ELSE 0 END FROM users",
+    );
+    assert_eq!(count_window_funcs(&plan), 1);
+    let mut funcs = Vec::new();
+    collect_window_funcs(&plan, &mut funcs);
+    assert!(matches!(funcs.as_slice(), [LogicalWindowFunc::RowNumber]));
+}
+
+#[test]
+fn window_call_as_function_argument_is_lifted() {
+    // pg_typeof(avg(v) OVER ()) — the avg-result type itself is a separate
+    // known issue; we only assert the window call is lifted and the query
+    // plans.
+    let plan = parse_bind_ok("SELECT pg_typeof(avg(score) OVER ()) FROM users");
+    assert_eq!(count_window_funcs(&plan), 1);
+}
+
+#[test]
+fn multiple_distinct_window_calls_in_one_expression_each_lifted() {
+    let plan = parse_bind_ok(
+        "SELECT COALESCE(rank() OVER (ORDER BY id) + dense_rank() OVER (ORDER BY id), 0) \
+         FROM users",
+    );
+    assert_eq!(
+        count_window_funcs(&plan),
+        2,
+        "rank() and dense_rank() must each get their own $wn_N"
+    );
+    let mut funcs = Vec::new();
+    collect_window_funcs(&plan, &mut funcs);
+    assert!(funcs.iter().any(|f| matches!(f, LogicalWindowFunc::Rank)));
+    assert!(
+        funcs
+            .iter()
+            .any(|f| matches!(f, LogicalWindowFunc::DenseRank))
+    );
+    let dump = plan.display(0);
+    assert!(dump.contains("$wn_0") && dump.contains("$wn_1"), "{dump}");
+}
+
+#[test]
+fn window_call_inside_cast_is_lifted() {
+    let plan = parse_bind_ok("SELECT CAST(row_number() OVER (ORDER BY id) AS BIGINT) FROM users");
+    assert_eq!(count_window_funcs(&plan), 1);
+}
+
+#[test]
+fn window_call_inside_in_list_is_lifted() {
+    let plan = parse_bind_ok("SELECT row_number() OVER (ORDER BY id) IN (1, 2) FROM users");
+    assert_eq!(count_window_funcs(&plan), 1);
+}
+
+#[test]
+fn window_call_inside_between_is_lifted() {
+    let plan =
+        parse_bind_ok("SELECT id BETWEEN 0 AND sum(id) OVER (ORDER BY id) AS in_range FROM users");
+    assert_eq!(count_window_funcs(&plan), 1);
+}
+
+#[test]
+fn window_in_window_over_clause_is_rejected() {
+    // row_number() OVER (ORDER BY (rank() OVER ())) — a window call inside
+    // another window's ORDER BY is illegal (PG 42P20).
+    let cat = users_catalog();
+    let sql = "SELECT row_number() OVER (ORDER BY (rank() OVER ())) FROM users";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    assert!(
+        matches!(&err, PlanError::InvalidWindowFrame(m) if m.contains("cannot be nested")),
+        "expected window-in-window rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn window_in_window_argument_is_rejected() {
+    let cat = users_catalog();
+    let sql = "SELECT sum(rank() OVER ()) OVER (ORDER BY id) FROM users";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    assert!(
+        matches!(&err, PlanError::InvalidWindowFrame(m) if m.contains("cannot be nested")),
+        "expected window-in-window rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn aggregate_of_window_call_is_rejected() {
+    // sum(count(*) OVER ()) — a plain aggregate cannot aggregate a window
+    // result (PG 42P20).
+    let cat = users_catalog();
+    let sql = "SELECT sum(count(*) OVER ()) FROM users";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    assert!(
+        matches!(
+            &err,
+            PlanError::InvalidWindowFrame(m)
+                if m.contains("aggregate function calls cannot contain window")
+        ),
+        "expected aggregate-of-window rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn window_call_in_where_is_still_rejected() {
+    // The window-extraction pass only runs on the projection; a window call
+    // in WHERE never lifts and must still error.
+    let cat = users_catalog();
+    let sql = "SELECT id FROM users WHERE row_number() OVER () = 1";
+    let err = parse_and_bind(sql, &cat).expect_err(sql);
+    // Any planning error is acceptable; the point is the query does NOT plan.
+    let _ = err;
+}
+
+#[test]
+fn window_call_inside_subquery_does_not_leak_to_outer_query() {
+    // The window call belongs to the scalar subquery's own SELECT, so the
+    // OUTER query must wrap zero Window nodes (the subquery is planned
+    // separately and is not flattened into the outer plan here).
+    let plan = parse_bind_ok(
+        "SELECT (SELECT row_number() OVER (ORDER BY id) FROM users LIMIT 1) AS sub FROM users",
+    );
+    assert_eq!(
+        count_window_funcs(&plan),
+        0,
+        "the subquery's window call must not be lifted into the outer query"
+    );
+}
+
 #[test]
 fn statement_family_display_schema_and_pipeline_modes_are_stable() {
     let cases = [
