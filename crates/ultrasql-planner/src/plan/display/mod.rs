@@ -41,6 +41,9 @@ impl LogicalPlan {
             }
             Self::Limit { input, n, offset } => scans::fmt_limit(input, *n, *offset, indent, out),
             Self::Sort { input, keys } => scans::fmt_sort(input, keys, indent, out),
+            Self::DistinctOn { input, on_keys } => {
+                scans::fmt_distinct_on(input, on_keys, indent, out);
+            }
             Self::Window {
                 input,
                 partition_by,

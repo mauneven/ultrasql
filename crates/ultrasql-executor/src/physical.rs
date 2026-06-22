@@ -31,6 +31,7 @@ use ultrasql_planner::{LogicalJoinCondition, LogicalJoinType, LogicalPlan, Scala
 use ultrasql_vec::Batch;
 
 use crate::cte_scan::CteScan;
+use crate::distinct_on::DistinctOn;
 use crate::filter_op::Filter;
 use crate::hash_aggregate::HashAggregate;
 use crate::hash_join::{HashJoin, HashJoinSchemas};
@@ -156,6 +157,11 @@ pub fn build_operator(
             let child = build_operator(input, data_source)?;
             let schema = child.schema().clone();
             Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+        }
+
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            let child = build_operator(input, data_source)?;
+            Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
         }
 
         LogicalPlan::Empty { schema } => {

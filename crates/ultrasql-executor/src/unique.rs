@@ -453,7 +453,7 @@ impl Unique {
 }
 
 /// Compare two rows for DISTINCT equality (NULL == NULL).
-fn rows_equal_for_distinct(a: &[Value], b: &[Value]) -> bool {
+pub(crate) fn rows_equal_for_distinct(a: &[Value], b: &[Value]) -> bool {
     if a.len() != b.len() {
         return false;
     }

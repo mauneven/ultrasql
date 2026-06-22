@@ -78,6 +78,25 @@ pub(super) fn fmt_sort(input: &LogicalPlan, keys: &[SortKey], indent: usize, out
     input.display_into(indent + 2, out);
 }
 
+pub(super) fn fmt_distinct_on(
+    input: &LogicalPlan,
+    on_keys: &[ScalarExpr],
+    indent: usize,
+    out: &mut String,
+) {
+    let pad = " ".repeat(indent);
+    out.push_str(&pad);
+    out.push_str("DistinctOn: ");
+    for (i, e) in on_keys.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = fmt::write(out, format_args!("{e}"));
+    }
+    out.push('\n');
+    input.display_into(indent + 2, out);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fmt_window(
     input: &LogicalPlan,

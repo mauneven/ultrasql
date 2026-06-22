@@ -759,6 +759,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Project { .. } => "Result",
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::DistinctOn { .. } => "Unique",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
         LogicalPlan::Pivot { .. } => "Pivot",

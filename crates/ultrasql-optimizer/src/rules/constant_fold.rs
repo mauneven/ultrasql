@@ -259,6 +259,18 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             }))
         }
 
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            let new_input = fold_plan(input)?;
+            let (new_keys, keys_changed) = fold_expr_list(on_keys);
+            if new_input.is_none() && !keys_changed {
+                return Ok(None);
+            }
+            Ok(Some(LogicalPlan::DistinctOn {
+                input: Box::new(new_input.unwrap_or_else(|| *input.clone())),
+                on_keys: new_keys,
+            }))
+        }
+
         LogicalPlan::Window {
             input,
             partition_by,

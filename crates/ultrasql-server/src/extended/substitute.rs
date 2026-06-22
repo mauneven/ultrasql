@@ -337,6 +337,10 @@ where
                 })
                 .collect(),
         },
+        LogicalPlan::DistinctOn { input, on_keys } => LogicalPlan::DistinctOn {
+            input: Box::new(map_plan_exprs(input, f)),
+            on_keys: on_keys.iter().map(f).collect(),
+        },
         LogicalPlan::Values { rows, schema } => {
             // After substitution, parameter cells become concrete-typed
             // literals; the binder built `schema` assuming `Null` for

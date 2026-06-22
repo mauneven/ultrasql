@@ -80,6 +80,23 @@ pub enum LogicalPlan {
         keys: Vec<SortKey>,
     },
 
+    /// `SELECT DISTINCT ON (expr, …)` deduplication.
+    ///
+    /// Keeps the **first** row of each group of rows that share the same
+    /// values for `on_keys`. The input is always a [`Self::Sort`] ordered on
+    /// the ON keys (optionally followed by the rest of `ORDER BY`), so "first
+    /// per group" is well-defined: the executor emits a row only when its
+    /// ON-key tuple differs from the previously emitted row's. The ON-key
+    /// expressions resolve against this node's input schema (which is the
+    /// output schema, since `DistinctOn` is non-projecting) and need not
+    /// appear in the projection above it.
+    DistinctOn {
+        /// Input plan, sorted on the ON keys.
+        input: Box<Self>,
+        /// ON-key expressions, in declaration order.
+        on_keys: Vec<ScalarExpr>,
+    },
+
     /// Window-function application. Wraps a child plan and appends one
     /// column carrying the per-row window result. The executor's
     /// `WindowAgg` operator consumes this shape directly.

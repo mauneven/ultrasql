@@ -159,6 +159,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::DistinctOn { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Pivot { input, .. }
         | LogicalPlan::Unpivot { input, .. }
@@ -342,6 +343,10 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             keys: keys.clone(),
+        },
+        LogicalPlan::DistinctOn { input, on_keys } => LogicalPlan::DistinctOn {
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
+            on_keys: on_keys.clone(),
         },
         LogicalPlan::Window {
             input,

@@ -252,6 +252,9 @@ impl ServerError {
             // windowing_error — an illegal window-frame clause (bad bound
             // ordering, RANGE offset without one ORDER BY col, etc.).
             Self::Plan(ultrasql_planner::PlanError::InvalidWindowFrame(_)) => "42P20",
+            // invalid_column_reference — DISTINCT ON expressions must be a
+            // prefix of ORDER BY.
+            Self::Plan(ultrasql_planner::PlanError::DistinctOnOrderByMismatch(_)) => "42P10",
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",

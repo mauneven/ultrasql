@@ -133,11 +133,18 @@ fn infer_into(
                 infer_in_expr(e, None, out);
             }
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Sort { input, .. } => {
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::DistinctOn { input, .. } => {
             infer_into(input, catalog, out);
             if let LogicalPlan::Sort { keys, .. } = plan {
                 for k in keys {
                     infer_in_expr(&k.expr, None, out);
+                }
+            }
+            if let LogicalPlan::DistinctOn { on_keys, .. } = plan {
+                for e in on_keys {
+                    infer_in_expr(e, None, out);
                 }
             }
         }
@@ -556,11 +563,18 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
                 walk_expr(e, f);
             }
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Sort { input, .. } => {
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::DistinctOn { input, .. } => {
             walk_plan_exprs(input, f);
             if let LogicalPlan::Sort { keys, .. } = plan {
                 for k in keys {
                     walk_expr(&k.expr, f);
+                }
+            }
+            if let LogicalPlan::DistinctOn { on_keys, .. } = plan {
+                for e in on_keys {
+                    walk_expr(e, f);
                 }
             }
         }

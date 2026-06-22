@@ -328,6 +328,12 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
                 walk_expr_for_max_param(&k.expr, max_idx);
             }
         }
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            walk_plan_for_max_param(input, max_idx);
+            for e in on_keys {
+                walk_expr_for_max_param(e, max_idx);
+            }
+        }
         LogicalPlan::Aggregate {
             input,
             group_by,

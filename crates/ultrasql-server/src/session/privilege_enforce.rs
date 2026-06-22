@@ -233,6 +233,13 @@ where
                 self.collect_sort_keys(keys, &sources);
                 self.collect_plan(input, output_observed);
             }
+            LogicalPlan::DistinctOn { input, on_keys } => {
+                let sources = plan_sources(input);
+                for expr in on_keys {
+                    self.collect_expr(expr, &sources, PrivilegeKind::Select);
+                }
+                self.collect_plan(input, output_observed);
+            }
             LogicalPlan::Window {
                 input,
                 partition_by,

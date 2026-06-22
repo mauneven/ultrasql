@@ -3,7 +3,8 @@
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{
-    Filter, Limit, MemTableScan, Operator, Pivot, Project, ResultOp, SetOp, Sort, Unpivot,
+    DistinctOn, Filter, Limit, MemTableScan, Operator, Pivot, Project, ResultOp, SetOp, Sort,
+    Unpivot,
 };
 use ultrasql_planner::{InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -47,6 +48,10 @@ pub fn lower_plan(
             let child = lower_plan(input, tables)?;
             let schema = child.schema().clone();
             Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+        }
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            let child = lower_plan(input, tables)?;
+            Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
         }
         LogicalPlan::Join {
             left,

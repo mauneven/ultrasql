@@ -50,9 +50,10 @@ use ultrasql_parser::ast::{
     DescribeObjectKind as AstDescribeObjectKind, DescribeStmt, DescribeTarget as AstDescribeTarget,
     Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, ExportDatabaseStmt, Expr as AstExpr,
     ImportDatabaseStmt, Literal, LockStrength as AstLockStrength,
-    LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp, SetQuantifier, SetRoleStmt, SetScope,
-    SetValue, SetVarStmt, Statement, SummarizeStmt,
+    LockWaitPolicy as AstLockWaitPolicy, NullsOrder, SelectStmt, SetOp, SetQuantifier, SetRoleStmt,
+    SetScope, SetValue, SetVarStmt, SortDirection, Statement, SummarizeStmt,
 };
+use ultrasql_parser::span::Span;
 
 use crate::catalog::Catalog;
 use crate::error::PlanError;
@@ -509,10 +510,6 @@ pub(super) fn bind_select(
     catalog: &dyn Catalog,
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
-    if matches!(select.distinct, Distinct::DistinctOn(_)) {
-        return Err(PlanError::NotSupported("SELECT DISTINCT ON (...)"));
-    }
-
     let mut cte_catalog: Vec<(String, Schema)> = Vec::new();
     let mut cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
     for cte in &select.ctes {
@@ -907,10 +904,11 @@ fn bind_select_body(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
-    if matches!(select.distinct, Distinct::DistinctOn(_)) {
-        return Err(PlanError::NotSupported("SELECT DISTINCT ON (...)"));
-    }
     let is_distinct = matches!(select.distinct, Distinct::Distinct);
+    let distinct_on = match &select.distinct {
+        Distinct::DistinctOn(exprs) => Some(exprs.as_slice()),
+        _ => None,
+    };
 
     let (mut plan, from_scope) = bind_from(&select.from, catalog, cte_catalog, scope)?;
 
@@ -993,8 +991,29 @@ fn bind_select_body(
             schema: proj_schema,
         };
 
-        plan =
-            bind_order_by_around_projection(plan, &select.order_by, catalog, cte_catalog, scope)?;
+        let order_input_schema = match &plan {
+            LogicalPlan::Project { input, .. } => input.schema().clone(),
+            _ => plan.schema().clone(),
+        };
+        if let Some(on_exprs) = distinct_on {
+            plan = bind_distinct_on(
+                plan,
+                on_exprs,
+                &select.order_by,
+                &order_input_schema,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
+        } else {
+            plan = bind_order_by_around_projection(
+                plan,
+                &select.order_by,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
+        }
     } else {
         let projection_input_schema = plan.schema().clone();
         let projected = bind_projection_with_scope(
@@ -1024,14 +1043,26 @@ fn bind_select_body(
             },
             &from_scope,
         )?;
-        plan = bind_order_by_around_projection_with_input_schema(
-            plan,
-            &select.order_by,
-            &order_input_schema,
-            catalog,
-            cte_catalog,
-            scope,
-        )?;
+        if let Some(on_exprs) = distinct_on {
+            plan = bind_distinct_on(
+                plan,
+                on_exprs,
+                &select.order_by,
+                &order_input_schema,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
+        } else {
+            plan = bind_order_by_around_projection_with_input_schema(
+                plan,
+                &select.order_by,
+                &order_input_schema,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
+        }
     }
 
     if is_distinct {
@@ -1201,4 +1232,139 @@ fn bind_order_by_around_projection_with_input_schema(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Bind `SELECT DISTINCT ON (e1, …) … [ORDER BY …]`.
+///
+/// PostgreSQL semantics:
+///
+/// * Keep the **first** row of each group of rows sharing the same values for
+///   the ON keys `(e1, …)`, where "first" is fixed by `ORDER BY`.
+/// * The ON keys must be a **prefix** of `ORDER BY`; otherwise raise
+///   `SELECT DISTINCT ON expressions must match initial ORDER BY expressions`
+///   (SQLSTATE 42P10).
+/// * Without `ORDER BY` the chosen row per group is implementation-defined; we
+///   sort by the ON keys alone (ascending, NULLs last) so the result is
+///   deterministic.
+///
+/// `plan` is the already-projected query (a [`LogicalPlan::Project`] in the
+/// common case). The ON keys and `ORDER BY` keys resolve against
+/// `input_schema` — the pre-projection schema, matching how `ORDER BY` keys
+/// not in the select list are bound. The resulting shape is
+/// `Project(DistinctOn(Sort(input)))`: the sort orders rows so the per-group
+/// first row is well-defined, the [`LogicalPlan::DistinctOn`] dedup emits one
+/// row per ON-key group, and the projection sits on top so an ON key need not
+/// appear in the select list.
+fn bind_distinct_on(
+    plan: LogicalPlan,
+    on_exprs: &[AstExpr],
+    order_by: &[ultrasql_parser::ast::OrderItem],
+    input_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    // Split off the top projection (the common case) so the dedup can sit
+    // beneath it; `None` covers the rare non-projected shape.
+    let (sort_input, proj) = match plan {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => (input, Some(ProjectParts { exprs, schema })),
+        other => (Box::new(other), None),
+    };
+    let proj_exprs = proj.as_ref().map(|p| p.exprs.as_slice());
+
+    // Bind the ON keys. Route them through the ORDER-BY binder (as synthetic
+    // ascending items) so positional and projection-alias references resolve
+    // exactly as they do in `ORDER BY` — this lets `DISTINCT ON (1)` match
+    // `ORDER BY 1`.
+    let on_items: Vec<ultrasql_parser::ast::OrderItem> = on_exprs
+        .iter()
+        .map(|expr| ultrasql_parser::ast::OrderItem {
+            expr: expr.clone(),
+            direction: SortDirection::Asc,
+            nulls: NullsOrder::Default,
+            span: Span::default(),
+        })
+        .collect();
+    let on_keys: Vec<ScalarExpr> = bind_order_by(
+        &on_items,
+        input_schema,
+        proj_exprs,
+        catalog,
+        cte_catalog,
+        scope,
+    )?
+    .into_iter()
+    .map(|key| key.expr)
+    .collect();
+
+    // Bind the real ORDER BY and enforce the prefix rule.
+    let order_keys = bind_order_by(
+        order_by,
+        input_schema,
+        proj_exprs,
+        catalog,
+        cte_catalog,
+        scope,
+    )?;
+    if !order_keys.is_empty() {
+        let prefix_matches = order_keys.len() >= on_keys.len()
+            && on_keys
+                .iter()
+                .zip(order_keys.iter())
+                .all(|(on, key)| *on == key.expr);
+        if !prefix_matches {
+            return Err(PlanError::DistinctOnOrderByMismatch(
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions".to_owned(),
+            ));
+        }
+    }
+
+    // Sort keys: the full ORDER BY (which begins with the ON keys when present)
+    // or, without ORDER BY, the ON keys alone (ascending, NULLs last) so the
+    // per-group first row is deterministic.
+    let sort_keys = if order_keys.is_empty() {
+        on_keys
+            .iter()
+            .map(|expr| SortKey {
+                expr: expr.clone(),
+                asc: true,
+                nulls_first: false,
+            })
+            .collect()
+    } else {
+        order_keys
+    };
+
+    let mut current = if sort_keys.is_empty() {
+        sort_input
+    } else {
+        Box::new(LogicalPlan::Sort {
+            input: sort_input,
+            keys: sort_keys,
+        })
+    };
+    current = Box::new(LogicalPlan::DistinctOn {
+        input: current,
+        on_keys,
+    });
+
+    Ok(match proj {
+        Some(ProjectParts { exprs, schema }) => LogicalPlan::Project {
+            input: current,
+            exprs,
+            schema,
+        },
+        None => *current,
+    })
+}
+
+/// The pieces of a [`LogicalPlan::Project`] lifted off so a `DISTINCT ON`
+/// dedup can be spliced beneath it.
+struct ProjectParts {
+    exprs: Vec<(ScalarExpr, String)>,
+    schema: Schema,
 }

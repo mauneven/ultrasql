@@ -244,6 +244,13 @@ impl<'s> CostModel<'s> {
                 cost_sort(input_est, &self.gucs)
             }
 
+            LogicalPlan::DistinctOn { input, .. } => {
+                // Streaming dedup over already-sorted input: a single linear
+                // pass that never increases the row count. Estimate as the
+                // input (the Sort below already carries the ordering cost).
+                self.estimate(input)
+            }
+
             LogicalPlan::Join {
                 left,
                 right,

@@ -58,6 +58,12 @@ pub enum PlanError {
     /// text; the server maps this to SQLSTATE `42P20` (`windowing_error`).
     #[error("{0}")]
     InvalidWindowFrame(String),
+
+    /// The `DISTINCT ON (...)` expressions are not a prefix of the `ORDER BY`
+    /// list. The message carries PostgreSQL-matching text; the server maps
+    /// this to SQLSTATE `42P10` (`invalid_column_reference`).
+    #[error("{0}")]
+    DistinctOnOrderByMismatch(String),
 }
 
 impl PlanError {

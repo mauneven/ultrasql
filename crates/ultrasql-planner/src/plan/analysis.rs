@@ -81,6 +81,7 @@ impl LogicalPlan {
         match self {
             Self::Scan { .. }
             | Self::Sort { .. }
+            | Self::DistinctOn { .. }
             | Self::Window { .. }
             | Self::Aggregate { .. }
             | Self::Pivot { .. }
@@ -227,9 +228,10 @@ impl LogicalPlan {
             | Self::Explain { schema, .. }
             | Self::FunctionScan { schema, .. }
             | Self::Window { schema, .. } => schema,
-            Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
-                input.schema()
-            }
+            Self::Filter { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Sort { input, .. }
+            | Self::DistinctOn { input, .. } => input.schema(),
         }
     }
 }

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
-    Filter, HashAggregate, Limit, Operator, Pivot, ProfiledOperator, ResultOp, Sort, TopK, Unique,
-    Unpivot, ValuesScan,
+    DistinctOn, Filter, HashAggregate, Limit, Operator, Pivot, ProfiledOperator, ResultOp, Sort,
+    TopK, Unique, Unpivot, ValuesScan,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
@@ -287,6 +287,13 @@ fn lower_query_inner(
                 Sort::new(child, keys.clone(), schema)
                     .with_work_mem_budget(Arc::clone(&ctx.work_mem)),
             ))
+        }
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            // The child is a `Sort` ordered on the ON keys (or, without
+            // ORDER BY, on the ON keys alone), so the streaming dedup emits
+            // the first row of each ON-key group.
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
         }
         LogicalPlan::Update {
             table,
@@ -734,6 +741,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Project { .. } => "Result",
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::DistinctOn { .. } => "Unique",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
         LogicalPlan::Pivot { .. } => "Pivot",
