@@ -169,6 +169,16 @@ pub(crate) fn local_output_from_select_result(
 pub(crate) fn local_result_messages(
     result: SelectResult,
 ) -> Result<Vec<BackendMessage>, ServerError> {
+    // Local / embedded execution decodes a complete contiguous body and
+    // cannot drive a streaming handle. Every caller reaches here via a
+    // dispatch context that passes `allow_streaming: false`, so the SELECT
+    // arm never produced a streaming handle; assert it to catch a future
+    // regression that would otherwise silently drop rows and leak the XID.
+    debug_assert!(
+        result.streaming.is_none(),
+        "local_result_messages received a streaming SelectResult; \
+         local/embedded execution cannot drive it (allow_streaming must be false)"
+    );
     if let Some(body) = result.streamed_body {
         return decode_local_result_body(body);
     }

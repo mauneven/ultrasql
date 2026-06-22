@@ -972,4 +972,160 @@ mod e2e {
         drop(client);
         handle.await.expect("join").expect("clean exit");
     }
+
+    // ---------- consumer-gating regression tests ----------
+    //
+    // These cover the consumers that receive a `SelectResult` but cannot
+    // drive a streaming handle. Before the streaming-gating fix they each
+    // requested streaming unconditionally and broke: the batch / embedded
+    // paths shipped only window 0 (no CommandComplete) and dropped the
+    // streaming handle holding the autocommit txn uncommitted, pinning the
+    // XID as in-progress forever. With `allow_streaming` supplied by the
+    // dispatch context, these consumers take the whole-buffer path and the
+    // bugs cannot occur.
+
+    /// True when no transaction is currently in progress: the oldest
+    /// in-progress XID has caught up to the next-to-allocate XID, i.e. the
+    /// CLOG holds no `InProgress` entry. A leaked streaming handle would
+    /// pin its XID `InProgress`, so this would be false.
+    fn no_xid_leaked(state: &Server) -> bool {
+        state.txn_manager.oldest_in_progress() == state.txn_manager.next_xid()
+    }
+
+    /// BUG 1 — multi-statement Simple-Query batch with a large leading
+    /// SELECT. The big SELECT must return ALL its rows with its OWN
+    /// CommandComplete, the trailing statement must still run, and the
+    /// autocommit XID must not leak.
+    ///
+    /// Fails before the fix: the batch path (`encode_query_result_body`)
+    /// ignored `result.streaming`, so the big SELECT shipped only window 0
+    /// with no CommandComplete (the second statement's reply merged into
+    /// the corrupt stream) and the dropped handle left the XID InProgress.
+    #[tokio::test]
+    async fn batch_with_large_leading_select_returns_all_rows_and_leaks_no_xid() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        startup(&mut client).await;
+        let rows = 6_000; // body well over the 256 KiB window high-water
+        seed_wide_table(&mut client, "batch_big", rows).await;
+
+        // One Simple-Query message carrying TWO statements: a large SELECT
+        // followed by a trivial one. The whole batch shares a single
+        // trailing ReadyForQuery.
+        send(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id, payload FROM batch_big; SELECT 1".to_string(),
+            },
+        )
+        .await;
+        let (_, msgs) = read_until_ready(&mut client).await;
+
+        // The big SELECT returns every row, with its OWN CommandComplete.
+        assert_eq!(
+            count_kind(&msgs, |m| matches!(m, BackendMessage::DataRow { .. })),
+            // rows from the big SELECT + 1 row from `SELECT 1`
+            rows + 1,
+            "batch did not return all rows of the large leading SELECT"
+        );
+        let tags: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tags.iter().any(|t| t == &format!("SELECT {rows}")),
+            "missing the large SELECT's CommandComplete; got tags {tags:?}"
+        );
+        // Both statements completed: two CommandCompletes (SELECT rows, SELECT 1).
+        assert_eq!(
+            tags,
+            vec![format!("SELECT {rows}"), "SELECT 1".to_string()],
+            "the trailing statement did not run after the large SELECT"
+        );
+        // Exactly one trailing ReadyForQuery for the whole batch.
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // No leaked XID: every autocommit txn from the batch is terminal.
+        assert!(
+            no_xid_leaked(&state),
+            "batch leaked an in-progress XID (oldest_in_progress={:?}, next_xid={:?})",
+            state.txn_manager.oldest_in_progress(),
+            state.txn_manager.next_xid()
+        );
+
+        send(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("join").expect("clean exit");
+    }
+
+    /// §7.5 — the buffered-vs-streaming decision boundary. A result just
+    /// under the window high-water (buffered) and one just over it
+    /// (streamed) must both return byte-correct, well-formed responses with
+    /// the correct row counts.
+    #[tokio::test]
+    async fn buffered_and_streamed_boundary_both_round_trip() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        startup(&mut client).await;
+
+        // ~80 wire bytes/row; pick counts that straddle 256 KiB.
+        let per_row = 80usize;
+        let under = STREAM_WINDOW_HIGH_WATER_BYTES / per_row / 2; // comfortably buffered
+        let over = (STREAM_WINDOW_HIGH_WATER_BYTES / per_row) * 3; // comfortably streamed
+
+        for (table, n) in [("boundary_under", under), ("boundary_over", over)] {
+            seed_wide_table(&mut client, table, n).await;
+            send(
+                &mut client,
+                &FrontendMessage::Query {
+                    sql: format!("SELECT id, payload FROM {table}"),
+                },
+            )
+            .await;
+            let (_, msgs) = read_until_ready(&mut client).await;
+            assert_eq!(
+                count_kind(&msgs, |m| matches!(m, BackendMessage::DataRow { .. })),
+                n,
+                "{table}: wrong DataRow count"
+            );
+            assert_eq!(
+                command_tag_of(&msgs).as_deref(),
+                Some(format!("SELECT {n}").as_str())
+            );
+            assert_eq!(
+                count_kind(&msgs, |m| matches!(
+                    m,
+                    BackendMessage::RowDescription { .. }
+                )),
+                1
+            );
+            assert!(matches!(
+                msgs.last().unwrap(),
+                BackendMessage::ReadyForQuery { status: b'I' }
+            ));
+        }
+        assert!(no_xid_leaked(&state), "boundary round-trip leaked an XID");
+
+        send(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("join").expect("clean exit");
+    }
+
+    /// Local helper: the `CommandComplete` tag from a decoded message run.
+    fn command_tag_of(msgs: &[BackendMessage]) -> Option<String> {
+        msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        })
+    }
 }

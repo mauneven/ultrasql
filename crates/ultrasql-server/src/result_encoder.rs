@@ -417,8 +417,16 @@ pub struct SelectResult {
     /// keep `SelectResult` small — the handle owns the root operator and an
     /// optional `Transaction`.
     pub streaming: Option<Box<StreamingSelect>>,
-    /// Number of rows produced. Mirrors the value embedded in the
-    /// trailing `CommandComplete` tag.
+    /// Number of rows produced, used for session bookkeeping and logging.
+    ///
+    /// For a fully-buffered result (`messages`, `streamed_body`,
+    /// `shared_streamed_body`) this equals the count embedded in the
+    /// `CommandComplete` tag. For a *streamed* result (`streaming.is_some()`)
+    /// it is only window 0's count — the rest of the rows have not been
+    /// pulled from the operator yet. The true final count is accumulated as
+    /// the drive loop drains the operator and is written into the
+    /// `CommandComplete` tag at EOF; for a streamed result the wire tag, not
+    /// this field, is authoritative.
     pub rows: u64,
 }
 

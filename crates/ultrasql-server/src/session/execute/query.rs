@@ -6,7 +6,22 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    pub(crate) fn execute_query(&mut self, sql: &str) -> Result<SelectResult, ServerError> {
+    /// Dispatch and execute a single statement, returning its
+    /// [`SelectResult`].
+    ///
+    /// `allow_streaming` is propagated unchanged to every SELECT-producing
+    /// sub-dispatch (`run_dml_or_select`, the EXECUTE meta path,
+    /// `execute_bound_plan`). It is `true` only on the single-statement
+    /// Simple-Query network path that can drive a streaming handle; every
+    /// other consumer (multi-statement batch, embedded API, import) passes
+    /// `false` and gets a fully buffered body. See
+    /// [`Self::run_dml_or_select`] for why a streaming handle that the
+    /// caller cannot drive corrupts the wire and leaks the XID.
+    pub(crate) fn execute_query(
+        &mut self,
+        sql: &str,
+        allow_streaming: bool,
+    ) -> Result<SelectResult, ServerError> {
         // Capture a per-statement catalog snapshot — wait-free arc-swap load.
         // The binder reads this snapshot first; if a name is not found there
         // (a runtime CREATE TABLE never landed it), the in-memory sample
@@ -90,16 +105,31 @@ where
                         // The view-rewrite produces a fresh `prepared` plan
                         // every call, so it has no stable identity to cache
                         // against — pass `None` and run the full checks.
-                        return self.run_dml_or_select(&prepared, &catalog_snapshot, None);
+                        return self.run_dml_or_select(
+                            &prepared,
+                            &catalog_snapshot,
+                            None,
+                            allow_streaming,
+                        );
                     }
-                    return self.execute_bound_plan(prepared, sql, catalog_snapshot);
+                    return self.execute_bound_plan(
+                        prepared,
+                        sql,
+                        catalog_snapshot,
+                        allow_streaming,
+                    );
                 }
                 // Stable path: `plan_arc` is the pointer-stable `stmt_cache`
                 // entry, so it can key the precheck cache by Arc identity.
-                return self.run_dml_or_select(&plan_arc, &catalog_snapshot, Some(&plan_arc));
+                return self.run_dml_or_select(
+                    &plan_arc,
+                    &catalog_snapshot,
+                    Some(&plan_arc),
+                    allow_streaming,
+                );
             }
             let plan = Arc::unwrap_or_clone(plan_arc);
-            return self.execute_bound_plan(plan, sql, catalog_snapshot);
+            return self.execute_bound_plan(plan, sql, catalog_snapshot, allow_streaming);
         }
 
         // Parser / binder errors inside an explicit transaction must
@@ -116,7 +146,7 @@ where
         // Extended Query path owns). Dispatched here so the bind step
         // never sees them; the binder rejects these AST variants.
         if let Some(result) =
-            self.try_dispatch_meta_statement(&stmt, Arc::clone(&catalog_snapshot))?
+            self.try_dispatch_meta_statement(&stmt, Arc::clone(&catalog_snapshot), allow_streaming)?
         {
             return Ok(result);
         }
@@ -422,7 +452,7 @@ where
         };
         // Cold path: `optimised_plan` is a freshly-allocated local with no
         // stable identity to cache against.
-        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None)
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None, allow_streaming)
     }
 
     pub(crate) fn is_ddl_plan(plan: &LogicalPlan) -> bool {

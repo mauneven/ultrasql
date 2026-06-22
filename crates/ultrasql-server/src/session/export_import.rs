@@ -174,7 +174,9 @@ where
             self.validate_import_statement(stmt)?;
         }
         for stmt in statements {
-            let _ = self.execute_query(&stmt)?;
+            // Import replays statements internally; there is no network
+            // driver to consume a streaming handle, so never request one.
+            let _ = self.execute_query(&stmt, false)?;
         }
         Ok(())
     }

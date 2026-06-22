@@ -18,6 +18,7 @@ where
         plan: LogicalPlan,
         sql: &str,
         catalog_snapshot: Arc<CatalogSnapshot>,
+        allow_streaming: bool,
     ) -> Result<SelectResult, ServerError> {
         if matches!(self.txn_state, TxnState::Failed(_)) {
             return Err(ServerError::TransactionAborted);
@@ -40,7 +41,7 @@ where
         };
         // `optimised_plan` is rebuilt from the bound plan each call, so it
         // carries no stable identity for the precheck cache.
-        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None)
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None, allow_streaming)
     }
 
     /// `true` iff `plan` is an `Update` whose source is a bare `Scan` or

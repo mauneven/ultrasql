@@ -55,12 +55,16 @@ where
         &mut self,
         stmt: &Statement,
         catalog_snapshot: Arc<CatalogSnapshot>,
+        allow_streaming: bool,
     ) -> Result<Option<SelectResult>, ServerError> {
         match stmt {
             Statement::Prepare(p) => {
                 Ok(Some(self.execute_prepare_statement(p, &catalog_snapshot)?))
             }
-            Statement::Execute(e) => Ok(Some(self.execute_execute_statement(e)?)),
+            // A prepared SELECT run via simple-query `EXECUTE` flows back to
+            // the network driver, so it inherits the caller's streaming
+            // intent unchanged.
+            Statement::Execute(e) => Ok(Some(self.execute_execute_statement(e, allow_streaming)?)),
             Statement::Deallocate(d) => Ok(Some(self.execute_deallocate_statement(d))),
             _ => Ok(None),
         }
@@ -104,6 +108,7 @@ where
     fn execute_execute_statement(
         &mut self,
         stmt: &ExecuteStmt,
+        allow_streaming: bool,
     ) -> Result<SelectResult, ServerError> {
         let name = stmt.name.value.clone();
         let prepared = self
@@ -140,7 +145,7 @@ where
         let executable = self.prepare_regular_view_plan(&substituted, &catalog_snapshot)?;
         // `executable` is a per-EXECUTE plan with substituted parameters and
         // no stable identity, so it is not eligible for the precheck cache.
-        self.run_dml_or_select(&executable, &catalog_snapshot, None)
+        self.run_dml_or_select(&executable, &catalog_snapshot, None, allow_streaming)
     }
 
     fn execute_deallocate_statement(&mut self, stmt: &DeallocateStmt) -> SelectResult {

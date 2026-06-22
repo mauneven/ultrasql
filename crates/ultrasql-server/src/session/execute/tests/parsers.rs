@@ -392,7 +392,10 @@ fn fast_insert_int32_pair_parser_accepts_simple_values_only() {
 fn fast_insert_int32_pair_dispatches_benchmark_table() {
     let mut session = test_session();
     session
-        .execute_query("CREATE TABLE bench_insert_0 (id INT NOT NULL, val INT)")
+        .execute_query(
+            "CREATE TABLE bench_insert_0 (id INT NOT NULL, val INT)",
+            false,
+        )
         .expect("create benchmark table");
     let snapshot = session.state.catalog_snapshot();
 

@@ -241,7 +241,11 @@ where
         self.state
             .workload_recorder
             .set_session_active(self.pid, trimmed.to_string());
-        let outcome = self.execute_query(trimmed);
+        // Single-statement Simple-Query path: this is the only consumer that
+        // drives a streaming handle (`send_query_result_with_ready` →
+        // `drive_streaming_select`), so it is the only caller that may
+        // request streaming.
+        let outcome = self.execute_query(trimmed, true);
         self.state.workload_recorder.set_session_idle(self.pid);
         drop(timeout_guard);
         let elapsed = started.elapsed();
@@ -322,7 +326,12 @@ where
             self.state
                 .workload_recorder
                 .set_session_active(self.pid, trimmed.to_string());
-            let outcome = self.execute_query(trimmed);
+            // Multi-statement batch: `encode_query_result_body` cannot drive
+            // a streaming handle, so the batch path must never request one.
+            // A streamed SELECT here would ship only window 0 (no
+            // CommandComplete → wire corruption) and leak the XID held by
+            // the dropped handle. Force the whole-buffer path with `false`.
+            let outcome = self.execute_query(trimmed, false);
             self.state.workload_recorder.set_session_idle(self.pid);
             drop(timeout_guard);
             let elapsed = started.elapsed();
@@ -382,6 +391,15 @@ where
     }
 
     fn encode_query_result_body(scratch: &mut BytesMut, mut result: SelectResult) {
+        // The batch path cannot drive a streaming handle. The dispatch
+        // context passes `allow_streaming: false` for every batch statement,
+        // so the SELECT arm can never have produced one; assert it to catch
+        // any future regression that re-enables streaming on this path.
+        debug_assert!(
+            result.streaming.is_none(),
+            "encode_query_result_body received a streaming SelectResult; \
+             the batch path cannot drive it (allow_streaming must be false)"
+        );
         if let Some(body) = result.streamed_body.take() {
             scratch.extend_from_slice(&body);
             return;

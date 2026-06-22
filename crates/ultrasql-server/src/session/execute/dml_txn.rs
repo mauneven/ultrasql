@@ -14,11 +14,22 @@ where
     ///   inside the existing txn, don't commit. On success state stays
     ///   `InTransaction`; on error transitions to `Failed`.
     /// - `Failed` → unreachable (the caller guarded).
+    ///
+    /// `allow_streaming` is supplied by the *dispatch context*, never
+    /// hardwired here: only the single-statement Simple-Query network path
+    /// (`handle_query` → `send_query_result_with_ready` →
+    /// `drive_streaming_select`) can actually drive a streaming handle, so
+    /// only it passes `true`. The multi-statement batch path, the embedded
+    /// API, import, and any nested/local caller pass `false` and receive a
+    /// fully buffered body (the pre-streaming behaviour) — a streaming
+    /// `SelectResult` they could not drive would otherwise ship only
+    /// window 0 and leak the XID held by the dropped handle.
     pub(crate) fn run_dml_or_select(
         &mut self,
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
         owner: Option<&Arc<LogicalPlan>>,
+        allow_streaming: bool,
     ) -> Result<SelectResult, ServerError> {
         // `owner`, when present, must be the `Arc` that `plan` derefs from:
         // the precheck cache pins it by identity, so a mismatch would let a
@@ -142,7 +153,7 @@ where
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     stream_buf: &mut self.write_buf,
-                    allow_streaming: true,
+                    allow_streaming,
                     // Clone the autocommit txn into the would-be streaming
                     // handle: the clone shares the same XID, so the drive
                     // loop commits the statement after the drain while the
@@ -150,7 +161,10 @@ where
                     // for an `InProgress` CLOG entry). Only consumed on the
                     // streaming SELECT branch; the buffered/DML paths drop
                     // the clone and `finalise_autocommit` commits `txn`.
-                    streaming_commit_txn: Some(txn.clone()),
+                    // Skip the clone entirely when streaming is disallowed:
+                    // the SELECT arm cannot produce a handle, so no consumer
+                    // exists for it.
+                    streaming_commit_txn: allow_streaming.then(|| txn.clone()),
                 });
                 self.finalise_autocommit(plan, txn, outcome)
             }
@@ -210,7 +224,7 @@ where
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     stream_buf: &mut self.write_buf,
-                    allow_streaming: true,
+                    allow_streaming,
                     // Inside an explicit transaction block the handle stays
                     // in `self.txn_state` and is committed later by COMMIT,
                     // so there is no per-statement txn to hand to the drive
