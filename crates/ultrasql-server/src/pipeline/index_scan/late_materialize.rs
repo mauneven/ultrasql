@@ -306,6 +306,10 @@ impl std::fmt::Debug for LateMaterializeScan {
 }
 
 impl LateMaterializeScan {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private constructor; each arg is a distinct field with no natural grouping"
+    )]
     fn new(
         entries: Vec<(i64, TupleId)>,
         codec: RowCodec,

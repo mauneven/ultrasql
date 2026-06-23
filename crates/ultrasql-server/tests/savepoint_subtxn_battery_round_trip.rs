@@ -123,6 +123,13 @@ async fn peer(bound: SocketAddr, app: &str) -> (Client, tokio::task::JoinHandle<
     connect_as(bound, "tester", app).await
 }
 
+/// Map a random `u64` to an index in `[0, len)` without lossy casts.
+/// Returns 0 for an empty slice (callers guard the empty case via `get`).
+fn pick_index(rng: u64, len: usize) -> usize {
+    let modulus = u64::try_from(len.max(1)).unwrap_or(1);
+    usize::try_from(rng % modulus).unwrap_or(0)
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // Test A — Own-write visible
 // ═════════════════════════════════════════════════════════════════════════
@@ -993,7 +1000,7 @@ async fn z_index_seq_agreement_fuzz() {
         // move on. The load-bearing invariant — seq == index == s2 on the
         // committed state — is checked after every round regardless.
         let mut failed = false;
-        let ops = 3 + (next() % 6) as usize;
+        let ops = 3 + usize::try_from(next() % 6).unwrap_or(0);
         for _ in 0..ops {
             if failed {
                 break;
@@ -1024,7 +1031,7 @@ async fn z_index_seq_agreement_fuzz() {
                     // INSERT a fresh id.
                     let id = next_id;
                     next_id += 1;
-                    let val = (next() % 100) as i32;
+                    let val = i32::try_from(next() % 100).unwrap_or(0);
                     let sql =
                         format!("INSERT INTO t_idx (id, val, name) VALUES ({id}, {val}, 'n{id}')");
                     if s1.batch_execute(&sql).await.is_err() {
@@ -1034,7 +1041,7 @@ async fn z_index_seq_agreement_fuzz() {
                 4 => {
                     // DELETE a currently-live id (heap truth).
                     let live = ids_seq(s1, Shape::Indexed).await;
-                    if let Some(&victim) = live.get((next() as usize) % live.len().max(1)) {
+                    if let Some(&victim) = live.get(pick_index(next(), live.len())) {
                         let sql = format!("DELETE FROM t_idx WHERE id = {victim}");
                         if s1.batch_execute(&sql).await.is_err() {
                             failed = true;
@@ -1045,8 +1052,8 @@ async fn z_index_seq_agreement_fuzz() {
                     // UPDATE a currently-live id's val (key-changing on the
                     // secondary index).
                     let live = ids_seq(s1, Shape::Indexed).await;
-                    if let Some(&target) = live.get((next() as usize) % live.len().max(1)) {
-                        let val = (next() % 100) as i32;
+                    if let Some(&target) = live.get(pick_index(next(), live.len())) {
+                        let val = i32::try_from(next() % 100).unwrap_or(0);
                         let sql = format!("UPDATE t_idx SET val = {val} WHERE id = {target}");
                         if s1.batch_execute(&sql).await.is_err() {
                             failed = true;
