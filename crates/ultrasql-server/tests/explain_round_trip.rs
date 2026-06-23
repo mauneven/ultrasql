@@ -434,9 +434,14 @@ async fn explain_analyze_late_materialization_handles_limit_order_nulls_and_dml(
     let text = collect_plan_text(&rows);
     for needle in [
         "Late Materialization: selected t_late_wide_id_idx",
-        "candidates=3",
+        // Under the lossy-index + heap-recheck model (PG-style, no per-MVCC-delete
+        // leaf removal) the `DELETE FROM t_late_wide WHERE id = 4` above leaves id=4's
+        // index leaf entry in place, so the late-materialization scan now examines it
+        // as a candidate and skips it after the heap visibility recheck: candidates
+        // 3 -> 4 and skipped 0 -> 1. `fetched` and the returned rows are unchanged.
+        "candidates=4",
         "fetched=3",
-        "skipped=0",
+        "skipped=1",
     ] {
         assert!(
             text.contains(needle),
