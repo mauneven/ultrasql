@@ -23,21 +23,23 @@ own-write visibility attempt) is listed here as TODO, not done.
 The top items by criticality and blast radius. These are the things that block any honest
 "production-grade, PostgreSQL-faithful" claim.
 
-1. **#1 — Fix SAVEPOINT subtransaction visibility correctly (own-write visibility + rolled-back-row hiding).**
-   This is a **data-integrity / correctness** defect, not a missing feature: a transaction cannot
-   see its own writes made under an active SAVEPOINT, and the rolled-back-row hiding path
-   (`is_visible_ext` / `SubxactOracle`) is dead code never invoked by any heap read path, with the
-   `SUBXACT` infomask never stamped on writes. A first full-visibility attempt was reverted after an
-   adversarial review found data corruption and B-tree incoherence on `ROLLBACK TO`. A
-   code-verified, corruption-proof design now exists —
-   [`docs/savepoint-subtransactions-design.md`](docs/savepoint-subtransactions-design.md): adopt
-   PostgreSQL's lossy-index + heap-recheck model (NO per-subxid index undo — the index read paths
-   already recheck heap visibility, so the index-undo problem that sank the first attempt is
-   dissolved), fix the two parent-stamp bugs (`bound_plan.rs:482`, `mvcc_maint.rs:163`), and
-   re-apply the reviewed-correct visibility/oracle/fold. It is deeply coupled (stamping ↔
-   own-write visibility ↔ commit/abort fold ↔ index model) with **no safe partial increment** (a
-   stamping fix alone trades one bug for another), so it is a dedicated multi-day effort gated on
-   the design's §5 adversarial battery before any push. Silently returns wrong results today. **Do this first.**
+1. **#1 — SAVEPOINT subtransaction visibility — ✅ LANDED (safe increment, adversarially gated).**
+   The data-integrity defect is fixed for single-phase transactions: a transaction sees its own
+   writes under an active SAVEPOINT; `ROLLBACK TO` hides a savepoint's inserts and restores its
+   deletes / in-place-update pre-images (verified from a second connection after `COMMIT`); `RELEASE`
+   keeps writes without leaking them before the parent commits; and the parent's commit/abort folds
+   the whole subxid family atomically **and durably** (the commit WAL record carries the committed
+   subxid list, so single-phase `COMMIT` recovers correctly). The index access method now follows
+   PostgreSQL's lossy-index + heap-recheck model (no per-subxid index undo). Implemented per
+   [`docs/savepoint-subtransactions-design.md`](docs/savepoint-subtransactions-design.md) and gated on
+   the §5 adversarial battery plus two independent adversarial re-reviews — which caught and fixed a
+   unique-index liveness bug (aborted-deleter double-live-key) and a recovery data-loss bug
+   (released/open subxid) **before any push**.
+   **Remaining follow-ups** (tracked in `docs/known-limitations.md`): two-phase commit does not yet
+   carry the subxid family, so `COMMIT PREPARED` recovery can lose a savepoint row (pre-existing); the
+   fused fast-path `DELETE` stays gated onto the general MVCC path under an open savepoint (perf, not
+   correctness); `COPY FROM STDIN` and `ALTER TABLE` heap-rewrite DDL under a savepoint stamp the
+   parent xid.
 2. **Predicate-precise SSI / serializable correctness** — column-range SSI degrades to relation-wide
    locks for most types and is not page/tuple/gap-precise; blocks any serializable-correctness claim
    (high).
@@ -50,15 +52,16 @@ The top items by criticality and blast radius. These are the things that block a
    inside explicit transaction blocks; both are atomicity/durability correctness gaps and block
    ORM/migration certification beyond autocommit (high).
 
-> **#1 to execute now: correct SAVEPOINT subtransaction visibility.** Justification below in the
-> `---WHY---` note.
+> **Most critical next: predicate-precise SSI / serializable correctness (#2).** SAVEPOINT (#1)
+> landed as a gated safe increment; the remaining 2PC/perf/DDL follow-ups are tracked in
+> `docs/known-limitations.md`.
 
 ---
 
 ## Correctness & MVCC
 
-- [ ] SAVEPOINT own-write visibility — a txn does not see its own writes under an active SAVEPOINT; writes stamped with subxid but `Snapshot::is_current_xid` compares only the single parent `current_xid`. Needs subxid stamping on every write fast-path (insert/update/delete/fused/COPY) + per-subxid index undo. First attempt reverted for data corruption / B-tree incoherence on `ROLLBACK TO` (critical; `crates/ultrasql-mvcc/src/snapshot.rs:95-97`, `crates/ultrasql-txn/src/manager.rs:173-178`, `docs/known-limitations.md:29-39`).
-- [ ] Wire `is_visible_ext` / `SubxactOracle` + stamp `InfoMask::SUBXACT` — rolled-back-savepoint visibility is dead code: every heap scan/update/delete calls plain `is_visible()`, `is_visible_ext` has zero non-test callers, and no write path sets the `SUBXACT` infomask, so `ROLLBACK TO` cannot hide rolled-back rows from in-progress same-txn reads via the local oracle (critical; `crates/ultrasql-mvcc/src/visibility.rs:142-162`, `crates/ultrasql-storage/src/heap/scan.rs:178`, `crates/ultrasql-storage/src/heap/delete.rs:1052`).
+- [x] SAVEPOINT own-write visibility — **DONE** (safe increment, adversarially gated). `Snapshot` now carries own-subxid sets (live + rolled-back) and `is_current_xid` recognises descendant subxids; every DML write path stamps the active subtransaction id via `Transaction::write_xid()` (debug-assert guarded). Adopted PostgreSQL's lossy-index + heap-recheck model instead of per-subxid index undo (the approach that sank the first attempt). The committed subxid family is folded atomically and durably (commit WAL record carries the list). See `docs/savepoint-subtransactions-design.md` and the `savepoint_subtxn_battery_round_trip` battery.
+- [x] Rolled-back-savepoint hiding — **DONE**, but via a different design than this item proposed: the dead `is_visible_ext` / `SubxactOracle` / `InfoMask::SUBXACT` path was **deleted**; rolled-back rows are now hidden by `own_subxid_rolled_back(xmin/xmax)` guards in the single `is_visible` predicate driven by the snapshot's own-subxid sets (no on-disk SUBXACT bit needed). Covered by battery tests B/C/E on both shapes.
 - [ ] Predicate-precise serializable isolation (SSI) — implement page/tuple/gap precision; today column-range SSI exists only for i64-mappable types (Bool/Int16/32/64/Timestamp/TimestampTz) and AND/OR scalar trees, everything else (text/numeric/float/date/uuid, joins, function predicates) degrades to relation-wide tags, so the engine is `not fully predicate-precise` SSI, causing spurious 40001 aborts and blocking broad serializable claims (high; `crates/ultrasql-txn/src/ssi.rs:10-12,416-417`, `crates/ultrasql-server/src/serializable.rs:428-438`, `docs/known-limitations.md:24-28`).
 - [ ] Real SSI engine + full isolation suite — serializable reuses the fixed RR snapshot + dangerous-structure check, not the full PostgreSQL SSI engine; executable coverage is only acid.sql + Hermitage G1a/PMP/G2. Import the upstream `src/test/isolation` isolationtester schedules and match expected outputs (high; `crates/ultrasql-txn/src/manager.rs:339-345`, `docs/testing/isolation-suite.md:14,32-43`).
 - [ ] EvalPlanQual / READ COMMITTED re-check on concurrent UPDATE/DELETE — on a concurrently-committed row, wait on the row lock then re-evaluate the qual against the new version instead of erroring. Today `HeapError::WriteConflict` propagates; the only committed-conflict detection is the int32-pair fast path, so lost-update breadth across arbitrary DML is unproven (high; `crates/ultrasql-storage/src/heap/update_inplace.rs:674-685`, `crates/ultrasql-executor/src/fused_update.rs:321-344`).
