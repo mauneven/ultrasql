@@ -349,3 +349,264 @@ async fn alter_table_rename_table_swaps_name() {
 
     shutdown(client, server_handle).await;
 }
+
+// ALTER COLUMN SET/DROP NOT NULL and SET/DROP DEFAULT
+// ------------------------------------------------------------------------
+
+/// `ALTER COLUMN ... SET NOT NULL` on a column with no NULLs succeeds;
+/// afterwards a NULL INSERT and a NULL UPDATE are both rejected `23502`.
+#[tokio::test]
+async fn alter_column_set_not_null_enforces_on_dml() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await
+        .expect("seed non-null rows");
+
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET NOT NULL")
+        .await
+        .expect("SET NOT NULL on column with no NULLs");
+
+    let err = client
+        .batch_execute("INSERT INTO t VALUES (3, NULL)")
+        .await
+        .expect_err("NULL insert rejected after SET NOT NULL");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    let err = client
+        .batch_execute("UPDATE t SET v = NULL WHERE id = 1")
+        .await
+        .expect_err("NULL update rejected after SET NOT NULL");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    // The original rows are untouched and a non-NULL insert still works.
+    client
+        .batch_execute("INSERT INTO t VALUES (3, 30)")
+        .await
+        .expect("non-null insert still works");
+    let rows = client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("select after enforcement");
+    assert_eq!(rows.len(), 3);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER COLUMN ... SET NOT NULL` on a column that already contains a
+/// NULL row is rejected `23502` and leaves the column nullable.
+#[tokio::test]
+async fn alter_column_set_not_null_rejects_existing_null() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10), (2, NULL)")
+        .await
+        .expect("seed with a NULL row");
+
+    let err = client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET NOT NULL")
+        .await
+        .expect_err("SET NOT NULL must reject pre-existing NULL");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    // The column stays nullable: a NULL insert still succeeds.
+    client
+        .batch_execute("INSERT INTO t VALUES (3, NULL)")
+        .await
+        .expect("column remains nullable after rejected SET NOT NULL");
+    let rows = client
+        .query("SELECT id FROM t WHERE v IS NULL ORDER BY id", &[])
+        .await
+        .expect("select NULL rows");
+    assert_eq!(rows.len(), 2);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER COLUMN ... DROP NOT NULL` allows NULLs afterwards; on a PRIMARY
+/// KEY column it is rejected `42P16`.
+#[tokio::test]
+async fn alter_column_drop_not_null_and_pk_rejection() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)")
+        .await
+        .expect("create with PK and NOT NULL column");
+
+    // DROP NOT NULL on a regular NOT NULL column: NULLs allowed after.
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v DROP NOT NULL")
+        .await
+        .expect("DROP NOT NULL on a regular column");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, NULL)")
+        .await
+        .expect("NULL insert allowed after DROP NOT NULL");
+
+    // DROP NOT NULL on a PRIMARY KEY column is rejected.
+    let err = client
+        .batch_execute("ALTER TABLE t ALTER COLUMN id DROP NOT NULL")
+        .await
+        .expect_err("DROP NOT NULL on a PK column must be rejected");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42P16");
+
+    // The PK column stays NOT NULL: a NULL id insert still fails.
+    let err = client
+        .batch_execute("INSERT INTO t VALUES (NULL, 5)")
+        .await
+        .expect_err("PK column stays NOT NULL");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER COLUMN ... SET DEFAULT` applies to new inserts that omit the
+/// column; existing rows are unchanged; a later change takes effect for
+/// new inserts only.
+#[tokio::test]
+async fn alter_column_set_default_applies_to_new_inserts_only() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t (id) VALUES (1)")
+        .await
+        .expect("seed row with no default -> NULL");
+
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET DEFAULT 7")
+        .await
+        .expect("SET DEFAULT 7");
+    client
+        .batch_execute("INSERT INTO t (id) VALUES (2)")
+        .await
+        .expect("insert omitting v uses default");
+
+    // Existing row 1 keeps NULL; new row 2 gets 7.
+    let row1 = client
+        .query("SELECT v FROM t WHERE id = 1", &[])
+        .await
+        .expect("select existing row");
+    assert_eq!(row1[0].get::<_, Option<i32>>(0), None);
+    let row2 = client
+        .query("SELECT v FROM t WHERE id = 2", &[])
+        .await
+        .expect("select new row");
+    assert_eq!(row2[0].get::<_, Option<i32>>(0), Some(7));
+
+    // Changing the default again affects only subsequent inserts.
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET DEFAULT 9")
+        .await
+        .expect("SET DEFAULT 9");
+    client
+        .batch_execute("INSERT INTO t (id) VALUES (3)")
+        .await
+        .expect("insert omitting v uses new default");
+    let row3 = client
+        .query("SELECT v FROM t WHERE id = 3", &[])
+        .await
+        .expect("select newest row");
+    assert_eq!(row3[0].get::<_, Option<i32>>(0), Some(9));
+    // Row 2 still has the old default value 7.
+    let row2 = client
+        .query("SELECT v FROM t WHERE id = 2", &[])
+        .await
+        .expect("re-select row 2");
+    assert_eq!(row2[0].get::<_, Option<i32>>(0), Some(7));
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER COLUMN ... DROP DEFAULT` makes omitting the column yield NULL,
+/// or `23502` when the column is also NOT NULL.
+#[tokio::test]
+async fn alter_column_drop_default_yields_null_or_violates_not_null() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT DEFAULT 5)")
+        .await
+        .expect("create with a column default");
+
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v DROP DEFAULT")
+        .await
+        .expect("DROP DEFAULT");
+    client
+        .batch_execute("INSERT INTO t (id) VALUES (1)")
+        .await
+        .expect("insert omitting v yields NULL after DROP DEFAULT");
+    let row = client
+        .query("SELECT v FROM t WHERE id = 1", &[])
+        .await
+        .expect("select row");
+    assert_eq!(row[0].get::<_, Option<i32>>(0), None);
+
+    // With a NOT NULL column and no default, omitting it violates 23502.
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET DEFAULT 5")
+        .await
+        .expect("restore default");
+    client
+        .batch_execute("DELETE FROM t")
+        .await
+        .expect("clear rows so SET NOT NULL succeeds");
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v SET NOT NULL")
+        .await
+        .expect("SET NOT NULL");
+    client
+        .batch_execute("ALTER TABLE t ALTER COLUMN v DROP DEFAULT")
+        .await
+        .expect("DROP DEFAULT on NOT NULL column");
+    let err = client
+        .batch_execute("INSERT INTO t (id) VALUES (2)")
+        .await
+        .expect_err("omitting a NOT NULL column with no default violates 23502");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER COLUMN ... SET NOT NULL` against an undefined column fails
+/// `42703` and the session survives.
+#[tokio::test]
+async fn alter_column_undefined_column_errors() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create");
+
+    let err = client
+        .batch_execute("ALTER TABLE t ALTER COLUMN nope SET NOT NULL")
+        .await
+        .expect_err("undefined column rejected");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "42703");
+
+    // Session survives.
+    let rows = client
+        .query("SELECT id FROM t", &[])
+        .await
+        .expect("session survives undefined-column error");
+    assert_eq!(rows.len(), 0);
+
+    shutdown(client, server_handle).await;
+}

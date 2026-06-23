@@ -231,3 +231,102 @@ async fn alter_table_drop_unique_constraint_survives_restart() {
     assert_eq!(rows.len(), 2);
     shutdown(running).await;
 }
+
+/// The load-bearing persistence proof: apply `SET NOT NULL` and
+/// `SET DEFAULT`, restart, and confirm BOTH the NOT-NULL flag and the
+/// default reloaded — i.e. the column-metadata mutation persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_column_set_not_null_and_default_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "alter_column_meta_restart").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE meta_restart (id INT, v INT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("INSERT INTO meta_restart (id, v) VALUES (1, 100)")
+        .await
+        .expect("seed a non-null row");
+    running
+        .client
+        .batch_execute("ALTER TABLE meta_restart ALTER COLUMN v SET NOT NULL")
+        .await
+        .expect("SET NOT NULL");
+    running
+        .client
+        .batch_execute("ALTER TABLE meta_restart ALTER COLUMN v SET DEFAULT 42")
+        .await
+        .expect("SET DEFAULT 42");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "alter_column_meta_restart").await;
+
+    // NOT NULL survived: a NULL insert is still rejected 23502.
+    let err = running
+        .client
+        .batch_execute("INSERT INTO meta_restart (id, v) VALUES (2, NULL)")
+        .await
+        .expect_err("NOT NULL must persist across restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23502");
+
+    // DEFAULT survived: an insert omitting v uses the persisted default.
+    running
+        .client
+        .batch_execute("INSERT INTO meta_restart (id) VALUES (3)")
+        .await
+        .expect("default applies after restart");
+    let row = running
+        .client
+        .query("SELECT v FROM meta_restart WHERE id = 3", &[])
+        .await
+        .expect("select defaulted row");
+    assert_eq!(row[0].get::<_, Option<i32>>(0), Some(42));
+
+    // The pre-existing row is untouched.
+    let row = running
+        .client
+        .query("SELECT v FROM meta_restart WHERE id = 1", &[])
+        .await
+        .expect("select seed row");
+    assert_eq!(row[0].get::<_, Option<i32>>(0), Some(100));
+
+    shutdown(running).await;
+}
+
+/// `DROP NOT NULL` persists across restart: NULLs remain allowed after
+/// reopening the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_column_drop_not_null_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "alter_drop_nn_restart").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE drop_nn_restart (id INT, v INT NOT NULL)")
+        .await
+        .expect("create with NOT NULL column");
+    running
+        .client
+        .batch_execute("ALTER TABLE drop_nn_restart ALTER COLUMN v DROP NOT NULL")
+        .await
+        .expect("DROP NOT NULL");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "alter_drop_nn_restart").await;
+    // The column stays nullable after restart: a NULL insert succeeds.
+    running
+        .client
+        .batch_execute("INSERT INTO drop_nn_restart (id, v) VALUES (1, NULL)")
+        .await
+        .expect("DROP NOT NULL must persist across restart");
+    let rows = running
+        .client
+        .query("SELECT id FROM drop_nn_restart WHERE v IS NULL", &[])
+        .await
+        .expect("select null rows");
+    assert_eq!(rows.len(), 1);
+    shutdown(running).await;
+}
