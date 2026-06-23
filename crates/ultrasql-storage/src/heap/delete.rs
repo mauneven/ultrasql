@@ -616,7 +616,12 @@ impl<L: PageLoader> HeapAccess<L> {
     /// `xmax`/`cmax` for DELETE stamps and aborted classical UPDATE old
     /// versions. In-place UPDATEs are skipped here because their payload
     /// must be restored from the undo log before their header is cleared.
-    pub(crate) fn rollback_delete_stamps(&self, xid: Xid) -> Result<usize, HeapError> {
+    ///
+    /// Public so the server's `ROLLBACK TO SAVEPOINT` path can clear a
+    /// rolled-back subtransaction's DELETE stamps directly. (The full-abort
+    /// path reaches this via [`Self::rollback_in_place_updates`], which
+    /// calls it after restoring in-place pre-images.)
+    pub fn rollback_delete_stamps(&self, xid: Xid) -> Result<usize, HeapError> {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE, PageHeader};
 
         let mut total_restored = 0_usize;

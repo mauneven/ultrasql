@@ -570,34 +570,55 @@ where
                 ))
             }
             TxnState::InTransaction(mut txn) | TxnState::Failed(mut txn) => {
-                if self
-                    .state
-                    .txn_manager
-                    .rollback_to_savepoint(&mut txn, name)
-                    .is_ok()
-                {
-                    // Clear the failure flag: the rolled-back work is
-                    // undone so the user can continue.
-                    self.txn_state = TxnState::InTransaction(txn);
-                    Ok(SelectResult {
-                        messages: vec![BackendMessage::CommandComplete {
-                            tag: "ROLLBACK".to_string(),
-                        }],
-                        streamed_body: None,
-                        shared_streamed_body: None,
-                        streaming: None,
-                        rows: 0,
-                    })
-                } else {
-                    // Unknown savepoint name. Restore the prior state
-                    // (the rollback did not fire so the txn is in the
-                    // same shape as before this call).
-                    self.txn_state = if prior_failed {
-                        TxnState::Failed(txn)
-                    } else {
-                        TxnState::InTransaction(txn)
-                    };
-                    Err(ServerError::SavepointNotFound(name.to_owned()))
+                match self.state.txn_manager.rollback_to_savepoint(&mut txn, name) {
+                    Ok(aborted_subxids) => {
+                        // Physically undo every write the rolled-back
+                        // subtransactions made: restore in-place-UPDATE
+                        // pre-images and clear DELETE stamps. With the
+                        // Phase-1 visibility predicate these are no longer
+                        // *required* for own-visibility (the snapshot's
+                        // rolled-back set already reverts them), but they
+                        // reclaim heap bytes, keep the seq-scan path and the
+                        // undo log consistent, and invalidate the column
+                        // cache for the touched relations (the heap undo
+                        // helpers bump the cache version internally). This
+                        // mirrors the full-abort path, scoped to the aborted
+                        // subxids.
+                        for sub_xid in aborted_subxids {
+                            if let Err(e) = self.state.heap.rollback_in_place_updates(sub_xid) {
+                                // Heap undo failed: the transaction is now in
+                                // an indeterminate physical state. Mark the
+                                // block failed so the user must ROLLBACK.
+                                self.txn_state = TxnState::Failed(txn);
+                                return Err(ServerError::Ddl(format!(
+                                    "ROLLBACK TO SAVEPOINT physical undo (subxid {sub_xid}): {e}"
+                                )));
+                            }
+                        }
+                        // Clear the failure flag: the rolled-back work is
+                        // undone so the user can continue.
+                        self.txn_state = TxnState::InTransaction(txn);
+                        Ok(SelectResult {
+                            messages: vec![BackendMessage::CommandComplete {
+                                tag: "ROLLBACK".to_string(),
+                            }],
+                            streamed_body: None,
+                            shared_streamed_body: None,
+                            streaming: None,
+                            rows: 0,
+                        })
+                    }
+                    Err(_) => {
+                        // Unknown savepoint name. Restore the prior state
+                        // (the rollback did not fire so the txn is in the
+                        // same shape as before this call).
+                        self.txn_state = if prior_failed {
+                            TxnState::Failed(txn)
+                        } else {
+                            TxnState::InTransaction(txn)
+                        };
+                        Err(ServerError::SavepointNotFound(name.to_owned()))
+                    }
                 }
             }
         }
