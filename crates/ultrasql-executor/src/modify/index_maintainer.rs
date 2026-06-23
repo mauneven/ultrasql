@@ -149,9 +149,35 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
         }
     }
 
-    /// `true` iff an `Invisible` tuple is invisible only because its writer
-    /// is still **in progress** (so the key is held by a pending live
-    /// version), not because it is aborted/deleted-committed (dead).
+    /// `true` iff an `Invisible` tuple still holds the key for a live or
+    /// *pending-live* version (so reusing the key would be a uniqueness
+    /// conflict), `false` iff the tuple is genuinely **dead** (its key is
+    /// free to reuse).
+    ///
+    /// This implements the PostgreSQL dirty-snapshot uniqueness rule. An
+    /// index hit is reusable-Dead only when the tuple is truly dead; any
+    /// other state — including a row whose deleter is still in-progress *or*
+    /// **aborted** — keeps the key occupied. The aborted-deleter case is the
+    /// load-bearing one: an aborted `DELETE` did not happen, so the row is
+    /// STILL LIVE and must NOT be misclassified as dead (doing so would let a
+    /// second inserter physically replace the live leaf entry, producing two
+    /// live committed heap rows sharing a unique key).
+    ///
+    /// Liveness truth table (`xmin` = inserter, `xmax` = deleter):
+    ///
+    /// | `status(xmin)`        | `status(xmax)`                    | result  |
+    /// |-----------------------|-----------------------------------|---------|
+    /// | invalid               | (any)                             | `false` |
+    /// | `Aborted`             | (any)                             | `false` |
+    /// | `Committed`/`Frozen`  | invalid / `Aborted` / `InProgress`| `true`  |
+    /// | `Committed`/`Frozen`  | `Committed` / `Frozen`            | `false` |
+    /// | `InProgress`          | `Committed` / `Frozen`            | `false` |
+    /// | `InProgress`          | invalid / `Aborted` / `InProgress`| `true`  |
+    ///
+    /// Collapsed invariant: pending-live iff the inserter is *not aborted*
+    /// (and valid) **and** the deleter is *not committed*. A committed (or
+    /// frozen) delete is the only thing that kills a row whose inserter did
+    /// not abort.
     fn tuple_is_pending_live<O: XidStatusOracle + ?Sized>(
         header: &ultrasql_mvcc::TupleHeader,
         oracle: &O,
@@ -160,25 +186,23 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
         if header.xmin.is_invalid() {
             return false;
         }
-        // If the inserter has not yet resolved, the key is held by a
-        // pending insert: treat as a live conflict.
-        if matches!(oracle.status(header.xmin), XidStatus::InProgress) {
-            return true;
-        }
-        // Inserter committed. If there is no deleter the row is live (the
-        // snapshot just doesn't see it yet — e.g. committed-after-snapshot);
-        // that still holds the key. A committed deleter makes it dead; an
-        // aborted inserter was handled above (status != InProgress only when
-        // committed/aborted — an aborted inserter yields a dead row).
+        // An aborted inserter never made the row exist: it is dead, the key
+        // is free.
         if matches!(oracle.status(header.xmin), XidStatus::Aborted) {
             return false;
         }
+        // Inserter is committed, frozen, or still in-progress — the row was
+        // (or is being) inserted and holds the key unless a *committed* (or
+        // frozen, i.e. committed-long-ago) delete has retired it. An aborted
+        // or still-in-progress deleter did NOT kill the row, so the key stays
+        // occupied (a live conflict). A missing deleter likewise keeps it.
         if header.xmax.is_invalid() {
             return true;
         }
-        // Has a deleter: live only if the delete is itself unresolved
-        // (in-progress) — a committed delete makes the row dead.
-        matches!(oracle.status(header.xmax), XidStatus::InProgress)
+        !matches!(
+            oracle.status(header.xmax),
+            XidStatus::Committed | XidStatus::Frozen
+        )
     }
 
     /// Insert a key, tolerating a stale duplicate physical entry whose heap

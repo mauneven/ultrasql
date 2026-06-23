@@ -2,6 +2,187 @@
 //! B-tree index conflict + maintenance helper coverage.
 
 use super::*;
+use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::status::test_support::MapOracle;
+use ultrasql_storage::heap::DeleteOptions;
+
+/// Insert a single-column-`Int32` row with an explicit `xmin`, returning its
+/// TID. Mirrors [`insert_payload`] but lets the test choose the inserter XID
+/// so liveness classification can be exercised against a chosen oracle.
+fn insert_row_with_xmin(
+    heap: &HeapAccess<MapLoader>,
+    schema: &Schema,
+    row: &[Value],
+    xmin: Xid,
+) -> TupleId {
+    let codec = RowCodec::new(schema.clone());
+    let payload = codec.encode(row).expect("payload");
+    let tids = heap
+        .insert_batch(
+            rel(),
+            &[payload.as_slice()],
+            InsertOptions {
+                xmin,
+                command_id: CommandId::FIRST,
+                n_atts: u16::try_from(schema.len()).expect("test schema fits u16"),
+                wal: None,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .expect("insert row");
+    tids[0]
+}
+
+/// BUG-1 regression (aborted-deleter misclassification).
+///
+/// A row whose inserter committed and whose deleter ABORTED is STILL LIVE: the
+/// aborted DELETE never happened. The unique-conflict classifier must report
+/// `Live` for such a row so a second inserter of the same key is rejected and
+/// does NOT physically replace the live leaf entry. Before the fix
+/// `tuple_is_pending_live` only treated an `InProgress` deleter as live-keeping
+/// and fell through (→ `Dead`) for an aborted deleter, corrupting the index.
+#[test]
+fn classify_unique_conflict_keeps_aborted_deleter_row_live() {
+    let heap = make_heap();
+    let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema");
+
+    let inserter = Xid::new(50); // committed
+    let aborted_deleter = Xid::new(60); // aborted DELETE — did NOT happen
+    let key = 7_i64;
+    let tid = insert_row_with_xmin(&heap, &schema, &[Value::Int32(7)], inserter);
+
+    // Stamp xmax = aborted_deleter (a DELETE that later aborts).
+    heap.delete(
+        tid,
+        DeleteOptions {
+            xmax: aborted_deleter,
+            cmax: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: None,
+        },
+    )
+    .expect("stamp xmax");
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(inserter);
+    oracle.set_aborted(aborted_deleter);
+
+    // A snapshot taken before `inserter` committed: it lists `inserter` as
+    // in-flight, so the row is `Invisible` and the classifier must fall to
+    // the pending-live test — exactly the path the bug corrupted.
+    let snapshot = Snapshot::new(
+        inserter,
+        Xid::new(100),
+        Xid::new(99),
+        CommandId::FIRST,
+        [inserter],
+    );
+
+    let mut index = btree_index("idx_aborted_deleter", true);
+    index
+        .insert_key(key, tid, Xid::new(70), None)
+        .expect("seed");
+
+    let conflict = index
+        .classify_unique_conflict(key, &heap, &snapshot, &oracle)
+        .expect("classify");
+    assert_eq!(
+        conflict,
+        crate::modify::index_maintainer::UniqueConflict::Live,
+        "row with a committed inserter and an ABORTED deleter is still live; \
+         classifying it Dead would let a second inserter replace the live entry"
+    );
+}
+
+/// Companion to the above: a row whose delete actually COMMITTED is genuinely
+/// dead, so its key is reusable (`Dead`). Guards against the fix over-correcting
+/// into never reporting a reusable key.
+#[test]
+fn classify_unique_conflict_reports_committed_delete_as_dead() {
+    let heap = make_heap();
+    let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema");
+
+    let inserter = Xid::new(50); // committed
+    let committed_deleter = Xid::new(60); // committed DELETE — row is dead
+    let key = 7_i64;
+    let tid = insert_row_with_xmin(&heap, &schema, &[Value::Int32(7)], inserter);
+    heap.delete(
+        tid,
+        DeleteOptions {
+            xmax: committed_deleter,
+            cmax: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: None,
+        },
+    )
+    .expect("stamp xmax");
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(inserter);
+    oracle.set_committed(committed_deleter);
+
+    let snapshot = Snapshot::new(
+        Xid::new(200),
+        Xid::new(200),
+        Xid::new(199),
+        CommandId::FIRST,
+        [],
+    );
+
+    let mut index = btree_index("idx_committed_delete", true);
+    index
+        .insert_key(key, tid, Xid::new(70), None)
+        .expect("seed");
+
+    let conflict = index
+        .classify_unique_conflict(key, &heap, &snapshot, &oracle)
+        .expect("classify");
+    assert_eq!(
+        conflict,
+        crate::modify::index_maintainer::UniqueConflict::Dead(tid),
+        "a committed DELETE makes the row dead; its key is reusable"
+    );
+}
+
+/// A row whose inserter ABORTED is genuinely dead even with no deleter — the
+/// insert never happened. Guards the `status(xmin) == Aborted` short-circuit.
+#[test]
+fn classify_unique_conflict_reports_aborted_inserter_as_dead() {
+    let heap = make_heap();
+    let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema");
+
+    let aborted_inserter = Xid::new(50); // aborted INSERT — never happened
+    let key = 7_i64;
+    let tid = insert_row_with_xmin(&heap, &schema, &[Value::Int32(7)], aborted_inserter);
+
+    let oracle = MapOracle::new();
+    oracle.set_aborted(aborted_inserter);
+
+    let snapshot = Snapshot::new(
+        Xid::new(200),
+        Xid::new(200),
+        Xid::new(199),
+        CommandId::FIRST,
+        [],
+    );
+
+    let mut index = btree_index("idx_aborted_inserter", true);
+    index
+        .insert_key(key, tid, Xid::new(70), None)
+        .expect("seed");
+
+    let conflict = index
+        .classify_unique_conflict(key, &heap, &snapshot, &oracle)
+        .expect("classify");
+    assert_eq!(
+        conflict,
+        crate::modify::index_maintainer::UniqueConflict::Dead(tid),
+        "an aborted inserter leaves a dead row; its key is reusable"
+    );
+}
 
 #[test]
 fn update_conflict_defaults_and_constraint_helpers_cover_error_edges() {
