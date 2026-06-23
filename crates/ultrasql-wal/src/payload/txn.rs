@@ -14,38 +14,94 @@ use super::{
 
 /// Payload for a `RecordType::Commit` WAL record.
 ///
-/// Carries the LSN at which the commit was written and the wall-clock time of
-/// the commit in microseconds since the Unix epoch. Recovery uses the commit
+/// Carries the LSN at which the commit was written, the wall-clock time of the
+/// commit in microseconds since the Unix epoch, and the list of subtransaction
+/// XIDs that committed atomically **with** the parent. Recovery uses the commit
 /// LSN to advance the flush watermark; the timestamp is used for
-/// transaction-time queries.
+/// transaction-time queries; the subxid list lets recovery mark every released
+/// or implicitly-released-at-commit subtransaction `Committed` together with
+/// the parent, in one atomic record (PostgreSQL's design — a crash either keeps
+/// the whole family committed or none of it).
 ///
 /// Wire layout (little-endian):
 /// ```text
 ///  0  8   commit_lsn (u64)
 ///  8  8   commit_timestamp_micros (u64)
+/// 16  4   subxid_count (u32)          ── absent in legacy 16-byte records
+/// 20  ..  subxid_count × 8 (u64 each)
 /// ```
-/// Total: 16 bytes.
+/// Total: `20 + 8 * subxid_count` bytes for a record written by this encoder.
+///
+/// # Back-compatibility
+///
+/// A legacy record written before the subxid list existed is exactly 16 bytes
+/// long (no `subxid_count` field). [`Self::decode`] accepts such a record and
+/// yields an **empty** `committed_subxids`, so pre-existing WAL still recovers.
+/// The current encoder always writes the 4-byte count (so an empty list encodes
+/// to 20 bytes, not 16); only on-disk legacy records take the 16-byte path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitPayload {
     /// LSN at which the commit record was written.
     pub commit_lsn: Lsn,
     /// Wall-clock commit time in microseconds since the Unix epoch.
     pub commit_timestamp_micros: u64,
+    /// Subtransaction XIDs that committed atomically with the parent. These are
+    /// the released (merged-up) subxids plus any open-savepoint subxids
+    /// implicitly released at COMMIT — the exact family the transaction manager
+    /// flips to `Committed`, **excluding** `ROLLBACK TO`-aborted subxids (which
+    /// correctly default to `Aborted` on recovery and must stay so).
+    pub committed_subxids: Vec<Xid>,
 }
 
 impl CommitPayload {
+    /// Fixed-size prefix written before the subxid section.
+    const FIXED: usize = 20;
+    /// Wire size of one subxid entry.
+    const SUBXID_SIZE: usize = 8;
+
     /// Encode this payload into a freshly-allocated byte vector.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0_u8; 16];
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PayloadError::Malformed`] when the subxid count does not fit
+    /// in a `u32`, or [`PayloadError::Malformed`] on a length-arithmetic
+    /// overflow (both unreachable for realistic transactions).
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let count = u32::try_from(self.committed_subxids.len())
+            .map_err(|_| PayloadError::Malformed("commit subxid count overflow"))?;
+        let body = checked_offset(
+            self.committed_subxids.len(),
+            self.committed_subxids.len(),
+            "commit subxid bytes overflow",
+        )
+        .and_then(|_| {
+            self.committed_subxids
+                .len()
+                .checked_mul(Self::SUBXID_SIZE)
+                .ok_or(PayloadError::Malformed("commit subxid bytes overflow"))
+        })?;
+        let total = checked_offset(Self::FIXED, body, "commit length overflow")?;
+        let mut out = vec![0_u8; total];
         write_u64_le(&mut out[0..8], self.commit_lsn.raw());
         write_u64_le(&mut out[8..16], self.commit_timestamp_micros);
-        out
+        write_u32_le(&mut out[16..20], count);
+        let mut offset = Self::FIXED;
+        for sub in &self.committed_subxids {
+            write_u64_le(&mut out[offset..offset + Self::SUBXID_SIZE], sub.raw());
+            offset += Self::SUBXID_SIZE;
+        }
+        Ok(out)
     }
 
     /// Decode a `CommitPayload` from a byte slice.
     ///
-    /// Returns [`PayloadError::Truncated`] when the slice is shorter than 16
-    /// bytes.
+    /// Accepts both the current framing (`commit_lsn` + timestamp +
+    /// `subxid_count` + subxids) and the legacy 16-byte framing (no subxid
+    /// section), which decodes to an empty `committed_subxids`.
+    ///
+    /// Returns [`PayloadError::Truncated`] when the slice is shorter than the
+    /// fixed prefix or the declared subxid section, and
+    /// [`PayloadError::Trailing`] when extra bytes follow the declared section.
     pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
         if bytes.len() < 16 {
             return Err(PayloadError::Truncated {
@@ -57,10 +113,50 @@ impl CommitPayload {
             Lsn::new(read_u64_le(&bytes[0..8]).map_err(|_| PayloadError::Malformed("commit lsn"))?);
         let commit_timestamp_micros =
             read_u64_le(&bytes[8..16]).map_err(|_| PayloadError::Malformed("commit timestamp"))?;
-        require_exact_len(bytes, 16)?;
+
+        // Legacy 16-byte record: no subxid section.
+        if bytes.len() == 16 {
+            return Ok(Self {
+                commit_lsn,
+                commit_timestamp_micros,
+                committed_subxids: Vec::new(),
+            });
+        }
+
+        if bytes.len() < Self::FIXED {
+            return Err(PayloadError::Truncated {
+                needed: Self::FIXED,
+                have: bytes.len(),
+            });
+        }
+        let count = usize::try_from(
+            read_u32_le(&bytes[16..20])
+                .map_err(|_| PayloadError::Malformed("commit subxid count"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("commit subxid count usize overflow"))?;
+        let body = count
+            .checked_mul(Self::SUBXID_SIZE)
+            .ok_or(PayloadError::Malformed("commit subxid bytes overflow"))?;
+        let needed = checked_offset(Self::FIXED, body, "commit length overflow")?;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        let mut committed_subxids = Vec::with_capacity(count);
+        let mut offset = Self::FIXED;
+        for _ in 0..count {
+            let raw = read_u64_le(&bytes[offset..offset + Self::SUBXID_SIZE])
+                .map_err(|_| PayloadError::Malformed("commit subxid"))?;
+            committed_subxids.push(Xid::new(raw));
+            offset += Self::SUBXID_SIZE;
+        }
+        require_exact_len(bytes, needed)?;
         Ok(Self {
             commit_lsn,
             commit_timestamp_micros,
+            committed_subxids,
         })
     }
 }

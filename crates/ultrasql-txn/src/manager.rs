@@ -498,6 +498,12 @@ impl TransactionManager {
     /// detected, the commit fails with [`TxnError::SerializationFailure`]
     /// and the caller must call [`Self::abort`] to roll back.
     ///
+    /// Returns the **committed subtransaction family** — every subxid flipped
+    /// to `Committed` alongside the parent (released + implicitly-released
+    /// open-savepoint subxids; `ROLLBACK TO`-aborted ones are excluded). The
+    /// caller embeds this list in the durable Commit WAL record so recovery can
+    /// mark the whole family committed atomically with the parent.
+    ///
     /// Returns [`TxnError::AlreadyTerminated`] if the XID has already
     /// been committed or aborted, [`TxnError::Unknown`] if the XID is
     /// not in the CLOG. Both indicate misuse; callers are expected to
@@ -511,7 +517,7 @@ impl TransactionManager {
         clippy::needless_pass_by_value,
         reason = "by-value enforces the at-most-once lifecycle invariant"
     )]
-    pub fn commit(&self, txn: Transaction) -> Result<(), TxnError> {
+    pub fn commit(&self, txn: Transaction) -> Result<Vec<Xid>, TxnError> {
         let xid = txn.xid;
         let isolation = txn.isolation;
         // Atomic family fold: the parent and every still-`InProgress`
@@ -553,7 +559,7 @@ impl TransactionManager {
             }
         }
 
-        Ok(())
+        Ok(folded)
     }
 
     /// Abort `txn`. Marks the XID `Aborted` in the CLOG.

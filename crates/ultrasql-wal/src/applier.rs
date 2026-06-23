@@ -886,8 +886,9 @@ mod tests {
         let commit_payload = CommitPayload {
             commit_lsn: Lsn::new(42),
             commit_timestamp_micros: 12345,
+            committed_subxids: Vec::new(),
         };
-        let rec = make_record(RecordType::Commit, commit_payload.encode());
+        let rec = make_record(RecordType::Commit, commit_payload.encode().unwrap());
         dispatch_record(&mock, &rec).unwrap();
 
         // Abort
@@ -1051,6 +1052,7 @@ mod tests {
         let commit_payload = CommitPayload {
             commit_lsn: Lsn::new(0),
             commit_timestamp_micros: 0,
+            committed_subxids: Vec::new(),
         };
         let delete_payload = HeapDeletePayload {
             tid: tid(1, 0, 0),
@@ -1074,8 +1076,11 @@ mod tests {
                 insert_payload3.encode().unwrap(),
             ))
             .unwrap();
-            buf.append(&make_record(RecordType::Commit, commit_payload.encode()))
-                .unwrap();
+            buf.append(&make_record(
+                RecordType::Commit,
+                commit_payload.encode().unwrap(),
+            ))
+            .unwrap();
             buf.append(&make_record(
                 RecordType::HeapDelete,
                 delete_payload.encode().unwrap(),

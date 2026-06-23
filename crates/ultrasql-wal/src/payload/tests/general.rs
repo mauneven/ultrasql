@@ -119,8 +119,10 @@ fn payload_decoders_reject_trailing_bytes() {
         CommitPayload {
             commit_lsn: Lsn::new(123),
             commit_timestamp_micros: 456,
+            committed_subxids: Vec::new(),
         }
-        .encode(),
+        .encode()
+        .expect("encode commit payload"),
         CommitPayload::decode,
     );
 

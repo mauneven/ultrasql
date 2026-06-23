@@ -103,7 +103,7 @@ impl Server {
             Ok(output) => self
                 .txn_manager
                 .commit(txn)
-                .map(|()| output)
+                .map(|_committed_subxids| output)
                 .map_err(|err| {
                     ServerError::ddl(format!("ultrasql-local read transaction commit: {err}"))
                 }),
@@ -252,15 +252,30 @@ impl Server {
     }
 
     /// Append a commit marker for WAL-backed SQL recovery.
-    pub(crate) fn append_commit_record(&self, xid: Xid) -> Result<Option<Lsn>, ServerError> {
+    ///
+    /// `committed_subxids` are the subtransaction XIDs that committed atomically
+    /// with the parent (released and implicitly-released-at-commit subxids). They
+    /// ride inside this single Commit record so recovery marks the whole family
+    /// `Committed` together — a row inserted under a released savepoint must not
+    /// vanish after a pure-WAL restart. The list excludes `ROLLBACK TO`-aborted
+    /// subxids, which correctly default to `Aborted` on recovery.
+    pub(crate) fn append_commit_record(
+        &self,
+        xid: Xid,
+        committed_subxids: Vec<Xid>,
+    ) -> Result<Option<Lsn>, ServerError> {
         let Some(wal) = self.heap.wal_sink() else {
             return Ok(None);
         };
         let payload = CommitPayload {
             commit_lsn: Lsn::ZERO,
             commit_timestamp_micros: unix_timestamp_micros(),
+            committed_subxids,
         };
-        let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
+        let encoded = payload
+            .encode()
+            .map_err(|e| ServerError::ddl(format!("commit WAL payload encode: {e}")))?;
+        let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, encoded)
             .map_err(|e| ServerError::ddl(format!("commit WAL record encode: {e}")))?;
         wal.append(record)
             .map(Some)
@@ -533,13 +548,15 @@ impl Server {
         context: &str,
     ) -> Result<(), ServerError> {
         let xid = txn.xid;
-        self.txn_manager.commit(txn).map_err(|e| match e {
+        let committed_subxids = self.txn_manager.commit(txn).map_err(|e| match e {
             TxnError::SerializationFailure { detail, .. } => {
                 ServerError::SerializationFailure(detail)
             }
             other => ServerError::ddl(format!("{context} commit: {other}")),
         })?;
-        if durable_commit_marker && let Some(commit_lsn) = self.append_commit_record(xid)? {
+        if durable_commit_marker
+            && let Some(commit_lsn) = self.append_commit_record(xid, committed_subxids)?
+        {
             self.wait_for_wal_durable(commit_lsn)?;
         }
         Ok(())

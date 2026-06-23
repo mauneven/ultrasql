@@ -320,7 +320,7 @@ fn persistent_server_can_force_commit_marker_durable() {
     let server = Server::init(data_dir.path()).unwrap();
 
     let commit_lsn = server
-        .append_commit_record(Xid::FIRST_USER)
+        .append_commit_record(Xid::FIRST_USER, Vec::new())
         .unwrap()
         .expect("persistent server must append a commit marker");
     server.wait_for_wal_durable(commit_lsn).unwrap();
@@ -525,13 +525,14 @@ fn server_init_does_not_restore_commit_status_after_recovery_target_lsn() {
     let commit = CommitPayload {
         commit_lsn: Lsn::new(200),
         commit_timestamp_micros: 1_700_000_000_000_000,
+        committed_subxids: Vec::new(),
     };
     let second = WalRecord::new(
         RecordType::Commit,
         xid_after_target,
         Lsn::ZERO,
         0,
-        commit.encode(),
+        commit.encode().expect("encode commit payload"),
     )
     .expect("test WAL commit record should fit size limits");
     let mut segment = first_bytes;

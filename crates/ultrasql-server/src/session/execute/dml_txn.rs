@@ -427,6 +427,7 @@ where
         self.state
             .txn_manager
             .commit(txn)
+            .map(|_committed_subxids| ())
             .map_err(|err| ServerError::Ddl(format!("{context}: {err}")))
     }
 

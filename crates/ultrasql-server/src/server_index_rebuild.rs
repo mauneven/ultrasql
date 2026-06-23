@@ -36,7 +36,7 @@ impl Server {
             Ok(value) => self
                 .txn_manager
                 .commit(txn)
-                .map(|()| value)
+                .map(|_committed_subxids| value)
                 .map_err(|err| ServerError::ddl(format!("{commit_context}: {err}"))),
             Err(err) => match self.txn_manager.abort(txn) {
                 Ok(()) => Err(err),

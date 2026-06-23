@@ -276,8 +276,9 @@ fn commit_round_trip_zero() {
     let p = CommitPayload {
         commit_lsn: Lsn::ZERO,
         commit_timestamp_micros: 0,
+        committed_subxids: Vec::new(),
     };
-    assert_eq!(CommitPayload::decode(&p.encode()).unwrap(), p);
+    assert_eq!(CommitPayload::decode(&p.encode().unwrap()).unwrap(), p);
 }
 
 #[test]
@@ -285,8 +286,40 @@ fn commit_round_trip_realistic() {
     let p = CommitPayload {
         commit_lsn: Lsn::new(0x0000_0001_0000_2000),
         commit_timestamp_micros: 1_715_000_000_000_000,
+        committed_subxids: Vec::new(),
     };
-    assert_eq!(CommitPayload::decode(&p.encode()).unwrap(), p);
+    assert_eq!(CommitPayload::decode(&p.encode().unwrap()).unwrap(), p);
+}
+
+#[test]
+fn commit_round_trip_with_subxids() {
+    let p = CommitPayload {
+        commit_lsn: Lsn::new(0x0000_0001_0000_2000),
+        commit_timestamp_micros: 1_715_000_000_000_000,
+        committed_subxids: vec![Xid::new(5), Xid::new(9), Xid::new(13)],
+    };
+    let encoded = p.encode().unwrap();
+    assert_eq!(encoded.len(), 20 + 3 * 8);
+    assert_eq!(CommitPayload::decode(&encoded).unwrap(), p);
+}
+
+/// A legacy 16-byte commit record (written before the subxid section existed)
+/// must still decode, yielding an empty `committed_subxids`. Guards WAL
+/// back-compatibility for pre-existing on-disk records.
+#[test]
+fn commit_legacy_16_byte_record_decodes_empty() {
+    let mut legacy = vec![0_u8; 16];
+    legacy[0..8].copy_from_slice(&0x0000_0001_0000_2000_u64.to_le_bytes());
+    legacy[8..16].copy_from_slice(&1_715_000_000_000_000_u64.to_le_bytes());
+    let decoded = CommitPayload::decode(&legacy).expect("legacy 16-byte record decodes");
+    assert_eq!(
+        decoded,
+        CommitPayload {
+            commit_lsn: Lsn::new(0x0000_0001_0000_2000),
+            commit_timestamp_micros: 1_715_000_000_000_000,
+            committed_subxids: Vec::new(),
+        }
+    );
 }
 
 // ── AbortPayload ──────────────────────────────────────────────────────
@@ -441,8 +474,23 @@ fn commit_truncated_by_one_byte_rejected() {
     let p = CommitPayload {
         commit_lsn: Lsn::new(1),
         commit_timestamp_micros: 2,
+        committed_subxids: Vec::new(),
     };
-    let mut raw = p.encode();
+    let mut raw = p.encode().unwrap();
+    raw.truncate(raw.len() - 1);
+    let err = CommitPayload::decode(&raw).unwrap_err();
+    assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
+}
+
+/// A record claiming N subxids but missing some of their bytes is rejected.
+#[test]
+fn commit_truncated_subxid_section_rejected() {
+    let p = CommitPayload {
+        commit_lsn: Lsn::new(1),
+        commit_timestamp_micros: 2,
+        committed_subxids: vec![Xid::new(7), Xid::new(8)],
+    };
+    let mut raw = p.encode().unwrap();
     raw.truncate(raw.len() - 1);
     let err = CommitPayload::decode(&raw).unwrap_err();
     assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");

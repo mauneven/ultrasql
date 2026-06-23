@@ -192,7 +192,20 @@ impl Server {
             observed_xids.insert(record.header.xid);
             self.txn_manager.recover_observed_xid(record.header.xid);
             match record.header.record_type {
-                RecordType::Commit => self.txn_manager.recover_committed(record.header.xid),
+                RecordType::Commit => {
+                    self.txn_manager.recover_committed(record.header.xid);
+                    // The parent's single Commit record carries the subxids
+                    // that committed atomically with it (released + implicitly
+                    // released-at-commit savepoints). Mark each one Committed so
+                    // the post-replay default-abort sweep below does NOT abort
+                    // them — otherwise a row inserted under a released savepoint
+                    // would have an aborted xmin and vanish on restart.
+                    if let Ok(payload) = CommitPayload::decode(&record.payload) {
+                        for subxid in payload.committed_subxids {
+                            self.txn_manager.recover_committed(subxid);
+                        }
+                    }
+                }
                 RecordType::Abort => self.txn_manager.recover_aborted(record.header.xid),
                 _ => {}
             }

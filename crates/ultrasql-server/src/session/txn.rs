@@ -182,7 +182,10 @@ where
                 .txn_manager
                 .validate_prepared(xid)
                 .map_err(|e| ServerError::Ddl(format!("validate_prepared({gid}): {e}")))?;
-            if let Some(commit_lsn) = self.state.append_commit_record(xid)? {
+            // A prepared (2PC) transaction carries no folded subxid family
+            // here; savepoint subxids inside a prepared txn are out of scope
+            // for the durable commit-record family.
+            if let Some(commit_lsn) = self.state.append_commit_record(xid, Vec::new())? {
                 self.state.wait_for_wal_durable(commit_lsn)?;
             }
             self.state

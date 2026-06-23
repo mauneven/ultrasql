@@ -1002,9 +1002,16 @@ mod tests {
         let payload = CommitPayload {
             commit_lsn: Lsn::ZERO,
             commit_timestamp_micros,
+            committed_subxids: Vec::new(),
         };
-        WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
-            .expect("test WAL record should fit size limits")
+        WalRecord::new(
+            RecordType::Commit,
+            xid,
+            Lsn::ZERO,
+            0,
+            payload.encode().expect("encode commit payload"),
+        )
+        .expect("test WAL record should fit size limits")
     }
 
     const RECORD_HEADER_CRC_BYTE_OFFSET_FOR_TEST: usize = 4;
