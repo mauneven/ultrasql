@@ -121,6 +121,18 @@ where
         if !returning.is_empty() {
             return Ok(None);
         }
+        // No-savepoint gate: when a savepoint is open, fall through to the
+        // general MVCC DELETE path. The fused in-place DELETE writes its
+        // `xmax` stamp directly to the page; routing it through the general
+        // path (which stamps via the operator's `ctx.xid == current_xid()`
+        // and records per-relation undo) keeps `ROLLBACK TO` able to revert
+        // the delete cleanly and guarantees no corruption even if a future
+        // refactor mis-stamps the fused path. The stamp itself is already
+        // correct (`write_xid()`, fixed in Phase 0); this gate is the
+        // belt-and-suspenders "safe milestone" guard from the design.
+        if txn.subtxn_stack.depth() > 0 {
+            return Ok(None);
+        }
         let entry = catalog_snapshot
             .tables
             .get(&table.to_ascii_lowercase())
@@ -159,8 +171,14 @@ where
             oracle: self.state.txn_manager.as_ref(),
             predicate,
         };
+        let write_xid = txn.write_xid();
+        txn.debug_assert_stamp(write_xid);
         let stamp = DeleteInt32PairStamp {
-            xid: txn.xid,
+            // Stamp the active subtransaction XID (parent when no savepoint
+            // is open). MUST be `write_xid()`, not `txn.xid` — stamping the
+            // parent here is the fused-DELETE corruption root the first
+            // attempt was reverted for. See `Transaction::write_xid`.
+            xid: write_xid,
             command_id: txn.current_command,
         };
         let deleted = if let Some(wal_sink) = wal_sink {

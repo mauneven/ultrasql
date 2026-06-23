@@ -471,6 +471,8 @@ where
             .iter()
             .map(|payload| payload.as_slice())
             .collect::<Vec<_>>();
+        let xmin = txn.write_xid();
+        txn.debug_assert_stamp(xmin);
         let wal_sink_arc = self.state.heap.wal_sink().cloned();
         let tids = self
             .state
@@ -479,7 +481,10 @@ where
                 RelationId(entry.oid),
                 &payload_refs,
                 InsertOptions {
-                    xmin: txn.xid,
+                    // Stamp the active subtransaction XID (parent when no
+                    // savepoint is open). MUST be `write_xid()`, not
+                    // `txn.xid` — see `Transaction::write_xid`.
+                    xmin,
                     command_id: txn.current_command,
                     n_atts: 2,
                     wal: wal_sink_arc.as_deref(),
