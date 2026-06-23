@@ -595,6 +595,19 @@ where
                                 )));
                             }
                         }
+                        // Invalidate the shared column cache for every table
+                        // modified in this transaction (design §3 R8). The
+                        // cache is version-keyed and replayed RAW; a rolled-
+                        // back INSERT does not flow through the heap undo
+                        // helpers (which only bump the cache for in-place /
+                        // delete-stamp undo), so its row could otherwise
+                        // linger in a cached projection whose coherence gate
+                        // — keyed on the now-aborted subxid — wrongly passes.
+                        // Bumping with the parent xid evicts the stale entry
+                        // and forces the next scan to rebuild from the heap,
+                        // where the Phase-1 predicate hides the rolled-back
+                        // rows.
+                        self.invalidate_modified_table_column_caches(txn.xid);
                         // Clear the failure flag: the rolled-back work is
                         // undone so the user can continue.
                         self.txn_state = TxnState::InTransaction(txn);
@@ -620,6 +633,31 @@ where
                         Err(ServerError::SavepointNotFound(name.to_owned()))
                     }
                 }
+            }
+        }
+    }
+
+    /// Evict the shared column-cache projection for every table this
+    /// transaction has modified, recording `writer_xid` as the new
+    /// last-writer so the current transaction can immediately rebuild a
+    /// fresh projection from the heap.
+    ///
+    /// Used by `ROLLBACK TO SAVEPOINT` so a rolled-back write cannot be
+    /// served from a stale cached projection (design §3 R8). The set of
+    /// modified tables is the session's `pending_table_modifications` keys;
+    /// invalidating a superset (all tables touched this txn, not just under
+    /// the rolled-back subxids) is safe — it only forces a heap rebuild.
+    fn invalidate_modified_table_column_caches(&self, writer_xid: ultrasql_core::Xid) {
+        if self.pending_table_modifications.is_empty() {
+            return;
+        }
+        let snapshot = self.state.catalog_snapshot();
+        for table in self.pending_table_modifications.keys() {
+            if let Some(entry) = snapshot.tables.get(&table.to_ascii_lowercase()) {
+                self.state
+                    .heap
+                    .column_cache
+                    .bump_version(ultrasql_core::RelationId(entry.oid), writer_xid);
             }
         }
     }
