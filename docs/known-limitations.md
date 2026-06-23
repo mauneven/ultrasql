@@ -26,17 +26,31 @@ completed evidence.
   relation-level fallback, but not fully predicate-precise SSI. The covered
   Hermitage write-skew case aborts one transaction with SQLSTATE `40001`, but
   broader isolation schedules remain open.
-- `SAVEPOINT` / subtransactions are parsed and the savepoint stack is
-  maintained, but subtransaction *visibility* is incomplete: a transaction does
-  not see its own writes made under an active `SAVEPOINT` (such rows are stamped
-  with the subtransaction id, which the read snapshot does not yet treat as
-  current). A first attempt at full subtransaction visibility was reverted after
-  an adversarial review found it introduced data-corruption and B-tree
-  incoherence on `ROLLBACK TO` across the fast/fused write paths. Correct
-  support requires subxid stamping on every write fast-path (insert/update/
-  delete, including the fused and COPY paths) plus per-subxid index undo so
-  `ROLLBACK TO` restores physically-removed index entries; this is tracked as
-  dedicated work.
+- `SAVEPOINT` / subtransaction *visibility* is implemented for DML: a
+  transaction sees its own writes made under an active `SAVEPOINT`, `ROLLBACK
+  TO` hides a savepoint's inserts and restores its deletes / in-place-update
+  pre-images (verified from a second connection after `COMMIT`), `RELEASE`
+  keeps a savepoint's writes without leaking them to other backends before the
+  parent commits, and the parent's commit/abort folds the whole subxid family
+  atomically. The read snapshot carries per-transaction own-subxid sets (live
+  vs rolled-back), every DML write path stamps the active subtransaction id via
+  `Transaction::write_xid()` (guarded by a debug stamp assertion), and the
+  index access method follows PostgreSQL's lossy-index + heap-recheck model
+  (MVCC `DELETE` / key-changing `UPDATE` no longer physically remove B-tree
+  leaf entries; the read paths recheck the heap and `VACUUM` reclaims the dead
+  leaves), so an index scan and a sequential scan agree on the visible row set
+  through arbitrary savepoint nesting. The behaviour is covered by an
+  adversarial two-connection battery on both an un-indexed int32-pair shape
+  (fused fast paths + column cache) and an indexed multi-column shape, plus a
+  crash-recovery replay test.
+
+  Remaining gaps: `COPY FROM STDIN` runs in its own autocommit transaction, so
+  it is not transactional with an enclosing block and a `ROLLBACK TO` does not
+  undo rows it inserted (the stamp itself is already the active xid). `ALTER
+  TABLE` heap-rewrite DDL stamps the parent transaction id rather than the
+  active subtransaction id, so exact own-write rollback of a table rewrite
+  performed under a savepoint is out of scope; run schema rewrites outside a
+  savepoint when exact subtransaction rollback is required.
 - Broader aggregate coverage remains open beyond the covered `STDDEV`,
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
