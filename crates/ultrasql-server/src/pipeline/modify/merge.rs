@@ -306,6 +306,10 @@ pub(crate) fn lower_real_merge(
         merge_source,
     )
     .with_visibility_map(Arc::clone(&ctx.vm))
+    .with_uniqueness_recheck(
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>,
+    )
     .with_update_extra_eval_columns()
     .with_insert_indexes(build_insert_index_maintainers(entry, ctx)?)
     .with_update_indexes(build_insert_index_maintainers(entry, ctx)?)

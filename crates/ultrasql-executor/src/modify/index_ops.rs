@@ -100,11 +100,72 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             if !index.is_unique() {
                 continue;
             }
-            if !seen_keys[idx].insert(key) || index.contains_key(key)? {
+            // In-batch duplicate: two rows in this statement carry the same
+            // unique key — always a violation regardless of heap state.
+            if !seen_keys[idx].insert(key) {
+                return Err(ExecError::UniqueViolation(index.name.clone()));
+            }
+            // Against the existing index: under Option-A a stale leaf entry
+            // pointing at a dead tuple is NOT a conflict. Heap-recheck when a
+            // uniqueness snapshot is wired; otherwise fall back to the
+            // index-only probe.
+            if self.insert_key_conflicts_live(idx, key)? {
                 return Err(ExecError::UniqueViolation(index.name.clone()));
             }
         }
         Ok(())
+    }
+
+    /// `true` iff inserting `key` into unique index `idx` conflicts with a
+    /// **live** existing row (heap-rechecking when a uniqueness snapshot is
+    /// wired; index-only otherwise).
+    pub(crate) fn insert_key_conflicts_live(
+        &self,
+        idx: usize,
+        key: i64,
+    ) -> Result<bool, ExecError> {
+        let index = &self.insert_indexes[idx];
+        match (&self.uniqueness_snapshot, &self.uniqueness_oracle) {
+            (Some(snapshot), Some(oracle)) => Ok(matches!(
+                index.classify_unique_conflict(
+                    key,
+                    self.heap.as_ref(),
+                    snapshot,
+                    oracle.as_ref(),
+                )?,
+                super::index_maintainer::UniqueConflict::Live
+            )),
+            _ => index.contains_key(key),
+        }
+    }
+
+    /// The dead TID (if any) to physically replace before inserting `key`
+    /// into unique index `idx` (Option-A targeted-dead-replace). `None`
+    /// when there is no entry, when the entry is live (caller already
+    /// rejected), when the index is non-unique, or when no recheck is wired.
+    pub(crate) fn insert_dead_replace_tid(
+        &self,
+        idx: usize,
+        key: i64,
+    ) -> Result<Option<TupleId>, ExecError> {
+        let index = &self.insert_indexes[idx];
+        if !index.is_unique() {
+            return Ok(None);
+        }
+        match (&self.uniqueness_snapshot, &self.uniqueness_oracle) {
+            (Some(snapshot), Some(oracle)) => {
+                match index.classify_unique_conflict(
+                    key,
+                    self.heap.as_ref(),
+                    snapshot,
+                    oracle.as_ref(),
+                )? {
+                    super::index_maintainer::UniqueConflict::Dead(tid) => Ok(Some(tid)),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(crate) fn remember_insert_keys(
@@ -148,27 +209,75 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 if old_key == new_key {
                     continue;
                 }
-                if let Some(key) = old_key {
-                    let _ = self.update_indexes[idx].delete_key(
+                // Option-A (design §1 A2): do NOT physically remove the old
+                // key's leaf entry. The old TID's tuple now carries
+                // `xmax = current_xid`, so the heap recheck filters it; the
+                // new entry below is the live one. Leaving the old entry
+                // keeps the index coherent under `ROLLBACK TO` and defers
+                // reclamation to VACUUM — same model as the DELETE arm.
+                if let Some(key) = new_key {
+                    // Heap-rechecking uniqueness: a stale leaf entry pointing
+                    // at a dead tuple is not a conflict (and is replaced).
+                    let dead_tid = self.classify_update_unique_conflict(idx, key, new_tid)?;
+                    self.update_indexes[idx].insert_key_replacing_dead(
                         key,
-                        change.old_tid,
+                        new_tid,
+                        dead_tid,
                         self.delete_xmax,
                         wal,
                     )?;
                 }
-                if let Some(key) = new_key {
-                    if self.update_indexes[idx].is_unique()
-                        && self.update_indexes[idx].contains_key(key)?
-                    {
-                        return Err(ExecError::UniqueViolation(
-                            self.update_indexes[idx].name.clone(),
-                        ));
-                    }
-                    self.update_indexes[idx].insert_key(key, new_tid, self.delete_xmax, wal)?;
-                }
             }
         }
         Ok(())
+    }
+
+    /// Resolve a unique-conflict for a key-changing UPDATE's new key.
+    ///
+    /// Returns the dead TID to replace (Option-A targeted-dead-replace) or
+    /// `None` when there is nothing to replace; errors with
+    /// `UniqueViolation` on a *live* conflict. When no uniqueness snapshot
+    /// is wired, or the index is non-unique, falls back to the index-only
+    /// probe so behaviour is unchanged for callers that did not opt in.
+    fn classify_update_unique_conflict(
+        &self,
+        idx: usize,
+        key: i64,
+        new_tid: TupleId,
+    ) -> Result<Option<TupleId>, ExecError> {
+        let index = &self.update_indexes[idx];
+        if !index.is_unique() {
+            return Ok(None);
+        }
+        match (&self.uniqueness_snapshot, &self.uniqueness_oracle) {
+            (Some(snapshot), Some(oracle)) => {
+                match index.classify_unique_conflict(
+                    key,
+                    self.heap.as_ref(),
+                    snapshot,
+                    oracle.as_ref(),
+                )? {
+                    super::index_maintainer::UniqueConflict::Live => {
+                        Err(ExecError::UniqueViolation(index.name.clone()))
+                    }
+                    super::index_maintainer::UniqueConflict::Dead(dead_tid) => {
+                        // A dead entry pointing at the row we just produced
+                        // (a HOT-style same-TID rewrite) is not a stale
+                        // duplicate to remove.
+                        Ok((dead_tid != new_tid).then_some(dead_tid))
+                    }
+                    super::index_maintainer::UniqueConflict::None => Ok(None),
+                }
+            }
+            // No recheck wired: preserve the index-only behaviour.
+            _ => {
+                if index.contains_key(key)? {
+                    Err(ExecError::UniqueViolation(index.name.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     pub(crate) fn precheck_update_index_changes(
@@ -183,9 +292,13 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 if change.old_keys[idx] == Some(new_key) {
                     continue;
                 }
-                if self.update_indexes[idx].is_unique()
-                    && self.update_indexes[idx].contains_key(new_key)?
-                {
+                if !self.update_indexes[idx].is_unique() {
+                    continue;
+                }
+                // Heap-rechecking precheck: a stale leaf entry pointing at a
+                // dead tuple is not a conflict (Option-A). Falls back to the
+                // index-only probe when no uniqueness snapshot is wired.
+                if self.update_key_conflicts_live(idx, new_key)? {
                     return Err(ExecError::UniqueViolation(
                         self.update_indexes[idx].name.clone(),
                     ));
@@ -193,6 +306,24 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             }
         }
         Ok(())
+    }
+
+    /// `true` iff `new_key` conflicts with a **live** row in unique update
+    /// index `idx` (heap-rechecking when wired; index-only otherwise).
+    fn update_key_conflicts_live(&self, idx: usize, new_key: i64) -> Result<bool, ExecError> {
+        let index = &self.update_indexes[idx];
+        match (&self.uniqueness_snapshot, &self.uniqueness_oracle) {
+            (Some(snapshot), Some(oracle)) => Ok(matches!(
+                index.classify_unique_conflict(
+                    new_key,
+                    self.heap.as_ref(),
+                    snapshot,
+                    oracle.as_ref(),
+                )?,
+                super::index_maintainer::UniqueConflict::Live
+            )),
+            _ => index.contains_key(new_key),
+        }
     }
 
     pub(crate) fn extract_delete_tids_and_index_changes(
@@ -338,22 +469,22 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
 
     pub(crate) fn apply_delete_index_changes(
         &mut self,
-        changes: &[DeleteIndexChange],
+        _changes: &[DeleteIndexChange],
     ) -> Result<(), ExecError> {
-        let wal = self.wal.clone();
-        let wal_ref = wal.as_deref();
-        for change in changes {
-            for idx in 0..self.delete_indexes.len() {
-                if let Some(key) = change.keys[idx] {
-                    let _ = self.delete_indexes[idx].delete_key(
-                        key,
-                        change.tid,
-                        self.delete_xmax,
-                        wal_ref,
-                    )?;
-                }
-            }
-        }
+        // Option-A (design §1 A1): MVCC DELETE no longer physically removes
+        // the B-tree leaf entry. The deleted tuple's `xmax` stamp is the
+        // sole authority — both index read paths (`btree_probe` /
+        // `late_materialize`) re-fetch the heap tuple and drop the candidate
+        // when the delete is visible, so a stale leaf entry can never
+        // surface a dead row. Leaving the entry in place makes `ROLLBACK TO`
+        // index-coherent for free (there is nothing to restore) and lets
+        // VACUUM reclaim the leaf once the tuple is dead to every snapshot.
+        //
+        // `extract_delete_tids_and_index_changes` still builds the
+        // `DeleteIndexChange` records (kept deliberately — see the struct's
+        // doc); only the B-tree *apply* becomes a no-op. The sibling
+        // `VectorDeleteIndexChange` path still applies, since vector indexes
+        // keep an explicit tombstone model rather than heap-recheck.
         Ok(())
     }
 

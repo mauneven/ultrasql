@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use num_traits::ToPrimitive;
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, RelationId};
 use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
 
@@ -745,8 +745,16 @@ async fn delete_on_indexed_table_removes_btree_entry() {
     graceful_shutdown(running).await;
 }
 
-/// SQL `VACUUM table` runs the B-tree vacuum pass and reclaims stale
-/// index TIDs that point at committed-dead heap slots.
+/// SQL `VACUUM table` runs the B-tree vacuum pass and reclaims the stale
+/// index entries that the Option-A no-index-undo model leaves behind on a
+/// committed DELETE.
+///
+/// Under Option-A (design §1) an MVCC DELETE no longer physically removes
+/// the B-tree leaf entry — it lingers pointing at the now-committed-dead
+/// heap tuple, filtered by the read-side heap recheck. This test asserts
+/// (a) the lingering entry is present after the committed DELETE, and
+/// (b) `VACUUM` reclaims it once the tuple is dead to every snapshot
+/// (design §4 step 15, the reclamation regression test).
 #[tokio::test]
 async fn vacuum_reclaims_stale_index_entries() {
     let running = start_sample_server("index_scan_test").await;
@@ -779,16 +787,21 @@ async fn vacuum_reclaims_stale_index_entries() {
         .get(&table.oid)
         .and_then(|indexes| indexes.first().cloned())
         .expect("index catalog entry");
-    let stale_tid = TupleId::new(PageId::new(RelationId(table.oid), BlockNumber::new(0)), 0);
-    let mut btree = BTree::open(
+
+    // Option-A: the DELETE leaves the leaf entry in place — it now points
+    // at a committed-dead heap tuple. No manual planting needed; the DELETE
+    // itself produces the stale entry the read side filters and VACUUM
+    // reclaims.
+    let btree = BTree::open(
         Arc::clone(server.heap.buffer_pool()),
         RelationId::new(index.oid.raw()),
         index.root_block,
     );
-    btree
-        .insert_non_unique::<i64>(1, stale_tid, Xid::new(1), None)
-        .expect("plant stale index entry");
-    assert_eq!(btree.lookup_all::<i64>(1).expect("lookup stale").len(), 1);
+    assert_eq!(
+        btree.lookup_all::<i64>(1).expect("lookup stale").len(),
+        1,
+        "Option-A leaves the committed-DELETE leaf entry for VACUUM"
+    );
 
     client
         .batch_execute("VACUUM t_vacuum_idx")
@@ -804,7 +817,8 @@ async fn vacuum_reclaims_stale_index_entries() {
         btree
             .lookup_all::<i64>(1)
             .expect("lookup after vacuum")
-            .is_empty()
+            .is_empty(),
+        "VACUUM must reclaim the stale leaf entry once the tuple is dead"
     );
 
     graceful_shutdown(running).await;

@@ -402,16 +402,31 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     debug_assert_eq!(tids.len(), payloads.len());
-                    for (idx, index) in self.insert_indexes.iter_mut().enumerate() {
-                        for (row_idx, key) in index_keys[idx].iter().enumerate() {
-                            if let Some(k) = key {
-                                let Some(tid) = tids.get(row_idx).copied() else {
-                                    return Err(ExecError::Internal(
-                                        "heap insert_batch returned fewer TIDs than payloads",
-                                    ));
-                                };
-                                index.insert_key(*k, tid, self.insert_xmin, wal_ref)?;
-                            }
+                    for idx in 0..self.insert_indexes.len() {
+                        for row_idx in 0..index_keys[idx].len() {
+                            let Some(k) = index_keys[idx][row_idx] else {
+                                continue;
+                            };
+                            let Some(tid) = tids.get(row_idx).copied() else {
+                                return Err(ExecError::Internal(
+                                    "heap insert_batch returned fewer TIDs than payloads",
+                                ));
+                            };
+                            // Option-A targeted-dead-replace: a unique index
+                            // may still hold a stale physical entry for `k`
+                            // pointing at a dead tuple. Remove that specific
+                            // entry before inserting, or the storage layer's
+                            // own `DuplicateKey` rejects the reuse. `None`
+                            // for the common no-stale-entry / non-unique /
+                            // no-recheck case (plain insert).
+                            let dead_tid = self.insert_dead_replace_tid(idx, k)?;
+                            self.insert_indexes[idx].insert_key_replacing_dead(
+                                k,
+                                tid,
+                                dead_tid,
+                                self.insert_xmin,
+                                wal_ref,
+                            )?;
                         }
                     }
                     for (idx, index) in self.insert_vector_indexes.iter().enumerate() {

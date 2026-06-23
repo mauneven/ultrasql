@@ -127,10 +127,31 @@ impl<L: PageLoader> ModifyTable<L> {
             referenced_by_delete_checks: Vec::new(),
             referenced_by_update_checks: Vec::new(),
             returning_evaluators: Vec::new(),
+            uniqueness_snapshot: None,
+            uniqueness_oracle: None,
             child,
             done: false,
             affected: 0,
         }
+    }
+
+    /// Attach the MVCC snapshot + status oracle used by the unique-index
+    /// conflict recheck (Option-A heap-recheck uniqueness, design §1 A3).
+    ///
+    /// Wire this for INSERT and key-changing UPDATE so a UNIQUE constraint
+    /// is enforced against *live* heap tuples only — a stale leaf entry
+    /// pointing at a dead tuple no longer fabricates a false
+    /// `UniqueViolation`. Omit it (the default `None`) to keep the
+    /// index-only probe.
+    #[must_use]
+    pub fn with_uniqueness_recheck(
+        mut self,
+        snapshot: ultrasql_mvcc::Snapshot,
+        oracle: Arc<dyn ultrasql_mvcc::XidStatusOracle>,
+    ) -> Self {
+        self.uniqueness_snapshot = Some(snapshot);
+        self.uniqueness_oracle = Some(oracle);
+        self
     }
 
     /// Attach the server-owned visibility map so heap mutations clear

@@ -167,6 +167,10 @@ pub(crate) fn lower_real_insert(
         child,
     )
     .with_visibility_map(Arc::clone(&ctx.vm))
+    .with_uniqueness_recheck(
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>,
+    )
     .with_insert_indexes(insert_indexes)
     .with_update_indexes(update_indexes)
     .with_insert_vector_indexes(insert_vector_indexes)

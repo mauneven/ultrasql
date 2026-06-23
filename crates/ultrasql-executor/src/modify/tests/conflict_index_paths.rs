@@ -303,10 +303,14 @@ fn btree_index_conflict_and_maintenance_helpers_cover_index_paths() {
             None,
         )
         .expect("apply update index");
+    // Option-A (design §1 A2): the old key's leaf entry is intentionally
+    // NOT physically removed on a key-changing UPDATE — it lingers for
+    // VACUUM and is filtered by the read-side heap recheck. The new key's
+    // entry is inserted as the live one.
     assert!(
-        !update_op.update_indexes[0]
+        update_op.update_indexes[0]
             .contains_key(1)
-            .expect("old gone")
+            .expect("old key lingers under Option-A (filtered by heap recheck)")
     );
     assert!(
         update_op.update_indexes[0]
@@ -341,9 +345,13 @@ fn btree_index_conflict_and_maintenance_helpers_cover_index_paths() {
             keys: vec![Some(5)],
         }])
         .expect("delete index");
+    // Option-A (design §1 A1): MVCC DELETE no longer physically removes the
+    // B-tree leaf entry. The entry lingers (filtered by the read-side heap
+    // recheck) until VACUUM reclaims it; `apply_delete_index_changes` is a
+    // B-tree no-op.
     assert!(
-        !delete_op.delete_indexes[0]
+        delete_op.delete_indexes[0]
             .contains_key(5)
-            .expect("delete gone")
+            .expect("delete-key entry lingers under Option-A (filtered by heap recheck)")
     );
 }

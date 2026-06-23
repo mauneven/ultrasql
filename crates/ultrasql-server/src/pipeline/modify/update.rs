@@ -372,7 +372,11 @@ pub(crate) fn lower_real_update(
         ctx.heap.wal_sink().cloned(),
         child,
     )
-    .with_visibility_map(Arc::clone(&ctx.vm));
+    .with_visibility_map(Arc::clone(&ctx.vm))
+    .with_uniqueness_recheck(
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>,
+    );
     let mut check_constraints = rls_update_checks;
     if let Some(constraints) = &constraints {
         check_constraints.extend(

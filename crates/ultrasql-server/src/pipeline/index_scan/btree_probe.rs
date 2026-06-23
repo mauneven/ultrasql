@@ -52,7 +52,7 @@ pub(super) fn probe_index_ordered(
     }
     let entries = probe_index_entries_ordered(index_entry, range, ascending, ctx)?;
     let tuples_read = usize_to_u64_saturating(entries.len());
-    let mut payloads = fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)?;
+    let mut payloads = fetch_visible_index_payloads(entries, index_entry, ctx)?;
     if payloads.is_empty()
         && let (Some(lo), Some(hi)) = (range.low, range.high)
         && lo == hi
@@ -98,7 +98,7 @@ pub(super) fn probe_index_ordered_limited(
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
                 {
                     tuples_read = tuples_read.saturating_add(1);
-                    push_visible_index_payload(&mut payloads, tid, ctx, limit)?;
+                    push_visible_index_payload(&mut payloads, lo, tid, index_entry, ctx, limit)?;
                 }
             } else {
                 for tid in btree
@@ -106,7 +106,8 @@ pub(super) fn probe_index_ordered_limited(
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
                 {
                     tuples_read = tuples_read.saturating_add(1);
-                    if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                    if push_visible_index_payload(&mut payloads, lo, tid, index_entry, ctx, limit)?
+                    {
                         break;
                     }
                 }
@@ -119,10 +120,10 @@ pub(super) fn probe_index_ordered_limited(
             let start = low.unwrap_or(i64::MIN);
             let end_exclusive = high.and_then(|h| h.checked_add(1));
             for entry in btree.range_scan::<i64>(start, end_exclusive) {
-                let (_key, tid) =
+                let (key, tid) =
                     entry.map_err(|e| ServerError::ddl(format!("IndexScan btree scan: {e}")))?;
                 tuples_read = tuples_read.saturating_add(1);
-                if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                if push_visible_index_payload(&mut payloads, key, tid, index_entry, ctx, limit)? {
                     break;
                 }
             }
@@ -134,10 +135,10 @@ pub(super) fn probe_index_ordered_limited(
                 .backward_scan::<i64>(start, end)
                 .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?
             {
-                let (_key, tid) = entry
+                let (key, tid) = entry
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?;
                 tuples_read = tuples_read.saturating_add(1);
-                if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                if push_visible_index_payload(&mut payloads, key, tid, index_entry, ctx, limit)? {
                     break;
                 }
             }
@@ -199,7 +200,7 @@ fn fallback_point_payloads(
     Ok(payloads)
 }
 
-fn value_matches_i64(value: &Value, key: i64) -> bool {
+pub(super) fn value_matches_i64(value: &Value, key: i64) -> bool {
     match value {
         Value::Int16(v) => i64::from(*v) == key,
         Value::Int32(v) => i64::from(*v) == key,
@@ -278,9 +279,116 @@ pub(crate) fn probe_index_entries_ordered(
     Ok(entries_out)
 }
 
-fn fetch_visible_index_payloads<I>(tids: I, ctx: &LowerCtx<'_>) -> Result<Vec<Vec<u8>>, ServerError>
+/// Per-probe context for re-checking that a heap tuple resolved through a
+/// (possibly stale) index entry still carries the index key the entry was
+/// stored under.
+///
+/// Required by the Option-A no-index-undo model (design §1): a key-changing
+/// UPDATE now leaves the old key's leaf entry in place (it points at the
+/// superseded heap version, or — after a HOT chase — at the *new* version
+/// whose key differs). Without a recheck, probing the *old* key would
+/// surface the new-key row. PostgreSQL performs exactly this recheck on a
+/// lossy/stale index scan: fetch the heap tuple, then re-test the index
+/// qual against it. We decode the indexed column and require it to equal the
+/// entry's key; a mismatch means the entry is stale and the row is dropped.
+pub(super) struct IndexKeyRecheck {
+    codec: RowCodec,
+    key: crate::index_key::IndexKeyEncoding,
+    /// Table column indices (attnums) the key encoding reads.
+    columns: Vec<usize>,
+    expected_key: i64,
+}
+
+impl IndexKeyRecheck {
+    /// Build a recheck for `expected_key` on `index_entry`'s key columns, or
+    /// `None` when the index/columns/encoding cannot be resolved (in which
+    /// case the caller skips the recheck — the pre-Option-A behaviour).
+    ///
+    /// The recheck recomputes the key from the resolved heap row with the
+    /// **same** [`crate::index_key::IndexKeyEncoding`] the CREATE INDEX
+    /// build and the probe use, so it is correct for every supported key
+    /// type (int family, bool, timestamp, orderly float, prefix-8 text, and
+    /// two-column composites) — not just integers. For the lossy text/float
+    /// encodings a match is over-inclusive (it can keep a row whose true key
+    /// differs but shares the encoded value), which is the *safe* direction
+    /// and exactly the lossiness the index itself already carries.
+    fn build(index_entry: &IndexEntry, expected_key: i64, ctx: &LowerCtx<'_>) -> Option<Self> {
+        // The value-encoding recheck is only valid for B-tree indexes, whose
+        // leaf key *is* the encoded column value. A hash index stores
+        // `hash(value)` as the leaf key, so recomputing the value encoding
+        // would never match the probed hash; skip the recheck there (a hash
+        // probe locates entries by the hash of the probe value, so a stale
+        // different-value entry is not surfaced for a point lookup anyway).
+        if !index_entry.access_method.eq_ignore_ascii_case("btree") {
+            return None;
+        }
+        let table_entry = ctx
+            .catalog_snapshot
+            .tables
+            .values()
+            .find(|entry| entry.oid == index_entry.table_oid)?;
+        let columns: Vec<usize> = index_entry
+            .columns
+            .iter()
+            .map(|&attnum| usize::from(attnum))
+            .collect();
+        let key =
+            crate::index_key::IndexKeyEncoding::for_columns(&table_entry.schema, &columns).ok()?;
+        Some(Self {
+            codec: RowCodec::new(table_entry.schema.clone()),
+            key,
+            columns,
+            expected_key,
+        })
+    }
+
+    /// `true` iff `payload` decodes to a row whose recomputed index key
+    /// equals the expected key. A decode/encode failure rejects the row (the
+    /// safe direction — never surface a mismatched row).
+    fn payload_matches(&self, payload: &[u8]) -> bool {
+        let Ok(row) = self.codec.decode(payload) else {
+            return false;
+        };
+        matches!(
+            encode_recheck_key(&self.key, &self.columns, &row),
+            Ok(Some(k)) if k == self.expected_key
+        )
+    }
+}
+
+/// Recompute the i64 index key for `row` under `encoding`.
+///
+/// A single-column encoding extracts its one key column from `row` and
+/// dispatches to `encode_value`; a composite encoding reads its own columns
+/// via `encode_row`. This mirrors how the CREATE INDEX build path encodes a
+/// row, so the recheck never disagrees with how entries were stored.
+pub(super) fn encode_recheck_key(
+    encoding: &crate::index_key::IndexKeyEncoding,
+    columns: &[usize],
+    row: &[Value],
+) -> Result<Option<i64>, ServerError> {
+    if matches!(
+        encoding,
+        crate::index_key::IndexKeyEncoding::CompositeTwoInts { .. }
+    ) {
+        return encoding.encode_row(row);
+    }
+    let Some(&col) = columns.first() else {
+        return Ok(None);
+    };
+    match row.get(col) {
+        Some(value) => encoding.encode_value(value),
+        None => Ok(None),
+    }
+}
+
+fn fetch_visible_index_payloads<I>(
+    entries: I,
+    index_entry: &IndexEntry,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError>
 where
-    I: IntoIterator<Item = TupleId>,
+    I: IntoIterator<Item = (i64, TupleId)>,
 {
     // Fetch the heap tuples in B-tree order and apply MVCC visibility
     // inline. An index entry whose heap tuple is invisible to the
@@ -290,11 +398,12 @@ where
     // chaining through `scan_visible` because the latter walks a
     // block-by-block iterator we cannot project onto an arbitrary
     // TupleId list.
-    let iter = tids.into_iter();
+    let iter = entries.into_iter();
     let (lower, _) = iter.size_hint();
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(lower);
-    for tid in iter {
-        if let Some(payload) = fetch_visible_index_payload(tid, ctx)? {
+    for (key, tid) in iter {
+        let recheck = IndexKeyRecheck::build(index_entry, key, ctx);
+        if let Some(payload) = fetch_visible_index_payload(tid, ctx, recheck.as_ref())? {
             payloads.push(payload);
         }
     }
@@ -303,11 +412,14 @@ where
 
 fn push_visible_index_payload(
     payloads: &mut Vec<Vec<u8>>,
+    key: i64,
     tid: TupleId,
+    index_entry: &IndexEntry,
     ctx: &LowerCtx<'_>,
     limit: usize,
 ) -> Result<bool, ServerError> {
-    if let Some(payload) = fetch_visible_index_payload(tid, ctx)? {
+    let recheck = IndexKeyRecheck::build(index_entry, key, ctx);
+    if let Some(payload) = fetch_visible_index_payload(tid, ctx, recheck.as_ref())? {
         payloads.push(payload);
     }
     Ok(payloads.len() >= limit)
@@ -316,6 +428,7 @@ fn push_visible_index_payload(
 pub(super) fn fetch_visible_index_payload(
     tid: TupleId,
     ctx: &LowerCtx<'_>,
+    recheck: Option<&IndexKeyRecheck>,
 ) -> Result<Option<Vec<u8>>, ServerError> {
     let mut current = tid;
     for _ in 0..64 {
@@ -325,7 +438,16 @@ pub(super) fn fetch_visible_index_payload(
             .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
         let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
         match visibility {
-            Visibility::Visible => return Ok(Some(tuple.data)),
+            Visibility::Visible => {
+                // Option-A recheck: confirm the resolved row still carries
+                // the index key this entry was stored under. A key-changing
+                // UPDATE leaves a stale entry behind; without this a probe of
+                // the *old* key would surface the new-key row.
+                if recheck.is_some_and(|rc| !rc.payload_matches(&tuple.data)) {
+                    return Ok(None);
+                }
+                return Ok(Some(tuple.data));
+            }
             Visibility::Invisible | Visibility::DeletedByOwn => {
                 if let Some(next) = updated_ctid_target(&tuple.header, current) {
                     current = next;
@@ -333,7 +455,25 @@ pub(super) fn fetch_visible_index_payload(
                 }
                 return Ok(None);
             }
-            Visibility::VisiblePreImage => return Ok(None),
+            Visibility::VisiblePreImage => {
+                // The slot holds the post-image of an in-place UPDATE the
+                // reader's snapshot does not see (or one a rolled-back subxid
+                // wrote). Surface the same pre-image a seq scan would,
+                // instead of dropping the row — so an index scan and a seq
+                // scan agree on the visible row set (design §3 R6).
+                let pre = ctx
+                    .heap
+                    .fetch_visible_pre_image(current, &ctx.snapshot, ctx.oracle.as_ref())
+                    .map_err(|e| ServerError::ddl(format!("IndexScan pre-image fetch: {e}")))?;
+                // Recheck the pre-image against the entry key too: an
+                // in-place key change would otherwise leak the wrong row.
+                return Ok(match pre {
+                    Some(payload) if recheck.is_none_or(|rc| rc.payload_matches(&payload)) => {
+                        Some(payload)
+                    }
+                    _ => None,
+                });
+            }
         }
     }
     Err(ServerError::ddl(

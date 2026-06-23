@@ -154,6 +154,21 @@ pub(crate) struct UpdateIndexChange {
     pub(crate) new_keys: Vec<Option<i64>>,
 }
 
+/// A B-tree index change recorded for a DELETE/MERGE-delete row.
+///
+/// Under the Option-A no-index-undo model (design §1) the B-tree *apply*
+/// for these is a no-op — the deleted tuple's `xmax` stamp is authoritative
+/// and the index read paths heap-recheck — so the fields are not currently
+/// read. They are retained because the extraction path
+/// (`extract_delete_tids_and_index_changes`) builds them alongside the
+/// heap-delete TIDs and the vector-index changes, keeping the DELETE/MERGE
+/// extraction symmetric and ready to drive targeted leaf reclamation if a
+/// future profiling pass justifies an eager-removal mode. VACUUM reclaims
+/// the lingering leaves in the meantime.
+#[allow(
+    dead_code,
+    reason = "Option-A leaves B-tree leaves for VACUUM; record retained for extraction symmetry / future eager-removal mode"
+)]
 pub(crate) struct DeleteIndexChange {
     pub(crate) tid: TupleId,
     pub(crate) keys: Vec<Option<i64>>,
@@ -386,6 +401,20 @@ pub struct ModifyTable<L: PageLoader> {
     pub(crate) referenced_by_delete_checks: Vec<RowConstraintCheck>,
     pub(crate) referenced_by_update_checks: Vec<RowUpdateConstraintCheck>,
     pub(crate) returning_evaluators: Vec<Eval>,
+    /// MVCC snapshot + status oracle used by the **unique-index conflict
+    /// recheck** (Option-A heap-recheck uniqueness, design §1 A3).
+    ///
+    /// With the no-index-undo model, a UNIQUE B-tree leaf may hold a stale
+    /// entry whose heap tuple is dead (deleted-and-committed, or written by
+    /// a rolled-back / aborted writer). A pure index probe would over-report
+    /// such an entry as a conflict and falsely reject a legitimate
+    /// re-insert. When present, the conflict test fetches the indexed TID's
+    /// heap tuple and only treats a hit pointing at a *live* (or in-progress
+    /// foreign) tuple as a real conflict. `None` falls back to the
+    /// index-only probe (correct for the still-physically-removing UPDATE
+    /// arm and for callers built before this wiring).
+    pub(crate) uniqueness_snapshot: Option<ultrasql_mvcc::Snapshot>,
+    pub(crate) uniqueness_oracle: Option<Arc<dyn ultrasql_mvcc::XidStatusOracle>>,
     pub(crate) child: Box<dyn Operator>,
     pub(crate) done: bool,
     pub(crate) affected: i64,
