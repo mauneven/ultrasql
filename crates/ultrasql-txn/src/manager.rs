@@ -54,9 +54,9 @@ use crate::lock::LockManager;
 use crate::savepoint::{SavepointError, Subtxn, SubtxnManager};
 use crate::ssi::{PredicateLockTag, SsiError, SsiManager};
 
-/// The transaction's own subtransaction sets, threaded into
-/// [`TransactionManager::build_snapshot`] so the resulting snapshot can
-/// tell *its own* savepoint writes apart from concurrent foreign writers.
+/// The transaction's own subtransaction sets, threaded into the
+/// snapshot-building path so the resulting snapshot can tell *its own*
+/// savepoint writes apart from concurrent foreign writers.
 ///
 /// - `live` — subxids that count as **self**: still-open savepoints plus
 ///   any `RELEASE`d-while-parent-open ("merged up") subxids. These are
