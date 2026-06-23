@@ -7,6 +7,8 @@
 //! - `RENAME TO new_name`
 //! - `ADD CONSTRAINT name constraint`
 //! - `DROP CONSTRAINT [IF EXISTS] name [CASCADE|RESTRICT]`
+//! - `ALTER [COLUMN] col SET NOT NULL | DROP NOT NULL`
+//! - `ALTER [COLUMN] col SET DEFAULT <expr> | DROP DEFAULT`
 //! - `ENABLE ROW LEVEL SECURITY`
 //! - `SET (option = value, ...)`
 
@@ -109,6 +111,10 @@ impl Parser<'_> {
                     span: Span::new(start, end),
                 })
             }
+            TokenKind::KwAlter => {
+                self.advance()?; // ALTER
+                self.parse_alter_table_alter_column(start)
+            }
             TokenKind::KwSet => {
                 self.advance()?; // SET
                 let options = self.parse_index_options()?;
@@ -133,7 +139,71 @@ impl Parser<'_> {
                 })
             }
             other => Err(ParseError::Expected {
-                expected: "ADD, DROP, RENAME, or SET",
+                expected: "ADD, ALTER, DROP, RENAME, or SET",
+                found: other,
+                offset: tok.span.start_usize(),
+            }),
+        }
+    }
+
+    /// Parse the tail of `ALTER TABLE … ALTER [COLUMN] col …`.
+    ///
+    /// The leading `ALTER` of the action clause has already been
+    /// consumed. The optional `COLUMN` keyword is accepted. The four
+    /// supported sub-actions are `SET NOT NULL`, `DROP NOT NULL`,
+    /// `SET DEFAULT <expr>`, and `DROP DEFAULT`.
+    fn parse_alter_table_alter_column(
+        &mut self,
+        start: u32,
+    ) -> Result<AlterTableAction, ParseError> {
+        self.match_kw(TokenKind::KwColumn);
+        let column = self.parse_identifier()?;
+        let tok = *self.peek()?;
+        match tok.kind {
+            TokenKind::KwSet => {
+                self.advance()?; // SET
+                if self.peek()?.kind == TokenKind::KwNot {
+                    // SET NOT NULL
+                    self.advance()?; // NOT
+                    self.expect(TokenKind::KwNull, "NULL")?;
+                    let end = self.peek()?.span.start;
+                    return Ok(AlterTableAction::AlterColumnSetNotNull {
+                        column,
+                        span: Span::new(start, end),
+                    });
+                }
+                // SET DEFAULT <expr>
+                self.expect(TokenKind::KwDefault, "DEFAULT or NOT NULL")?;
+                let expr = self.parse_expr()?;
+                let end = self.peek()?.span.start;
+                Ok(AlterTableAction::AlterColumnSetDefault {
+                    column,
+                    expr: Box::new(expr),
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::KwDrop => {
+                self.advance()?; // DROP
+                if self.peek()?.kind == TokenKind::KwNot {
+                    // DROP NOT NULL
+                    self.advance()?; // NOT
+                    self.expect(TokenKind::KwNull, "NULL")?;
+                    let end = self.peek()?.span.start;
+                    return Ok(AlterTableAction::AlterColumnDropNotNull {
+                        column,
+                        span: Span::new(start, end),
+                    });
+                }
+                // DROP DEFAULT
+                self.expect(TokenKind::KwDefault, "DEFAULT or NOT NULL")?;
+                let end = self.peek()?.span.start;
+                Ok(AlterTableAction::AlterColumnDropDefault {
+                    column,
+                    span: Span::new(start, end),
+                })
+            }
+            other => Err(ParseError::Expected {
+                expected: "SET or DROP",
                 found: other,
                 offset: tok.span.start_usize(),
             }),
@@ -265,11 +335,98 @@ mod tests {
         assert_eq!(options[1].name.value, "autovacuum_analyze_scale_factor");
     }
 
+    // ---- ALTER COLUMN -----------------------------------------------------
+
+    #[test]
+    fn alter_table_alter_column_set_not_null() {
+        let stmt = parse_alter("ALTER TABLE t ALTER COLUMN c SET NOT NULL");
+        let AlterTableAction::AlterColumnSetNotNull { column, .. } = stmt.action else {
+            panic!("expected AlterColumnSetNotNull")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_set_not_null_without_column_keyword() {
+        let stmt = parse_alter("ALTER TABLE t ALTER c SET NOT NULL");
+        let AlterTableAction::AlterColumnSetNotNull { column, .. } = stmt.action else {
+            panic!("expected AlterColumnSetNotNull")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_drop_not_null() {
+        let stmt = parse_alter("ALTER TABLE t ALTER COLUMN c DROP NOT NULL");
+        let AlterTableAction::AlterColumnDropNotNull { column, .. } = stmt.action else {
+            panic!("expected AlterColumnDropNotNull")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_drop_not_null_without_column_keyword() {
+        let stmt = parse_alter("ALTER TABLE t ALTER c DROP NOT NULL");
+        let AlterTableAction::AlterColumnDropNotNull { column, .. } = stmt.action else {
+            panic!("expected AlterColumnDropNotNull")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_set_default() {
+        let stmt = parse_alter("ALTER TABLE t ALTER COLUMN c SET DEFAULT 42");
+        let AlterTableAction::AlterColumnSetDefault { column, expr, .. } = stmt.action else {
+            panic!("expected AlterColumnSetDefault")
+        };
+        assert_eq!(column.value, "c");
+        // The default expression must carry the integer literal `42`.
+        let crate::ast::Expr::Literal(crate::ast::Literal::Integer { text, .. }) = *expr else {
+            panic!("expected integer literal default, got {expr:?}");
+        };
+        assert_eq!(text, "42");
+    }
+
+    #[test]
+    fn alter_table_alter_column_set_default_without_column_keyword() {
+        let stmt = parse_alter("ALTER TABLE t ALTER c SET DEFAULT 'x'");
+        let AlterTableAction::AlterColumnSetDefault { column, .. } = stmt.action else {
+            panic!("expected AlterColumnSetDefault")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_drop_default() {
+        let stmt = parse_alter("ALTER TABLE t ALTER COLUMN c DROP DEFAULT");
+        let AlterTableAction::AlterColumnDropDefault { column, .. } = stmt.action else {
+            panic!("expected AlterColumnDropDefault")
+        };
+        assert_eq!(column.value, "c");
+    }
+
+    #[test]
+    fn alter_table_alter_column_drop_default_without_column_keyword() {
+        let stmt = parse_alter("ALTER TABLE t ALTER c DROP DEFAULT");
+        let AlterTableAction::AlterColumnDropDefault { column, .. } = stmt.action else {
+            panic!("expected AlterColumnDropDefault")
+        };
+        assert_eq!(column.value, "c");
+    }
+
     // ---- negative case ----------------------------------------------------
 
     #[test]
     fn alter_table_unknown_action_errors() {
         let err = Parser::new("ALTER TABLE t TRUNCATE")
+            .parse_statement()
+            .unwrap_err();
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn alter_table_alter_column_unknown_subaction_errors() {
+        let err = Parser::new("ALTER TABLE t ALTER COLUMN c RENAME")
             .parse_statement()
             .unwrap_err();
         assert!(matches!(err, ParseError::Expected { .. }));

@@ -339,6 +339,36 @@ pub enum AlterTableAction {
         /// Source span.
         span: Span,
     },
+    /// `ALTER [COLUMN] col SET NOT NULL`.
+    AlterColumnSetNotNull {
+        /// Target column name.
+        column: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `ALTER [COLUMN] col DROP NOT NULL`.
+    AlterColumnDropNotNull {
+        /// Target column name.
+        column: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `ALTER [COLUMN] col SET DEFAULT <expr>`.
+    AlterColumnSetDefault {
+        /// Target column name.
+        column: Identifier,
+        /// New default expression.
+        expr: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// `ALTER [COLUMN] col DROP DEFAULT`.
+    AlterColumnDropDefault {
+        /// Target column name.
+        column: Identifier,
+        /// Source span.
+        span: Span,
+    },
     /// `ENABLE ROW LEVEL SECURITY`.
     EnableRowLevelSecurity {
         /// Source span.
