@@ -1181,3 +1181,133 @@ async fn r_crash_recovery_of_subxact_rollback() {
         shutdown(running).await;
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// Test R2 — Durable commit of released / open / rolled-back subxids (BUG 2)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// A row inserted under a SAVEPOINT and then RELEASEd (or left open at COMMIT)
+// must SURVIVE a pure-WAL restart: its heap xmin is the subxid, so unless the
+// parent's Commit record durably records that subxid as committed, recovery's
+// default-abort sweep marks the subxid Aborted and the row vanishes (the
+// data-loss bug). Conversely a row inserted then ROLLBACK-TO-aborted under a
+// committed parent must STAY gone — its subxid must NOT be in the committed
+// list. All three are exercised in one durable transaction, then verified
+// after restart, for both Shape N (no index) and Shape I (indexed).
+//
+// Each scenario builds a *distinct* parent transaction so the recovered
+// commit family is unambiguous:
+//   - row 7: SAVEPOINT, INSERT, RELEASE, COMMIT          → must survive
+//   - row 8: SAVEPOINT, INSERT, COMMIT (implicit release)→ must survive
+//   - row 9: SAVEPOINT, INSERT, ROLLBACK TO, COMMIT      → must stay gone
+
+async fn test_r2_durable_subxids(shape: Shape, tag: &str) {
+    use support::start_persistent_server;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    support::make_data_dir_private(dir.path());
+
+    // Phase 1: three durable parent transactions exercising release / open /
+    // rollback subxids.
+    {
+        let running = start_persistent_server(dir.path(), tag).await;
+        let c = &running.client;
+        shape.create(c).await;
+
+        // Scenario 1 — released-then-committed: row 7 must survive.
+        c.batch_execute("BEGIN").await.expect("BEGIN s1");
+        c.batch_execute("SAVEPOINT s").await.expect("SAVEPOINT s1");
+        shape.insert(c, 7, 700).await;
+        c.batch_execute("RELEASE SAVEPOINT s")
+            .await
+            .expect("RELEASE s1");
+        c.batch_execute("COMMIT").await.expect("COMMIT s1");
+
+        // Scenario 2 — open-at-commit (implicit release): row 8 must survive.
+        c.batch_execute("BEGIN").await.expect("BEGIN s2");
+        c.batch_execute("SAVEPOINT s").await.expect("SAVEPOINT s2");
+        shape.insert(c, 8, 800).await;
+        c.batch_execute("COMMIT").await.expect("COMMIT s2");
+
+        // Scenario 3 — rolled-back-then-committed-parent: row 9 must stay gone.
+        c.batch_execute("BEGIN").await.expect("BEGIN s3");
+        c.batch_execute("SAVEPOINT s").await.expect("SAVEPOINT s3");
+        shape.insert(c, 9, 900).await;
+        c.batch_execute("ROLLBACK TO SAVEPOINT s")
+            .await
+            .expect("ROLLBACK TO s3");
+        c.batch_execute("COMMIT").await.expect("COMMIT s3");
+
+        // Pre-restart truth.
+        let ids = ids_seq(c, shape).await;
+        assert_eq!(
+            ids,
+            vec![7, 8],
+            "R2 pre-restart [{tag}]: released + open subxids visible, rolled-back gone"
+        );
+        assert_eq!(val_of(c, shape, 7).await, Some(700), "R2 pre row 7");
+        assert_eq!(val_of(c, shape, 8).await, Some(800), "R2 pre row 8");
+
+        shutdown(running).await;
+    }
+
+    // Phase 2: pure-WAL restart and re-read.
+    {
+        let running = start_persistent_server(dir.path(), &format!("{tag}_2")).await;
+        let c = &running.client;
+
+        let ids = ids_seq(c, shape).await;
+        assert_eq!(
+            ids,
+            vec![7, 8],
+            "R2 post-restart [{tag}]: released subxid (7) and open-at-commit subxid (8) \
+             MUST survive WAL replay; rolled-back subxid (9) MUST stay gone"
+        );
+        assert_eq!(
+            val_of(c, shape, 7).await,
+            Some(700),
+            "R2 post-restart [{tag}]: released-then-committed row 7 durable with its value"
+        );
+        assert_eq!(
+            val_of(c, shape, 8).await,
+            Some(800),
+            "R2 post-restart [{tag}]: open-at-commit row 8 durable with its value"
+        );
+        assert_eq!(
+            val_of(c, shape, 9).await,
+            None,
+            "R2 post-restart [{tag}]: rolled-back-under-committed-parent row 9 absent"
+        );
+
+        // For Shape I the index scan must agree with the heap scan — no
+        // phantom / orphaned index entry for the resurrected rows.
+        if matches!(shape, Shape::Indexed) {
+            assert_eq!(
+                ids_by_val(c, shape, 700).await,
+                vec![7],
+                "R2 post-restart [{tag}]: index-by-val agrees for row 7"
+            );
+            assert_eq!(
+                ids_by_val(c, shape, 800).await,
+                vec![8],
+                "R2 post-restart [{tag}]: index-by-val agrees for row 8"
+            );
+            assert!(
+                ids_by_val(c, shape, 900).await.is_empty(),
+                "R2 post-restart [{tag}]: no index entry resolves to the rolled-back row 9"
+            );
+        }
+
+        shutdown(running).await;
+    }
+}
+
+#[tokio::test]
+async fn r2_durable_released_and_open_subxids_no_index() {
+    test_r2_durable_subxids(Shape::NoIndex, "sp_battery_r2_n").await;
+}
+
+#[tokio::test]
+async fn r2_durable_released_and_open_subxids_indexed() {
+    test_r2_durable_subxids(Shape::Indexed, "sp_battery_r2_i").await;
+}

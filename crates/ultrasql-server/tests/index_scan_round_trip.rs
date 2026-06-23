@@ -515,6 +515,114 @@ async fn duplicate_insert_after_unique_index_returns_23505_and_preserves_heap() 
     graceful_shutdown(running).await;
 }
 
+/// BUG-1 companion (end-to-end behavioural guard for the aborted-deleter
+/// unique conflict, driven through the full INSERT pipeline).
+///
+/// This exercises the unique heap-recheck (`classify_unique_conflict`) under a
+/// long-lived REPEATABLE READ inserter B whose frozen snapshot does NOT see
+/// A's committed row, so classification reaches the `Invisible` liveness path
+/// (the path the bug corrupted). It asserts the correct end state: B's re-insert
+/// of the still-live key is rejected (23505) and the heap keeps exactly one live
+/// row K with index == seq agreement.
+///
+/// NOTE: the *authoritative* pre-fix-failing regression for BUG 1 is the unit
+/// test `classify_unique_conflict_keeps_aborted_deleter_row_live` in
+/// `modify/index_maintainer` tests. The on-disk trigger requires a tuple that
+/// retains an *aborted* `xmax` stamp; the ordinary SQL `ROLLBACK` path eagerly
+/// clears `xmax`, so this end-to-end test reaches the `Invisible` recheck with a
+/// cleared `xmax` and is a non-vacuous behavioural guard rather than a faithful
+/// reproduction of the retained-aborted-xmax state.
+///
+/// Sequence (B holds an RR snapshot from before A's insert):
+///   1. B: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT (snapshot taken).
+///   2. A: INSERT (1,10,…), commit.
+///   3. A: DELETE id=1 then ROLLBACK (heap clears the delete's xmax).
+///   4. B: INSERT (1,99,…) — under B's pre-insert snapshot the row is Invisible;
+///      the live row still holds the key and B must be rejected.
+#[tokio::test]
+async fn reinsert_after_aborted_delete_is_rejected_one_live_key() {
+    let running = start_sample_server("index_scan_test").await;
+    let bound = running.bound;
+    let a = &running.client;
+    // A 3-column table with a TEXT column does NOT qualify for the int32-pair
+    // fast-insert path, so INSERT goes through the full pipeline where the
+    // unique-index heap-recheck (`classify_unique_conflict`) actually runs.
+    a.batch_execute("CREATE TABLE t_aborted_del (id INT NOT NULL, val INT NOT NULL, name TEXT)")
+        .await
+        .expect("create table");
+    a.batch_execute("CREATE UNIQUE INDEX ix_t_aborted_del_id ON t_aborted_del(id)")
+        .await
+        .expect("create unique index");
+
+    // Second connection B pins a REPEATABLE READ snapshot BEFORE A inserts.
+    let (b, b_handle) = support::connect_as(bound, "tester", "aborted_del_b").await;
+    b.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("B BEGIN RR");
+    // Materialise B's snapshot now (empty table) so A's later insert is not
+    // committed-before-B's-snapshot.
+    let _ = b
+        .query("SELECT id FROM t_aborted_del", &[])
+        .await
+        .expect("B snapshot read");
+
+    // A inserts and commits key 1.
+    a.batch_execute("INSERT INTO t_aborted_del VALUES (1, 10, 'orig')")
+        .await
+        .expect("A insert key 1");
+
+    // A deletes key 1 then ABORTs: xmax = aborted on the still-live row.
+    a.batch_execute("BEGIN").await.expect("A BEGIN");
+    a.batch_execute("DELETE FROM t_aborted_del WHERE id = 1")
+        .await
+        .expect("A delete key 1");
+    a.batch_execute("ROLLBACK").await.expect("A ROLLBACK");
+
+    // B (its snapshot predates A's insert → row is Invisible to B) inserts the
+    // same key. The aborted-deleter row is still live and holds the key, so
+    // this must be a unique violation.
+    let err = b
+        .batch_execute("INSERT INTO t_aborted_del VALUES (1, 99, 'dup')")
+        .await
+        .expect_err("re-insert of a still-live key must be rejected under B's snapshot");
+    assert_eq!(
+        err.code().expect("server-sent SQLSTATE present").code(),
+        "23505",
+        "re-insert over an aborted-deleter live row is a unique violation"
+    );
+    // B's transaction is now aborted by the error; roll it back explicitly.
+    let _ = b.batch_execute("ROLLBACK").await;
+
+    // Exactly one live row K, original value, with index == seq agreement.
+    let by_index: Vec<i32> = a
+        .query("SELECT val FROM t_aborted_del WHERE id = 1", &[])
+        .await
+        .expect("index probe")
+        .iter()
+        .map(|r| r.get::<_, i32>(0))
+        .collect();
+    let by_seq: Vec<i32> = a
+        .query("SELECT val FROM t_aborted_del", &[])
+        .await
+        .expect("seq scan")
+        .iter()
+        .map(|r| r.get::<_, i32>(0))
+        .collect();
+    assert_eq!(
+        by_index, by_seq,
+        "index-scan rowset must equal seq-scan rowset (no two live rows share key 1)"
+    );
+    assert_eq!(
+        by_index,
+        vec![10],
+        "exactly one live row K with the original value; the leaf was not replaced"
+    );
+
+    drop(b);
+    b_handle.abort();
+    graceful_shutdown(running).await;
+}
+
 /// Updating a non-key column after `CREATE INDEX` must keep the
 /// indexed point lookup alive.
 #[tokio::test]
@@ -819,6 +927,152 @@ async fn vacuum_reclaims_stale_index_entries() {
             .expect("lookup after vacuum")
             .is_empty(),
         "VACUUM must reclaim the stale leaf entry once the tuple is dead"
+    );
+
+    graceful_shutdown(running).await;
+}
+
+/// Key-changing UPDATE on a **TEXT**-keyed index where the old and new keys
+/// share an 8-byte prefix (`'aaaaaaaa1'` → `'aaaaaaaa2'`). Under Option-A the
+/// old key's leaf entry lingers (no index undo) and is filtered by the
+/// read-side heap recheck. This exercises the recheck against TEXT keys whose
+/// truncated 8-byte index prefix collides — the recheck must compare the FULL
+/// key, so a probe by the OLD key returns nothing and index agrees with seq.
+#[tokio::test]
+async fn key_changing_update_on_text_index_rechecks_full_key() {
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE t_text_key (k TEXT NOT NULL, v INT NOT NULL)")
+        .await
+        .expect("create table");
+    // Two rows whose keys share the first 8 bytes 'aaaaaaaa'.
+    client
+        .batch_execute("INSERT INTO t_text_key VALUES ('aaaaaaaa1', 1), ('aaaaaaaa2', 2)")
+        .await
+        .expect("seed rows");
+    client
+        .batch_execute("CREATE INDEX ix_t_text_key_k ON t_text_key(k)")
+        .await
+        .expect("create index");
+
+    // Change row 1's key to a third prefix-sharing value.
+    client
+        .batch_execute("UPDATE t_text_key SET k = 'aaaaaaaa3' WHERE v = 1")
+        .await
+        .expect("key-changing UPDATE");
+
+    // Probe by the OLD key — must return nothing (the heap recheck rejects the
+    // lingering old leaf entry).
+    let old_key_rows = client
+        .query("SELECT v FROM t_text_key WHERE k = 'aaaaaaaa1'", &[])
+        .await
+        .expect("probe old key");
+    assert!(
+        old_key_rows.is_empty(),
+        "query by the OLD text key must return nothing after the key-changing UPDATE"
+    );
+
+    // Probe by the NEW key — exactly the moved row.
+    let new_key_rows = client
+        .query("SELECT v FROM t_text_key WHERE k = 'aaaaaaaa3'", &[])
+        .await
+        .expect("probe new key");
+    let new_vs: Vec<i32> = new_key_rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(
+        new_vs,
+        vec![1],
+        "query by the NEW text key returns the moved row"
+    );
+
+    // The unmoved prefix-sharing row is untouched.
+    let kept_rows = client
+        .query("SELECT v FROM t_text_key WHERE k = 'aaaaaaaa2'", &[])
+        .await
+        .expect("probe kept key");
+    let kept_vs: Vec<i32> = kept_rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(
+        kept_vs,
+        vec![2],
+        "the unmoved prefix-sharing row stays addressable"
+    );
+
+    // Index path must agree with the heap (seq) path over the full table.
+    let mut seq_keys: Vec<String> = client
+        .query("SELECT k FROM t_text_key", &[])
+        .await
+        .expect("seq scan")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    seq_keys.sort();
+    assert_eq!(
+        seq_keys,
+        vec!["aaaaaaaa2".to_string(), "aaaaaaaa3".to_string()],
+        "seq-scan key set reflects the moved + kept rows, no resurrected old key"
+    );
+
+    graceful_shutdown(running).await;
+}
+
+/// Key-changing UPDATE on a **FLOAT**-keyed index. Floats are encoded into the
+/// B-tree as order-preserving integer keys; a key change leaves the old entry
+/// lingering. The read-side heap recheck must filter it, so a probe by the old
+/// float value returns nothing and the index agrees with the heap.
+#[tokio::test]
+async fn key_changing_update_on_float_index_rechecks_full_key() {
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE t_float_key (k FLOAT8 NOT NULL, v INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t_float_key VALUES (1.5, 1), (2.5, 2)")
+        .await
+        .expect("seed rows");
+    client
+        .batch_execute("CREATE INDEX ix_t_float_key_k ON t_float_key(k)")
+        .await
+        .expect("create index");
+
+    client
+        .batch_execute("UPDATE t_float_key SET k = 3.5 WHERE v = 1")
+        .await
+        .expect("key-changing UPDATE");
+
+    let old_key_rows = client
+        .query("SELECT v FROM t_float_key WHERE k = 1.5", &[])
+        .await
+        .expect("probe old key");
+    assert!(
+        old_key_rows.is_empty(),
+        "query by the OLD float key must return nothing after the key-changing UPDATE"
+    );
+
+    let new_key_rows = client
+        .query("SELECT v FROM t_float_key WHERE k = 3.5", &[])
+        .await
+        .expect("probe new key");
+    let new_vs: Vec<i32> = new_key_rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(
+        new_vs,
+        vec![1],
+        "query by the NEW float key returns the moved row"
+    );
+
+    let mut seq_keys: Vec<f64> = client
+        .query("SELECT k FROM t_float_key", &[])
+        .await
+        .expect("seq scan")
+        .iter()
+        .map(|r| r.get::<_, f64>(0))
+        .collect();
+    seq_keys.sort_by(|a, b| a.partial_cmp(b).expect("finite floats"));
+    assert_eq!(
+        seq_keys,
+        vec![2.5, 3.5],
+        "seq-scan key set reflects the moved + kept rows, no resurrected old key"
     );
 
     graceful_shutdown(running).await;
