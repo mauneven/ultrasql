@@ -91,6 +91,15 @@ pub struct SubtxnManager {
     /// manager after updating the CLOG) and never removed — aborted state
     /// is permanent.
     rolled_back: Mutex<HashSet<Xid>>,
+    /// XIDs of subtransactions that were `RELEASE`d while the parent is
+    /// still open ("merged up"). These are no longer on the stack but
+    /// their writes count as **self** — visible to the parent and folded
+    /// into the parent's single commit/abort boundary. A `ROLLBACK TO` an
+    /// *outer* savepoint must prune every merged-up subxid at or above the
+    /// cutoff back into [`Self::rolled_back`] (see [`Self::rollback_to`]),
+    /// so an already-released inner savepoint is correctly discarded
+    /// instead of folded `Committed` at top commit.
+    merged_up: Mutex<HashSet<Xid>>,
 }
 
 impl Clone for SubtxnManager {
@@ -103,10 +112,12 @@ impl Clone for SubtxnManager {
     fn clone(&self) -> Self {
         let stack_clone = self.stack.lock().clone();
         let rolled_back_clone = self.rolled_back.lock().clone();
+        let merged_up_clone = self.merged_up.lock().clone();
         Self {
             parent_xid: self.parent_xid,
             stack: Mutex::new(stack_clone),
             rolled_back: Mutex::new(rolled_back_clone),
+            merged_up: Mutex::new(merged_up_clone),
         }
     }
 }
@@ -120,6 +131,7 @@ impl SubtxnManager {
             parent_xid: parent,
             stack: Mutex::new(Vec::new()),
             rolled_back: Mutex::new(HashSet::new()),
+            merged_up: Mutex::new(HashSet::new()),
         }
     }
 
@@ -174,11 +186,44 @@ impl SubtxnManager {
                     name: name.to_owned(),
                 })?;
 
+        // Cutoff = the target savepoint's own subxid. Subxids are handed
+        // out strictly increasing, so every subtransaction established at
+        // or after the target (whether still on the stack or already
+        // RELEASEd into `merged_up`) carries `xid >= cutoff` and must be
+        // discarded by this rollback.
+        let cutoff = stack[pos].xid;
+
         // Drain from `pos` to the end.  The entry at `pos` itself is also
         // removed — after rollback the savepoint no longer exists and must be
         // re-established via another `SAVEPOINT name` if needed.
         let removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
         drop(stack);
+
+        // Prune `merged_up`: any subxid RELEASEd earlier but at or above
+        // the cutoff was nested *inside* the rolled-back region. It must be
+        // discarded — moved into `rolled_back` — instead of folding
+        // `Committed` at top commit. Without this, `ROLLBACK TO` an outer
+        // savepoint would leave an already-RELEASEd inner savepoint's
+        // writes durably visible (the cross-txn leak / nested-release bug).
+        {
+            let mut merged = self.merged_up.lock();
+            let mut rolled = self.rolled_back.lock();
+            merged.retain(|&xid| {
+                if xid >= cutoff {
+                    rolled.insert(xid);
+                    false
+                } else {
+                    true
+                }
+            });
+            // The drained stack subxids themselves are recorded rolled-back
+            // by the manager via `record_rolled_back`, but record them here
+            // too so the local "self vs reverted" view is coherent the
+            // instant the stack drains.
+            for &xid in &removed {
+                rolled.insert(xid);
+            }
+        }
         Ok(removed)
     }
 
@@ -205,6 +250,12 @@ impl SubtxnManager {
                 })?;
         let xid = stack.remove(pos).xid;
         drop(stack);
+        // The released subxid is no longer on the stack but its writes
+        // remain part of **self** until the parent commits/aborts. Record
+        // it in `merged_up` so [`Self::self_subxids`] keeps treating its
+        // rows as own-writes and so a later `ROLLBACK TO` an outer
+        // savepoint can still discard it.
+        self.merged_up.lock().insert(xid);
         Ok(xid)
     }
 
@@ -237,6 +288,54 @@ impl SubtxnManager {
     #[must_use]
     pub fn is_rolled_back(&self, subxid: Xid) -> bool {
         self.rolled_back.lock().contains(&subxid)
+    }
+
+    /// Every subtransaction XID that currently counts as **self**: live
+    /// (still on the stack) plus merged-up (RELEASEd while the parent is
+    /// open). Excludes any that were rolled back. A row stamped with one
+    /// of these is one of the transaction's own writes.
+    ///
+    /// Used to populate [`crate::manager::OwnSubxids::live`] so the
+    /// snapshot's [`ultrasql_mvcc::Snapshot::is_current_xid`] treats these
+    /// rows as own-writes.
+    #[must_use]
+    pub fn self_subxids(&self) -> Vec<Xid> {
+        let rolled = self.rolled_back.lock();
+        let mut out: Vec<Xid> = self
+            .stack
+            .lock()
+            .iter()
+            .map(|s| s.xid)
+            .filter(|xid| !rolled.contains(xid))
+            .collect();
+        for &xid in self.merged_up.lock().iter() {
+            if !rolled.contains(&xid) {
+                out.push(xid);
+            }
+        }
+        out
+    }
+
+    /// Snapshot of the rolled-back subxid set.
+    #[must_use]
+    pub fn rolled_back_subxids(&self) -> Vec<Xid> {
+        self.rolled_back.lock().iter().copied().collect()
+    }
+
+    /// Snapshot of the merged-up (RELEASEd-but-parent-open) subxid set.
+    ///
+    /// Used by the manager's atomic commit/abort family fold to flip these
+    /// still-`InProgress` subxids together with the parent under one lock.
+    #[must_use]
+    pub fn merged_up_subxids(&self) -> Vec<Xid> {
+        self.merged_up.lock().iter().copied().collect()
+    }
+
+    /// Snapshot of every subxid still on the active stack (live, not yet
+    /// released or rolled back), bottom to top.
+    #[must_use]
+    pub fn live_stack_subxids(&self) -> Vec<Xid> {
+        self.stack.lock().iter().map(|s| s.xid).collect()
     }
 }
 

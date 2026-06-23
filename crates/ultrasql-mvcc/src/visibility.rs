@@ -12,42 +12,6 @@ use crate::snapshot::Snapshot;
 use crate::status::{XidStatus, XidStatusOracle};
 use crate::tuple_header::{InfoMask, TupleHeader};
 
-/// Oracle consulted when a tuple has the [`InfoMask::SUBXACT`] bit set.
-///
-/// Implementations return `true` if the given subtransaction XID was
-/// rolled back within its parent transaction.  A tuple with `SUBXACT` set
-/// whose `xmin` returns `true` here is invisible even to the parent
-/// transaction — it was written under a savepoint that was subsequently
-/// rolled back.
-///
-/// A no-op implementation (always returns `false`) is correct when
-/// subtransactions are not in use or when the CLOG already marks the subxid
-/// as `Aborted` (visibility will then reject it via the normal oracle path).
-/// The dedicated oracle exists for the case where the parent transaction is
-/// still in progress and the CLOG entry for the subxid is `Aborted` but
-/// the caller wants a fast local check without a CLOG lookup.
-pub trait SubxactOracle: Send + Sync {
-    /// Return `true` iff `subxid` was rolled back within its parent
-    /// transaction.
-    fn is_rolled_back(&self, subxid: Xid) -> bool;
-}
-
-/// A [`SubxactOracle`] that always returns `false`.
-///
-/// Use this when no subtransaction tracking is available or when the
-/// normal XID-status oracle already handles aborted subtransactions via
-/// CLOG entries.
-///
-/// See module-level docs for usage.
-#[derive(Debug)]
-pub struct NoSubxacts;
-
-impl SubxactOracle for NoSubxacts {
-    fn is_rolled_back(&self, _subxid: Xid) -> bool {
-        false
-    }
-}
-
 /// Outcome of a visibility check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -80,84 +44,59 @@ pub enum Visibility {
 /// Decide whether `header` is visible to `snapshot`, consulting the
 /// `oracle` for transaction status when needed.
 ///
-/// This is the core MVCC predicate used by heap scans. For scenarios
-/// involving subtransaction rollback tracking, prefer
-/// [`is_visible_ext`] which accepts an additional [`SubxactOracle`]
-/// parameter.
+/// This is the single core MVCC predicate used by every heap and index
+/// read path. Subtransaction-rollback awareness is carried **in the
+/// snapshot** (via [`Snapshot::own_subxid_rolled_back`] /
+/// [`Snapshot::is_current_xid`]), not through a separate oracle: a row's
+/// savepoint-ness is never recorded on disk, so the snapshot's own-subxid
+/// sets are the sole authority. This keeps savepoint state off the heap
+/// and makes the predicate correct **independent of whether physical heap
+/// undo has run** after a `ROLLBACK TO`.
 ///
-/// Decision tree (mirroring HeapTupleSatisfiesMVCC):
+/// Decision tree (mirroring `HeapTupleSatisfiesMVCC` with the subxid
+/// extension):
 ///
 /// 1. **Frozen tuples** are visible to everyone.
-/// 2. If the inserter is the current transaction:
+/// 2. **Own rolled-back insert guard:** if `xmin` is one of our own
+///    rolled-back subtransactions, the row is invisible — its insert
+///    "did not count" — beating any CLOG "committed" hint at any
+///    isolation level.
+/// 3. If the inserter is the current transaction (parent or a live /
+///    merged-up subxid):
 ///    - if the insert command is **after** the snapshot's current
-///      command, the tuple is invisible (a statement does not see
-///      writes from its own future).
-///    - if the deleter is also the current transaction at an earlier
-///      command, the tuple is **[`Visibility::DeletedByOwn`]**.
+///      command, the tuple is invisible.
+///    - **DEFECT-3 own rolled-back xmax guard:** if `xmax` is one of our
+///      own rolled-back subtransactions, the delete / in-place update
+///      "did not count" — the row reverts to its live / pre-image form.
+///    - if we in-place-updated it ourselves, surface the right
+///      pre-/post-image view.
+///    - if we deleted it ourselves at an earlier command, surface
+///      [`Visibility::DeletedByOwn`].
 ///    - otherwise the tuple is visible.
-/// 3. If the inserter is **not** committed (in progress or aborted)
+/// 4. If the inserter is **not** committed (in progress or aborted)
 ///    according to the snapshot, the tuple is invisible.
-/// 4. If the deleter is committed before the snapshot, the tuple is
+/// 5. If `xmax` names one of our own rolled-back subxids, the foreign-
+///    inserted row's delete is reverted: it stays visible.
+/// 6. If the deleter is committed before the snapshot, the tuple is
 ///    invisible.
-/// 5. Otherwise the tuple is visible.
-///
-/// Note: tuples with the [`InfoMask::SUBXACT`] bit set are handled
-/// correctly when the CLOG already marks the subtransaction `Aborted`.
-/// For the in-transaction case where the parent is still in-progress,
-/// use [`is_visible_ext`] with a proper [`SubxactOracle`].
+/// 7. Otherwise the tuple is visible.
 #[must_use]
 pub fn is_visible<O: XidStatusOracle + ?Sized>(
     header: &TupleHeader,
     snapshot: &Snapshot,
     oracle: &O,
 ) -> Visibility {
-    is_visible_ext(header, snapshot, oracle, &NoSubxacts)
-}
-
-/// Decide whether `header` is visible, with subtransaction rollback
-/// awareness.
-///
-/// Extends [`is_visible`] with an additional [`SubxactOracle`] consulted
-/// when the tuple has the [`InfoMask::SUBXACT`] bit set. A tuple written
-/// by a rolled-back savepoint is invisible even to the parent transaction.
-///
-/// Decision tree (mirroring `HeapTupleSatisfiesMVCC` with subtxn extension):
-///
-/// 1. **Frozen tuples** are visible to everyone.
-/// 2. If the tuple has the [`InfoMask::SUBXACT`] bit set and `subxact`
-///    reports the `xmin` subtransaction XID as rolled back, the tuple is
-///    invisible — it was written under a savepoint that was rolled back.
-/// 3. If the inserter is the current transaction:
-///    - if the insert command is **after** the snapshot's current
-///      command, the tuple is invisible.
-///    - if the deleter is also the current transaction at an earlier
-///      command, the tuple is **[`Visibility::DeletedByOwn`]**.
-///    - otherwise the tuple is visible.
-/// 4. If the inserter is **not** committed (in progress or aborted)
-///    according to the snapshot, the tuple is invisible.
-/// 5. If the deleter is committed before the snapshot, the tuple is
-///    invisible.
-/// 6. Otherwise the tuple is visible.
-#[must_use]
-pub fn is_visible_ext<O, S>(
-    header: &TupleHeader,
-    snapshot: &Snapshot,
-    oracle: &O,
-    subxact: &S,
-) -> Visibility
-where
-    O: XidStatusOracle + ?Sized,
-    S: SubxactOracle + ?Sized,
-{
     if header.infomask.is_frozen() {
         return Visibility::Visible;
     }
 
-    // --- subtransaction rollback check ----------------------------------
-
-    if header.infomask.contains(InfoMask::SUBXACT) && subxact.is_rolled_back(header.xmin) {
-        // Written under a savepoint that was subsequently rolled back.
-        // Invisible even to the parent transaction.
+    // --- own rolled-back insert guard -----------------------------------
+    //
+    // A row inserted under one of our own savepoints that we later rolled
+    // back is invisible — even if the subxid's CLOG entry says committed
+    // (it never will under the keep-InProgress release model, but a
+    // belt-and-suspenders check here keeps visibility self-sufficient).
+    if snapshot.own_subxid_rolled_back(header.xmin) {
         return Visibility::Invisible;
     }
 
@@ -169,10 +108,26 @@ where
     }
 
     if snapshot.is_current_xid(header.xmin) {
-        // Inserted by us. Visible only at commands strictly later than
-        // when the insert happened.
+        // Inserted by us (parent or a live / merged-up subxid). Visible
+        // only at commands strictly later than when the insert happened.
         if header.cmin >= snapshot.current_command {
             return Visibility::Invisible;
+        }
+
+        // DEFECT-3 FIX (the masked self-inserter gap): our own row was
+        // deleted / in-place-updated by a subxid we rolled back. The
+        // delete / update "did not count" — revert independently of any
+        // physical undo. This must run *before* the live-xmax handling
+        // below, which would otherwise treat the reverted xmax as a real
+        // own-delete / own-update.
+        if !header.xmax.is_invalid() && snapshot.own_subxid_rolled_back(header.xmax) {
+            return if header.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+                // The slot bytes are the rolled-back post-image; the
+                // caller must substitute the undo-log pre-image.
+                Visibility::VisiblePreImage
+            } else {
+                Visibility::Visible
+            };
         }
 
         // In-place UPDATE we performed ourselves at a prior command:
@@ -213,6 +168,16 @@ where
 
     if header.xmax.is_invalid() {
         return Visibility::Visible;
+    }
+
+    // Foreign-inserted row whose delete / in-place update was performed by
+    // one of our own rolled-back subxids: the deletion "did not count".
+    if snapshot.own_subxid_rolled_back(header.xmax) {
+        return if header.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+            Visibility::VisiblePreImage
+        } else {
+            Visibility::Visible
+        };
     }
 
     // In-place UPDATE semantics: a non-`INVALID` xmax with the
@@ -425,51 +390,105 @@ mod tests {
         assert_eq!(is_visible(&header, &snap, &oracle), Visibility::Visible);
     }
 
-    // ── subtransaction visibility ─────────────────────────────────────────────
+    // ── subtransaction visibility (snapshot-driven) ───────────────────────────
 
-    /// A tuple with SUBXACT set whose subxid is in the rolled-back set
-    /// must be invisible, even when the CLOG would say committed.
+    /// A row inserted under one of our own rolled-back subxids is
+    /// invisible even when the CLOG would report it committed — the
+    /// snapshot's rolled-back set beats the oracle.
     #[test]
-    fn subxact_rolled_back_tuple_is_invisible() {
-        use std::collections::HashSet;
-
-        struct RolledBackOracle(HashSet<u64>);
-        impl SubxactOracle for RolledBackOracle {
-            fn is_rolled_back(&self, subxid: Xid) -> bool {
-                self.0.contains(&subxid.raw())
-            }
-        }
-
-        let mut header = h(42, 0, 0, 0);
-        header.infomask.set(InfoMask::SUBXACT);
-
-        let snap = snap(10, 60, 50, 1);
+    fn own_rolled_back_insert_is_invisible() {
+        let header = h(42, 0, 0, 0); // inserted by subxid 42
+        let mut snap = snap(10, 60, 50, 1);
+        // Parent is 50; subxid 42 was rolled back.
+        snap.set_own_subxids(std::iter::empty(), [Xid::new(42)]);
         let oracle = MapOracle::new();
-        oracle.set_committed(Xid::new(42));
-
-        let rolled = RolledBackOracle(std::iter::once(42).collect());
+        oracle.set_committed(Xid::new(42)); // CLOG lies "committed".
         assert_eq!(
-            is_visible_ext(&header, &snap, &oracle, &rolled),
+            is_visible(&header, &snap, &oracle),
             Visibility::Invisible,
-            "rolled-back savepoint tuple must be invisible"
+            "rolled-back savepoint insert must be invisible despite CLOG"
         );
     }
 
-    /// A tuple with SUBXACT set whose subxid is NOT rolled back follows
-    /// normal MVCC rules.
+    /// A row inserted under a *live* (not rolled-back) own subxid is
+    /// visible to the same transaction.
     #[test]
-    fn subxact_not_rolled_back_follows_normal_rules() {
-        let mut header = h(5, 0, 0, 0);
-        header.infomask.set(InfoMask::SUBXACT);
+    fn own_live_subxid_insert_is_visible() {
+        let header = h(42, 0, 0, 0); // inserted by subxid 42 at cmd 0
+        let mut snap = snap(10, 60, 50, 1);
+        snap.set_own_subxids([Xid::new(42)], std::iter::empty());
+        let oracle = MapOracle::new();
+        oracle.set_in_progress(Xid::new(42));
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::Visible,
+            "live savepoint insert must be visible to its own transaction"
+        );
+    }
 
+    /// DEFECT-3: our own row (inserted by the parent) was DELETEd by a
+    /// subxid we rolled back. The delete "did not count" — the row must
+    /// be visible again, independent of physical undo.
+    #[test]
+    fn own_row_deleted_by_rolled_back_subxid_reverts_to_visible() {
+        // Parent 50 inserted at cmd 0; subxid 42 deleted it at cmd 1.
+        let header = h(50, 0, 42, 1);
+        let mut snap = snap(10, 60, 50, 5);
+        snap.set_own_subxids(std::iter::empty(), [Xid::new(42)]);
+        let oracle = MapOracle::new();
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::Visible,
+            "row deleted by a rolled-back subxid must revert to visible"
+        );
+    }
+
+    /// DEFECT-3 (in-place update variant): our own row was in-place
+    /// UPDATEd by a subxid we rolled back. The slot bytes are the
+    /// rolled-back post-image, so the caller must see the pre-image.
+    #[test]
+    fn own_row_in_place_updated_by_rolled_back_subxid_yields_pre_image() {
+        let mut header = h(50, 0, 42, 1);
+        header.infomask.set(InfoMask::UPDATED_IN_PLACE);
+        let mut snap = snap(10, 60, 50, 5);
+        snap.set_own_subxids(std::iter::empty(), [Xid::new(42)]);
+        let oracle = MapOracle::new();
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::VisiblePreImage,
+            "in-place update by a rolled-back subxid must surface the pre-image"
+        );
+    }
+
+    /// A foreign-committed row whose delete was performed by one of our
+    /// own rolled-back subxids stays visible (the delete is reverted).
+    #[test]
+    fn foreign_row_deleted_by_rolled_back_subxid_stays_visible() {
+        // Inserted by committed foreign txn 5; deleted by our subxid 42.
+        let header = h(5, 0, 42, 0);
+        let mut snap = snap(10, 60, 50, 5);
+        snap.set_own_subxids(std::iter::empty(), [Xid::new(42)]);
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(5));
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::Visible,
+            "foreign row whose delete was rolled back stays visible"
+        );
+    }
+
+    /// A savepoint write that was NOT rolled back follows normal MVCC
+    /// rules (visible when committed).
+    #[test]
+    fn non_rolled_back_subxact_follows_normal_rules() {
+        let header = h(5, 0, 0, 0);
         let snap = snap(10, 20, 50, 0);
         let oracle = MapOracle::new();
         oracle.set_committed(Xid::new(5));
-
         assert_eq!(
-            is_visible_ext(&header, &snap, &oracle, &NoSubxacts),
+            is_visible(&header, &snap, &oracle),
             Visibility::Visible,
-            "non-rolled-back savepoint tuple must be visible when committed"
+            "non-rolled-back committed tuple must be visible"
         );
     }
 
