@@ -593,6 +593,28 @@ fn append_resolved_records(server: &Server, count: usize) {
     }
 }
 
+/// `perform_checkpoint`, retrying while the WAL writer hasn't caught up.
+///
+/// A checkpoint waits for the WAL to be durable up to the checkpoint LSN. On a
+/// heavily loaded CI runner — notably Windows, running many test binaries in
+/// parallel — the single WAL-writer thread can be starved long enough that the
+/// in-checkpoint 5 s durability wait times out with `flushed_lsn=0`. That is a
+/// scheduling/timing flake, not a durability bug: the writer simply hasn't been
+/// scheduled yet. Each attempt recomputes the checkpoint and the writer catches
+/// up as parallel tests drain, so a bounded retry on the timeout is safe and
+/// makes the test deterministic.
+fn checkpoint_with_retry(server: &Server) {
+    for attempt in 0..10 {
+        match server.perform_checkpoint() {
+            Ok(()) => return,
+            Err(e) if attempt < 9 && e.to_string().to_lowercase().contains("timed out") => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => panic!("perform_checkpoint failed (attempt {attempt}): {e}"),
+        }
+    }
+}
+
 #[test]
 fn fold_min_nonzero_lsn_skips_zero_and_keeps_minimum() {
     use super::super::fold_min_nonzero_lsn;
@@ -679,7 +701,7 @@ fn checkpoint_recycles_wal_segments_below_the_floor() {
         // The checkpoint forces every record durable (writing the segments) and
         // then recycles those below the floor — so the post-checkpoint state is
         // deterministic, unlike a pre-checkpoint count that races the writer.
-        server.perform_checkpoint().unwrap();
+        checkpoint_with_retry(&server);
 
         // A floor at segment N>0 is itself proof that segments 0..N existed and
         // were recycled (the floor only advances over whole removed segments).
@@ -730,7 +752,7 @@ fn checkpoint_keeps_an_in_progress_transactions_segment() {
     // Many resolved transactions then span many later segments.
     append_resolved_records(&server, 600);
 
-    server.perform_checkpoint().unwrap();
+    checkpoint_with_retry(&server);
 
     // The floor must not pass the in-progress transaction's first record: its
     // records must survive so a crash recovery can still mark it aborted (an
@@ -745,7 +767,7 @@ fn checkpoint_keeps_an_in_progress_transactions_segment() {
 
     // Once it resolves, the next checkpoint advances past it.
     server.txn_manager.commit(long).unwrap();
-    server.perform_checkpoint().unwrap();
+    checkpoint_with_retry(&server);
     let advanced = ultrasql_wal::read_floor(&wal_dir).unwrap();
     assert!(
         advanced.floor_lsn.raw() > long_first_lsn.raw(),
