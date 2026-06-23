@@ -418,6 +418,36 @@ pub(super) fn fmt_alter_table(
                 format_args!("AlterTable: {table_name} DROP CONSTRAINT {exists}{name}\n"),
             );
         }
+        LogicalAlterTableAction::AlterColumnSetNotNull { column_name, .. } => {
+            let _ = fmt::write(
+                out,
+                format_args!("AlterTable: {table_name} ALTER COLUMN {column_name} SET NOT NULL\n"),
+            );
+        }
+        LogicalAlterTableAction::AlterColumnDropNotNull { column_name, .. } => {
+            let _ = fmt::write(
+                out,
+                format_args!("AlterTable: {table_name} ALTER COLUMN {column_name} DROP NOT NULL\n"),
+            );
+        }
+        LogicalAlterTableAction::AlterColumnSetDefault {
+            column_name,
+            default,
+            ..
+        } => {
+            let _ = fmt::write(
+                out,
+                format_args!(
+                    "AlterTable: {table_name} ALTER COLUMN {column_name} SET DEFAULT {default}\n"
+                ),
+            );
+        }
+        LogicalAlterTableAction::AlterColumnDropDefault { column_name, .. } => {
+            let _ = fmt::write(
+                out,
+                format_args!("AlterTable: {table_name} ALTER COLUMN {column_name} DROP DEFAULT\n"),
+            );
+        }
     }
 }
 

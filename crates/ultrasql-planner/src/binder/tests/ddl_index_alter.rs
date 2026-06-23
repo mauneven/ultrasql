@@ -633,3 +633,92 @@ fn alter_view_replace_definition_is_explicitly_unsupported() {
         )
     );
 }
+
+// ALTER TABLE ALTER COLUMN SET/DROP NOT NULL and SET/DROP DEFAULT
+// -----------------------------------------------------------------------
+
+#[test]
+fn binds_alter_column_set_not_null_resolves_index() {
+    let plan = parse_bind_ok("ALTER TABLE users ALTER COLUMN name SET NOT NULL");
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AlterColumnSetNotNull {
+        column_index,
+        column_name,
+    } = action
+    else {
+        panic!("expected AlterColumnSetNotNull action");
+    };
+    assert_eq!(column_index, 1);
+    assert_eq!(column_name, "name");
+}
+
+#[test]
+fn binds_alter_column_drop_not_null_without_column_keyword() {
+    let plan = parse_bind_ok("ALTER TABLE users ALTER name DROP NOT NULL");
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AlterColumnDropNotNull { column_index, .. } = action else {
+        panic!("expected AlterColumnDropNotNull action");
+    };
+    assert_eq!(column_index, 1);
+}
+
+#[test]
+fn binds_alter_column_set_default_type_checks_and_coerces() {
+    // `score` is Float64; an integer literal default must coerce.
+    let plan = parse_bind_ok("ALTER TABLE users ALTER COLUMN score SET DEFAULT 1");
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AlterColumnSetDefault {
+        column_index,
+        default,
+        ..
+    } = action
+    else {
+        panic!("expected AlterColumnSetDefault action");
+    };
+    assert_eq!(column_index, 2);
+    assert_eq!(default.data_type(), DataType::Float64);
+}
+
+#[test]
+fn binds_alter_column_drop_default_resolves_index() {
+    let plan = parse_bind_ok("ALTER TABLE users ALTER COLUMN score DROP DEFAULT");
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::AlterColumnDropDefault { column_index, .. } = action else {
+        panic!("expected AlterColumnDropDefault action");
+    };
+    assert_eq!(column_index, 2);
+}
+
+#[test]
+fn alter_column_unknown_column_is_column_not_found() {
+    let cat = users_catalog();
+    let err = parse_and_bind("ALTER TABLE users ALTER COLUMN bogus SET NOT NULL", &cat)
+        .expect_err("unknown column");
+    assert!(matches!(err, PlanError::ColumnNotFound(ref s) if s == "bogus"));
+}
+
+#[test]
+fn alter_column_set_default_rejects_uncoercible_type() {
+    // `id` is Int32; a text default cannot coerce.
+    let cat = users_catalog();
+    let err = parse_and_bind("ALTER TABLE users ALTER COLUMN id SET DEFAULT 'abc'", &cat)
+        .expect_err("uncoercible default");
+    assert!(matches!(err, PlanError::TypeMismatch(_)));
+}
+
+#[test]
+fn alter_column_set_default_rejects_volatile_expression() {
+    // A default referencing a parameter is not a constant-folded literal.
+    let cat = users_catalog();
+    let err = parse_and_bind("ALTER TABLE users ALTER COLUMN id SET DEFAULT $1", &cat)
+        .expect_err("non-safe default");
+    assert!(matches!(err, PlanError::NotSupported(_)));
+}

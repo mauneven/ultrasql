@@ -405,6 +405,49 @@ pub enum LogicalAlterTableAction {
         /// diagnostics and forward compatibility.
         cascade: bool,
     },
+    /// `ALTER TABLE t ALTER [COLUMN] c SET NOT NULL`.
+    ///
+    /// Flips the column's nullability flag to `NOT NULL`. The executor
+    /// first validates that no existing row carries NULL in the column.
+    AlterColumnSetNotNull {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Column name (kept for diagnostics + error messages).
+        column_name: String,
+    },
+    /// `ALTER TABLE t ALTER [COLUMN] c DROP NOT NULL`.
+    ///
+    /// Clears the column's `NOT NULL` flag. The executor rejects the
+    /// change when the column participates in a PRIMARY KEY.
+    AlterColumnDropNotNull {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Column name (kept for diagnostics + error messages).
+        column_name: String,
+    },
+    /// `ALTER TABLE t ALTER [COLUMN] c SET DEFAULT <expr>`.
+    ///
+    /// Stores the bound default on the column's runtime metadata.
+    /// Existing rows are not changed; future INSERTs that omit the
+    /// column use the new default.
+    AlterColumnSetDefault {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Column name (kept for diagnostics + error messages).
+        column_name: String,
+        /// Bound, type-checked default expression.
+        default: ScalarExpr,
+    },
+    /// `ALTER TABLE t ALTER [COLUMN] c DROP DEFAULT`.
+    ///
+    /// Clears the column's stored default. Future INSERTs that omit the
+    /// column get NULL (or fail `23502` if the column is `NOT NULL`).
+    AlterColumnDropDefault {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Column name (kept for diagnostics + error messages).
+        column_name: String,
+    },
 }
 
 /// One action clause of an [`LogicalPlan::AlterView`](crate::plan::LogicalPlan::AlterView).

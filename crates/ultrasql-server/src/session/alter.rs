@@ -122,7 +122,348 @@ where
             } => {
                 self.execute_alter_drop_constraint(table_name, name, *if_exists, *cascade, snapshot)
             }
+            LogicalAlterTableAction::AlterColumnSetNotNull {
+                column_index,
+                column_name,
+            } => self.execute_alter_column_set_not_null(
+                table_name,
+                *column_index,
+                column_name,
+                snapshot,
+            ),
+            LogicalAlterTableAction::AlterColumnDropNotNull {
+                column_index,
+                column_name,
+            } => self.execute_alter_column_drop_not_null(
+                table_name,
+                *column_index,
+                column_name,
+                snapshot,
+            ),
+            LogicalAlterTableAction::AlterColumnSetDefault {
+                column_index,
+                column_name,
+                default,
+            } => self.execute_alter_column_set_default(
+                table_name,
+                *column_index,
+                column_name,
+                default.clone(),
+                snapshot,
+            ),
+            LogicalAlterTableAction::AlterColumnDropDefault {
+                column_index,
+                column_name,
+            } => self.execute_alter_column_drop_default(
+                table_name,
+                *column_index,
+                column_name,
+                snapshot,
+            ),
         }
+    }
+
+    /// Execute `ALTER TABLE t ALTER [COLUMN] c SET NOT NULL`.
+    ///
+    /// 1. Scan every visible row; the first NULL in the target column
+    ///    aborts with `23502` (`not_null_violation`) naming the column,
+    ///    so the flag is never set against data that already violates it.
+    /// 2. Rebuild the schema with the column's `nullable` flag cleared
+    ///    and publish it through [`MutableCatalog::alter_table_replace_schema`],
+    ///    persisting the new `pg_attribute` rows so the `NOT NULL` flag
+    ///    survives restart. Subsequent INSERT/UPDATE enforcement is the
+    ///    existing schema-driven `check_not_null_violations` path.
+    fn execute_alter_column_set_not_null(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let field = entry.schema.field(column_index).ok_or_else(|| {
+            ServerError::ddl(format!(
+                "ALTER TABLE SET NOT NULL: column index {column_index} out of bounds for {table_name}"
+            ))
+        })?;
+        // Already NOT NULL — nothing to validate or persist.
+        if !field.nullable {
+            return Ok(run_ddl_command("ALTER TABLE"));
+        }
+
+        // Validate existing data: no visible row may carry NULL.
+        let validate_txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let validate_result = (|| -> Result<(), ServerError> {
+            let rel = RelationId(entry.oid);
+            let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+            let codec = ultrasql_executor::RowCodec::new(entry.schema.clone());
+            let scan = self.state.heap.scan_visible(
+                rel,
+                block_count,
+                &validate_txn.snapshot,
+                self.state.txn_manager.as_ref(),
+            );
+            for result in scan {
+                let tup = result
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE SET NOT NULL scan: {e}")))?;
+                let row = codec.decode(&tup.data).map_err(|e| {
+                    ServerError::ddl(format!("ALTER TABLE SET NOT NULL decode: {e}"))
+                })?;
+                if matches!(row.get(column_index), Some(Value::Null)) {
+                    return Err(ServerError::Execute(
+                        ultrasql_executor::ExecError::NotNullViolation(column_name.to_owned()),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = validate_result {
+            return Err(self.rollback_transaction_after_error(
+                validate_txn,
+                e,
+                "ALTER TABLE SET NOT NULL rollback after existing-row validation",
+            ));
+        }
+        self.state
+            .commit_transaction(validate_txn, true, "ALTER TABLE SET NOT NULL validation")?;
+
+        self.replace_column_nullability(table_name, column_index, false, snapshot)
+    }
+
+    /// Execute `ALTER TABLE t ALTER [COLUMN] c DROP NOT NULL`.
+    ///
+    /// Rejects the change when the column participates in a PRIMARY KEY
+    /// (`42P16`, `invalid_table_definition`), matching PostgreSQL.
+    /// Otherwise sets the column's `nullable` flag and persists the new
+    /// schema so NULLs are allowed afterward and across restart.
+    fn execute_alter_column_drop_not_null(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let field = entry.schema.field(column_index).ok_or_else(|| {
+            ServerError::ddl(format!(
+                "ALTER TABLE DROP NOT NULL: column index {column_index} out of bounds for {table_name}"
+            ))
+        })?;
+        if column_in_primary_key(snapshot, entry.oid, column_index) {
+            return Err(ServerError::InvalidTableDefinition(format!(
+                "column \"{column_name}\" is in a primary key"
+            )));
+        }
+        // Already nullable — nothing to persist.
+        if field.nullable {
+            return Ok(run_ddl_command("ALTER TABLE"));
+        }
+        self.replace_column_nullability(table_name, column_index, true, snapshot)
+    }
+
+    /// Rebuild a table's schema with a single column's nullability flag
+    /// changed, publish it, and persist the new `pg_attribute` rows so
+    /// the change survives restart.
+    fn replace_column_nullability(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        nullable: bool,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let mut new_fields: Vec<ultrasql_core::Field> = entry.schema.fields().to_vec();
+        let target = new_fields.get_mut(column_index).ok_or_else(|| {
+            ServerError::ddl(format!(
+                "ALTER TABLE ALTER COLUMN: column index {column_index} out of bounds for {table_name}"
+            ))
+        })?;
+        target.nullable = nullable;
+        let new_schema = ultrasql_core::Schema::new(new_fields).map_err(|e| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::schema_conflict(format!(
+                "ALTER TABLE ALTER COLUMN: {e}"
+            )))
+        })?;
+        // Preserve `pg_attribute.atthasdef` so a column's stored default
+        // is not silently forgotten when the schema is re-persisted.
+        let attr_has_defaults = if let Some(runtime) = self.state.table_constraints.get(&entry.oid)
+        {
+            alter_attr_has_defaults(Some(runtime.value().as_ref()), new_schema.len())
+        } else {
+            alter_attr_has_defaults(None, new_schema.len())
+        };
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let updated_entry = self
+            .state
+            .persistent_catalog
+            .alter_table_replace_schema(table_name, new_schema)
+            .map_err(ServerError::Catalog)?;
+        if let Err(e) = self
+            .state
+            .persistent_catalog
+            .persist_table_schema_replacement_with_defaults(
+                entry,
+                &updated_entry,
+                &attr_has_defaults,
+                self.state.heap.as_ref(),
+                txn.xid,
+                txn.current_command,
+            )
+        {
+            return Err(self.rollback_catalog_transaction_after_error(
+                txn,
+                e.into(),
+                "ALTER TABLE ALTER COLUMN catalog rollback after persist error",
+            ));
+        }
+        self.state
+            .commit_transaction(txn, true, "ALTER TABLE ALTER COLUMN nullability")?;
+        self.state.plan_cache.invalidate_all();
+        Ok(run_ddl_command("ALTER TABLE"))
+    }
+
+    /// Execute `ALTER TABLE t ALTER [COLUMN] c SET DEFAULT <expr>`.
+    ///
+    /// Stores the bound default on the table's runtime constraints side
+    /// map (indexed by column position) and flushes the runtime metadata
+    /// so future INSERTs that omit the column use it — and the default
+    /// survives restart. Existing rows are not changed (PostgreSQL
+    /// semantics).
+    fn execute_alter_column_set_default(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        default: ScalarExpr,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        self.update_column_default(
+            table_name,
+            column_index,
+            column_name,
+            Some(default),
+            snapshot,
+        )
+    }
+
+    /// Execute `ALTER TABLE t ALTER [COLUMN] c DROP DEFAULT`.
+    ///
+    /// Clears the column's stored default. Future INSERTs that omit the
+    /// column get NULL (or fail `23502` if the column is `NOT NULL`).
+    fn execute_alter_column_drop_default(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        self.update_column_default(table_name, column_index, column_name, None, snapshot)
+    }
+
+    /// Set or clear a column's runtime default and persist the change.
+    ///
+    /// Both `pg_attribute.atthasdef` (re-persisted via a schema
+    /// replacement) and the runtime constraints side map are kept in
+    /// sync, so catalog views and DML lowering agree and the change
+    /// reloads correctly on restart.
+    fn update_column_default(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        default: Option<ScalarExpr>,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let width = entry.schema.len();
+        if column_index >= width {
+            return Err(ServerError::ddl(format!(
+                "ALTER TABLE ALTER COLUMN DEFAULT: column index {column_index} out of bounds for {table_name}"
+            )));
+        }
+        let _ = column_name;
+
+        // Stage the new runtime side-map entry and make sure it is
+        // serializable before any durable write.
+        let table_key = ultrasql_catalog::table_lookup_key(&entry.schema_name, &entry.name);
+        let previous = self
+            .state
+            .table_constraints
+            .get(&entry.oid)
+            .map(|guard| guard.clone());
+        let mut runtime = previous
+            .as_ref()
+            .map(|existing| existing.as_ref().clone())
+            .unwrap_or_default();
+        // A column-position-indexed vec must cover the target column.
+        if runtime.defaults.len() < width {
+            runtime.defaults.resize(width, None);
+        }
+        runtime.defaults[column_index] = default;
+        self.state
+            .ensure_table_runtime_constraints_metadata_persistable(&table_key, &runtime)?;
+        self.state
+            .ensure_table_runtime_constraints_metadata_slots_persistable()?;
+
+        // Re-persist the schema so `pg_attribute.atthasdef` matches the
+        // new default state. The schema itself is unchanged.
+        let attr_has_defaults = alter_attr_has_defaults(Some(&runtime), width);
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        if let Err(e) = self
+            .state
+            .persistent_catalog
+            .persist_table_rows_with_defaults(
+                entry,
+                &attr_has_defaults,
+                self.state.heap.as_ref(),
+                txn.xid,
+                txn.current_command,
+            )
+        {
+            return Err(self.rollback_catalog_transaction_after_error(
+                txn,
+                e.into(),
+                "ALTER TABLE ALTER COLUMN DEFAULT catalog rollback after persist error",
+            ));
+        }
+        self.state
+            .commit_transaction(txn, true, "ALTER TABLE ALTER COLUMN DEFAULT")?;
+
+        // Publish the runtime default, then flush runtime metadata so the
+        // default is applied (and survives restart). Roll the in-memory
+        // side map back if the metadata flush fails.
+        self.state
+            .table_constraints
+            .insert(entry.oid, Arc::new(runtime));
+        if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
+            match previous {
+                Some(previous) => {
+                    self.state.table_constraints.insert(entry.oid, previous);
+                }
+                None => {
+                    self.state.table_constraints.remove(&entry.oid);
+                }
+            }
+            return Err(e);
+        }
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("ALTER TABLE"))
     }
 
     fn execute_alter_add_unique_constraint(
@@ -1720,6 +2061,30 @@ where
             }
         }
     }
+}
+
+/// Return whether the 0-based `column_index` participates in a live
+/// PRIMARY KEY constraint on the table.
+///
+/// `pg_constraint.conkey` stores 1-based attribute numbers, so the
+/// target column matches `column_index + 1`. Used to reject
+/// `DROP NOT NULL` on a primary-key column, as PostgreSQL does.
+fn column_in_primary_key(
+    snapshot: &CatalogSnapshot,
+    table_oid: ultrasql_core::Oid,
+    column_index: usize,
+) -> bool {
+    let Ok(attnum) = i16::try_from(column_index + 1) else {
+        return false;
+    };
+    snapshot.constraints.values().any(|row| {
+        row.conrelid == table_oid
+            && matches!(
+                row.contype,
+                ultrasql_catalog::persistent::ConType::PrimaryKey
+            )
+            && row.conkey.contains(&attnum)
+    })
 }
 
 fn alter_add_column_default_value(

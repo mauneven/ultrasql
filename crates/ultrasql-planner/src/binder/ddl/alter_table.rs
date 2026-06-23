@@ -178,6 +178,51 @@ pub(in crate::binder) fn bind_alter_table(
             if_exists: *if_exists,
             cascade: *cascade,
         },
+        AlterTableAction::AlterColumnSetNotNull { column, .. } => {
+            let (idx, _) = resolve_alter_column(table_schema, column)?;
+            LogicalAlterTableAction::AlterColumnSetNotNull {
+                column_index: idx,
+                column_name: column.value.clone(),
+            }
+        }
+        AlterTableAction::AlterColumnDropNotNull { column, .. } => {
+            let (idx, _) = resolve_alter_column(table_schema, column)?;
+            LogicalAlterTableAction::AlterColumnDropNotNull {
+                column_index: idx,
+                column_name: column.value.clone(),
+            }
+        }
+        AlterTableAction::AlterColumnSetDefault { column, expr, .. } => {
+            let (idx, field) = resolve_alter_column(table_schema, column)?;
+            let dtype = field.data_type.clone();
+            let mut scope = ScopeStack::new();
+            let mut bound = bind_expr(expr, &Schema::empty(), catalog, &mut scope)?;
+            if !is_default_safe(&bound) {
+                return Err(PlanError::NotSupported(
+                    "ALTER TABLE ALTER COLUMN SET DEFAULT: DEFAULT may not refer to rows, parameters, or subqueries",
+                ));
+            }
+            coerce_default_expr_to_type(&mut bound, &dtype);
+            let actual = bound.data_type();
+            if actual != dtype && actual != DataType::Null {
+                return Err(PlanError::TypeMismatch(format!(
+                    "DEFAULT for column '{}' has type {actual:?}, expected {dtype:?}",
+                    column.value,
+                )));
+            }
+            LogicalAlterTableAction::AlterColumnSetDefault {
+                column_index: idx,
+                column_name: column.value.clone(),
+                default: bound,
+            }
+        }
+        AlterTableAction::AlterColumnDropDefault { column, .. } => {
+            let (idx, _) = resolve_alter_column(table_schema, column)?;
+            LogicalAlterTableAction::AlterColumnDropDefault {
+                column_index: idx,
+                column_name: column.value.clone(),
+            }
+        }
     };
 
     Ok(LogicalPlan::AlterTable {
@@ -185,6 +230,21 @@ pub(in crate::binder) fn bind_alter_table(
         action,
         schema: Schema::empty(),
     })
+}
+
+/// Resolve a target column for an `ALTER COLUMN` sub-action, returning
+/// its 0-based index and resolved [`Field`].
+///
+/// Mirrors PostgreSQL: an unknown column raises
+/// [`PlanError::ColumnNotFound`] (SQLSTATE `42703`).
+fn resolve_alter_column<'s>(
+    table_schema: &'s Schema,
+    column: &ultrasql_parser::ast::Identifier,
+) -> Result<(usize, &'s Field), PlanError> {
+    let raw = column.value.to_ascii_lowercase();
+    table_schema
+        .find(&raw)
+        .ok_or_else(|| PlanError::ColumnNotFound(column.value.clone()))
 }
 
 fn reject_unsupported_alter_add_column_constraints(

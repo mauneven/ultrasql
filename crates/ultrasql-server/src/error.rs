@@ -116,6 +116,12 @@ pub enum ServerError {
     #[error("{0}")]
     DependentObjectsStillExist(String),
 
+    /// A DDL change would leave the table in an invalid definition — for
+    /// example `ALTER COLUMN ... DROP NOT NULL` on a primary-key column.
+    /// Maps to PostgreSQL SQLSTATE `42P16` (`invalid_table_definition`).
+    #[error("{0}")]
+    InvalidTableDefinition(String),
+
     /// A statement was issued while the current explicit transaction
     /// was already aborted by a prior error. Maps to PostgreSQL
     /// SQLSTATE `25P02` (`in_failed_sql_transaction`); the user must
@@ -221,6 +227,7 @@ impl ServerError {
                 | Self::DuplicateObject(_)
                 | Self::UndefinedSchema(_)
                 | Self::DependentObjectsStillExist(_)
+                | Self::InvalidTableDefinition(_)
                 | Self::TransactionAborted
                 | Self::SerializationFailure(_)
                 | Self::Savepoint(_)
@@ -264,6 +271,7 @@ impl ServerError {
             Self::Build(_) | Self::Unsupported(_) | Self::UnsupportedOwned(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01", // protocol_violation
             Self::DependentObjectsStillExist(_) => "2BP01", // dependent_objects_still_exist
+            Self::InvalidTableDefinition(_) => "42P16",  // invalid_table_definition
             Self::Catalog(_) => "42000",                 // generic catalog failure
             Self::SerializationFailure(_) => "40001",    // serialization_failure
             Self::TransactionAborted => "25P02",         // in_failed_sql_transaction
