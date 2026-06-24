@@ -313,44 +313,14 @@ where
             )));
         }
 
-        // Scope boundary: a `CREATE INDEX` on a table CREATED EARLIER IN THE
-        // SAME TRANSACTION is deferred to a follow-up. The created table lives
-        // in this session's overlay (not the global catalog); building an index
-        // over it would have to thread the overlay's unbuilt table through the
-        // deferred-build path. Reject it cleanly for now with `0A000`.
-        if let Some(overlay) = self.pending_catalog_ddl.as_ref()
-            && overlay
-                .table
-                .as_ref()
-                .is_some_and(|created| created.oid == table.oid)
-        {
-            return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
-                "CREATE INDEX on a table created earlier in the same transaction is not yet \
-                 supported\nHINT:  commit the CREATE TABLE first, or create the index in autocommit"
-                    .to_string(),
-            )));
-        }
-
-        // Overlay-clobber guard (milestones 1–3): the session catalog overlay
-        // (`pending_catalog_ddl`) holds ONE schema-changing statement. If an
-        // overlay already exists here, a PRIOR in-txn DDL statement (e.g. a
-        // CREATE TABLE on a different relation, or an earlier CREATE INDEX) has
-        // already staged its rows. Appending this index's `extra_indexes` —
-        // after persisting its pg_index rows — silently grows a SECOND producer
-        // of the single overlay, which the COMMIT-time deferred build does not
-        // robustly reconcile (the symmetric `execute_create_table` path would
-        // overwrite it). Reject the second statement with `0A000` BEFORE any
-        // durable persist (no pg_index rows) and BEFORE the overlay is touched,
-        // so the first statement's overlay survives for a later ROLLBACK/COMMIT.
-        // (The same-table-created combo is the more specific reject above.)
-        if self.pending_catalog_ddl.is_some() {
-            return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
-                "a second schema-changing statement inside an explicit transaction is not yet \
-                 supported\nHINT:  only one schema-changing statement is supported per \
-                 transaction so far; commit and start a new transaction"
-                    .to_string(),
-            )));
-        }
+        // Multi-statement accumulation: a `CREATE INDEX` on a table created
+        // EARLIER IN THE SAME TRANSACTION is now supported. The target table
+        // lives in this session's overlay (`created_tables`); the deferred
+        // build at COMMIT resolves it there (against the in-memory `TableEntry`)
+        // and indexes the rows the transaction inserted into it. A second (or
+        // later) in-txn DDL statement APPENDS to the overlay rather than
+        // clobbering it (`get_or_insert_with` + `push` below), so the prior
+        // statements' staged rows survive for a later atomic COMMIT/ROLLBACK.
 
         // Validate the key encoding up front (same resolution the IndexScan
         // probe path uses) so an unsupported key shape fails before any durable
@@ -427,21 +397,25 @@ where
             return Err(self.fail_if_in_transaction(e.into()));
         }
 
-        // Stage the entry in a freshly created overlay. The overlay-clobber
-        // guard above guarantees `pending_catalog_ddl` is `None` here — at most
-        // one schema-changing statement is staged per transaction — so this
-        // CREATE INDEX is the sole producer of the overlay. A pure `CREATE
-        // INDEX` overlay carries `table == None`.
-        debug_assert!(self.pending_catalog_ddl.is_none());
-        self.pending_catalog_ddl = Some(super::super::catalog_overlay::CatalogOverlay {
-            xid: user_xid,
-            table: None,
-            indexes: Vec::new(),
-            constraints: Vec::new(),
-            extra_indexes: vec![entry],
-            extra_index_constraints: Vec::new(),
-            staged: None,
+        // Append the entry to the (possibly pre-existing) overlay so multiple
+        // in-txn `CREATE INDEX` / `CREATE TABLE` statements accumulate and
+        // commit atomically. The target table may be one created earlier in the
+        // same transaction (`created_tables`) or one already committed in the
+        // global catalog — the deferred build resolves it at COMMIT by
+        // `table_oid`.
+        let overlay = self.pending_catalog_ddl.get_or_insert_with(|| {
+            super::super::catalog_overlay::CatalogOverlay {
+                xid: user_xid,
+                created_tables: Vec::new(),
+                indexes: Vec::new(),
+                constraints: Vec::new(),
+                extra_indexes: Vec::new(),
+                extra_index_constraints: Vec::new(),
+                staged: Vec::new(),
+            }
         });
+        debug_assert_eq!(overlay.xid, user_xid);
+        overlay.extra_indexes.push(entry);
 
         // Mark the target table modified so `commit_transaction`'s
         // `modified_tables` is non-empty → a durable commit marker is written,

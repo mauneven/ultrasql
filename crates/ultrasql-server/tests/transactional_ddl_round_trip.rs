@@ -2528,57 +2528,79 @@ async fn in_txn_create_unique_index_over_duplicates_fails_23505_full_rollback() 
     shutdown(running).await;
 }
 
-// ───────────────────────────── M3 #7 (regression) ─────────────────────────────
-// In-txn CREATE INDEX on a SAME-TXN-created table is the scope boundary and must
-// reject 0A000 → Failed (25P02). (The other out-of-scope index forms — hash /
-// expression / CONCURRENTLY — and the other DDL classes are covered by
-// `out_of_scope_ddl_still_rejected_in_transaction` above.) Autocommit
-// CREATE INDEX of every form is unchanged (covered by
-// `create_index_types_round_trip`).
+// ───────────────────────────── M3 #7 (UNBLOCKED: same-txn table+index) ─────────────────────────────
+// In-txn CREATE INDEX on a SAME-TXN-created table — the M3 scope boundary — is
+// now LIFTED. A non-unique index over a freshly created table accumulates and
+// builds at COMMIT (resolving its target against the overlay's `created_tables`,
+// not the committed snapshot). Self sees the index inside the same txn; after
+// ROLLBACK both the table and index are gone. (Out-of-scope index forms — hash /
+// expression / CONCURRENTLY — and the other DDL classes still reject; covered by
+// `out_of_scope_ddl_still_rejected_in_transaction`.)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_txn_create_index_on_same_txn_created_table_is_rejected() {
+async fn in_txn_create_index_on_same_txn_created_table_now_accumulates() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let running = start_persistent_server(data_dir.path(), "txddl_ci_sametxn").await;
     let client = &running.client;
 
+    // Accumulate-and-COMMIT: a non-unique index over a same-txn table.
     client.batch_execute("BEGIN").await.expect("begin");
     client
         .batch_execute("CREATE TABLE ci_same (id INT NOT NULL)")
         .await
         .expect("in-txn create table (overlay holds the created table)");
-    // CREATE INDEX on the just-created (same-txn) table is the scope boundary.
-    let err = client
+    client
+        .batch_execute("INSERT INTO ci_same VALUES (1), (2), (2), (3)")
+        .await
+        .expect("in-txn rows (duplicates allowed: non-unique index)");
+    client
         .batch_execute("CREATE INDEX ci_same_ix ON ci_same (id)")
         .await
-        .expect_err("CREATE INDEX on a same-txn-created table must be rejected");
-    assert_eq!(
-        sqlstate(&err),
-        "0A000",
-        "same-txn table+index combo must be feature_not_supported, got {err}"
-    );
-    // The block is now Failed: a subsequent statement gets 25P02.
-    let in_failed = client
-        .batch_execute("SELECT 1")
+        .expect("CREATE INDEX on a same-txn-created table now accumulates");
+    client
+        .batch_execute("COMMIT")
         .await
-        .expect_err("statement after rejected DDL must be 25P02");
-    assert_eq!(
-        sqlstate(&in_failed),
-        "25P02",
-        "in-failed-block must be in_failed_sql_transaction, got {in_failed}"
+        .expect("the non-unique index builds over the in-txn rows at COMMIT");
+    assert!(
+        running
+            .server
+            .catalog_snapshot()
+            .indexes
+            .contains_key("ci_same_ix"),
+        "the same-txn index must be published after commit",
     );
-    client.batch_execute("ROLLBACK").await.expect("rollback");
+    // The index carries the (duplicate-tolerant) rows: a key lookup resolves.
+    let count = client
+        .query_one("SELECT count(*) FROM ci_same WHERE id = 2", &[])
+        .await
+        .expect("index lookup on the same-txn-created table")
+        .get::<_, i64>(0);
+    assert_eq!(count, 2, "both id=2 rows are present (non-unique index)");
 
-    // After rollback the table is gone (its CREATE rolled back too) and a clean
-    // autocommit CREATE TABLE + CREATE INDEX works.
+    // Accumulate-and-ROLLBACK: both the table and index vanish.
+    client.batch_execute("BEGIN").await.expect("begin rb");
     client
-        .batch_execute("CREATE TABLE ci_same (id INT NOT NULL)")
+        .batch_execute("CREATE TABLE ci_rb (id INT NOT NULL)")
         .await
-        .expect("autocommit recreate works");
+        .expect("create table for rollback");
     client
-        .batch_execute("CREATE INDEX ci_same_ix ON ci_same (id)")
+        .batch_execute("CREATE INDEX ci_rb_ix ON ci_rb (id)")
         .await
-        .expect("autocommit CREATE INDEX works");
+        .expect("index on the same-txn table accumulates");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    let err = client
+        .query("SELECT id FROM ci_rb", &[])
+        .await
+        .expect_err("the rolled-back same-txn table must be gone");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .indexes
+            .contains_key("ci_rb_ix"),
+        "the rolled-back same-txn index must not be in the snapshot",
+    );
 
     shutdown(running).await;
 }
@@ -2673,43 +2695,35 @@ async fn extended_path_in_txn_create_index_commits_working_index() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Overlay-clobber (milestones 1–3): the session catalog overlay
-// (`Session::pending_catalog_ddl`) holds ONE schema-changing statement's staged
-// rows. A SECOND in-txn DDL statement that also produces an overlay (CREATE
-// TABLE, CREATE INDEX) USED to OVERWRITE it — discarding the first statement's
-// staged (UNBUILT) index — so the first op's catalog rows reached durable
-// commit UNBUILT: a UNIQUE index that silently did not enforce uniqueness,
-// forever (resurrected unbuilt on restart). The fix rejects the second
-// schema-changing statement with 0A000 (block → Failed 25P02) BEFORE any
-// durable persist or overlay touch, so the first op's overlay survives intact
-// for a subsequent ROLLBACK/COMMIT. Each pairing (CREATE INDEX+CREATE TABLE,
-// CREATE INDEX+CREATE INDEX, CREATE TABLE+CREATE TABLE) is a gate.
+// Transactional-DDL multi-statement ACCUMULATION (lifting the M3 one-schema-
+// statement-per-transaction limit). The session catalog overlay
+// (`Session::pending_catalog_ddl`) now ACCUMULATES multiple in-txn
+// `CREATE TABLE` / `CREATE INDEX` statements: every producer APPENDS to the
+// overlay (`created_tables` / `extra_indexes` / `staged` Vecs) instead of
+// clobbering it. All accumulated statements commit atomically — a single
+// COMMIT publish, or, if ANY deferred index build hits a duplicate, the WHOLE
+// transaction rolls back (every table, row, and index rides the one aborted
+// user xid, hidden by the visibility-filtered bootstrap on restart). The four
+// `*_rejects_second` cases below are CONVERTED from "second statement rejected
+// 0A000" to "both accumulate and commit / both roll back", and a new battery
+// (ACC #1..#7) covers the multi-op matrix — esp. the CRUX (a duplicate in a
+// later build aborts everything) and the previously-blocked combo
+// (CREATE INDEX on a table created earlier in the same transaction).
 
-// ───────────────────────────── OC #1 (THE CRUX — corruption gate) ─────────────────────────────
+// ───────────────────────────── ACC: CREATE INDEX then CREATE TABLE (was rejected) ─────────────────────────────
 // BEGIN; CREATE UNIQUE INDEX ix ON existing_t; CREATE TABLE u; COMMIT.
-// The SECOND statement (CREATE TABLE) must be REJECTED 0A000 → block Failed
-// (25P02). After ROLLBACK neither `ix` nor `u` exists. CRUCIALLY, on a fresh
-// reopen the existing table has NO half-built UNBUILT index resurrected: a
-// duplicate insert into `existing_t` still succeeds (no index at all), proving
-// no silently-unenforced unique index was committed.
-//
-// Pre-fix: the CREATE TABLE clobbered the overlay (`extra_indexes: Vec::new()`),
-// discarding the staged UNBUILT unique index; the COMMIT then made the index's
-// pg_class/pg_index rows durable with `root_block == INVALID`. On restart the
-// existing table carried a resurrected UNBUILT unique index that did NOT enforce
-// uniqueness — a duplicate insert would silently succeed. Post-fix nothing is
-// staged for the rejected second statement, so nothing commits.
+// Both now accumulate and commit atomically: the index is BUILT and enforcing,
+// the new table exists. After a separate ROLLBACK run, neither survives.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_txn_create_index_then_create_table_rejects_second_and_no_unbuilt_index() {
+async fn in_txn_create_index_then_create_table_accumulates_and_commits() {
     let data_dir = tempfile::TempDir::new().unwrap();
     make_data_dir_private(data_dir.path());
 
     {
-        let running = start_persistent_server(data_dir.path(), "txddl_oc_crux_a").await;
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_ci_ct_a").await;
         let client = &running.client;
 
-        // Existing committed table whose `id` column is unique so far.
         client
             .batch_execute("CREATE TABLE oc_existing (id INT NOT NULL)")
             .await
@@ -2720,302 +2734,700 @@ async fn in_txn_create_index_then_create_table_rejects_second_and_no_unbuilt_ind
             .expect("seed unique rows");
 
         client.batch_execute("BEGIN").await.expect("begin");
-        // First schema-changing statement: stages an UNBUILT unique index.
         client
             .batch_execute("CREATE UNIQUE INDEX oc_ix ON oc_existing (id)")
             .await
-            .expect("in-txn CREATE UNIQUE INDEX stages the overlay (first op)");
-        // Second schema-changing statement: must be REJECTED before it touches
-        // the overlay (which would discard the staged index).
-        let err = client
+            .expect("first op: CREATE UNIQUE INDEX accumulates into the overlay");
+        client
             .batch_execute("CREATE TABLE oc_u (id INT)")
             .await
-            .expect_err("a second schema-changing statement must be rejected");
-        assert_eq!(
-            sqlstate(&err),
-            "0A000",
-            "second in-txn DDL must be feature_not_supported, got {err}"
-        );
-        // The block is now Failed: a subsequent statement gets 25P02.
-        let in_failed = client
-            .batch_execute("SELECT 1")
-            .await
-            .expect_err("statement after the rejected second DDL must be 25P02");
-        assert_eq!(
-            sqlstate(&in_failed),
-            "25P02",
-            "in-failed-block must be in_failed_sql_transaction, got {in_failed}"
-        );
-        client.batch_execute("ROLLBACK").await.expect("rollback");
-
-        // Neither the index nor the second table exists for the issuer or the
-        // global snapshot.
-        assert!(
-            !running
-                .server
-                .catalog_snapshot()
-                .indexes
-                .contains_key("oc_ix"),
-            "the rolled-back index must not be in the snapshot",
-        );
-        let err = client
-            .query("SELECT id FROM oc_u", &[])
-            .await
-            .expect_err("the rejected second table must not exist");
-        assert!(
-            is_undefined_table(&err),
-            "expected 42P01 for oc_u, got {err}"
-        );
-
-        // The existing table is intact and — critically — carries NO index, so a
-        // duplicate insert is accepted (no unbuilt unique index sneaked in). The
-        // table now holds 1, 2, 3, 1.
+            .expect("second op: CREATE TABLE accumulates (no longer rejected)");
         client
+            .batch_execute("COMMIT")
+            .await
+            .expect("both schema changes commit atomically");
+
+        // The unique index is BUILT and enforcing.
+        let dup = client
             .batch_execute("INSERT INTO oc_existing VALUES (1)")
             .await
-            .expect("duplicate accepted: no index exists on the existing table");
-        let count = client
-            .query_one("SELECT count(*) FROM oc_existing WHERE id = 1", &[])
+            .expect_err("duplicate must violate the built unique index");
+        assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+        // The new table exists and is usable.
+        client
+            .batch_execute("INSERT INTO oc_u VALUES (7)")
             .await
-            .expect("count id=1")
-            .get::<_, i64>(0);
+            .expect("the in-txn-created table is usable after commit");
+
+        shutdown(running).await;
+    }
+
+    // After restart both survive: the index still enforces uniqueness (rebuilt
+    // BUILT) and the second table is present.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_ci_ct_a2").await;
+    let client = &running.client;
+    let dup = client
+        .batch_execute("INSERT INTO oc_existing VALUES (2)")
+        .await
+        .expect_err("post-restart duplicate must violate the rebuilt unique index");
+    assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+    let row = client
+        .query_one("SELECT count(*) FROM oc_u", &[])
+        .await
+        .expect("the committed second table is present after restart")
+        .get::<_, i64>(0);
+    assert_eq!(row, 1, "the in-txn-created table's row survives restart");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC: two CREATE INDEX (was rejected) ─────────────────────────────
+// BEGIN; CREATE INDEX a ON t1; CREATE UNIQUE INDEX b ON t2; COMMIT.
+// Both now BUILD and enforce after COMMIT; both survive restart BUILT.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_two_create_index_accumulates_and_builds_both() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ci_a").await;
+        let client = &running.client;
+
+        client
+            .batch_execute("CREATE TABLE oc_t1 (id INT NOT NULL)")
+            .await
+            .expect("create t1");
+        client
+            .batch_execute("CREATE TABLE oc_t2 (id INT NOT NULL)")
+            .await
+            .expect("create t2");
+        client
+            .batch_execute("INSERT INTO oc_t1 VALUES (1), (2)")
+            .await
+            .expect("seed t1");
+        client
+            .batch_execute("INSERT INTO oc_t2 VALUES (1), (2)")
+            .await
+            .expect("seed t2 (distinct keys)");
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE INDEX oc_a ON oc_t1 (id)")
+            .await
+            .expect("first CREATE INDEX accumulates");
+        client
+            .batch_execute("CREATE UNIQUE INDEX oc_b ON oc_t2 (id)")
+            .await
+            .expect("second CREATE INDEX accumulates (no longer rejected)");
+        client
+            .batch_execute("COMMIT")
+            .await
+            .expect("both indexes build atomically at COMMIT");
+
+        // Both indexes reached the global snapshot.
+        for ix in ["oc_a", "oc_b"] {
+            assert!(
+                running.server.catalog_snapshot().indexes.contains_key(ix),
+                "index {ix} must be published after commit",
+            );
+        }
+        // The unique one enforces uniqueness.
+        let dup = client
+            .batch_execute("INSERT INTO oc_t2 VALUES (1)")
+            .await
+            .expect_err("duplicate must violate the built unique index oc_b");
+        assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+
+        shutdown(running).await;
+    }
+
+    // Both survive restart BUILT: the unique index still enforces uniqueness.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ci_a2").await;
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO oc_t2 VALUES (2)")
+        .await
+        .expect_err("post-restart duplicate must violate the rebuilt unique index");
+    assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC: CREATE TABLE then CREATE INDEX on it (was rejected — THE UNBLOCKED COMBO) ─────────────────────────────
+// BEGIN; CREATE TABLE t; INSERT INTO t …; CREATE INDEX ix ON t; COMMIT.
+// The M3 same-txn-created-table reject is LIFTED: the index now builds over the
+// rows the transaction inserted into the freshly created table (resolved at
+// COMMIT against the overlay's `created_tables`, not the committed snapshot). A
+// post-restart duplicate fails 23505 (built + durable + rebuilt BUILT).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_table_then_index_on_it_now_builds() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_t_then_ix_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE oc_ti (id INT NOT NULL, v TEXT)")
+            .await
+            .expect("first op: in-txn create table");
+        client
+            .batch_execute("INSERT INTO oc_ti VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .expect("in-txn rows into the freshly created table");
+        client
+            .batch_execute("CREATE UNIQUE INDEX oc_ti_ix ON oc_ti (id)")
+            .await
+            .expect("CREATE INDEX on a same-txn-created table now accumulates");
+        client
+            .batch_execute("COMMIT")
+            .await
+            .expect("the index builds over the in-txn rows at COMMIT");
+
+        // The index resolves a specific key (it carries the in-txn rows).
+        let row = client
+            .query_one("SELECT v FROM oc_ti WHERE id = 2", &[])
+            .await
+            .expect("index lookup on the same-txn-created table")
+            .get::<_, String>(0);
+        assert_eq!(row, "b");
+        // Uniqueness is enforced against an EXISTING key.
+        let dup = client
+            .batch_execute("INSERT INTO oc_ti VALUES (2, 'dup')")
+            .await
+            .expect_err("re-inserting an existing key must violate the built index");
+        assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+
+        shutdown(running).await;
+    }
+
+    // After restart the table + its rows + the BUILT index all survive; a
+    // post-restart duplicate fails 23505 (rebuilt BUILT, not resurrected
+    // UNBUILT).
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_t_then_ix_a2").await;
+    let rows = running
+        .client
+        .query("SELECT id FROM oc_ti ORDER BY id", &[])
+        .await
+        .expect("rows present after restart");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3], "all in-txn rows survive restart");
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO oc_ti VALUES (3, 'x')")
+        .await
+        .expect_err("post-restart duplicate must violate the rebuilt index");
+    assert_eq!(
+        sqlstate(&dup),
+        "23505",
+        "expected 23505 post-restart, got {dup}"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC #1: two CREATE TABLE accumulate + commit ─────────────────────────────
+// BEGIN; CREATE TABLE a; CREATE TABLE b; COMMIT → both present (self, 2nd conn,
+// restart).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_two_create_table_accumulates_and_commits() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ct_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE oc_first (id INT NOT NULL)")
+            .await
+            .expect("first CREATE TABLE accumulates");
+        client
+            .batch_execute("CREATE TABLE oc_second (id INT NOT NULL)")
+            .await
+            .expect("second CREATE TABLE accumulates (no longer rejected)");
+        client
+            .batch_execute("INSERT INTO oc_first VALUES (10)")
+            .await
+            .expect("insert into the first in-txn table");
+        client
+            .batch_execute("INSERT INTO oc_second VALUES (20)")
+            .await
+            .expect("insert into the second in-txn table");
+        client
+            .batch_execute("COMMIT")
+            .await
+            .expect("both tables commit atomically");
+
+        // Self sees both.
+        for (name, val) in [("oc_first", 10_i32), ("oc_second", 20)] {
+            let got = client
+                .query_one(&format!("SELECT id FROM {name}"), &[])
+                .await
+                .expect("self sees the committed table")
+                .get::<_, i32>(0);
+            assert_eq!(got, val, "{name} carries its row");
+        }
+        // A 2nd connection sees both.
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_acc_two_ct_b").await;
+        for name in ["oc_first", "oc_second"] {
+            client_b
+                .query_one(&format!("SELECT count(*) FROM {name}"), &[])
+                .await
+                .expect("2nd connection sees the committed table");
+        }
+        drop(client_b);
+        let _ = b_handle.await;
+
+        shutdown(running).await;
+    }
+
+    // After restart both survive.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ct_a2").await;
+    for (name, val) in [("oc_first", 10_i32), ("oc_second", 20)] {
+        let got = running
+            .client
+            .query_one(&format!("SELECT id FROM {name}"), &[])
+            .await
+            .expect("committed table present after restart")
+            .get::<_, i32>(0);
+        assert_eq!(got, val, "{name} survives restart with its row");
+    }
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC #2: two CREATE TABLE + ROLLBACK ─────────────────────────────
+// BEGIN; CREATE TABLE a; CREATE TABLE b; ROLLBACK → both gone (self + global +
+// restart-clean, no orphan segment).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_two_create_table_rollback_leaves_nothing() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ct_rb_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE rb_first (id INT NOT NULL)")
+            .await
+            .expect("first CREATE TABLE accumulates");
+        client
+            .batch_execute("CREATE TABLE rb_second (id INT NOT NULL)")
+            .await
+            .expect("second CREATE TABLE accumulates");
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+
+        // Neither table exists for the issuer or the global snapshot.
+        for name in ["rb_first", "rb_second"] {
+            let err = client
+                .query(&format!("SELECT id FROM {name}"), &[])
+                .await
+                .expect_err("rolled-back table absent");
+            assert!(
+                is_undefined_table(&err),
+                "expected 42P01 for {name}, got {err}"
+            );
+            assert!(
+                !running.server.catalog_snapshot().tables.contains_key(name),
+                "global snapshot must not carry {name}",
+            );
+        }
+        // No user-relation segment leaked (no INSERTs, lazy creation).
         assert_eq!(
-            count, 2,
-            "two rows with id=1 coexist: no unique index exists"
+            user_relation_segments(data_dir.path()),
+            Vec::<String>::new(),
+            "ROLLBACK of two CREATE TABLE must not leave a base/<user-oid> segment",
         );
 
         shutdown(running).await;
     }
 
-    // Fresh reopen: the existing table must have NO resurrected UNBUILT unique
-    // index. The corruption symptom is a UNIQUE index in pg_class that does NOT
-    // enforce uniqueness; post-fix there is no index row at all, AND a duplicate
-    // insert still succeeds.
-    let running = start_persistent_server(data_dir.path(), "txddl_oc_crux_a2").await;
+    // After restart neither resurrects.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_two_ct_rb_a2").await;
+    for name in ["rb_first", "rb_second"] {
+        assert!(
+            !running.server.catalog_snapshot().tables.contains_key(name),
+            "rolled-back table {name} must not resurrect after restart",
+        );
+        let err = running
+            .client
+            .query(&format!("SELECT id FROM {name}"), &[])
+            .await
+            .expect_err("rolled-back table absent after restart");
+        assert!(
+            is_undefined_table(&err),
+            "expected 42P01 for {name}, got {err}"
+        );
+    }
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC #4 (THE CRUX — corruption gate) ─────────────────────────────
+// BEGIN; CREATE TABLE t; INSERT duplicate; CREATE UNIQUE INDEX ON t; COMMIT →
+// the deferred build hits a duplicate and fails 23505, rolling back the WHOLE
+// transaction. The table, its rows, and the index are ALL absent (self, 2nd
+// conn, restart). This is the all-or-nothing crux: a later op's build failure
+// undoes the earlier op's CREATE TABLE.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_table_insert_dup_then_unique_index_full_rollback() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    let dup_sqlstate;
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_crux_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE crux_t (id INT NOT NULL)")
+            .await
+            .expect("in-txn create table");
+        client
+            .batch_execute("INSERT INTO crux_t VALUES (1), (1)")
+            .await
+            .expect("duplicate inserts succeed in-txn (index not yet built)");
+        client
+            .batch_execute("CREATE UNIQUE INDEX crux_ix ON crux_t (id)")
+            .await
+            .expect("CREATE INDEX accumulates (build deferred to COMMIT)");
+
+        let err = client
+            .batch_execute("COMMIT")
+            .await
+            .expect_err("COMMIT must fail when the deferred unique build hits a duplicate");
+        dup_sqlstate = sqlstate(&err);
+        assert_eq!(
+            dup_sqlstate, "23505",
+            "expected 23505 at COMMIT build, got {err}"
+        );
+
+        // FULL rollback: the table created EARLIER in the same txn is also gone.
+        let err = client
+            .query("SELECT id FROM crux_t", &[])
+            .await
+            .expect_err("the CREATE TABLE must be undone by the later build failure");
+        assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("crux_t"),
+            "global snapshot must not carry the aborted table",
+        );
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .indexes
+                .contains_key("crux_ix"),
+            "global snapshot must not carry the aborted index",
+        );
+
+        // A 2nd connection never saw any of it.
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_acc_crux_b").await;
+        let err = client_b
+            .query("SELECT id FROM crux_t", &[])
+            .await
+            .expect_err("2nd connection must not see the aborted table");
+        assert!(is_undefined_table(&err), "expected 42P01 for B, got {err}");
+        drop(client_b);
+        let _ = b_handle.await;
+
+        shutdown(running).await;
+    }
+    assert_eq!(dup_sqlstate, "23505");
+
+    // After restart nothing resurrects — no table row and no UNBUILT index row.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_crux_a2").await;
     let client = &running.client;
-    // No durable pg_class row for the never-committed index.
-    let idx_rows = client
-        .query_one(
-            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'oc_ix'",
-            &[],
-        )
-        .await
-        .expect("pg_class probe")
-        .get::<_, i64>(0);
-    assert_eq!(
-        idx_rows, 0,
-        "no UNBUILT index row may resurrect for the rejected-second-statement txn",
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("crux_t"),
+        "the aborted table must not resurrect after restart",
     );
     assert!(
         !running
             .server
             .catalog_snapshot()
             .indexes
-            .contains_key("oc_ix"),
-        "no index must resurrect in the catalog snapshot after restart",
+            .contains_key("crux_ix"),
+        "the aborted index must not resurrect after restart",
     );
-    // The existing table's data is intact and unprotected by any index: a
-    // duplicate of an existing key is ACCEPTED (pre-fix the resurrected UNBUILT
-    // "unique" index silently allowed this too, but its mere existence as an
-    // unenforced UNIQUE index in pg_class was the corruption — gated above).
-    client
-        .batch_execute("INSERT INTO oc_existing VALUES (2)")
+    let table_rows = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'crux_t' AND relkind = 'r'",
+            &[],
+        )
         .await
-        .expect("duplicate accepted post-restart: existing table has no index");
-    let count = client
-        .query_one("SELECT count(*) FROM oc_existing WHERE id = 2", &[])
-        .await
-        .expect("count id=2")
+        .expect("pg_class table probe")
         .get::<_, i64>(0);
     assert_eq!(
-        count, 2,
-        "two rows with id=2 coexist: no unique index was committed",
+        table_rows, 0,
+        "no durable pg_class row for the aborted table"
     );
+    let idx_rows = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'crux_ix'",
+            &[],
+        )
+        .await
+        .expect("pg_class index probe")
+        .get::<_, i64>(0);
+    assert_eq!(idx_rows, 0, "no durable pg_class row for the aborted index");
     shutdown(running).await;
 }
 
-// ───────────────────────────── OC #2 (corruption gate) ─────────────────────────────
-// BEGIN; CREATE INDEX a ON t1; CREATE INDEX b ON t2; COMMIT.
-// The second CREATE INDEX is rejected 0A000 → block Failed (25P02). After
-// ROLLBACK neither index exists.
+// ───────────────────────────── ACC #5: crash mid-multi-op does not resurrect ─────────────────────────────
+// BEGIN; CREATE TABLE a; CREATE TABLE b; CREATE INDEX on b; <crash, no COMMIT>.
+// Nothing resurrects after restart — and no UNBUILT pg_class index row survives.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_txn_two_create_index_rejects_second() {
+async fn crash_mid_multi_op_in_txn_ddl_does_not_resurrect() {
     let data_dir = tempfile::TempDir::new().unwrap();
-    let running = start_persistent_server(data_dir.path(), "txddl_oc_two_ci").await;
-    let client = &running.client;
+    make_data_dir_private(data_dir.path());
 
-    client
-        .batch_execute("CREATE TABLE oc_t1 (id INT NOT NULL)")
-        .await
-        .expect("create t1");
-    client
-        .batch_execute("CREATE TABLE oc_t2 (id INT NOT NULL)")
-        .await
-        .expect("create t2");
-    client
-        .batch_execute("INSERT INTO oc_t1 VALUES (1), (2)")
-        .await
-        .expect("seed t1");
-    client
-        .batch_execute("INSERT INTO oc_t2 VALUES (1), (2)")
-        .await
-        .expect("seed t2");
-
-    client.batch_execute("BEGIN").await.expect("begin");
-    client
-        .batch_execute("CREATE INDEX oc_a ON oc_t1 (id)")
-        .await
-        .expect("first in-txn CREATE INDEX stages the overlay");
-    let err = client
-        .batch_execute("CREATE INDEX oc_b ON oc_t2 (id)")
-        .await
-        .expect_err("a second in-txn CREATE INDEX must be rejected");
-    assert_eq!(
-        sqlstate(&err),
-        "0A000",
-        "second in-txn CREATE INDEX must be feature_not_supported, got {err}"
-    );
-    let in_failed = client
-        .batch_execute("SELECT 1")
-        .await
-        .expect_err("statement after the rejected second CREATE INDEX must be 25P02");
-    assert_eq!(
-        sqlstate(&in_failed),
-        "25P02",
-        "in-failed-block must be in_failed_sql_transaction, got {in_failed}"
-    );
-    client.batch_execute("ROLLBACK").await.expect("rollback");
-
-    // Neither index reached the global snapshot (the whole txn rolled back).
-    for ix in ["oc_a", "oc_b"] {
-        assert!(
-            !running.server.catalog_snapshot().indexes.contains_key(ix),
-            "rolled-back index {ix} must not be in the snapshot",
-        );
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_crash_a").await;
+        let client = &running.client;
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE crash_a (id INT NOT NULL)")
+            .await
+            .expect("first create table");
+        client
+            .batch_execute("CREATE TABLE crash_b (id INT NOT NULL)")
+            .await
+            .expect("second create table");
+        client
+            .batch_execute("INSERT INTO crash_b VALUES (1), (2)")
+            .await
+            .expect("rows into crash_b");
+        client
+            .batch_execute("CREATE INDEX crash_b_ix ON crash_b (id)")
+            .await
+            .expect("create index accumulates (deferred build)");
+        // Drop without COMMIT/ROLLBACK — the user xid has no commit marker.
+        shutdown(running).await;
     }
 
-    shutdown(running).await;
-}
-
-// ───────────────────────────── OC #3 (regression) ─────────────────────────────
-// BEGIN; CREATE TABLE t; CREATE INDEX ix ON t; … — already rejected (the
-// same-txn-created-table scope boundary, M3 #7). Confirm it STILL rejects with
-// the overlay-clobber guard in place (the more specific same-table reject must
-// win — and either way the block goes Failed).
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_txn_create_table_then_index_on_it_still_rejected() {
-    let data_dir = tempfile::TempDir::new().unwrap();
-    let running = start_persistent_server(data_dir.path(), "txddl_oc_t_then_ix").await;
+    // Restart: nothing resurrects.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_crash_a2").await;
     let client = &running.client;
-
-    client.batch_execute("BEGIN").await.expect("begin");
-    client
-        .batch_execute("CREATE TABLE oc_ti (id INT NOT NULL)")
-        .await
-        .expect("first op: in-txn create table");
-    let err = client
-        .batch_execute("CREATE INDEX oc_ti_ix ON oc_ti (id)")
-        .await
-        .expect_err("CREATE INDEX on a same-txn-created table must be rejected");
-    assert_eq!(
-        sqlstate(&err),
-        "0A000",
-        "table+index combo must be feature_not_supported, got {err}"
-    );
-    let in_failed = client
-        .batch_execute("SELECT 1")
-        .await
-        .expect_err("statement after the rejected DDL must be 25P02");
-    assert_eq!(
-        sqlstate(&in_failed),
-        "25P02",
-        "in-failed-block must be in_failed_sql_transaction, got {in_failed}"
-    );
-    client.batch_execute("ROLLBACK").await.expect("rollback");
-
-    // After rollback neither survives; an autocommit recreate works.
-    let err = client
-        .query("SELECT id FROM oc_ti", &[])
-        .await
-        .expect_err("the rolled-back table must be gone");
-    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
-    client
-        .batch_execute("CREATE TABLE oc_ti (id INT NOT NULL)")
-        .await
-        .expect("autocommit recreate works");
-    client
-        .batch_execute("CREATE INDEX oc_ti_ix ON oc_ti (id)")
-        .await
-        .expect("autocommit CREATE INDEX works");
-
-    shutdown(running).await;
-}
-
-// ───────────────────────────── OC #4 (corruption gate) ─────────────────────────────
-// BEGIN; CREATE TABLE t; CREATE TABLE u; COMMIT.
-// The second CREATE TABLE is rejected 0A000 → block Failed (25P02) — confirming
-// no table-clobber either. After ROLLBACK neither table exists.
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_txn_two_create_table_rejects_second() {
-    let data_dir = tempfile::TempDir::new().unwrap();
-    let running = start_persistent_server(data_dir.path(), "txddl_oc_two_ct").await;
-    let client = &running.client;
-
-    client.batch_execute("BEGIN").await.expect("begin");
-    client
-        .batch_execute("CREATE TABLE oc_first (id INT NOT NULL)")
-        .await
-        .expect("first in-txn CREATE TABLE stages the overlay");
-    let err = client
-        .batch_execute("CREATE TABLE oc_second (id INT NOT NULL)")
-        .await
-        .expect_err("a second in-txn CREATE TABLE must be rejected");
-    assert_eq!(
-        sqlstate(&err),
-        "0A000",
-        "second in-txn CREATE TABLE must be feature_not_supported, got {err}"
-    );
-    let in_failed = client
-        .batch_execute("SELECT 1")
-        .await
-        .expect_err("statement after the rejected second CREATE TABLE must be 25P02");
-    assert_eq!(
-        sqlstate(&in_failed),
-        "25P02",
-        "in-failed-block must be in_failed_sql_transaction, got {in_failed}"
-    );
-    client.batch_execute("ROLLBACK").await.expect("rollback");
-
-    // Neither table exists for the issuer or the global snapshot.
-    for name in ["oc_first", "oc_second"] {
+    for name in ["crash_a", "crash_b"] {
+        assert!(
+            !running.server.catalog_snapshot().tables.contains_key(name),
+            "crash-before-commit table {name} must not resurrect",
+        );
         let err = client
             .query(&format!("SELECT id FROM {name}"), &[])
             .await
-            .expect_err("rolled-back table absent");
+            .expect_err("crash-before-commit table absent after restart");
         assert!(
             is_undefined_table(&err),
             "expected 42P01 for {name}, got {err}"
         );
-        assert!(
-            !running.server.catalog_snapshot().tables.contains_key(name),
-            "global snapshot must not carry {name}",
-        );
     }
-
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .indexes
+            .contains_key("crash_b_ix"),
+        "crash-before-commit index must not resurrect in the snapshot",
+    );
+    // No durable pg_class row for the never-committed index (no UNBUILT leak).
+    let idx_rows = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'crash_b_ix'",
+            &[],
+        )
+        .await
+        .expect("pg_class index probe")
+        .get::<_, i64>(0);
+    assert_eq!(idx_rows, 0, "no UNBUILT pg_class index row may resurrect");
     shutdown(running).await;
 }
 
-// ───────────────────────────── OC #5 (no-regression) ─────────────────────────────
-// The guard fires only on a SECOND schema-changing statement. The single-
-// statement cases still work and BUILD their index:
-//   (a) M2: BEGIN; CREATE TABLE t(id INT PRIMARY KEY); INSERT; COMMIT — the
-//       implicit PK index (one overlay producer, within ONE call) is BUILT, and
-//       a post-restart duplicate fails 23505.
-//   (b) M3: BEGIN; CREATE INDEX ix ON existing; COMMIT — the index is BUILT, and
-//       a post-restart duplicate fails 23505.
+// ───────────────────────────── ACC #6 (PARTIAL-BUILD — corruption gate) ─────────────────────────────
+// BEGIN; CREATE TABLE a (ok); CREATE TABLE b; INSERT dup into b; CREATE UNIQUE
+// INDEX on b; COMMIT → the LATER build fails 23505 → ALL-or-nothing: BOTH a and
+// b are gone (no op commits durably when a subsequent build fails). This proves
+// an earlier, perfectly-valid CREATE TABLE does not half-commit when a later
+// statement's build aborts the transaction.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_partial_build_failure_rolls_back_all_ops() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_acc_partial_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        // (a) A perfectly valid CREATE TABLE — would commit cleanly on its own.
+        client
+            .batch_execute("CREATE TABLE pb_a (id INT NOT NULL)")
+            .await
+            .expect("first table (valid)");
+        client
+            .batch_execute("INSERT INTO pb_a VALUES (100)")
+            .await
+            .expect("row into pb_a");
+        // (b) A second table whose later unique-index build will fail.
+        client
+            .batch_execute("CREATE TABLE pb_b (id INT NOT NULL)")
+            .await
+            .expect("second table");
+        client
+            .batch_execute("INSERT INTO pb_b VALUES (5), (5)")
+            .await
+            .expect("duplicate rows into pb_b");
+        client
+            .batch_execute("CREATE UNIQUE INDEX pb_b_ix ON pb_b (id)")
+            .await
+            .expect("create unique index (build deferred to COMMIT)");
+
+        let err = client
+            .batch_execute("COMMIT")
+            .await
+            .expect_err("COMMIT must fail on the later duplicate build");
+        assert_eq!(sqlstate(&err), "23505", "expected 23505, got {err}");
+
+        // BOTH tables are gone — the valid first one did NOT half-commit.
+        for name in ["pb_a", "pb_b"] {
+            let err = client
+                .query(&format!("SELECT id FROM {name}"), &[])
+                .await
+                .expect_err("all-or-nothing: every op rolls back");
+            assert!(
+                is_undefined_table(&err),
+                "expected 42P01 for {name}, got {err}"
+            );
+            assert!(
+                !running.server.catalog_snapshot().tables.contains_key(name),
+                "global snapshot must not carry {name}",
+            );
+        }
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .indexes
+                .contains_key("pb_b_ix"),
+            "the aborted index must not be in the snapshot",
+        );
+
+        shutdown(running).await;
+    }
+
+    // After restart neither table (and no index) resurrects — the valid first
+    // CREATE TABLE must NOT have committed durably.
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_partial_a2").await;
+    let client = &running.client;
+    for name in ["pb_a", "pb_b"] {
+        assert!(
+            !running.server.catalog_snapshot().tables.contains_key(name),
+            "table {name} must not resurrect after restart",
+        );
+        let count = client
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = '{name}' AND relkind = 'r'"
+                ),
+                &[],
+            )
+            .await
+            .expect("pg_class probe")
+            .get::<_, i64>(0);
+        assert_eq!(count, 0, "no durable pg_class row for aborted table {name}");
+    }
+    let idx_rows = client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pb_b_ix'",
+            &[],
+        )
+        .await
+        .expect("pg_class index probe")
+        .get::<_, i64>(0);
+    assert_eq!(idx_rows, 0, "no durable pg_class row for the aborted index");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── ACC #7: concurrent same-name still serializes ─────────────────────────────
+// Accumulation does not relax the per-name AccessExclusive serialization: two
+// transactions racing to create the same relation still cannot both commit a
+// pg_class row. While A holds the name lock (open txn), B's same-name CREATE
+// fails immediately with 40001; after A commits, B sees the committed table and
+// fails 42P07. (Mirrors Battery #5, re-asserted under the multi-op overlay.)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_name_create_still_serializes_under_accumulation() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_acc_race_a").await;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_acc_race_b").await;
+    let client_a = &running.client;
+
+    // A opens a multi-op transaction and creates `race_one` (taking the name
+    // lock on `race_dup`'s precursor) then the contended `race_dup`.
+    client_a.batch_execute("BEGIN").await.expect("A begin");
+    client_a
+        .batch_execute("CREATE TABLE race_one (id INT NOT NULL)")
+        .await
+        .expect("A first table accumulates");
+    client_a
+        .batch_execute("CREATE TABLE race_dup (id INT NOT NULL)")
+        .await
+        .expect("A creates the contended name, holding its AccessExclusive lock");
+
+    // While A's transaction is open, B's same-name autocommit CREATE fails
+    // immediately with a retryable serialization error (40001) — the lock is
+    // non-blocking.
+    let err = client_b
+        .batch_execute("CREATE TABLE race_dup (id INT NOT NULL)")
+        .await
+        .expect_err("B's same-name CREATE must not block; it fails 40001 while A holds the lock");
+    assert_eq!(
+        sqlstate(&err),
+        "40001",
+        "expected serialization_failure while A holds the name lock, got {err}"
+    );
+
+    // A commits, releasing the lock and publishing both tables.
+    client_a.batch_execute("COMMIT").await.expect("A commit");
+
+    // Now B sees A's committed `race_dup` and fails with already-exists (42P07).
+    let err = client_b
+        .batch_execute("CREATE TABLE race_dup (id INT NOT NULL)")
+        .await
+        .expect_err("after A commits, B's same-name CREATE must fail 42P07");
+    assert_eq!(
+        sqlstate(&err),
+        "42P07",
+        "expected duplicate_table after A committed, got {err}"
+    );
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ───────────────────────────── No-regression: single schema statement still builds ─────────────────────────────
+// The single-statement cases still BUILD their index (one overlay producer):
+//   (a) M2: BEGIN; CREATE TABLE t(id INT PRIMARY KEY); INSERT; COMMIT.
+//   (b) M3: BEGIN; CREATE INDEX ix ON existing; COMMIT.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_schema_statement_per_txn_still_builds_index() {
@@ -3026,9 +3438,7 @@ async fn single_schema_statement_per_txn_still_builds_index() {
         let running = start_persistent_server(data_dir.path(), "txddl_oc_single_a").await;
         let client = &running.client;
 
-        // (a) Within-ONE-statement CREATE TABLE … PRIMARY KEY (the implicit
-        //     index is a single overlay producer in one execute_create_table
-        //     call — the guard must NOT trip on it).
+        // (a) Within-ONE-statement CREATE TABLE … PRIMARY KEY.
         client.batch_execute("BEGIN").await.expect("begin a");
         client
             .batch_execute("CREATE TABLE oc_pk (id INT PRIMARY KEY)")

@@ -87,26 +87,11 @@ where
             }
             _ => None,
         };
-        // Overlay-clobber guard (milestones 1–3): the session catalog overlay
-        // (`pending_catalog_ddl`) holds ONE schema-changing statement's staged
-        // rows. A SECOND in-txn DDL statement here would overwrite the overlay
-        // below (`extra_indexes: Vec::new()`), discarding the first statement's
-        // staged (UNBUILT) index — which then reaches durable commit unbuilt: a
-        // silently-unenforced index, forever. Reject the second statement with
-        // `0A000` BEFORE any durable persist (no pg_class / pg_index rows) and
-        // BEFORE the name lock or overlay is touched, so the first statement's
-        // overlay is preserved intact for a subsequent ROLLBACK/COMMIT. The
-        // within-ONE-statement case (a `CREATE TABLE … PRIMARY KEY` staging its
-        // implicit index in this single call) is unaffected: the overlay is
-        // still `None` on entry.
-        if in_txn_xid.is_some() && self.pending_catalog_ddl.is_some() {
-            return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
-                "a second schema-changing statement inside an explicit transaction is not yet \
-                 supported\nHINT:  only one schema-changing statement is supported per \
-                 transaction so far; commit and start a new transaction"
-                    .to_string(),
-            )));
-        }
+        // Transactional-DDL multi-statement accumulation: a SECOND (or later)
+        // in-txn `CREATE TABLE` no longer clobbers the overlay — it APPENDS its
+        // table / indexes / constraints / staged side effects to the existing
+        // overlay below (`get_or_insert_with` + `push`/`extend`). All the
+        // accumulated statements commit atomically or roll back together.
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
         let table_key = ultrasql_catalog::table_lookup_key(namespace, table_name);
@@ -714,15 +699,25 @@ where
                 privilege_default_grants_before: before_default_grants,
                 privileges_changed: grants_changed,
             };
-            self.pending_catalog_ddl = Some(super::super::catalog_overlay::CatalogOverlay {
-                xid: user_xid,
-                table: Some(entry.clone()),
-                indexes: created_unique_indexes,
-                constraints: persistent_constraint_rows,
-                extra_indexes: Vec::new(),
-                extra_index_constraints: Vec::new(),
-                staged: Some(staged),
+            // Accumulate into the (possibly pre-existing) overlay rather than
+            // overwrite it: a `BEGIN; CREATE TABLE a; CREATE TABLE b; …` stages
+            // both tables in one overlay, all riding the one user xid.
+            let overlay = self.pending_catalog_ddl.get_or_insert_with(|| {
+                super::super::catalog_overlay::CatalogOverlay {
+                    xid: user_xid,
+                    created_tables: Vec::new(),
+                    indexes: Vec::new(),
+                    constraints: Vec::new(),
+                    extra_indexes: Vec::new(),
+                    extra_index_constraints: Vec::new(),
+                    staged: Vec::new(),
+                }
             });
+            debug_assert_eq!(overlay.xid, user_xid);
+            overlay.created_tables.push(entry.clone());
+            overlay.indexes.extend(created_unique_indexes);
+            overlay.constraints.extend(persistent_constraint_rows);
+            overlay.staged.push(staged);
             // Mark the new table modified so `commit_transaction`'s
             // `modified_tables` is non-empty → a durable commit marker is
             // written, making the user-xid catalog rows visible after restart.

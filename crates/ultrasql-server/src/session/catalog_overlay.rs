@@ -18,7 +18,9 @@
 //!
 //! On `COMMIT` the overlay is merged into the global catalog with a single
 //! `rebuild_snapshot()` publish; on `ROLLBACK` it is discarded and the
-//! staged (non-MVCC) in-memory side effects are reverted.
+//! staged (non-MVCC) in-memory side effects are reverted. Multiple in-txn
+//! `CREATE TABLE` / `CREATE INDEX` statements ACCUMULATE in one overlay and
+//! commit atomically or roll back together.
 
 use std::sync::Arc;
 
@@ -40,42 +42,44 @@ use crate::{TableRowSecurity, TableRuntimeConstraints};
 /// A session-local, transaction-scoped record of the in-progress
 /// transactional-DDL catalog effects for one transaction.
 ///
-/// Milestone 1/2 stages a single created table per overlay (a `BEGIN; CREATE
-/// TABLE t; CREATE TABLE u` second statement is rejected — see
-/// [`crate::session`]'s in-txn create-table guard).
+/// The overlay ACCUMULATES multiple schema-changing statements issued inside
+/// one explicit `BEGIN … COMMIT`: every in-txn `CREATE TABLE` appends to
+/// `created_tables` (with its implicit constraint indexes / rows folded into
+/// `indexes` / `constraints`), and every in-txn `CREATE INDEX` appends to
+/// `extra_indexes` (and `extra_index_constraints`). They all commit atomically
+/// (a single COMMIT publish) or roll back together (the durable rows ride the
+/// one user xid; a failed deferred build aborts the whole transaction).
 ///
-/// Milestone 3 (transactional `CREATE INDEX` on an EXISTING table) reuses the
-/// same overlay with `table == None`: the target table is already in the
-/// global catalog, so only the new index's [`IndexEntry`] (and any unique
-/// `pg_constraint` row) is staged, in `extra_indexes` / `extra_index_constraints`.
-/// An overlay can therefore carry a created table, one-or-more extra indexes on
-/// existing tables, or both (the same-txn table+index combo is deferred to a
-/// follow-up and rejected for now).
+/// An `extra_index` may target a table created EARLIER in the same transaction
+/// (resolved at COMMIT against `created_tables`) or one already committed in
+/// the global catalog — both are supported.
 pub(crate) struct CatalogOverlay {
     /// The transaction this overlay belongs to. Cross-checked against the
     /// active transaction's xid before the overlay is read, so a stale
     /// overlay can never leak into a different transaction.
     pub(crate) xid: Xid,
-    /// The created table, if this overlay stages an in-txn `CREATE TABLE`.
-    /// `None` for a pure `CREATE INDEX` overlay (the target table is already
-    /// committed in the global catalog).
-    pub(crate) table: Option<TableEntry>,
-    /// Implicit unique / primary-key indexes created with the table.
+    /// Tables created in-txn by `CREATE TABLE`, in issue order. Empty for an
+    /// overlay that stages only `CREATE INDEX` over already-committed tables.
+    pub(crate) created_tables: Vec<TableEntry>,
+    /// Implicit unique / primary-key indexes created with the tables in
+    /// `created_tables` (each carries its parent's `table_oid`).
     pub(crate) indexes: Vec<IndexEntry>,
-    /// `pg_constraint` rows for the created table (unique / PK / check / FK /
+    /// `pg_constraint` rows for the created tables (unique / PK / check / FK /
     /// exclusion).
     pub(crate) constraints: Vec<ConstraintRow>,
-    /// Indexes created in-txn over an EXISTING table (milestone 3 `CREATE
-    /// INDEX`). Staged UNBUILT (`root_block == INVALID`) and built at COMMIT
-    /// by [`Session::build_pending_catalog_ddl_indexes`], identically to the
-    /// implicit constraint indexes in `indexes`.
+    /// Indexes created in-txn by `CREATE INDEX` over a target table — either an
+    /// EXISTING (committed) table or one created earlier in the same
+    /// transaction (milestone 3). Staged UNBUILT (`root_block == INVALID`) and
+    /// built at COMMIT by [`Session::build_pending_catalog_ddl_indexes`],
+    /// identically to the implicit constraint indexes in `indexes`.
     pub(crate) extra_indexes: Vec<IndexEntry>,
-    /// `pg_constraint` rows for a `CREATE UNIQUE INDEX` over an existing table.
+    /// `pg_constraint` rows for a `CREATE UNIQUE INDEX` over a target table.
     pub(crate) extra_index_constraints: Vec<ConstraintRow>,
-    /// Staged in-memory side effects of an in-txn `CREATE TABLE` to apply at
-    /// COMMIT-merge and revert at ROLLBACK. `None` for a pure `CREATE INDEX`
-    /// overlay, which stages no non-MVCC in-memory side map.
-    pub(crate) staged: Option<StagedSideEffects>,
+    /// Staged in-memory side effects of each in-txn `CREATE TABLE`, in issue
+    /// order, to apply at COMMIT-merge and revert at ROLLBACK. Empty for an
+    /// overlay that stages only `CREATE INDEX` (which stages no non-MVCC
+    /// in-memory side map).
+    pub(crate) staged: Vec<StagedSideEffects>,
 }
 
 /// Non-MVCC, in-memory side effects of a `CREATE TABLE` that were applied
@@ -137,7 +141,7 @@ where
             return base;
         }
         Arc::new(base.with_overlay(
-            overlay.table.as_ref(),
+            &overlay.created_tables,
             &overlay.indexes,
             &overlay.constraints,
             &overlay.extra_indexes,
@@ -190,14 +194,16 @@ where
     /// that should never reach here, or an empty overlay) are skipped.
     ///
     /// Milestone 3: the same deferred-build machinery also drives an in-txn
-    /// `CREATE INDEX` on an EXISTING table (`overlay.extra_indexes`). The only
-    /// difference is the source of the table schema/blocks — the implicit
-    /// constraint indexes target the overlay's freshly created `table`, while a
-    /// `CREATE INDEX` targets a table already in the committed snapshot
-    /// (resolved here by `table_oid`). For an existing table `txn.snapshot`
-    /// correctly sees all committed rows PLUS the issuing transaction's own
-    /// writes, so the freshly built tree indexes exactly the rows that COMMIT
-    /// will make durable.
+    /// `CREATE INDEX` (`overlay.extra_indexes`). The only difference is the
+    /// source of the table schema/blocks — the implicit constraint indexes
+    /// target one of the overlay's freshly created tables (resolved by
+    /// `table_oid` against `created_tables`), while a `CREATE INDEX` targets
+    /// either a table created earlier in THIS transaction (resolved against
+    /// `created_tables` first, since it is not yet in the committed snapshot)
+    /// or one already committed (resolved against the snapshot's
+    /// `tables_by_oid`). Either way `txn.snapshot` sees every committed row PLUS
+    /// the issuing transaction's own writes, so the freshly built tree indexes
+    /// exactly the rows that COMMIT will make durable.
     pub(crate) fn build_pending_catalog_ddl_indexes(
         &mut self,
         txn: &Transaction,
@@ -209,40 +215,61 @@ where
             return Ok(());
         };
         // The implicit constraint indexes are plain unique B-trees over the
-        // overlay's freshly created table; gather its schema once.
-        let created_table = overlay.table.clone();
+        // overlay's freshly created tables; gather them once (each index
+        // carries its parent's `table_oid`).
+        let created_tables = overlay.created_tables.clone();
         let mut indexes = std::mem::take(&mut overlay.indexes);
         let mut extra_indexes = std::mem::take(&mut overlay.extra_indexes);
 
         let build_result =
             (|| -> Result<(), ServerError> {
-                if let Some(table) = created_table.as_ref() {
-                    for index in indexes.iter_mut() {
-                        self.build_one_deferred_index(
-                            index,
-                            &table.schema,
-                            RelationId(table.oid),
-                            table.n_blocks,
-                            txn,
-                        )?;
-                    }
+                // Phase 1: implicit constraint indexes over the freshly created
+                // tables. Resolve each index's parent by `table_oid`.
+                for index in indexes.iter_mut() {
+                    let table = created_tables
+                        .iter()
+                        .find(|t| t.oid == index.table_oid)
+                        .ok_or_else(|| {
+                            ServerError::ddl(format!(
+                                "COMMIT index build: parent table for implicit index '{}' \
+                                 not found in overlay",
+                                index.name
+                            ))
+                        })?;
+                    self.build_one_deferred_index(
+                        index,
+                        &table.schema,
+                        RelationId(table.oid),
+                        table.n_blocks,
+                        txn,
+                    )?;
                 }
-                // Milestone 3: each `CREATE INDEX` targets a table already in the
-                // committed snapshot. Resolve its schema by OID (the issuing
-                // transaction never altered it — same-txn-created tables are
-                // rejected by the in-txn CREATE INDEX guard).
+                // Phase 2: each explicit `CREATE INDEX` targets a table either
+                // created earlier in THIS transaction (resolve against the
+                // overlay's in-memory `created_tables` FIRST — it is not yet in
+                // the committed snapshot) or already committed (fall back to the
+                // committed snapshot's `tables_by_oid`).
                 for index in extra_indexes.iter_mut() {
-                    let snapshot = self.state.catalog_snapshot();
-                    let target = snapshot.tables_by_oid.get(&index.table_oid).ok_or_else(|| {
-                    ServerError::ddl(format!(
-                        "COMMIT index build: target table for index '{}' not found in catalog",
-                        index.name
-                    ))
-                })?;
-                    let schema = target.schema.clone();
-                    let table_rel = RelationId(target.oid);
-                    let n_blocks = target.n_blocks;
-                    drop(snapshot);
+                    let (schema, table_rel, n_blocks) =
+                        if let Some(t) = created_tables.iter().find(|t| t.oid == index.table_oid) {
+                            (t.schema.clone(), RelationId(t.oid), t.n_blocks)
+                        } else {
+                            let snapshot = self.state.catalog_snapshot();
+                            let target = snapshot.tables_by_oid.get(&index.table_oid).ok_or_else(
+                                || {
+                                    ServerError::ddl(format!(
+                                        "COMMIT index build: target table for index '{}' not found \
+                                     in catalog",
+                                        index.name
+                                    ))
+                                },
+                            )?;
+                            (
+                                target.schema.clone(),
+                                RelationId(target.oid),
+                                target.n_blocks,
+                            )
+                        };
                     self.build_one_deferred_index(index, &schema, table_rel, n_blocks, txn)?;
                 }
                 Ok(())
@@ -380,10 +407,9 @@ where
             return;
         };
         let catalog = &self.state.persistent_catalog;
-        // An in-txn `CREATE TABLE` overlay publishes the table first; a pure
-        // `CREATE INDEX` overlay (`table == None`) skips this — the target
-        // table is already in the global catalog.
-        if let Some(table) = overlay.table.as_ref() {
+        // Publish every in-txn `CREATE TABLE` first (empty for a pure `CREATE
+        // INDEX` overlay), then their implicit constraint indexes.
+        for table in &overlay.created_tables {
             if let Err(e) = catalog.create_table(table.clone()) {
                 tracing::error!(
                     error = %e,
@@ -392,19 +418,19 @@ where
                      heap rows are durable and will be rebuilt on restart"
                 );
             }
-            for index in &overlay.indexes {
-                if let Err(e) = catalog.create_index(index.clone()) {
-                    tracing::error!(
-                        error = %e,
-                        index = %index.name,
-                        "transactional CREATE TABLE commit: publishing index to global catalog failed"
-                    );
-                }
+        }
+        for index in &overlay.indexes {
+            if let Err(e) = catalog.create_index(index.clone()) {
+                tracing::error!(
+                    error = %e,
+                    index = %index.name,
+                    "transactional CREATE TABLE commit: publishing index to global catalog failed"
+                );
             }
         }
-        // Milestone 3: publish each in-txn `CREATE INDEX` over an existing
-        // table. The entry now carries the real (built) `root_block` from the
-        // deferred build, so it is immediately probe-able.
+        // Milestone 3: publish each in-txn `CREATE INDEX`. The entry now carries
+        // the real (built) `root_block` from the deferred build, so it is
+        // immediately probe-able.
         for index in &overlay.extra_indexes {
             if let Err(e) = catalog.create_index(index.clone()) {
                 tracing::error!(
@@ -421,11 +447,11 @@ where
         constraint_rows.extend(overlay.extra_index_constraints.iter().cloned());
         catalog.install_constraint_rows(constraint_rows);
 
-        // The table is now in the global snapshot, so the metadata sidecars
-        // (deferred at create time) can be written including it. A pure
+        // The tables are now in the global snapshot, so the metadata sidecars
+        // (deferred at create time) can be written including them. A pure
         // `CREATE INDEX` overlay staged no in-memory side maps, so these are
-        // no-ops there (and `staged` is `None`).
-        if overlay.staged.is_some() {
+        // no-ops there (and `staged` is empty).
+        if !overlay.staged.is_empty() {
             if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
                 tracing::error!(error = %e, "transactional CREATE TABLE commit: persist runtime-constraints metadata failed");
             }
@@ -435,8 +461,8 @@ where
         }
         if overlay
             .staged
-            .as_ref()
-            .is_some_and(|staged| staged.privileges_changed)
+            .iter()
+            .any(|staged| staged.privileges_changed)
             && let Err(e) = self.state.persist_privilege_metadata()
         {
             tracing::error!(error = %e, "transactional CREATE TABLE commit: persist privilege metadata failed");
@@ -494,28 +520,44 @@ impl<RW> Session<RW> {
         // A pure `CREATE INDEX` overlay (milestone 3) staged no in-memory side
         // map — the durable unbuilt `pg_index` rows ride the aborted user xid
         // and the segment was never built — so there is nothing to revert here.
-        let Some(staged) = overlay.staged else {
+        if overlay.staged.is_empty() {
             return;
-        };
+        }
 
-        if staged.runtime_constraints.is_some() {
-            self.state.table_constraints.remove(&staged.oid);
-        }
-        match staged.row_security_before {
-            Some(prev) => {
-                self.state.row_security.insert(staged.oid, prev);
+        // Revert each created table's per-OID side maps (runtime constraints,
+        // RLS, time partition). These are independent per table, so order does
+        // not matter.
+        for staged in &overlay.staged {
+            if staged.runtime_constraints.is_some() {
+                self.state.table_constraints.remove(&staged.oid);
             }
-            None => {
-                self.state.row_security.remove(&staged.oid);
+            match &staged.row_security_before {
+                Some(prev) => {
+                    self.state.row_security.insert(staged.oid, Arc::clone(prev));
+                }
+                None => {
+                    self.state.row_security.remove(&staged.oid);
+                }
+            }
+            if staged.time_partition_inserted {
+                self.state.time_partitions.remove(&staged.table_key);
             }
         }
-        if staged.time_partition_inserted {
-            self.state.time_partitions.remove(&staged.table_key);
-        }
-        if staged.privileges_changed {
+
+        // Privileges are a single global catalog, not a per-table side map:
+        // each `CREATE TABLE` mutated it in place on top of the previous one.
+        // The FIRST staged entry's `privilege_*_grants_before` snapshot was
+        // captured before ANY of the accumulated statements ran, so it is the
+        // exact pre-transaction state — restore it ONCE (later entries'
+        // snapshots already reflect earlier statements' grants and would leave
+        // them installed). Only restore if any statement actually changed the
+        // privilege catalog.
+        if overlay.staged.iter().any(|s| s.privileges_changed) {
+            // The first entry exists (the slice is non-empty here).
+            let first = &overlay.staged[0];
             self.state.privilege_catalog.install_snapshot(
-                staged.privilege_grants_before,
-                staged.privilege_default_grants_before,
+                first.privilege_grants_before.clone(),
+                first.privilege_default_grants_before.clone(),
             );
         }
     }

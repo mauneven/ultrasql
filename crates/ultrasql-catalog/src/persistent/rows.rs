@@ -368,25 +368,26 @@ impl CatalogSnapshot {
     /// DashMaps use, so a name resolved through the overlay matches the one
     /// resolved after the change commits.
     ///
-    /// `table` is the in-txn `CREATE TABLE` entry (with its implicit
-    /// constraint `indexes` and `constraints`); it is `None` for a pure
+    /// `tables` are the in-txn `CREATE TABLE` entries (each with its implicit
+    /// constraint `indexes` and `constraints`); the slice is empty for a pure
     /// `CREATE INDEX` overlay where the target table is already committed.
     /// `extra_indexes` / `extra_index_constraints` (milestone 3) overlay an
-    /// in-txn `CREATE INDEX` on an EXISTING table.
+    /// in-txn `CREATE INDEX` on an EXISTING table or one created earlier in the
+    /// same transaction.
     ///
     /// The entries are inserted, never removed: the supported transactional
     /// DDL (`CREATE TABLE`, `CREATE INDEX`) is purely additive.
     #[must_use]
     pub fn with_overlay(
         &self,
-        table: Option<&TableEntry>,
+        tables: &[TableEntry],
         indexes: &[IndexEntry],
         constraints: &[ConstraintRow],
         extra_indexes: &[IndexEntry],
         extra_index_constraints: &[ConstraintRow],
     ) -> Self {
         let mut snap = self.clone();
-        if let Some(table) = table {
+        for table in tables {
             snap.tables.insert(
                 table_lookup_key(&table.schema_name, &table.name),
                 table.clone(),

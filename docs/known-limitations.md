@@ -31,17 +31,21 @@ completed evidence.
   the `COMMIT` with SQLSTATE `23505` and a full rollback (no half-committed schema),
   and a `ROLLBACK` or crash before `COMMIT` builds nothing so no index segment leaks;
   a committed index is re-persisted with its real root so it is built (uniqueness
-  enforced) after restart. **One schema-changing statement per transaction** so far —
-  a second overlay-producing DDL in the same block is rejected `0A000`
-  (multi-statement accumulation is a later milestone). Still rejected (SQLSTATE
+  enforced) after restart. **Multiple schema-changing statements now ACCUMULATE in
+  one transaction** — any sequence of in-txn `CREATE TABLE` / `CREATE INDEX`
+  appends to the one overlay and commits atomically or rolls back together (a
+  duplicate at any deferred build fails the whole `COMMIT` with `23505`; an earlier,
+  valid `CREATE TABLE` does not half-commit). `CREATE INDEX` on a table created
+  EARLIER in the same transaction is now supported (the index builds over the
+  in-txn rows at `COMMIT`). Still rejected (SQLSTATE
   `0A000` + `HINT`, block then `Failed`/`25P02`) inside a transaction: `FOREIGN KEY`,
   `serial`/`IDENTITY`/`DEFAULT nextval`, `CREATE TABLE AS SELECT`, `TEMP`,
   `PARTITION BY`, expression/partial/INCLUDE or non-B-tree `CREATE INDEX`,
-  `CREATE INDEX … CONCURRENTLY`, `CREATE INDEX` on a same-transaction-created table,
+  `CREATE INDEX … CONCURRENTLY`,
   DDL under an active `SAVEPOINT`, and `PREPARE TRANSACTION` over an uncommitted
   in-txn DDL. **All other DDL** (`DROP`, `ALTER`, `GRANT`, `CREATE ROLE`, etc.) is
   still rejected `0A000` inside a transaction; autocommit DDL is unchanged. Later
-  milestones add `DROP`/`ALTER`, multi-statement accumulation, and two-phase commit,
+  milestones add `DROP`/`ALTER` and two-phase commit,
   per [Transactional DDL Design](transactional-ddl-design.md), each behind the
   adversarial battery.
 - Latent catalog-bootstrap corruption vector (crash-recovery durability): even
