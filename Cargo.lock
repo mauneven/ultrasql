@@ -3430,6 +3430,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "ultrasql-core",
+ "ultrasql-mvcc",
  "ultrasql-storage",
 ]
 

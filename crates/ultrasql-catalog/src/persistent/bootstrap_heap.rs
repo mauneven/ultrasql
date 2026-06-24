@@ -36,6 +36,66 @@ impl PersistentCatalog {
         &self,
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
+        // The default (warm-restart-within-a-running-process and unit-test)
+        // entry point scans every normal slot regardless of the writing
+        // transaction's commit status. This is correct for callers that rebuild
+        // the in-memory snapshot after their own committed DDL: there is no
+        // durable-but-uncommitted catalog row mid-session.
+        self.bootstrap_from_heap_with_scan(heap, |rel, blocks| Box::new(heap.scan(rel, blocks)))
+    }
+
+    /// Visibility-filtered catalog bootstrap for crash recovery.
+    ///
+    /// Identical to [`Self::bootstrap_from_heap`] except every catalog heap
+    /// scan applies MVCC visibility against `snapshot`/`oracle`, so a catalog
+    /// row written by a transaction that did **not** commit (aborted, or a
+    /// crash before its commit marker became durable) is skipped — it cannot
+    /// resurrect an uncommitted table/index/constraint/sequence into the
+    /// in-memory catalog.
+    ///
+    /// The caller must rebuild the commit-status oracle (the CLOG, via the
+    /// durable snapshot import plus the WAL commit-status pass and the
+    /// uncommitted→aborted sweep) **before** calling this, and pass a
+    /// "committed-as-of-recovery" `snapshot` — one under which no real
+    /// transaction is in progress (`xmin == xmax`, empty `xip`), so the
+    /// visibility predicate reduces to "the writer is Committed/Frozen per the
+    /// rebuilt oracle". Because the catalog heap is strictly append-only (no
+    /// in-place updates or deletes — every catalog tuple carries an INVALID
+    /// `xmax`), a row is visible iff its `xmin` committed: a committed catalog
+    /// row is *never* hidden, and an uncommitted one is *always* hidden.
+    pub fn bootstrap_from_heap_visible<L, O>(
+        &self,
+        heap: &HeapAccess<L>,
+        snapshot: &ultrasql_mvcc::Snapshot,
+        oracle: &O,
+    ) -> Result<CatalogStats, CatalogError>
+    where
+        L: PageLoader,
+        O: ultrasql_mvcc::XidStatusOracle + ?Sized,
+    {
+        self.bootstrap_from_heap_with_scan(heap, |rel, blocks| {
+            Box::new(heap.scan_visible(rel, blocks, snapshot, oracle))
+        })
+    }
+
+    /// Shared bootstrap body parameterized by how each catalog relation is
+    /// scanned. `scan` yields the relation's tuples in append order (the raw
+    /// path yields every normal slot; the recovery path yields only the
+    /// MVCC-visible ones). Keeping a single body guarantees the raw and
+    /// visibility-filtered paths reconstruct the catalog identically given the
+    /// same set of tuples.
+    fn bootstrap_from_heap_with_scan<L, S, I>(
+        &self,
+        heap: &HeapAccess<L>,
+        scan: S,
+    ) -> Result<CatalogStats, CatalogError>
+    where
+        L: PageLoader,
+        S: Fn(RelationId, u32) -> I,
+        I: Iterator<
+            Item = Result<ultrasql_storage::heap::HeapTuple, ultrasql_storage::heap::HeapError>,
+        >,
+    {
         use crate::encoding::{
             decode_attribute_row, decode_constraint_row, decode_description_row, decode_enum_row,
             decode_index_row, decode_sequence_row, decode_statistic_ext_row, decode_statistic_row,
@@ -95,7 +155,7 @@ impl PersistentCatalog {
         let mut type_rows_by_oid: std::collections::HashMap<Oid, TypeRow> =
             std::collections::HashMap::new();
         if type_blocks > 0 {
-            let type_scan = heap.scan(pg_type_rel, type_blocks);
+            let type_scan = scan(pg_type_rel, type_blocks);
             for result in type_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_type: {e}"))
@@ -113,7 +173,7 @@ impl PersistentCatalog {
         let mut enum_rows_by_type: std::collections::HashMap<Oid, Vec<EnumRow>> =
             std::collections::HashMap::new();
         if enum_blocks > 0 {
-            let enum_scan = heap.scan(pg_enum_rel, enum_blocks);
+            let enum_scan = scan(pg_enum_rel, enum_blocks);
             for result in enum_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_enum: {e}"))
@@ -181,7 +241,7 @@ impl PersistentCatalog {
             std::collections::HashMap::new();
         let mut total_attrs: u32 = 0;
         if attribute_blocks > 0 {
-            let attr_scan = heap.scan(pg_attribute_rel, attribute_blocks);
+            let attr_scan = scan(pg_attribute_rel, attribute_blocks);
             for result in attr_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_attribute: {e}"))
@@ -215,7 +275,7 @@ impl PersistentCatalog {
             std::collections::HashMap::new();
         let mut total_index_rows: u32 = 0;
         if index_blocks > 0 {
-            let index_scan = heap.scan(pg_index_rel, index_blocks);
+            let index_scan = scan(pg_index_rel, index_blocks);
             for result in index_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_index: {e}"))
@@ -239,7 +299,7 @@ impl PersistentCatalog {
             std::collections::HashMap::new();
         let mut total_constraint_rows: u32 = 0;
         if constraint_blocks > 0 {
-            let constraint_scan = heap.scan(pg_constraint_rel, constraint_blocks);
+            let constraint_scan = scan(pg_constraint_rel, constraint_blocks);
             for result in constraint_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_constraint: {e}"))
@@ -257,7 +317,7 @@ impl PersistentCatalog {
         let mut sequence_rows: std::collections::HashMap<Oid, SequenceRow> =
             std::collections::HashMap::new();
         if sequence_blocks > 0 {
-            let sequence_scan = heap.scan(pg_sequence_rel, sequence_blocks);
+            let sequence_scan = scan(pg_sequence_rel, sequence_blocks);
             for result in sequence_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_sequence: {e}"))
@@ -273,7 +333,7 @@ impl PersistentCatalog {
         // latest row per OID before rebuilding tables. This lets ALTER TABLE
         // replacement rows override CREATE-time rows without consuming the
         // attribute set twice.
-        let class_scan = heap.scan(pg_class_rel, class_blocks);
+        let class_scan = scan(pg_class_rel, class_blocks);
         let mut latest_class_by_oid: std::collections::HashMap<Oid, ClassRow> =
             std::collections::HashMap::new();
         for result in class_scan {
@@ -457,7 +517,7 @@ impl PersistentCatalog {
         let mut statistics = initial.statistics;
         let mut total_statistics: u32 = 0;
         if statistic_blocks > 0 {
-            let statistic_scan = heap.scan(pg_statistic_rel, statistic_blocks);
+            let statistic_scan = scan(pg_statistic_rel, statistic_blocks);
             for result in statistic_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_statistic: {e}"))
@@ -478,7 +538,7 @@ impl PersistentCatalog {
         let mut statistic_ext = initial.statistic_ext;
         let mut total_statistic_ext: u32 = 0;
         if statistic_ext_blocks > 0 {
-            let statistic_ext_scan = heap.scan(pg_statistic_ext_rel, statistic_ext_blocks);
+            let statistic_ext_scan = scan(pg_statistic_ext_rel, statistic_ext_blocks);
             for result in statistic_ext_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!(
@@ -502,7 +562,7 @@ impl PersistentCatalog {
         let mut descriptions = initial.descriptions;
         let mut total_description_rows: u32 = 0;
         if description_blocks > 0 {
-            let description_scan = heap.scan(pg_description_rel, description_blocks);
+            let description_scan = scan(pg_description_rel, description_blocks);
             for result in description_scan {
                 let tuple = result.map_err(|e| {
                     CatalogError::schema_conflict(format!("heap scan error on pg_description: {e}"))

@@ -181,43 +181,6 @@ impl Server {
         Ok(())
     }
 
-    pub(crate) fn recover_commit_status_from_wal(&self) -> Result<(), ServerError> {
-        let Some(data_dir) = &self.data_dir else {
-            return Ok(());
-        };
-        let wal_dir = data_dir.join("pg_wal");
-        let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
-        let mut observed_xids = std::collections::BTreeSet::new();
-        ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
-            observed_xids.insert(record.header.xid);
-            self.txn_manager.recover_observed_xid(record.header.xid);
-            match record.header.record_type {
-                RecordType::Commit => {
-                    self.txn_manager.recover_committed(record.header.xid);
-                    // The parent's single Commit record carries the subxids
-                    // that committed atomically with it (released + implicitly
-                    // released-at-commit savepoints). Mark each one Committed so
-                    // the post-replay default-abort sweep below does NOT abort
-                    // them — otherwise a row inserted under a released savepoint
-                    // would have an aborted xmin and vanish on restart.
-                    if let Ok(payload) = CommitPayload::decode(&record.payload) {
-                        for subxid in payload.committed_subxids {
-                            self.txn_manager.recover_committed(subxid);
-                        }
-                    }
-                }
-                RecordType::Abort => self.txn_manager.recover_aborted(record.header.xid),
-                _ => {}
-            }
-            Ok(())
-        })
-        .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))?;
-        for xid in observed_xids {
-            self.txn_manager.recover_uncommitted_as_aborted(xid);
-        }
-        Ok(())
-    }
-
     pub(crate) fn rebuild_persistent_index_sidecars(
         &self,
         recovered_lsn: Lsn,
@@ -601,4 +564,54 @@ impl Server {
         )?;
         Ok((brin, rows))
     }
+}
+
+/// Rebuild the commit-status oracle (CLOG) of `txn_manager` by scanning the WAL
+/// under `data_dir`.
+///
+/// This is the authoritative crash-recovery pass: it marks every WAL-observed
+/// transaction Committed / Aborted from its terminal record, then sweeps every
+/// observed-but-unresolved XID to Aborted. It depends on **nothing** but the
+/// transaction manager and the data directory, so it can run against a bare
+/// [`TransactionManager`] **before** the `Server` and its catalog are
+/// assembled — which is required so the catalog bootstrap can scan the heap
+/// with a fully-populated commit-status oracle and skip uncommitted DDL rows.
+///
+/// Idempotent: re-running it (e.g. the `&self` wrapper after `Server`
+/// construction) only re-asserts the same terminal statuses.
+pub(crate) fn rebuild_commit_status_from_wal(
+    txn_manager: &TransactionManager,
+    data_dir: &Path,
+) -> Result<(), ServerError> {
+    let wal_dir = data_dir.join("pg_wal");
+    let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+    let mut observed_xids = std::collections::BTreeSet::new();
+    ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
+        observed_xids.insert(record.header.xid);
+        txn_manager.recover_observed_xid(record.header.xid);
+        match record.header.record_type {
+            RecordType::Commit => {
+                txn_manager.recover_committed(record.header.xid);
+                // The parent's single Commit record carries the subxids
+                // that committed atomically with it (released + implicitly
+                // released-at-commit savepoints). Mark each one Committed so
+                // the post-replay default-abort sweep below does NOT abort
+                // them — otherwise a row inserted under a released savepoint
+                // would have an aborted xmin and vanish on restart.
+                if let Ok(payload) = CommitPayload::decode(&record.payload) {
+                    for subxid in payload.committed_subxids {
+                        txn_manager.recover_committed(subxid);
+                    }
+                }
+            }
+            RecordType::Abort => txn_manager.recover_aborted(record.header.xid),
+            _ => {}
+        }
+        Ok(())
+    })
+    .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))?;
+    for xid in observed_xids {
+        txn_manager.recover_uncommitted_as_aborted(xid);
+    }
+    Ok(())
 }

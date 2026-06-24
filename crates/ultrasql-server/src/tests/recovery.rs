@@ -778,3 +778,145 @@ fn checkpoint_keeps_an_in_progress_transactions_segment() {
         long_first_lsn.raw()
     );
 }
+
+/// Crash-mid-DDL catalog corruption vector.
+///
+/// A DDL writes its `pg_class` / `pg_attribute` catalog rows under a
+/// self-committing `ddl_txn`, then appends the txn's commit marker. If the
+/// process crashes between the catalog rows becoming durable (WAL-applied) and
+/// the commit marker becoming durable, restart replays the rows into the heap
+/// but the `ddl_txn` ends up Aborted (no commit record). A catalog bootstrap
+/// that scans the heap WITHOUT a visibility filter would resurrect the
+/// uncommitted table as live schema — a durability corruption.
+///
+/// This test stages exactly that state: `t_keep` is persisted under a
+/// committed `ddl_txn` (durable commit marker), while `t_ghost` is persisted
+/// under a `ddl_txn` that is never committed or aborted (its commit marker
+/// never reaches the WAL — the crash-before-commit window). A checkpoint forces
+/// both relations' catalog rows durable. On reopen, the rebuilt CLOG marks the
+/// ghost xid Aborted and the visibility-filtered bootstrap drops its rows.
+///
+/// Pre-fix (raw `bootstrap_from_heap`, CLOG rebuilt after bootstrap) `t_ghost`
+/// RESURRECTS and this assertion fails; post-fix it stays gone while `t_keep`
+/// (committed) survives — proving the fix neither under- nor over-filters.
+#[test]
+fn uncommitted_ddl_catalog_rows_do_not_resurrect_after_restart() {
+    use ultrasql_catalog::{Catalog, MutableCatalog, PersistentCatalog, TableEntry};
+    use ultrasql_core::{DataType, Field, Schema};
+    use ultrasql_txn::IsolationLevel;
+
+    fn user_table(catalog: &PersistentCatalog, name: &str) -> TableEntry {
+        let oid = catalog.next_oid();
+        let schema = Schema::new(vec![
+            Field {
+                name: "id".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "label".into(),
+                data_type: DataType::Text { max_len: None },
+                nullable: true,
+            },
+        ])
+        .expect("schema");
+        TableEntry::new(oid, name.to_owned(), "public".to_owned(), schema)
+    }
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let ghost_xid;
+    let keep_xid;
+    {
+        let server = Server::init(data_dir.path()).unwrap();
+
+        // `t_keep`: a normally-committed DDL. Persist its catalog rows under a
+        // ddl_txn, then commit with a durable commit marker — exactly the
+        // surviving half of a real CREATE TABLE.
+        let keep_entry = user_table(server.persistent_catalog.as_ref(), "t_keep");
+        let keep_txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+        keep_xid = keep_txn.xid;
+        server
+            .persistent_catalog
+            .persist_table_rows(
+                &keep_entry,
+                server.heap.as_ref(),
+                keep_xid,
+                keep_txn.current_command,
+            )
+            .expect("persist t_keep catalog rows");
+        server
+            .persistent_catalog
+            .create_table(keep_entry)
+            .expect("in-memory create t_keep");
+        server
+            .commit_transaction(keep_txn, true, "t_keep ddl_txn")
+            .expect("commit t_keep");
+
+        // `t_ghost`: the crash-before-commit window. Persist its catalog rows
+        // (WAL-logged, so they replay on restart) under a ddl_txn that is NEVER
+        // committed and NEVER aborted — no terminal WAL record for `ghost_xid`.
+        let ghost_entry = user_table(server.persistent_catalog.as_ref(), "t_ghost");
+        let ghost_txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+        ghost_xid = ghost_txn.xid;
+        server
+            .persistent_catalog
+            .persist_table_rows(
+                &ghost_entry,
+                server.heap.as_ref(),
+                ghost_xid,
+                ghost_txn.current_command,
+            )
+            .expect("persist t_ghost catalog rows");
+        // Intentionally drop `ghost_txn` without commit/abort: a `Transaction`
+        // has no auto-abort Drop, so no Commit/Abort record is written.
+        drop(ghost_txn);
+
+        // Force every catalog heap row durable (WAL flushed + pages fsynced) so
+        // both tables' rows survive the restart. The ghost txn is still
+        // InProgress, so the checkpoint's CLOG snapshot (terminal entries only)
+        // does not record it.
+        checkpoint_with_retry(&server);
+    }
+
+    // Reopen from the same data dir: WAL replay re-inserts both tables' catalog
+    // rows; the rebuilt CLOG marks `ghost_xid` Aborted; the visibility-filtered
+    // bootstrap keeps the committed `t_keep` and drops the uncommitted
+    // `t_ghost`.
+    let reopened = Server::init(data_dir.path()).unwrap();
+
+    assert_eq!(
+        reopened.txn_manager.status(keep_xid),
+        XidStatus::Committed,
+        "the committed DDL txn must be Committed after restart"
+    );
+    assert_eq!(
+        reopened.txn_manager.status(ghost_xid),
+        XidStatus::Aborted,
+        "the never-committed DDL txn must be swept to Aborted after restart"
+    );
+
+    let snapshot = reopened.catalog_snapshot();
+    assert!(
+        snapshot.tables.contains_key("t_keep"),
+        "a committed CREATE TABLE must survive restart (no over-filtering)"
+    );
+    assert!(
+        !snapshot.tables.contains_key("t_ghost"),
+        "an uncommitted (crash-before-commit) CREATE TABLE must NOT resurrect \
+         after restart — this is the catalog-bootstrap corruption vector"
+    );
+    assert!(
+        reopened
+            .persistent_catalog
+            .lookup_table("t_ghost")
+            .is_none(),
+        "the uncommitted table must be absent from the persistent catalog too"
+    );
+    assert!(
+        reopened.persistent_catalog.lookup_table("t_keep").is_some(),
+        "the committed table must be present in the persistent catalog"
+    );
+}

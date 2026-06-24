@@ -416,17 +416,23 @@ impl Server {
             ultrasql_storage::CheckpointerConfig::default(),
         ));
 
-        let persistent_catalog = Arc::new(PersistentCatalog::new());
-        let stats = require_wal_backed_catalog_bootstrap(
-            persistent_catalog.bootstrap_from_heap(heap.as_ref()),
-        )?;
-        tracing::info!(?stats, "persistent catalog bootstrapped (WAL-backed)");
-
-        let mut catalog = InMemoryCatalog::new();
-        let tables = build_sample_database(&mut catalog);
+        // Build the transaction manager and rebuild its commit-status oracle
+        // (the CLOG) BEFORE the catalog bootstrap. A naive catalog bootstrap
+        // reads the newest heap row per catalog OID regardless of whether the
+        // writing `ddl_txn` committed: a crash between a DDL's catalog rows
+        // becoming durable (WAL-applied) and its commit marker becoming durable
+        // leaves those rows on disk with the `ddl_txn` unresolved, and a raw
+        // scan would resurrect the uncommitted table/index/sequence as live
+        // schema. To prevent that the bootstrap must scan with a fully
+        // reconstructed commit-status oracle and skip rows whose writer did not
+        // commit — so the oracle has to exist first.
         let ssi = Arc::new(SsiManager::new());
         let txn_manager = Arc::new(TransactionManager::new_with_ssi(ssi));
-        let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
+
+        // 2PC recovery seeds prepared (still-InProgress) XIDs into the CLOG
+        // before the commit-status rebuild's uncommitted->aborted sweep, so a
+        // prepared transaction is not wrongly swept to Aborted. A prepared (not
+        // yet committed) DDL is correctly invisible to the bootstrap snapshot.
         let two_phase_dir = data_dir.join("pg_twophase");
         std::fs::create_dir_all(&two_phase_dir).map_err(ServerError::Io)?;
         let two_phase_coord = ultrasql_txn::two_phase::TwoPhaseCoordinator::new(two_phase_dir);
@@ -457,6 +463,69 @@ impl Server {
             "2PC state recovery complete"
         );
         let two_phase = Arc::new(two_phase_coord);
+
+        // Restore the commit log from a durable snapshot before scanning the
+        // WAL, so transactions whose Commit/Abort records were recycled keep
+        // their status. Used only if it decodes cleanly AND its snapshot LSN is
+        // within the durable WAL end (a snapshot ahead of the recovered WAL
+        // would assert statuses for records that did not survive). The
+        // commit-status WAL scan below then runs idempotently on top (retained
+        // WAL is authoritative; import seeds only the truncated tail).
+        if let Some(bytes) = read_clog_snapshot(data_dir) {
+            match decode_clog_snapshot(&bytes) {
+                Ok((snapshot_lsn, next_xid, entries)) if snapshot_lsn <= recovered_lsn => {
+                    txn_manager.import_clog(next_xid, &entries);
+                }
+                Ok((snapshot_lsn, _, _)) => tracing::warn!(
+                    snapshot_lsn = snapshot_lsn.raw(),
+                    recovered_lsn = recovered_lsn.raw(),
+                    "commit-log snapshot ahead of recovered WAL; ignoring"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "commit-log snapshot unreadable; full WAL commit-status rebuild"
+                ),
+            }
+        }
+        // The authoritative commit-status pass: mark Commit/Abort from the
+        // retained WAL, then sweep every observed-but-unresolved XID to Aborted.
+        // After this the CLOG reports exactly the committed-as-of-recovery set.
+        crate::server_recovery_rebuild::rebuild_commit_status_from_wal(
+            txn_manager.as_ref(),
+            data_dir,
+        )?;
+
+        // Bootstrap snapshot: a "committed-as-of-recovery" snapshot under which
+        // NO real transaction is in progress (`xmin == xmax == next_xid`, empty
+        // `xip`, `current_xid` a sentinel above every observed XID). Combined
+        // with the rebuilt oracle, the visibility predicate reduces — for the
+        // strictly append-only catalog heap (every tuple has an INVALID `xmax`)
+        // — to "the writer committed". A committed catalog row is therefore
+        // never hidden; an aborted / never-committed one is always hidden.
+        let bootstrap_xid = txn_manager.next_xid();
+        let bootstrap_snapshot = ultrasql_mvcc::Snapshot::new(
+            bootstrap_xid,
+            bootstrap_xid,
+            bootstrap_xid,
+            ultrasql_core::CommandId::FIRST,
+            std::iter::empty(),
+        );
+
+        let persistent_catalog = Arc::new(PersistentCatalog::new());
+        let stats =
+            require_wal_backed_catalog_bootstrap(persistent_catalog.bootstrap_from_heap_visible(
+                heap.as_ref(),
+                &bootstrap_snapshot,
+                txn_manager.as_ref(),
+            ))?;
+        tracing::info!(
+            ?stats,
+            "persistent catalog bootstrapped (WAL-backed, visibility-filtered)"
+        );
+
+        let mut catalog = InMemoryCatalog::new();
+        let tables = build_sample_database(&mut catalog);
+        let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
 
         let server = Self {
             catalog,
@@ -508,32 +577,12 @@ impl Server {
             wal_buffer_sink: Some(buffer_sink),
             wal_dir: Some(wal_dir.clone()),
         };
-        // Restore the commit log from a durable snapshot before scanning the
-        // WAL, so transactions whose Commit/Abort records were recycled keep
-        // their status. Used only if it decodes cleanly AND its snapshot LSN is
-        // within the durable WAL end (a snapshot ahead of the recovered WAL
-        // would assert statuses for records that did not survive). The
-        // commit-status WAL scan below then runs idempotently on top (retained
-        // WAL is authoritative; import seeds only the truncated tail).
-        if let Some(data_dir) = &server.data_dir
-            && let Some(bytes) = read_clog_snapshot(data_dir)
-        {
-            match decode_clog_snapshot(&bytes) {
-                Ok((snapshot_lsn, next_xid, entries)) if snapshot_lsn <= recovered_lsn => {
-                    server.txn_manager.import_clog(next_xid, &entries);
-                }
-                Ok((snapshot_lsn, _, _)) => tracing::warn!(
-                    snapshot_lsn = snapshot_lsn.raw(),
-                    recovered_lsn = recovered_lsn.raw(),
-                    "commit-log snapshot ahead of recovered WAL; ignoring"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "commit-log snapshot unreadable; full WAL commit-status rebuild"
-                ),
-            }
-        }
-        server.recover_commit_status_from_wal()?;
+        // The commit-status oracle (durable CLOG import + WAL commit-status
+        // rebuild + uncommitted->aborted sweep) was fully reconstructed BEFORE
+        // the catalog bootstrap above, against the bare transaction manager, so
+        // the bootstrap's visibility filter could skip uncommitted DDL rows. No
+        // re-run is needed here.
+
         // Phase two of durable block-count seeding (see WAL-recovery comment
         // above): now that the catalog knows which relations are user *tables*,
         // seed their durable block counts so post-recycle scans — and the index

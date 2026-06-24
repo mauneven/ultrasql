@@ -17,6 +17,7 @@ testing = ["ultrasql-storage/testing"]
 
 [dependencies]
 ultrasql-core    = { workspace = true }
+ultrasql-mvcc    = { workspace = true }
 ultrasql-storage = { workspace = true }
 thiserror        = { workspace = true }
 parking_lot      = { workspace = true }
