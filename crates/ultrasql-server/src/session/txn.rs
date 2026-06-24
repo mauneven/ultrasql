@@ -465,6 +465,24 @@ where
                         return Err(err);
                     }
                 }
+                // Transactional-DDL milestone 2: build any deferred constraint
+                // index (in-txn `CREATE TABLE … PRIMARY KEY / UNIQUE` staged the
+                // index UNBUILT) BEFORE the commit marker is written. A duplicate
+                // key surfaces here as `23505`; taking the deferred-FK rollback
+                // path aborts the WHOLE transaction (rows + table + index gone)
+                // so a violation can never half-commit the table. Only when the
+                // build is clean do we reach `commit_transaction`.
+                if let Err(e) = self.build_pending_catalog_ddl_indexes(&txn) {
+                    let err = self.rollback_transaction_after_error_with_abort_marker(
+                        txn,
+                        e,
+                        "COMMIT rollback after deferred index build failure",
+                        true,
+                    );
+                    self.discard_pending_catalog_ddl();
+                    self.clear_pending_dml_effects();
+                    return Err(err);
+                }
                 if let Err(e) = self.state.commit_transaction(
                     txn,
                     !modified_tables.is_empty(),

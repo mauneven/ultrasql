@@ -1,11 +1,17 @@
 //! Adversarial battery for transactional `CREATE TABLE` (transactional-DDL
-//! milestone 1).
+//! milestones 1 and 2).
 //!
 //! A rolled-back `CREATE TABLE` whose catalog row or snapshot entry survives is
 //! silent schema corruption — the exact class that got SAVEPOINT reverted once.
 //! This battery is the gate: tests #1 (ROLLBACK in-memory), #2 (second-connection
 //! isolation), and #4 (crash mid-transaction) are the corruption cases and must
 //! pass for both the simple-query and the extended/portal path.
+//!
+//! Milestone 2 (the `M2 #*` tests at the end) adds in-txn `PRIMARY KEY / UNIQUE`
+//! by deferring the implicit constraint-index B-tree build to COMMIT: M2 #2
+//! (no segment on ROLLBACK), M2 #3 (crash before commit), and M2 #5 (a duplicate
+//! key at the COMMIT build fails 23505 with a FULL rollback) are the new
+//! corruption gates.
 
 pub mod support;
 
@@ -868,16 +874,10 @@ async fn autocommit_then_in_txn_same_name_create_yields_single_durable_row() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_side_effect_create_table_variants_rejected_in_txn() {
-    // PRIMARY KEY / UNIQUE / FOREIGN KEY / PARTITION BY / DEFAULT nextval and
-    // serial all build (or depend on) a durable artifact the overlay cannot
-    // undo: reject in-txn.
-    assert_ddl_rejected_in_txn("txddl_v_pk", &[], "CREATE TABLE v_pk (id INT PRIMARY KEY)").await;
-    assert_ddl_rejected_in_txn(
-        "txddl_v_unique",
-        &[],
-        "CREATE TABLE v_uniq (id INT, u INT UNIQUE)",
-    )
-    .await;
+    // FOREIGN KEY / PARTITION BY / DEFAULT nextval and serial all build (or
+    // depend on) a durable artifact the overlay cannot undo: reject in-txn.
+    // (PRIMARY KEY / UNIQUE are now supported via the milestone-2 deferred
+    // index build — see `in_txn_create_table_primary_key_*` below.)
     assert_ddl_rejected_in_txn(
         "txddl_v_fk",
         &["CREATE TABLE v_parent (id INT PRIMARY KEY)"],
@@ -1341,5 +1341,614 @@ async fn failed_block_prepare_discards_in_txn_ddl_overlay() {
 
     drop(client_b);
     let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ═══════════════════ Transactional-DDL milestone 2 ═══════════════════
+// In-txn `CREATE TABLE … PRIMARY KEY / UNIQUE` is now supported by deferring the
+// implicit constraint-index B-tree build to COMMIT. The index is staged UNBUILT
+// (`root_block == INVALID`) so in-txn INSERTs skip its maintenance and a
+// ROLLBACK / crash-before-commit leaks no durable index segment; the tree is
+// built once, over the table's rows under the user snapshot, at COMMIT. A
+// duplicate key found during that build aborts the WHOLE transaction with 23505
+// — never a half-committed table.
+
+// ───────────────────────────── M2 #1 ─────────────────────────────
+// COMMIT publishes a working index: visible to a 2nd connection, the index
+// enforces uniqueness on a post-commit INSERT, and survives restart BUILT
+// (a post-restart duplicate still fails 23505 — proves the durable root_block
+// was corrected, not left INVALID/unbuilt).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_table_primary_key_commits_working_index() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_pk_commit_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE pk_t (id INT PRIMARY KEY)")
+            .await
+            .expect("in-txn CREATE TABLE … PRIMARY KEY is accepted (milestone 2)");
+        client.batch_execute("COMMIT").await.expect("commit");
+
+        // Visible to a 2nd connection, with the index on `id`.
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_pk_commit_b").await;
+        client_b
+            .query("SELECT id FROM pk_t", &[])
+            .await
+            .expect("2nd connection sees the committed table");
+        client_b
+            .batch_execute("INSERT INTO pk_t VALUES (1)")
+            .await
+            .expect("first insert ok");
+        // The index enforces uniqueness on a post-commit INSERT.
+        let dup = client_b
+            .batch_execute("INSERT INTO pk_t VALUES (1)")
+            .await
+            .expect_err("duplicate id must violate the committed PRIMARY KEY index");
+        assert_eq!(
+            sqlstate(&dup),
+            "23505",
+            "post-commit duplicate must report unique_violation, got {dup}"
+        );
+
+        drop(client_b);
+        let _ = b_handle.await;
+        shutdown(running).await;
+    }
+
+    // Survives restart BUILT: the table and its row are present, and the index
+    // still rejects a duplicate (so the durable root_block was corrected from
+    // INVALID to the real built tree — not left unbuilt).
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_commit_a2").await;
+    let rows = running
+        .client
+        .query("SELECT id FROM pk_t ORDER BY id", &[])
+        .await
+        .expect("committed PK table present after restart");
+    assert_eq!(rows.len(), 1, "the single row survives restart");
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO pk_t VALUES (1)")
+        .await
+        .expect_err("post-restart duplicate must still violate the rebuilt PK index");
+    assert_eq!(
+        sqlstate(&dup),
+        "23505",
+        "post-restart duplicate must report unique_violation (index rebuilt BUILT), got {dup}"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #2 (corruption gate) ─────────────────────────────
+// ROLLBACK of an in-txn CREATE TABLE … PRIMARY KEY leaves NO durable index (or
+// table) segment, no catalog entry, and restart-clean. No INSERTs ran, so the
+// table is never materialized and the index is never built — the strict
+// `user_relation_segments`-empty check applies.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_in_txn_create_table_primary_key_leaves_no_segment() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_pk_rollback_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE pk_rb (id INT PRIMARY KEY)")
+            .await
+            .expect("in-txn create with PK");
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+
+        // No user-relation segment file: the table was never INSERTed into
+        // (lazy materialization) and the deferred index was never built — a
+        // ROLLBACK leaks no `base/<user-oid>` segment for either OID.
+        assert_eq!(
+            user_relation_segments(data_dir.path()),
+            Vec::<String>::new(),
+            "ROLLBACK of CREATE TABLE … PRIMARY KEY must leave no base/<user-oid> segment \
+             (table never materialized, index never built)",
+        );
+
+        // Invisible to self and to the global committed snapshot.
+        let err = client
+            .query("SELECT id FROM pk_rb", &[])
+            .await
+            .expect_err("rolled-back PK table must be invisible to self");
+        assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("pk_rb"),
+            "global snapshot must not carry the rolled-back PK table",
+        );
+
+        shutdown(running).await;
+    }
+
+    // Restart-clean: no table, no index, no durable pg_class row.
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_rollback_a2").await;
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("pk_rb"),
+        "rolled-back PK table must not resurrect after restart",
+    );
+    let err = running
+        .client
+        .query("SELECT id FROM pk_rb", &[])
+        .await
+        .expect_err("rolled-back PK table must be absent after restart");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+    let count = running
+        .client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pk_rb'",
+            &[],
+        )
+        .await
+        .expect("pg_class probe")
+        .get::<_, i64>(0);
+    assert_eq!(
+        count, 0,
+        "no durable pg_class row for the rolled-back PK table"
+    );
+    // And still no orphaned user segment after the restart's recovery.
+    assert_eq!(
+        user_relation_segments(data_dir.path()),
+        Vec::<String>::new(),
+        "no user segment after restart either",
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #3 (corruption gate) ─────────────────────────────
+// Crash mid-transaction after an in-txn CREATE TABLE … PRIMARY KEY, before
+// COMMIT: the table AND its index must not resurrect on restart. The deferred
+// build never ran (no COMMIT), so no index segment was ever allocated, and the
+// catalog rows ride the uncommitted user xid (hidden by the visibility-filtered
+// bootstrap).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_before_commit_in_txn_create_table_primary_key_does_not_resurrect() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_pk_crash_a").await;
+        running.client.batch_execute("BEGIN").await.expect("begin");
+        running
+            .client
+            .batch_execute("CREATE TABLE pk_crash (id INT PRIMARY KEY)")
+            .await
+            .expect("in-txn create with PK (durable catalog rows under user xid, NO commit)");
+        // Drop the server WITHOUT COMMIT/ROLLBACK — the user xid has no commit
+        // record; the deferred index was never built.
+        shutdown(running).await;
+    }
+
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_crash_a2").await;
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("pk_crash"),
+        "crash-before-commit PK table must not resurrect in the catalog snapshot",
+    );
+    let err = running
+        .client
+        .query("SELECT id FROM pk_crash", &[])
+        .await
+        .expect_err("crash-before-commit PK table must be absent after restart");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+    // No durable pg_class row for the table or its implicit index.
+    let count = running
+        .client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class \
+             WHERE relname = 'pk_crash' OR relname LIKE 'pk_crash%pkey%'",
+            &[],
+        )
+        .await
+        .expect("pg_class probe")
+        .get::<_, i64>(0);
+    assert_eq!(
+        count, 0,
+        "no durable pg_class row for the crash-before-commit table or its index",
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #4 ─────────────────────────────
+// CREATE + INSERT(unique) + COMMIT: the deferred build indexes the existing
+// rows; index lookups work; rows + index survive restart.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_insert_unique_commit_builds_index_over_rows() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_pk_rows_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE pk_rows (id INT PRIMARY KEY, v TEXT)")
+            .await
+            .expect("in-txn create with PK");
+        client
+            .batch_execute("INSERT INTO pk_rows VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .expect("in-txn unique inserts (index unbuilt, maintenance skipped)");
+        client
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit builds the index over the rows");
+
+        // An index lookup resolves a specific key (the tree carries the rows).
+        let row = client
+            .query_one("SELECT v FROM pk_rows WHERE id = 2", &[])
+            .await
+            .expect("index lookup on the committed PK");
+        assert_eq!(row.get::<_, &str>(0), "b");
+        // Uniqueness is enforced post-commit against an EXISTING key.
+        let dup = client
+            .batch_execute("INSERT INTO pk_rows VALUES (2, 'dup')")
+            .await
+            .expect_err("re-inserting an existing key must violate the built index");
+        assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+
+        shutdown(running).await;
+    }
+
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_rows_a2").await;
+    let rows = running
+        .client
+        .query("SELECT id FROM pk_rows ORDER BY id", &[])
+        .await
+        .expect("rows present after restart");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3], "all three rows survive restart");
+    // Index still enforces uniqueness after restart (rebuilt BUILT).
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO pk_rows VALUES (3, 'x')")
+        .await
+        .expect_err("post-restart duplicate must violate the rebuilt index");
+    assert_eq!(
+        sqlstate(&dup),
+        "23505",
+        "expected 23505 post-restart, got {dup}"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #5 (THE CRUX — corruption gate) ─────────────────────────────
+// CREATE + INSERT(DUPLICATE) + COMMIT: the duplicate is caught during the
+// deferred build at COMMIT, which fails 23505 and rolls back the WHOLE
+// transaction. From a 2nd connection AND after restart the table, its rows, and
+// its index are ALL absent.
+//
+// Note on segments: the two INSERTs materialize the table heap before the build
+// fails, so a `base/<table_oid>` orphan segment may exist on disk after the
+// abort. That is the same bounded, MVCC-safe orphan-file leak the engine already
+// tolerates for aborted xids (the rows carry the aborted xmin → invisible; the
+// catalog-driven, visibility-filtered bootstrap never resurrects the relation).
+// The correctness gate is therefore catalog/query/restart ABSENCE, not a literal
+// zero-file count (which only holds for the no-INSERT case, M2 #2).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_insert_duplicate_commit_fails_23505_full_rollback() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    let dup_sqlstate;
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_pk_dup_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE pk_dup (id INT PRIMARY KEY)")
+            .await
+            .expect("in-txn create with PK");
+        // Both inserts succeed in-txn (the index is unbuilt — maintenance
+        // skipped — so the duplicate is NOT caught here).
+        client
+            .batch_execute("INSERT INTO pk_dup VALUES (1), (1)")
+            .await
+            .expect("duplicate inserts succeed in-txn (deferred uniqueness check)");
+
+        // COMMIT runs the deferred build, finds the duplicate, and fails 23505,
+        // rolling back the whole transaction.
+        let err = client
+            .batch_execute("COMMIT")
+            .await
+            .expect_err("COMMIT must fail when the deferred index build hits a duplicate");
+        dup_sqlstate = sqlstate(&err);
+        assert_eq!(
+            dup_sqlstate, "23505",
+            "duplicate at the COMMIT build must report unique_violation, got {err}"
+        );
+
+        // FULL rollback: self no longer sees the table (the txn is over and
+        // aborted — the table never committed).
+        let err = client
+            .query("SELECT id FROM pk_dup", &[])
+            .await
+            .expect_err("table must be absent after the failed COMMIT");
+        assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("pk_dup"),
+            "global snapshot must not carry the aborted table",
+        );
+
+        // A 2nd connection also never sees it.
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_pk_dup_b").await;
+        let err = client_b
+            .query("SELECT id FROM pk_dup", &[])
+            .await
+            .expect_err("2nd connection must not see the aborted table");
+        assert!(is_undefined_table(&err), "expected 42P01 for B, got {err}");
+
+        // The same name creates cleanly afterward (no stale state).
+        client_b
+            .batch_execute("CREATE TABLE pk_dup (id INT PRIMARY KEY)")
+            .await
+            .expect("same-name autocommit CREATE works after the aborted in-txn one");
+        client_b
+            .batch_execute("INSERT INTO pk_dup VALUES (9)")
+            .await
+            .expect("the freshly created table is usable");
+
+        drop(client_b);
+        let _ = b_handle.await;
+        shutdown(running).await;
+    }
+    assert_eq!(dup_sqlstate, "23505");
+
+    // After restart: the recreated `pk_dup` (the clean autocommit one with a
+    // single row 9) is present — exactly one durable pg_class row — and the
+    // aborted in-txn table/rows/index left nothing behind.
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_dup_a2").await;
+    let rows = running
+        .client
+        .query("SELECT id FROM pk_dup ORDER BY id", &[])
+        .await
+        .expect("the clean recreated table is present after restart");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(
+        ids,
+        vec![9],
+        "only the clean autocommit row survives — the aborted in-txn rows (1),(1) are gone",
+    );
+    // Exactly one durable pg_class row for the name (no aborted duplicate).
+    let count = running
+        .client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'pk_dup' AND relkind = 'r'",
+            &[],
+        )
+        .await
+        .expect("pg_class probe")
+        .get::<_, i64>(0);
+    assert_eq!(
+        count, 1,
+        "exactly one durable pg_class table row for 'pk_dup' (no aborted-txn leak)",
+    );
+    // The rebuilt index still enforces uniqueness (the recreated PK is BUILT).
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO pk_dup VALUES (9)")
+        .await
+        .expect_err("post-restart duplicate on the recreated table must violate its PK");
+    assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #6 ─────────────────────────────
+// Concurrent same-name in-txn CREATE TABLE … PRIMARY KEY still serializes on the
+// per-name AccessExclusive lock (unchanged by the deferred build): the loser
+// fails immediately with 40001 while the holder is open, and 42P07 after it
+// commits.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_in_txn_create_same_name_primary_key_serializes() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_race_a").await;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_pk_race_b").await;
+
+    running
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("A begin");
+    running
+        .client
+        .batch_execute("CREATE TABLE pk_race (id INT PRIMARY KEY)")
+        .await
+        .expect("A in-txn create takes the name lock");
+
+    client_b.batch_execute("BEGIN").await.expect("B begin");
+    let err = client_b
+        .batch_execute("CREATE TABLE pk_race (id INT PRIMARY KEY)")
+        .await
+        .expect_err("B's same-name CREATE must fail while A holds the name lock");
+    assert_eq!(
+        sqlstate(&err),
+        "40001",
+        "concurrent same-name PK CREATE must report serialization_failure, got {err}"
+    );
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("B rollback");
+
+    running
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("A commit wins");
+
+    client_b.batch_execute("BEGIN").await.expect("B begin 2");
+    let err = client_b
+        .batch_execute("CREATE TABLE pk_race (id INT PRIMARY KEY)")
+        .await
+        .expect_err("B's retry must see A's committed table");
+    assert_eq!(
+        sqlstate(&err),
+        "42P07",
+        "retry after winner committed must report duplicate_table, got {err}"
+    );
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("B rollback 2");
+
+    // Exactly one usable table whose PK enforces uniqueness.
+    running
+        .client
+        .batch_execute("INSERT INTO pk_race VALUES (1)")
+        .await
+        .expect("the single committed table is usable");
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO pk_race VALUES (1)")
+        .await
+        .expect_err("the committed table's PK enforces uniqueness");
+    assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #7 ─────────────────────────────
+// A multi-column UNIQUE constraint is built correctly at COMMIT (composite-key
+// encoding must match the insert-time maintainer): a composite duplicate is
+// caught post-commit, distinct composites are allowed, and it survives restart.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_create_table_composite_unique_builds_and_enforces() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_uniq2_a").await;
+        let client = &running.client;
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE uniq2 (a INT, b INT, UNIQUE (a, b))")
+            .await
+            .expect("in-txn create with composite UNIQUE");
+        client
+            .batch_execute("INSERT INTO uniq2 VALUES (1, 1), (1, 2), (2, 1)")
+            .await
+            .expect("distinct composite keys insert in-txn");
+        client
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit builds the composite index");
+
+        // A composite duplicate of an existing (a,b) pair is rejected; a pair
+        // that differs in one column is allowed (proves the build used the same
+        // composite encoding as the insert-time maintainer).
+        let dup = client
+            .batch_execute("INSERT INTO uniq2 VALUES (1, 1)")
+            .await
+            .expect_err("(1,1) duplicates an existing composite key");
+        assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+        client
+            .batch_execute("INSERT INTO uniq2 VALUES (1, 3)")
+            .await
+            .expect("(1,3) is a distinct composite key — allowed");
+
+        shutdown(running).await;
+    }
+
+    let running = start_persistent_server(data_dir.path(), "txddl_uniq2_a2").await;
+    let count = running
+        .client
+        .query_one("SELECT count(*) FROM uniq2", &[])
+        .await
+        .expect("rows after restart")
+        .get::<_, i64>(0);
+    assert_eq!(count, 4, "the four committed rows survive restart");
+    let dup = running
+        .client
+        .batch_execute("INSERT INTO uniq2 VALUES (2, 1)")
+        .await
+        .expect_err("post-restart composite duplicate must violate the rebuilt UNIQUE");
+    assert_eq!(
+        sqlstate(&dup),
+        "23505",
+        "expected 23505 post-restart, got {dup}"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M2 #8 (extended path) ─────────────────────────────
+// The deferred build holds on the extended (Parse/Bind/Execute) path too: an
+// in-txn PRIMARY KEY CREATE + parametrized INSERTs committed via the extended
+// path build a working index, and a post-commit prepared duplicate fails 23505.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_path_in_txn_create_table_primary_key_commits_working_index() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_pk_ext").await;
+    let client = &running.client;
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    // `execute` issues Parse/Bind/Execute (extended path).
+    client
+        .execute("CREATE TABLE pk_ext (id INT PRIMARY KEY)", &[])
+        .await
+        .expect("extended in-txn CREATE TABLE … PRIMARY KEY");
+    client
+        .execute("INSERT INTO pk_ext VALUES ($1)", &[&5_i32])
+        .await
+        .expect("parametrized insert into the unbuilt-index table");
+    client
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit builds the index");
+
+    // The committed index enforces uniqueness against the row inserted in-txn.
+    let dup = client
+        .execute("INSERT INTO pk_ext VALUES ($1)", &[&5_i32])
+        .await
+        .expect_err("re-inserting the existing key must violate the built PK index");
+    assert_eq!(sqlstate(&dup), "23505", "expected 23505, got {dup}");
+
+    // A distinct key is accepted.
+    client
+        .execute("INSERT INTO pk_ext VALUES ($1)", &[&6_i32])
+        .await
+        .expect("a distinct key is accepted");
+    let rows = client
+        .query("SELECT id FROM pk_ext ORDER BY id", &[])
+        .await
+        .expect("query committed rows");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(ids, vec![5, 6]);
+
     shutdown(running).await;
 }

@@ -175,7 +175,7 @@ where
                 ultrasql_catalog::CatalogError::already_exists(table_name.clone()),
             )));
         }
-        // Transactional-DDL milestone 1 only stages catalog metadata that the
+        // Transactional-DDL milestone 1/2 only stages catalog metadata that the
         // session overlay can publish at COMMIT or discard at ROLLBACK via MVCC.
         // Any `CREATE TABLE` variant that produces a SEPARATE durable artifact
         // the overlay cannot transactionally undo is rejected in-txn with the
@@ -183,9 +183,6 @@ where
         // supported on the autocommit path, which self-commits the artifact.
         //
         // Rejected in-txn:
-        // - PRIMARY KEY / UNIQUE: builds a durable B-tree segment at create time
-        //   (`create_table_unique_indexes`) that a ROLLBACK would orphan, and on
-        //   restart the index OID can be reused onto the stale segment.
         // - FOREIGN KEY: validates against and references another relation; its
         //   semantics span tables the whole-transaction overlay does not model.
         // - PARTITION BY: a partitioned parent installs a non-MVCC time-partition
@@ -196,18 +193,16 @@ where
         //   unconditionally on restart) — kept at its original site.
         //
         // ALLOWED in-txn: plain columns, NOT NULL, DEFAULT with a constant /
-        // immutable (non-nextval) expression, and CHECK constraints (which
-        // persist as pure `pg_constraint` MVCC rows under the user xid — no
-        // separate durable artifact).
+        // immutable (non-nextval) expression, CHECK constraints (which persist
+        // as pure `pg_constraint` MVCC rows under the user xid), and — as of
+        // milestone 2 — PRIMARY KEY / UNIQUE. The implicit constraint index is
+        // staged UNBUILT (`root_block == INVALID`) so in-txn INSERTs skip its
+        // maintenance (`build_one_insert_index_maintainer` auto-skips an
+        // INVALID-root index); its B-tree is built once, over the table's rows
+        // under the user snapshot, at COMMIT — so a ROLLBACK (or crash before
+        // COMMIT) leaks no durable index segment and a duplicate key aborts the
+        // whole transaction with `23505` rather than half-committing the table.
         if in_txn_xid.is_some() {
-            if !unique_constraints.is_empty() {
-                return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
-                    "PRIMARY KEY / UNIQUE on CREATE TABLE inside an explicit transaction is not \
-                     yet supported\nHINT:  it builds a durable index segment that cannot be \
-                     transactionally rolled back yet; create the table in autocommit"
-                        .to_string(),
-                )));
-            }
             if !foreign_keys.is_empty() {
                 return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
                     "FOREIGN KEY on CREATE TABLE inside an explicit transaction is not yet \
@@ -479,6 +474,7 @@ where
             &entry,
             unique_constraints,
             in_txn_xid.is_none(),
+            in_txn_xid.is_some(),
         ) {
             Ok(indexes) => indexes,
             Err(e) => {
@@ -789,25 +785,37 @@ where
     /// `false` for the in-transaction path where the parent table is not in
     /// the global catalog (it lives in the session overlay) so a global
     /// `create_index` would fail the parent-OID lookup. In the in-txn case
-    /// the entries are returned for the overlay; the empty btree pages were
-    /// already allocated here (a rolled-back transaction leaks those pages,
-    /// a bounded cosmetic cost mirroring the OID leak — PG-tolerable).
+    /// the entries are returned for the overlay.
+    ///
+    /// `defer_build` (transactional-DDL milestone 2) controls whether the
+    /// durable B-tree SEGMENT is allocated here. The autocommit path
+    /// (`defer_build == false`) calls [`BTree::create`] eagerly and stamps the
+    /// real `root_block` — the table is empty so there are no rows to populate.
+    /// The in-transaction path (`defer_build == true`) SKIPS the `BTree::create`
+    /// and leaves `entry.root_block == BlockNumber::INVALID`: building a durable
+    /// index segment that a ROLLBACK could not transactionally undo is the
+    /// corruption hazard milestone 1 rejected outright. Instead the index is
+    /// staged UNBUILT — in-txn INSERTs auto-skip its maintenance (the
+    /// INVALID-root skip in `build_one_insert_index_maintainer`) — and its tree
+    /// is built once, over the table's rows under the user snapshot, at COMMIT
+    /// by `Session::build_pending_catalog_ddl_indexes`. The index's catalog heap
+    /// rows are still persisted under the user xid here (carrying the INVALID
+    /// root_block); the COMMIT build mutates the overlay entry's `root_block` in
+    /// place AND re-persists the index rows so the durable
+    /// `pg_class.relfilenode` is corrected to the real root — leaving both the
+    /// live global catalog entry and a restart-rebuilt entry pointing at the
+    /// freshly built, probe-able tree.
     fn create_table_unique_indexes(
         &self,
         table: &TableEntry,
         unique_constraints: &[ultrasql_planner::LogicalUniqueConstraint],
         install_global: bool,
+        defer_build: bool,
     ) -> Result<Vec<IndexEntry>, ServerError> {
         let mut created = Vec::with_capacity(unique_constraints.len());
         for unique in unique_constraints {
             crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &unique.columns)?;
             let index_oid = self.state.persistent_catalog.next_oid();
-            let index_rel = RelationId::new(index_oid.raw());
-            let btree = BTree::create(Arc::clone(self.state.heap.buffer_pool()), index_rel)
-                .map_err(|e| {
-                    ServerError::ddl(format!("CREATE TABLE constraint index create: {e}"))
-                })?;
-            let root_block = btree.root_block();
             let mut attnums = Vec::with_capacity(unique.columns.len());
             for &col in &unique.columns {
                 let attnum = u16::try_from(col).map_err(|_| {
@@ -817,12 +825,27 @@ where
                 })?;
                 attnums.push(attnum);
             }
+            // `IndexEntry::new` defaults `root_block` to `BlockNumber::INVALID`.
             let mut entry =
                 IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true)
                     .with_schema_name(table.schema_name.clone())
                     .with_primary(unique.primary_key);
-            entry.root_block = root_block;
-            // Empty table, so there are no existing heap rows to populate.
+            if defer_build {
+                // In-transaction: leave the segment unbuilt. `root_block` stays
+                // INVALID so in-txn INSERTs skip index maintenance and a
+                // ROLLBACK leaks no durable index segment. The tree is built at
+                // COMMIT over the table's rows.
+                debug_assert_eq!(entry.root_block, ultrasql_core::BlockNumber::INVALID);
+            } else {
+                // Autocommit: allocate the (empty) durable tree now. The table
+                // is empty, so there are no existing heap rows to populate.
+                let index_rel = RelationId::new(index_oid.raw());
+                let btree = BTree::create(Arc::clone(self.state.heap.buffer_pool()), index_rel)
+                    .map_err(|e| {
+                        ServerError::ddl(format!("CREATE TABLE constraint index create: {e}"))
+                    })?;
+                entry.root_block = btree.root_block();
+            }
             if install_global {
                 self.state.persistent_catalog.create_index(entry.clone())?;
             }
