@@ -1,9 +1,12 @@
 //! UltraSQL cost-based optimizer.
 //!
 //! Two-phase optimizer: rule-based rewrites (predicate pushdown, constant
-//! folding, projection pushdown, subquery decorrelation) followed by a
-//! Cascades-style top-down search for join order and physical operator
-//! selection. Statistics are sourced from the catalog.
+//! folding, projection pushdown, subquery decorrelation) followed by
+//! cost-based join reordering (DPsize for small joins, greedy above).
+//! Statistics are sourced from the catalog. A Cascades-style memo and
+//! per-operator cost formulas exist as scaffolding for a future (v0.7)
+//! top-down search driver, but that driver is not yet wired — physical
+//! operator selection currently happens during executor lowering.
 //!
 //! ## Module layout
 //!
@@ -13,7 +16,7 @@
 //! | `error` | [`OptimizeError`] error type |
 //! | [`stats`] | Statistics catalog, `ANALYZE` support, histograms, and MCVs |
 //! | [`cost`] | Cost estimates, selectivity heuristics, and operator formulas |
-//! | [`enumeration`] | Join enumeration, memo search, and physical operator choice |
+//! | [`enumeration`] | Cost-based join reordering; memo + physical-operator cost rules (scaffolding for the v0.7 search driver) |
 //!
 //! ## Quick start
 //!
