@@ -21,6 +21,31 @@ completed evidence.
   locale/collation behavior, and domain/composite type breadth.
 - Transactional DDL is not complete; ORM schema-creation certification runs in
   autocommit mode until DDL inside explicit transaction blocks is implemented.
+  DDL issued inside an explicit `BEGIN…COMMIT` block is rejected with SQLSTATE
+  `0A000` (`feature_not_supported`) and a `HINT` to run the statement in
+  autocommit; the block then transitions to `Failed` (subsequent statements get
+  `25P02`) until `COMMIT`/`ROLLBACK`. The rejection is deliberate: the catalog is
+  mutated globally-in-place (no per-transaction overlay, no xmin/xmax on the
+  in-memory snapshot) and made durable mid-statement under a private,
+  self-committing `ddl_txn`, while `COMMIT`/`ROLLBACK` never touch the catalog —
+  so a rolled-back transaction's schema change could not be undone. The dedicated
+  effort (per-transaction catalog overlay, durable rows retargeted onto the user
+  xid, `AccessExclusive` locking, scoped to TABLE/INDEX/CONSTRAINT/TYPE DDL) is
+  designed in [Transactional DDL Design](transactional-ddl-design.md) and gated
+  behind an adversarial battery.
+- Latent catalog-bootstrap corruption vector (crash-recovery durability): even
+  for an **autocommit** DDL, a crash *between* the statement's catalog rows
+  becoming durable and its commit marker becoming durable can resurrect
+  uncommitted schema on restart. `bootstrap_from_heap` rebuilds the catalog with
+  a raw, non-visibility heap scan that keeps the newest row per OID regardless of
+  whether the writing transaction committed, so durably-written-but-uncommitted
+  catalog rows reappear as live schema. The fix (a commit-aware, visibility-filtered
+  bootstrap) is gated on a recovery re-ordering: the commit log (CLOG) is currently
+  rebuilt *after* catalog bootstrap, so a visibility filter against the empty CLOG
+  would hide all committed schema. Recovery must rebuild commit status before
+  bootstrap and define a bootstrap snapshot first. This is tracked as the
+  recommended first step (Increment A) in
+  [Transactional DDL Design](transactional-ddl-design.md).
 - Serializable transactions use column-range SSI for supported scalar
   comparisons and fully supported `AND` / `OR` predicate trees plus
   relation-level fallback, but not fully predicate-precise SSI. The covered

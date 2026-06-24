@@ -1,6 +1,6 @@
 # Documentation Status Audit
 
-Last audited: 2026-06-22.
+Last audited: 2026-06-24.
 
 Scope: every first-party Markdown file found by:
 
@@ -66,7 +66,7 @@ unless quoting a prohibited claim in the claim-policy section.
 
 ## First-Party Markdown Audit Ledger
 
-The audit covers these 98 files. "Checked" means the file was inspected for
+The audit covers these 99 files. "Checked" means the file was inspected for
 stale maturity language, unsupported production-readiness claims, and broad
 benchmark claims that are not backed by committed artifacts.
 
@@ -151,6 +151,7 @@ benchmark claims that are not backed by committed artifacts.
 | `docs/testing/coverage-evidence-2026-05-29-workspace.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
 | `docs/testing/external-sql-test-reuse.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
 | `docs/testing/isolation-suite.md` | historical evidence ledger; keep dated entries, avoid rewriting old evidence |
+| `docs/transactional-ddl-design.md` | internal design doc (TODO #5); no project maturity claim |
 | `docs/transactional-embeddings.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/vector-benchmarks.md` | benchmark/performance policy; checked for claim scoping |
 | `examples/node-rag/README.md` | test/imported fixture docs; no public maturity claim |
