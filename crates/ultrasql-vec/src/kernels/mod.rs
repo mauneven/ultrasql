@@ -1,9 +1,10 @@
 //! Vectorized kernels.
 //!
-//! Each kernel here has a scalar (auto-vectorizable) implementation
-//! that is the source of truth. SIMD specializations land alongside
-//! the scalar versions and are validated bit-for-bit against scalar
-//! in property tests.
+//! Each kernel here is a portable scalar implementation, written to be
+//! auto-vectorized by LLVM, and is the source of truth for correctness.
+//! There are currently no hand-written `core::arch` SIMD specializations;
+//! when one is added it must live alongside the scalar version and be
+//! validated bit-for-bit against it in property tests.
 //!
 //! Sub-modules
 //! -----------

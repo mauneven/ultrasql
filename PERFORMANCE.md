@@ -146,8 +146,12 @@ layer is synchronous CPU work. The split is deliberate:
 ## 7. SIMD Rules
 
 - Kernels live in `ultrasql-vec`.
+- **Current state:** all kernels are portable scalar Rust that relies on
+  LLVM auto-vectorization; there are no hand-written `core::arch`
+  intrinsics yet. The rules below govern intrinsics work *when* a profiled
+  hot path needs more than the compiler delivers.
 - Every kernel has a scalar implementation that is the source of
-  truth. SIMD paths are validated bit-for-bit against scalar in
+  truth. Any future SIMD path is validated bit-for-bit against scalar in
   property tests.
 - `cfg(target_arch = "aarch64")` for ARM64 SIMD paths,
   `cfg(target_arch = "x86_64")` for AVX2/AVX-512. Use

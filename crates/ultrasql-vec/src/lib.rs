@@ -2,8 +2,12 @@
 //!
 //! Column-oriented in-memory format with explicit null bitmaps,
 //! length-prefixed varbinary buffers, and aligned numeric storage.
-//! Kernels are auto-vectorized; selected hot paths have hand-written
-//! NEON intrinsics for ARM64 and AVX2/AVX-512 intrinsics for `x86_64`.
+//! Kernels are portable scalar Rust written to auto-vectorize under LLVM
+//! (branchless inner loops that lower to NEON on ARM64 and AVX on
+//! `x86_64`). There are no hand-written `core::arch` intrinsics today; an
+//! architecture-specific intrinsics tier — validated bit-for-bit against
+//! the scalar reference — is reserved for hot paths the compiler
+//! under-vectorizes.
 //!
 //! Crate layout
 //! ------------

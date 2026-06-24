@@ -433,7 +433,8 @@ aggregate. Each kernel has:
 - A portable scalar implementation that is the source of truth.
 - An auto-vectorized loop that LLVM tends to vectorize well.
 - An optional hand-written intrinsics path behind `cfg(target_arch)`
-  guards, validated against the scalar path by property tests.
+  guards, validated against the scalar path by property tests. This tier
+  is **not yet present** — kernels currently rely on tiers 1–2 only.
 
 **Rationale.** SIMD is central to fast analytical queries. The
 scalar/auto/intrinsic three-tier approach keeps the scalar version honest as
