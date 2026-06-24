@@ -19,20 +19,24 @@ completed evidence.
 - Some SQL data types are partial or missing, including full XML namespace /
   full `XMLTABLE` coverage beyond the first secure projection subset, full
   locale/collation behavior, and domain/composite type breadth.
-- Transactional DDL is not complete; ORM schema-creation certification runs in
-  autocommit mode until DDL inside explicit transaction blocks is implemented.
-  DDL issued inside an explicit `BEGIN…COMMIT` block is rejected with SQLSTATE
-  `0A000` (`feature_not_supported`) and a `HINT` to run the statement in
-  autocommit; the block then transitions to `Failed` (subsequent statements get
-  `25P02`) until `COMMIT`/`ROLLBACK`. The rejection is deliberate: the catalog is
-  mutated globally-in-place (no per-transaction overlay, no xmin/xmax on the
-  in-memory snapshot) and made durable mid-statement under a private,
-  self-committing `ddl_txn`, while `COMMIT`/`ROLLBACK` never touch the catalog —
-  so a rolled-back transaction's schema change could not be undone. The dedicated
-  effort (per-transaction catalog overlay, durable rows retargeted onto the user
-  xid, `AccessExclusive` locking, scoped to TABLE/INDEX/CONSTRAINT/TYPE DDL) is
-  designed in [Transactional DDL Design](transactional-ddl-design.md) and gated
-  behind an adversarial battery.
+- Transactional DDL is partial (milestone 1). `CREATE TABLE` now works inside an
+  explicit `BEGIN…COMMIT` block via a per-transaction catalog overlay: the issuing
+  transaction sees the table it created, other sessions do not until `COMMIT`, the
+  durable catalog rows ride the user xid (so `ROLLBACK` and crash recovery discard
+  them — they are MVCC-invisible and hidden by the visibility-filtered bootstrap),
+  and a per-name `AccessExclusive` lock serializes concurrent same-name creation.
+  Milestone 1 deliberately rejects (SQLSTATE `0A000` + `HINT`, block then `Failed`/
+  `25P02`) every in-transaction `CREATE TABLE` variant whose durable side-effect the
+  overlay cannot yet roll back — `PRIMARY KEY`/`UNIQUE` (index build), `FOREIGN KEY`,
+  `serial`/`IDENTITY`/`DEFAULT nextval` (sequence), `CREATE TABLE AS SELECT`, `TEMP`,
+  `PARTITION BY` — and rejects `PREPARE TRANSACTION` over an uncommitted in-txn DDL.
+  Allowed in-transaction: plain columns, `NOT NULL`, immutable-expression `DEFAULT`,
+  `CHECK`. **All other DDL** (`DROP`, `CREATE INDEX`, `ALTER`, `GRANT`, `CREATE
+  ROLE`, etc.) is still rejected `0A000` inside a transaction; autocommit DDL is
+  unchanged. Later milestones add PK/UNIQUE via deferred index build, the remaining
+  statement types, and two-phase commit, per
+  [Transactional DDL Design](transactional-ddl-design.md), each behind the
+  adversarial battery.
 - Latent catalog-bootstrap corruption vector (crash-recovery durability): even
   for an **autocommit** DDL, a crash *between* the statement's catalog rows
   becoming durable and its commit marker becoming durable can resurrect
