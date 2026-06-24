@@ -8,6 +8,12 @@ and must document the break here.
 
 ### Added
 
+- Read-only transactions: `BEGIN` and `SET TRANSACTION` now parse and honor
+  `READ ONLY` / `READ WRITE` (and accept `[NOT] DEFERRABLE`, currently inert).
+  A data-modifying statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE` /
+  `COPY … FROM`) inside a read-only transaction is rejected with SQLSTATE
+  `25006` (`read_only_sql_transaction`) and aborts the block; `SELECT` and
+  sequence advancement (`nextval`) remain allowed, matching PostgreSQL.
 - SQL server, CLI, and local runner binaries.
 - MVCC heap storage, WAL, crash-recovery primitives, B-tree/BRIN/GiST/GIN
   foundations, COPY, backup/restore utilities, and catalog version guard.
