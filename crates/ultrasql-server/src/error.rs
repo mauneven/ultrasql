@@ -167,6 +167,14 @@ pub enum ServerError {
     #[error("savepoint '{0}' does not exist")]
     SavepointNotFound(String),
 
+    /// A data-modifying statement was issued inside a read-only
+    /// transaction (`BEGIN READ ONLY` / `SET TRANSACTION READ ONLY`).
+    /// Maps to PostgreSQL SQLSTATE `25006` (`read_only_sql_transaction`).
+    /// The string names the rejected command (e.g. `INSERT`). Like any
+    /// in-transaction error, this aborts the surrounding block.
+    #[error("cannot execute {0} in a read-only transaction")]
+    ReadOnlyTransaction(&'static str),
+
     /// Authentication challenge rejected (wrong password, wrong user
     /// name, missing Password message). Maps to PostgreSQL SQLSTATE
     /// `28P01` (`invalid_password`). The connection is closed after
@@ -250,6 +258,7 @@ impl ServerError {
                 | Self::SerializationFailure(_)
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
+                | Self::ReadOnlyTransaction(_)
                 | Self::CopyFormat(_)
                 | Self::CopyAborted(_)
                 | Self::ObjectNotInPrerequisiteState(_)
@@ -299,6 +308,7 @@ impl ServerError {
             Self::TransactionAborted => "25P02",         // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",               // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001",       // invalid_savepoint_specification
+            Self::ReadOnlyTransaction(_) => "25006",     // read_only_sql_transaction
             Self::InsufficientPrivilege(_) => "42501",   // insufficient_privilege
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT / UPDATE. Mirrors PostgreSQL's

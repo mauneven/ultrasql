@@ -16,7 +16,7 @@ use ultrasql_txn::Transaction;
 
 use super::super::Session;
 use super::{CopyOptions, ServerCopyFormat, ServerError};
-use crate::CombinedCatalog;
+use crate::{CombinedCatalog, TxnState};
 
 impl<RW> Session<RW>
 where
@@ -153,6 +153,17 @@ where
                 "handle_copy_statement called with non-Copy plan",
             ));
         };
+
+        // Read-only transaction enforcement (SQLSTATE 25006): `COPY ... FROM`
+        // writes rows into a table. `COPY ... TO` is a read and is allowed.
+        // The error routes through `fail_if_in_transaction`, which aborts the
+        // surrounding block like any other in-transaction failure.
+        if matches!(direction, CopyDirection::From)
+            && let TxnState::InTransaction(txn) = &self.txn_state
+            && txn.read_only
+        {
+            return Err(ServerError::ReadOnlyTransaction("COPY"));
+        }
 
         let opts = CopyOptions {
             format: match format {

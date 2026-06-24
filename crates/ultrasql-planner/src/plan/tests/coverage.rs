@@ -408,7 +408,8 @@ fn display_schema_and_pipeline_cover_control_and_ddl_variants() {
         ),
         (
             LogicalPlan::SetTransaction {
-                isolation_level: TxnIsolationLevel::Serializable,
+                isolation_level: Some(TxnIsolationLevel::Serializable),
+                read_only: None,
                 schema: empty(),
             },
             "SetTransaction:",

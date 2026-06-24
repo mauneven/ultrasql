@@ -66,13 +66,23 @@ pub(super) fn fmt_rollback_prepared(gid: &str, indent: usize, out: &mut String) 
 }
 
 pub(super) fn fmt_set_transaction(
-    isolation_level: &TxnIsolationLevel,
+    isolation_level: &Option<TxnIsolationLevel>,
+    read_only: Option<bool>,
     indent: usize,
     out: &mut String,
 ) {
     let pad = " ".repeat(indent);
     out.push_str(&pad);
-    let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
+    out.push_str("SetTransaction:");
+    if let Some(level) = isolation_level {
+        let _ = fmt::write(out, format_args!(" {level:?}"));
+    }
+    match read_only {
+        Some(true) => out.push_str(" READ ONLY"),
+        Some(false) => out.push_str(" READ WRITE"),
+        None => {}
+    }
+    out.push('\n');
 }
 
 pub(super) fn fmt_set_variable(

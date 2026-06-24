@@ -421,8 +421,10 @@ impl LogicalPlan {
             Self::CommitPrepared { gid, .. } => misc::fmt_commit_prepared(gid, indent, out),
             Self::RollbackPrepared { gid, .. } => misc::fmt_rollback_prepared(gid, indent, out),
             Self::SetTransaction {
-                isolation_level, ..
-            } => misc::fmt_set_transaction(isolation_level, indent, out),
+                isolation_level,
+                read_only,
+                ..
+            } => misc::fmt_set_transaction(isolation_level, *read_only, indent, out),
             Self::SetVariable {
                 name,
                 action,

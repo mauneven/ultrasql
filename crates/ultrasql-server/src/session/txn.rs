@@ -41,8 +41,10 @@ where
     ) -> Result<SelectResult, ServerError> {
         match plan {
             LogicalPlan::Begin {
-                isolation_level, ..
-            } => self.execute_begin(*isolation_level),
+                isolation_level,
+                read_only,
+                ..
+            } => self.execute_begin(*isolation_level, *read_only),
             LogicalPlan::Commit { .. } => self.execute_commit(),
             LogicalPlan::Rollback { .. } => self.execute_rollback(),
             LogicalPlan::Savepoint { name, .. } => self.execute_savepoint(name),
@@ -54,8 +56,10 @@ where
             LogicalPlan::CommitPrepared { gid, .. } => self.execute_commit_prepared(gid),
             LogicalPlan::RollbackPrepared { gid, .. } => self.execute_rollback_prepared(gid),
             LogicalPlan::SetTransaction {
-                isolation_level, ..
-            } => self.execute_set_transaction(*isolation_level),
+                isolation_level,
+                read_only,
+                ..
+            } => self.execute_set_transaction(*isolation_level, *read_only),
             _ => Err(ServerError::Unsupported(
                 "execute_txn_control called with non-txn-control plan",
             )),
@@ -274,6 +278,7 @@ where
     pub(crate) fn execute_begin(
         &mut self,
         level: Option<TxnIsolationLevel>,
+        read_only: Option<bool>,
     ) -> Result<SelectResult, ServerError> {
         let iso = match level {
             None | Some(TxnIsolationLevel::ReadCommitted) => IsolationLevel::ReadCommitted,
@@ -282,7 +287,10 @@ where
         };
         let warn = match &self.txn_state {
             TxnState::Idle => {
-                let txn = self.state.txn_manager.begin(iso);
+                let mut txn = self.state.txn_manager.begin(iso);
+                // `READ WRITE` and an unspecified access mode both default
+                // to read-write; only `READ ONLY` flips the flag.
+                txn.read_only = read_only.unwrap_or(false);
                 self.txn_state = TxnState::InTransaction(txn);
                 self.state
                     .workload_recorder
@@ -323,25 +331,33 @@ where
     ///   conflict tracking.
     pub(crate) fn execute_set_transaction(
         &mut self,
-        level: TxnIsolationLevel,
+        level: Option<TxnIsolationLevel>,
+        read_only: Option<bool>,
     ) -> Result<SelectResult, ServerError> {
-        let iso = match level {
+        let iso = level.map(|l| match l {
             TxnIsolationLevel::ReadCommitted => IsolationLevel::ReadCommitted,
             TxnIsolationLevel::RepeatableRead => IsolationLevel::RepeatableRead,
             TxnIsolationLevel::Serializable => IsolationLevel::Serializable,
-        };
+        });
         let mut messages: Vec<BackendMessage> = Vec::with_capacity(2);
         match &mut self.txn_state {
             TxnState::Idle => {
                 messages.push(notice_warning(
                     "25P01",
-                    "SET TRANSACTION ISOLATION LEVEL outside a transaction",
+                    "SET TRANSACTION outside a transaction",
                 ));
             }
             TxnState::InTransaction(txn) => {
-                txn.isolation = iso;
-                if iso == IsolationLevel::Serializable {
-                    self.state.txn_manager.register_serializable(txn.xid);
+                if let Some(iso) = iso {
+                    txn.isolation = iso;
+                    if iso == IsolationLevel::Serializable {
+                        self.state.txn_manager.register_serializable(txn.xid);
+                    }
+                }
+                // `None` leaves the access mode unchanged (e.g. a plain
+                // `SET TRANSACTION ISOLATION LEVEL …`).
+                if let Some(ro) = read_only {
+                    txn.read_only = ro;
                 }
             }
             TxnState::Failed(_) => {
@@ -749,14 +765,14 @@ mod tests {
         assert_eq!(prepare.messages.len(), 2);
 
         session
-            .execute_begin(Some(TxnIsolationLevel::Serializable))
+            .execute_begin(Some(TxnIsolationLevel::Serializable), None)
             .expect("begin");
         assert!(matches!(session.txn_state, TxnState::InTransaction(_)));
-        let nested = session.execute_begin(None).expect("nested begin warning");
+        let nested = session.execute_begin(None, None).expect("nested begin warning");
         assert_eq!(last_tag(&nested), "BEGIN");
         assert_eq!(nested.messages.len(), 2);
         let set = session
-            .execute_set_transaction(TxnIsolationLevel::RepeatableRead)
+            .execute_set_transaction(Some(TxnIsolationLevel::RepeatableRead), None)
             .expect("set transaction");
         assert_eq!(last_tag(&set), "SET");
 
@@ -788,7 +804,7 @@ mod tests {
         assert!(session.execute_rollback_to_savepoint("s").is_err());
         assert!(session.execute_release_savepoint("s").is_err());
 
-        session.execute_begin(None).expect("begin");
+        session.execute_begin(None, None).expect("begin");
         session.execute_savepoint("s1").expect("savepoint");
         assert!(session.execute_rollback_to_savepoint("missing").is_err());
         assert!(matches!(session.txn_state, TxnState::InTransaction(_)));
@@ -803,14 +819,14 @@ mod tests {
             .expect("release savepoint");
         session.execute_rollback().expect("rollback");
 
-        session.execute_begin(None).expect("begin failed release");
+        session.execute_begin(None, None).expect("begin failed release");
         session.execute_savepoint("bad_release").expect("savepoint");
         assert!(session.execute_release_savepoint("missing").is_err());
         assert!(matches!(session.txn_state, TxnState::Failed(_)));
         assert!(session.execute_savepoint("after_failed").is_err());
         session.execute_rollback().expect("rollback failed block");
 
-        session.execute_begin(None).expect("begin prepare commit");
+        session.execute_begin(None, None).expect("begin prepare commit");
         session
             .execute_prepare_transaction("commit-gid")
             .expect("prepare commit");
@@ -819,7 +835,7 @@ mod tests {
             .expect("commit prepared");
         assert_eq!(last_tag(&committed), "COMMIT PREPARED");
 
-        session.execute_begin(None).expect("begin prepare rollback");
+        session.execute_begin(None, None).expect("begin prepare rollback");
         session
             .execute_prepare_transaction("rollback-gid")
             .expect("prepare rollback");
@@ -893,7 +909,7 @@ mod tests {
         let server = Arc::new(Server::init(data_dir.path()).expect("persistent server"));
         let (io, _peer) = duplex(64);
         let mut session = Session::new(io, Arc::clone(&server), None);
-        session.execute_begin(None).expect("begin");
+        session.execute_begin(None, None).expect("begin");
         session
             .pending_table_modifications
             .insert("t".to_owned(), 1);

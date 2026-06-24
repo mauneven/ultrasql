@@ -40,6 +40,22 @@ where
             owner.is_none_or(|arc| std::ptr::eq(&**arc, plan)),
             "run_dml_or_select owner Arc must point to the plan passed by value",
         );
+        // Read-only transaction enforcement (SQLSTATE 25006). A
+        // data-modifying statement inside a READ ONLY transaction is
+        // rejected and, like any in-transaction error, aborts the block.
+        // Checked before the prechecked fast path so cached fused
+        // INSERT/UPDATE/DELETE shapes are caught too.
+        if let TxnState::InTransaction(txn) = &self.txn_state
+            && txn.read_only
+            && let Some(command) = Self::read_only_violation_command(plan)
+        {
+            if let TxnState::InTransaction(txn) =
+                std::mem::replace(&mut self.txn_state, TxnState::Idle)
+            {
+                self.txn_state = TxnState::Failed(txn);
+            }
+            return Err(ServerError::ReadOnlyTransaction(command));
+        }
         let prechecked = self.fast_dml_prechecked(owner);
         let rls_plan = if prechecked {
             None

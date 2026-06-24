@@ -1565,6 +1565,7 @@ mod tests {
             },
             LogicalPlan::Begin {
                 isolation_level: None,
+                read_only: None,
                 schema: empty_schema(),
             },
             LogicalPlan::Listen {

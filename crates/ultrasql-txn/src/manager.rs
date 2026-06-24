@@ -185,6 +185,13 @@ pub struct Transaction {
     pub snapshot: Snapshot,
     /// Isolation level chosen at begin.
     pub isolation: IsolationLevel,
+    /// Whether this transaction is read-only (`BEGIN READ ONLY` / `SET
+    /// TRANSACTION READ ONLY`). The server rejects data-modifying statements
+    /// with SQLSTATE `25006` while this is set. Sequence advancement
+    /// (`nextval`) is intentionally still permitted, matching PostgreSQL.
+    /// `begin()` defaults this to `false`; the server sets it from the
+    /// requested access mode.
+    pub read_only: bool,
     /// WAL LSN observed at begin. v0.5 records the manager-local
     /// monotonic counter; once the WAL crate exposes the durable LSN at
     /// begin, this field will reflect that value instead. The type is
@@ -400,6 +407,7 @@ impl TransactionManager {
             xid,
             snapshot,
             isolation,
+            read_only: false,
             start_lsn: Lsn::ZERO,
             current_command: CommandId::FIRST,
             subtxn_stack: SubtxnManager::new(xid),

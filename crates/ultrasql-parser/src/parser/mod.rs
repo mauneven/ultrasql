@@ -242,10 +242,12 @@ impl<'src> Parser<'src> {
                 if self.peek()?.kind == TokenKind::KwTransaction {
                     self.advance()?;
                 }
-                // Optional ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE}
-                let isolation_level = self.parse_opt_isolation_level()?;
+                // Optional transaction modes: ISOLATION LEVEL …, READ ONLY /
+                // READ WRITE, [NOT] DEFERRABLE — in any order, comma-optional.
+                let (isolation_level, access_mode) = self.parse_transaction_modes()?;
                 Ok(Statement::Begin {
                     isolation_level,
+                    access_mode,
                     span: tok.span,
                 })
             }
@@ -291,15 +293,19 @@ impl<'src> Parser<'src> {
                     let set_tok = self.advance()?; // SET
                     self.advance()?; // TRANSACTION
                     let next_tok = *self.peek()?;
-                    let isolation_level =
-                        self.parse_opt_isolation_level()?
-                            .ok_or(ParseError::Expected {
-                                expected: "ISOLATION LEVEL after SET TRANSACTION",
-                                found: next_tok.kind,
-                                offset: next_tok.span.start_usize(),
-                            })?;
+                    // SET TRANSACTION accepts the same mode list as BEGIN, but
+                    // requires at least one mode (PostgreSQL).
+                    let (isolation_level, access_mode) = self.parse_transaction_modes()?;
+                    if isolation_level.is_none() && access_mode.is_none() {
+                        return Err(ParseError::Expected {
+                            expected: "ISOLATION LEVEL, READ ONLY/WRITE, or DEFERRABLE after SET TRANSACTION",
+                            found: next_tok.kind,
+                            offset: next_tok.span.start_usize(),
+                        });
+                    }
                     Ok(Statement::SetTransaction {
                         isolation_level,
+                        access_mode,
                         span: set_tok.span,
                     })
                 } else if (head_kind == TokenKind::KwSet || head_kind == TokenKind::KwReset)
@@ -902,6 +908,76 @@ impl<'src> Parser<'src> {
                 offset: tok.span.start_usize(),
             }),
         }
+    }
+
+    /// Parse a PostgreSQL transaction-mode list for `BEGIN` / `SET
+    /// TRANSACTION`: `mode [, mode …]` where each mode is `ISOLATION LEVEL
+    /// …`, `READ ONLY`, `READ WRITE`, or `[NOT] DEFERRABLE`. Modes may appear
+    /// in any order and the separating comma is optional (matching
+    /// PostgreSQL). Later modes win on repetition. `[NOT] DEFERRABLE` is
+    /// accepted but inert — safe-snapshot deferral is not yet implemented.
+    /// Returns the requested isolation level and access mode, each `None`
+    /// when unspecified.
+    pub(crate) fn parse_transaction_modes(
+        &mut self,
+    ) -> Result<
+        (
+            Option<crate::ast::AstIsolationLevel>,
+            Option<crate::ast::TransactionAccessMode>,
+        ),
+        ParseError,
+    > {
+        let mut isolation_level = None;
+        let mut access_mode = None;
+        loop {
+            let parsed = match self.peek()?.kind {
+                TokenKind::KwIsolation => {
+                    if let Some(level) = self.parse_opt_isolation_level()? {
+                        isolation_level = Some(level);
+                    }
+                    true
+                }
+                TokenKind::KwRead => {
+                    self.advance()?; // READ
+                    let next = *self.peek()?;
+                    if next.kind == TokenKind::KwOnly {
+                        self.advance()?;
+                        access_mode = Some(crate::ast::TransactionAccessMode::ReadOnly);
+                    } else if next
+                        .text(self.source)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("write"))
+                    {
+                        self.advance()?;
+                        access_mode = Some(crate::ast::TransactionAccessMode::ReadWrite);
+                    } else {
+                        return Err(ParseError::Expected {
+                            expected: "ONLY or WRITE after READ",
+                            found: next.kind,
+                            offset: next.span.start_usize(),
+                        });
+                    }
+                    true
+                }
+                TokenKind::KwNot => {
+                    self.advance()?; // NOT
+                    self.expect(TokenKind::KwDeferrable, "DEFERRABLE")?;
+                    true // accepted but inert
+                }
+                TokenKind::KwDeferrable => {
+                    self.advance()?;
+                    true // accepted but inert
+                }
+                _ => false,
+            };
+            if !parsed {
+                break;
+            }
+            // Optional comma between modes.
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            }
+        }
+        Ok((isolation_level, access_mode))
     }
 
     pub(crate) fn next_token_is_reserved_clause(&mut self) -> bool {

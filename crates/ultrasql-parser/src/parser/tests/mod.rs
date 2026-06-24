@@ -217,7 +217,7 @@ fn set_transaction_isolation_level() {
     else {
         panic!()
     };
-    assert_eq!(isolation_level, AstIsolationLevel::ReadCommitted);
+    assert_eq!(isolation_level, Some(AstIsolationLevel::ReadCommitted));
 
     let stmt = parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
     let Statement::SetTransaction {
@@ -226,7 +226,7 @@ fn set_transaction_isolation_level() {
     else {
         panic!()
     };
-    assert_eq!(isolation_level, AstIsolationLevel::RepeatableRead);
+    assert_eq!(isolation_level, Some(AstIsolationLevel::RepeatableRead));
 
     let stmt = parse("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
     let Statement::SetTransaction {
@@ -235,11 +235,61 @@ fn set_transaction_isolation_level() {
     else {
         panic!()
     };
-    assert_eq!(isolation_level, AstIsolationLevel::Serializable);
+    assert_eq!(isolation_level, Some(AstIsolationLevel::Serializable));
 
     // SET <var> = … must still parse as SetVar (not SetTransaction).
     let stmt = parse("SET search_path TO public");
     assert!(matches!(stmt, Statement::SetVar(_)));
+}
+
+#[test]
+fn transaction_access_modes_parse() {
+    use crate::ast::{AstIsolationLevel, TransactionAccessMode};
+
+    // BEGIN ... READ ONLY (access mode without isolation level).
+    let Statement::Begin {
+        isolation_level,
+        access_mode,
+        ..
+    } = parse("BEGIN READ ONLY")
+    else {
+        panic!("expected Begin")
+    };
+    assert_eq!(isolation_level, None);
+    assert_eq!(access_mode, Some(TransactionAccessMode::ReadOnly));
+
+    // BEGIN ... READ WRITE.
+    let Statement::Begin { access_mode, .. } = parse("BEGIN TRANSACTION READ WRITE") else {
+        panic!("expected Begin")
+    };
+    assert_eq!(access_mode, Some(TransactionAccessMode::ReadWrite));
+
+    // Combined: isolation level + access mode + DEFERRABLE (inert), comma-separated.
+    let Statement::Begin {
+        isolation_level,
+        access_mode,
+        ..
+    } = parse("BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE")
+    else {
+        panic!("expected Begin")
+    };
+    assert_eq!(isolation_level, Some(AstIsolationLevel::Serializable));
+    assert_eq!(access_mode, Some(TransactionAccessMode::ReadOnly));
+
+    // SET TRANSACTION READ ONLY (no isolation level).
+    let Statement::SetTransaction {
+        isolation_level,
+        access_mode,
+        ..
+    } = parse("SET TRANSACTION READ ONLY")
+    else {
+        panic!("expected SetTransaction")
+    };
+    assert_eq!(isolation_level, None);
+    assert_eq!(access_mode, Some(TransactionAccessMode::ReadOnly));
+
+    // SET TRANSACTION with neither isolation nor access mode is an error.
+    assert!(Parser::new("SET TRANSACTION").parse_statement().is_err());
 }
 
 #[test]

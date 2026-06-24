@@ -190,6 +190,24 @@ where
         }
     }
 
+    /// The SQL command name to report when `plan` is a data-modifying
+    /// statement that must be rejected inside a read-only transaction, or
+    /// `None` when the plan does not modify data. Drives `READ ONLY`
+    /// enforcement (SQLSTATE `25006`).
+    ///
+    /// DDL is intentionally absent: it is independently rejected inside an
+    /// explicit transaction block. Sequence advancement (`nextval`) is
+    /// permitted in a read-only transaction, matching PostgreSQL.
+    pub(crate) fn read_only_violation_command(plan: &LogicalPlan) -> Option<&'static str> {
+        match plan {
+            LogicalPlan::Insert { .. } => Some("INSERT"),
+            LogicalPlan::Update { .. } => Some("UPDATE"),
+            LogicalPlan::Delete { .. } => Some("DELETE"),
+            LogicalPlan::Merge { .. } => Some("MERGE"),
+            _ => None,
+        }
+    }
+
     pub(crate) fn dml_change_kind(plan: &LogicalPlan) -> Option<LogicalChangeKind> {
         match plan {
             LogicalPlan::Insert { .. } => Some(LogicalChangeKind::Insert),

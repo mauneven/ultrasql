@@ -36,6 +36,17 @@ pub enum AstIsolationLevel {
     Serializable,
 }
 
+/// Transaction access mode for `BEGIN` / `SET TRANSACTION`
+/// (`READ WRITE` | `READ ONLY`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionAccessMode {
+    /// `READ WRITE` — the default; the transaction may modify data.
+    ReadWrite,
+    /// `READ ONLY` — the transaction may not modify data (PostgreSQL
+    /// rejects writes with SQLSTATE `25006`).
+    ReadOnly,
+}
+
 /// Top-level SQL statement.
 ///
 /// `SelectStmt` and the DML statement types are comparatively large, so
@@ -73,6 +84,9 @@ pub enum Statement {
     Begin {
         /// Optional isolation level requested by the client.
         isolation_level: Option<AstIsolationLevel>,
+        /// Optional access mode (`READ ONLY` / `READ WRITE`); `None` when
+        /// the client did not specify one (defaults to read-write).
+        access_mode: Option<TransactionAccessMode>,
         /// Source span.
         span: Span,
     },
@@ -186,8 +200,13 @@ pub enum Statement {
     /// data has been read or written; PostgreSQL rejects late changes with
     /// SQLSTATE `25001`.
     SetTransaction {
-        /// Isolation level requested by the client.
-        isolation_level: AstIsolationLevel,
+        /// Isolation level requested by the client, if one was given.
+        /// `SET TRANSACTION` may set only the access mode (e.g.
+        /// `SET TRANSACTION READ ONLY`), leaving this `None`.
+        isolation_level: Option<AstIsolationLevel>,
+        /// Optional access mode (`READ ONLY` / `READ WRITE`); `None` leaves
+        /// the current transaction's access mode unchanged.
+        access_mode: Option<TransactionAccessMode>,
         /// Source span.
         span: Span,
     },

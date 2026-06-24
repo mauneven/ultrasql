@@ -913,6 +913,10 @@ pub enum LogicalPlan {
         /// Requested isolation level. `None` means the server's default
         /// (`ReadCommitted` in UltraSQL, matching PostgreSQL's default).
         isolation_level: Option<TxnIsolationLevel>,
+        /// Requested access mode: `Some(true)` for `READ ONLY`,
+        /// `Some(false)` for `READ WRITE`, `None` when unspecified
+        /// (defaults to read-write).
+        read_only: Option<bool>,
         /// Always [`Schema::empty`].
         schema: Schema,
     },
@@ -1019,8 +1023,12 @@ pub enum LogicalPlan {
     ///
     /// `schema` is always [`Schema::empty`].
     SetTransaction {
-        /// Requested isolation level.
-        isolation_level: TxnIsolationLevel,
+        /// Requested isolation level, if one was given. `None` when the
+        /// statement sets only the access mode (`SET TRANSACTION READ ONLY`).
+        isolation_level: Option<TxnIsolationLevel>,
+        /// Requested access mode: `Some(true)` for `READ ONLY`,
+        /// `Some(false)` for `READ WRITE`, `None` to leave it unchanged.
+        read_only: Option<bool>,
         /// Always [`Schema::empty`].
         schema: Schema,
     },

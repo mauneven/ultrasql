@@ -404,6 +404,14 @@ where
                 Ok(Some(fast_insert_result(rows)))
             }
             TxnState::InTransaction(mut txn) => {
+                // Read-only transaction enforcement (SQLSTATE 25006): this
+                // fast path is always an INSERT and bypasses
+                // `run_dml_or_select`, so it needs its own guard. Reject
+                // and abort the block, matching the general DML path.
+                if txn.read_only {
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(ServerError::ReadOnlyTransaction("INSERT"));
+                }
                 self.state.txn_manager.refresh_snapshot(&mut txn);
                 let outcome = self
                     .fast_insert_int32_pair_rows(entry, &parsed.rows, &txn)

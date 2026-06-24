@@ -166,7 +166,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         // variants so the Simple- and Extended-Query paths share a single
         // dispatch surface.
         Statement::Begin {
-            isolation_level, ..
+            isolation_level,
+            access_mode,
+            ..
         } => {
             use ultrasql_parser::ast::AstIsolationLevel as AL;
             let level = isolation_level.map(|l| match l {
@@ -176,6 +178,8 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             });
             Ok(LogicalPlan::Begin {
                 isolation_level: level,
+                read_only: access_mode
+                    .map(|m| matches!(m, ultrasql_parser::ast::TransactionAccessMode::ReadOnly)),
                 schema: Schema::empty(),
             })
         }
@@ -210,16 +214,20 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             schema: Schema::empty(),
         }),
         Statement::SetTransaction {
-            isolation_level, ..
+            isolation_level,
+            access_mode,
+            ..
         } => {
             use ultrasql_parser::ast::AstIsolationLevel as AL;
-            let level = match isolation_level {
+            let level = isolation_level.map(|l| match l {
                 AL::ReadCommitted => TxnIsolationLevel::ReadCommitted,
                 AL::RepeatableRead => TxnIsolationLevel::RepeatableRead,
                 AL::Serializable => TxnIsolationLevel::Serializable,
-            };
+            });
             Ok(LogicalPlan::SetTransaction {
                 isolation_level: level,
+                read_only: access_mode
+                    .map(|m| matches!(m, ultrasql_parser::ast::TransactionAccessMode::ReadOnly)),
                 schema: Schema::empty(),
             })
         }

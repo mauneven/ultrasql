@@ -1509,3 +1509,140 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
 
     shutdown(client, server_handle).await;
 }
+
+/// SQLSTATE code carried by a wire error, if any.
+fn db_sqlstate(err: &tokio_postgres::Error) -> Option<String> {
+    err.as_db_error().map(|e| e.code().code().to_string())
+}
+
+/// `BEGIN READ ONLY; INSERT …` is rejected with SQLSTATE `25006`
+/// (`read_only_sql_transaction`) and aborts the block, while `SELECT`
+/// is still allowed. Uses a non-`(int32,int32)` table so the statement
+/// flows through the general DML path (`run_dml_or_select`).
+#[tokio::test]
+async fn read_only_transaction_rejects_general_insert_and_allows_select() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE ro_general (id INT NOT NULL, name TEXT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO ro_general VALUES (1, 'seed')")
+        .await
+        .expect("seed row in autocommit");
+
+    client
+        .batch_execute("BEGIN READ ONLY")
+        .await
+        .expect("BEGIN READ ONLY");
+
+    // SELECT is permitted in a read-only transaction.
+    let rows = client
+        .query("SELECT count(*) FROM ro_general", &[])
+        .await
+        .expect("SELECT allowed in read-only txn");
+    assert_eq!(rows.len(), 1);
+
+    // INSERT is rejected with 25006.
+    let err = client
+        .batch_execute("INSERT INTO ro_general VALUES (2, 'blocked')")
+        .await
+        .expect_err("INSERT must be rejected in a read-only transaction");
+    assert_eq!(
+        db_sqlstate(&err).as_deref(),
+        Some("25006"),
+        "read-only INSERT must report read_only_sql_transaction"
+    );
+
+    // The violation aborted the block: subsequent statements get 25P02.
+    let err = client
+        .batch_execute("SELECT 1")
+        .await
+        .expect_err("block is aborted after the read-only violation");
+    assert_eq!(db_sqlstate(&err).as_deref(), Some("25P02"));
+
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    // After ROLLBACK the session is read-write again (autocommit).
+    client
+        .batch_execute("INSERT INTO ro_general VALUES (3, 'after')")
+        .await
+        .expect("INSERT works again after leaving the read-only block");
+
+    let rows = client
+        .query("SELECT count(*) FROM ro_general", &[])
+        .await
+        .expect("count");
+    let count: i64 = rows[0].get(0);
+    assert_eq!(count, 2, "only the seed and post-rollback rows persisted");
+
+    shutdown(client, server_handle).await;
+}
+
+/// The `(int32, int32)` fast-INSERT path bypasses `run_dml_or_select`, so
+/// it carries its own read-only guard. Verify it also reports `25006`.
+#[tokio::test]
+async fn read_only_transaction_rejects_fast_int32_pair_insert() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE ro_pair (a INT, b INT)")
+        .await
+        .expect("create (int32,int32) table");
+
+    client
+        .batch_execute("BEGIN READ ONLY")
+        .await
+        .expect("BEGIN READ ONLY");
+
+    let err = client
+        .batch_execute("INSERT INTO ro_pair VALUES (1, 2)")
+        .await
+        .expect_err("fast-path INSERT must be rejected in a read-only transaction");
+    assert_eq!(
+        db_sqlstate(&err).as_deref(),
+        Some("25006"),
+        "fast int32-pair INSERT must also honor READ ONLY"
+    );
+
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+    shutdown(client, server_handle).await;
+}
+
+/// `SET TRANSACTION READ ONLY` (no isolation level) downgrades the open
+/// transaction; a later `UPDATE` is rejected with `25006` and the row is
+/// unchanged after `ROLLBACK`.
+#[tokio::test]
+async fn set_transaction_read_only_rejects_update() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE ro_upd (id INT NOT NULL, v INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO ro_upd VALUES (1, 1)")
+        .await
+        .expect("seed row");
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SET TRANSACTION READ ONLY")
+        .await
+        .expect("SET TRANSACTION READ ONLY");
+
+    let err = client
+        .batch_execute("UPDATE ro_upd SET v = 2 WHERE id = 1")
+        .await
+        .expect_err("UPDATE must be rejected after SET TRANSACTION READ ONLY");
+    assert_eq!(db_sqlstate(&err).as_deref(), Some("25006"));
+
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    let rows = client
+        .query("SELECT v FROM ro_upd WHERE id = 1", &[])
+        .await
+        .expect("read back");
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, 1, "the rejected UPDATE left the row unchanged");
+
+    shutdown(client, server_handle).await;
+}
