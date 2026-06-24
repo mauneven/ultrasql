@@ -768,7 +768,9 @@ mod tests {
             .execute_begin(Some(TxnIsolationLevel::Serializable), None)
             .expect("begin");
         assert!(matches!(session.txn_state, TxnState::InTransaction(_)));
-        let nested = session.execute_begin(None, None).expect("nested begin warning");
+        let nested = session
+            .execute_begin(None, None)
+            .expect("nested begin warning");
         assert_eq!(last_tag(&nested), "BEGIN");
         assert_eq!(nested.messages.len(), 2);
         let set = session
@@ -819,14 +821,18 @@ mod tests {
             .expect("release savepoint");
         session.execute_rollback().expect("rollback");
 
-        session.execute_begin(None, None).expect("begin failed release");
+        session
+            .execute_begin(None, None)
+            .expect("begin failed release");
         session.execute_savepoint("bad_release").expect("savepoint");
         assert!(session.execute_release_savepoint("missing").is_err());
         assert!(matches!(session.txn_state, TxnState::Failed(_)));
         assert!(session.execute_savepoint("after_failed").is_err());
         session.execute_rollback().expect("rollback failed block");
 
-        session.execute_begin(None, None).expect("begin prepare commit");
+        session
+            .execute_begin(None, None)
+            .expect("begin prepare commit");
         session
             .execute_prepare_transaction("commit-gid")
             .expect("prepare commit");
@@ -835,7 +841,9 @@ mod tests {
             .expect("commit prepared");
         assert_eq!(last_tag(&committed), "COMMIT PREPARED");
 
-        session.execute_begin(None, None).expect("begin prepare rollback");
+        session
+            .execute_begin(None, None)
+            .expect("begin prepare rollback");
         session
             .execute_prepare_transaction("rollback-gid")
             .expect("prepare rollback");
