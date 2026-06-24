@@ -261,10 +261,12 @@ where
         // rows, so the lowerer would only round-trip it through an
         // unreachable arm. DDL inside an explicit transaction is
         // rejected today because the catalog mutations are not
-        // transactional under the v0.5 catalog (see AGENTS.md §11; a
-        // follow-up RFC will add transactional DDL). The rejection
-        // transitions the txn to `Failed` so subsequent statements get
-        // SQLSTATE `25P02` until COMMIT/ROLLBACK.
+        // transactional under the v0.5 catalog (see AGENTS.md §11 and
+        // `docs/transactional-ddl-design.md`; lifting this gate without
+        // the catalog-overlay work is silent schema corruption). The
+        // rejection returns SQLSTATE `0A000` (feature_not_supported) with
+        // an autocommit HINT, and transitions the txn to `Failed` so
+        // subsequent statements get SQLSTATE `25P02` until COMMIT/ROLLBACK.
         let is_ddl = matches!(
             &plan,
             LogicalPlan::CreateTable { .. }
@@ -300,9 +302,7 @@ where
                 | LogicalPlan::Truncate { .. }
         );
         if is_ddl && matches!(self.txn_state, TxnState::InTransaction(_)) {
-            return Err(self.fail_if_in_transaction(ServerError::Unsupported(
-                "DDL inside an explicit transaction block is not yet supported",
-            )));
+            return Err(self.fail_if_in_transaction(ServerError::DdlInTransaction));
         }
         match &plan {
             LogicalPlan::CreateTable { .. } => {

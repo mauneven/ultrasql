@@ -192,6 +192,16 @@ async fn views_reject_dml_targets_and_definition_replacement() {
         .batch_execute("ALTER VIEW view_dml_v RENAME TO view_dml_renamed")
         .await
         .expect_err("ALTER VIEW in explicit transaction must fail");
+    // DDL-in-transaction is rejected with SQLSTATE 0A000
+    // (feature_not_supported) — PostgreSQL implements transactional DDL;
+    // UltraSQL does not yet (see docs/transactional-ddl-design.md).
+    let txn_sqlstate = txn_err
+        .code()
+        .map_or_else(String::new, |c| c.code().to_string());
+    assert_eq!(
+        txn_sqlstate, "0A000",
+        "transactional DDL must be feature_not_supported: {txn_err}"
+    );
     let txn_msg = txn_err
         .as_db_error()
         .map(tokio_postgres::error::DbError::message)

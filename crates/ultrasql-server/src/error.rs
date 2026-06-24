@@ -71,6 +71,23 @@ pub enum ServerError {
     #[error("unsupported in v0.5: {0}")]
     Unsupported(&'static str),
 
+    /// DDL was issued inside an explicit transaction block. PostgreSQL
+    /// supports transactional DDL; UltraSQL does not yet (the catalog is
+    /// mutated globally-in-place and committed durably mid-statement
+    /// under a private `ddl_txn`, with no per-transaction overlay, so a
+    /// rolled-back transaction's schema change could not be undone — see
+    /// `docs/transactional-ddl-design.md`). Maps to PostgreSQL SQLSTATE
+    /// `0A000` (`feature_not_supported`) — the PG-faithful code for a
+    /// feature PostgreSQL implements but UltraSQL has not yet. The
+    /// message carries a `HINT:` telling the caller to run the DDL in
+    /// autocommit (outside an explicit transaction) until transactional
+    /// DDL lands, so ORM/migration tooling gets a deterministic,
+    /// classifiable failure rather than a generic "unsupported" string.
+    #[error(
+        "DDL inside an explicit transaction block is not yet supported\nHINT:  run the statement in autocommit (outside an explicit BEGIN/COMMIT block); transactional DDL is not yet implemented"
+    )]
+    DdlInTransaction,
+
     /// A statement uses an unsupported construct whose explanation is
     /// computed from the rejected query.
     #[error("unsupported in v0.5: {0}")]
@@ -221,6 +238,7 @@ impl ServerError {
                 | Self::Build(_)
                 | Self::Unsupported(_)
                 | Self::UnsupportedOwned(_)
+                | Self::DdlInTransaction
                 | Self::Ddl(_)
                 | Self::Catalog(_)
                 | Self::UndefinedObject(_)
@@ -269,6 +287,10 @@ impl ServerError {
             Self::DuplicateObject(_) => "42710", // duplicate_object
             Self::UndefinedSchema(_) => "3F000", // invalid_schema_name
             Self::Build(_) | Self::Unsupported(_) | Self::UnsupportedOwned(_) => "0A000", // feature_not_supported
+            // feature_not_supported — DDL inside an explicit transaction
+            // block. PostgreSQL implements transactional DDL; UltraSQL
+            // does not yet, so 0A000 is the PG-faithful classification.
+            Self::DdlInTransaction => "0A000",
             Self::UnsupportedProtocol { .. } => "08P01", // protocol_violation
             Self::DependentObjectsStillExist(_) => "2BP01", // dependent_objects_still_exist
             Self::InvalidTableDefinition(_) => "42P16",  // invalid_table_definition
@@ -389,6 +411,29 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unsupported in v0.5: unsupported function 'foo'"
+        );
+    }
+
+    #[test]
+    fn ddl_in_transaction_is_feature_not_supported_with_hint() {
+        let err = ServerError::DdlInTransaction;
+
+        // Query-scoped: the session survives, the block transitions to
+        // Failed at the call site, not the connection.
+        assert!(err.is_query_scoped());
+        // PG-faithful: PostgreSQL supports transactional DDL, so the
+        // "not implemented here yet" code is feature_not_supported.
+        assert_eq!(err.sqlstate(), "0A000");
+        // Deterministic, classifiable message + a HINT so ORM/migration
+        // tooling can route the user to autocommit.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DDL inside an explicit transaction block is not yet supported"),
+            "message names the rejected construct: {msg}"
+        );
+        assert!(
+            msg.contains("HINT:") && msg.contains("autocommit"),
+            "message carries an autocommit hint: {msg}"
         );
     }
 

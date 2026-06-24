@@ -1429,3 +1429,83 @@ async fn repeatable_read_snapshot_frozen_wire_level() {
 
     shutdown(client, server_handle).await;
 }
+
+/// DDL inside an explicit transaction block is rejected deterministically
+/// with SQLSTATE `0A000` (feature_not_supported) and an autocommit HINT.
+///
+/// PostgreSQL implements transactional DDL; UltraSQL does not yet (the
+/// catalog is mutated globally-in-place and committed durably mid-statement
+/// under a private `ddl_txn`, with no per-transaction overlay — see
+/// `docs/transactional-ddl-design.md`). Until that lands, the gate must
+/// fail honestly: a classifiable SQLSTATE plus a hint, the block then
+/// transitioning to Failed (25P02) per PostgreSQL's in-failed-block rule,
+/// and the session fully usable again after ROLLBACK.
+#[tokio::test]
+async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+
+    let err = client
+        .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
+        .await
+        .expect_err("DDL inside an explicit transaction must be rejected");
+
+    // PG-faithful classification: feature_not_supported, not a generic
+    // internal error, so ORM/migration tooling can route on it.
+    let sqlstate = err
+        .code()
+        .map_or_else(String::new, |c| c.code().to_string());
+    assert_eq!(
+        sqlstate, "0A000",
+        "DDL-in-transaction must report feature_not_supported: {err}"
+    );
+
+    // The failure is honest: it names the construct and carries a HINT
+    // pointing at autocommit. The server reports errors through a uniform
+    // (message, sqlstate) path with no separate wire HINT field, so the
+    // hint travels in the message text; assert both halves are present.
+    let message = err
+        .as_db_error()
+        .map(tokio_postgres::error::DbError::message)
+        .unwrap_or("");
+    assert!(
+        message.contains("DDL inside an explicit transaction block is not yet supported"),
+        "message names the rejected construct: {err}"
+    );
+    assert!(
+        message.contains("HINT:") && message.contains("autocommit"),
+        "rejection carries an autocommit hint: message={message:?}, err={err}"
+    );
+
+    // Per PostgreSQL semantics the block is now Failed: subsequent
+    // statements get 25P02 until the block ends.
+    let in_failed = client
+        .batch_execute("SELECT 1")
+        .await
+        .expect_err("statement in failed block must be rejected");
+    let in_failed_sqlstate = in_failed
+        .code()
+        .map_or_else(String::new, |c| c.code().to_string());
+    assert_eq!(
+        in_failed_sqlstate, "25P02",
+        "in-failed-block must report in_failed_sql_transaction: {in_failed}"
+    );
+
+    // ROLLBACK leaves the failed-block state and the session is usable.
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+    let rows = client
+        .query("SELECT 1", &[])
+        .await
+        .expect("session usable after rollback");
+    assert_eq!(rows.len(), 1, "session recovered after rollback");
+
+    // And the rejected DDL did not leak: the table does not exist, and it
+    // can now be created in autocommit (the documented workaround).
+    client
+        .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
+        .await
+        .expect("DDL succeeds in autocommit after the rejected in-txn attempt");
+
+    shutdown(client, server_handle).await;
+}

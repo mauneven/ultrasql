@@ -462,9 +462,7 @@ where
         {
             let catalog_snapshot = self.state.catalog_snapshot();
             let result = if matches!(self.txn_state, TxnState::InTransaction(_)) {
-                Err(self.fail_if_in_transaction(ServerError::Unsupported(
-                    "DDL inside an explicit transaction block is not yet supported",
-                )))
+                Err(self.fail_if_in_transaction(ServerError::DdlInTransaction))
             } else {
                 self.execute_ddl_plan(plan, &catalog_snapshot)
             };
