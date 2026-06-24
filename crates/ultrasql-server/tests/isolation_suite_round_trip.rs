@@ -542,6 +542,553 @@ async fn serializable_empty_strict_range_does_not_false_abort_wire() {
     shutdown(running).await;
 }
 
+/// DATE-keyed write-skew (missed-conflict direction): two serializable
+/// transactions each read a date the other writes into. With the tighter
+/// `Date` ColumnRange lock the dangerous structure MUST still be caught —
+/// exactly one transaction commits and the other fails with 40001. A
+/// regression to "both commit" would mean the tightened lock silently
+/// misses a real conflict (unsound).
+#[tokio::test]
+async fn serializable_date_write_skew_aborts_one_wire() {
+    let running = start_sample_server("serializable_date_write_skew").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_date_write_skew_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_date_skew (d DATE NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_date_skew \
+                VALUES (DATE '2024-01-01', 1), (DATE '2024-01-02', 1)",
+        )
+        .await
+        .expect("seed date write-skew table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // Each transaction reads the date point the *other* will write into.
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_date_skew WHERE d = DATE '2024-01-01'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_date_skew WHERE d = DATE '2024-01-02'",
+        )
+        .await,
+        1
+    );
+
+    // Cross writes: A writes the row B read; B writes the row A read.
+    running
+        .client
+        .batch_execute("UPDATE serializable_date_skew SET v = v + 1 WHERE d = DATE '2024-01-02'")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_date_skew SET v = v + 1 WHERE d = DATE '2024-01-01'")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "one date-skew serializable tx must commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "one date-skew serializable tx must fail with 40001: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+/// DATE-keyed disjoint ranges (the precision benefit): two serializable
+/// transactions read and write strictly disjoint date ranges. Before
+/// `Date` joined the range-lock allowlist these degraded to a
+/// relation-wide lock and spuriously aborted; with the tighter
+/// per-column-range lock they no longer overlap, so BOTH commit. A
+/// `Time`-keyed disjoint pair is checked in the same transaction to cover
+/// the microsecond domain.
+#[tokio::test]
+async fn serializable_date_time_disjoint_ranges_both_commit_wire() {
+    let running = start_sample_server("serializable_date_time_disjoint").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_date_time_disjoint_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_dt_disjoint (d DATE NOT NULL, t TIME NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_dt_disjoint VALUES \
+                (DATE '2024-01-01', TIME '01:00:00', 10), \
+                (DATE '2024-06-01', TIME '13:00:00', 20)",
+        )
+        .await
+        .expect("seed date/time disjoint table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // Disjoint date ranges: A reads the January half, B reads the June half.
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT v FROM serializable_dt_disjoint WHERE d < DATE '2024-03-01'",
+        )
+        .await,
+        10
+    );
+    assert_eq!(
+        scalar_i32(
+            &peer,
+            "SELECT v FROM serializable_dt_disjoint WHERE d >= DATE '2024-03-01'",
+        )
+        .await,
+        20
+    );
+
+    // Each writes only inside the date range it read (disjoint from the peer).
+    running
+        .client
+        .batch_execute("UPDATE serializable_dt_disjoint SET v = v + 1 WHERE d < DATE '2024-03-01'")
+        .await
+        .expect("update a");
+    peer.batch_execute(
+        "UPDATE serializable_dt_disjoint SET v = v + 1 WHERE d >= DATE '2024-03-01'",
+    )
+    .await
+    .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert!(
+        a_commit.is_ok() && b_commit.is_ok(),
+        "disjoint date-range serializable updates should both commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT SUM(v) FROM serializable_dt_disjoint"
+        )
+        .await,
+        32,
+        "both disjoint date-range updates must have applied"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+/// CROSS-TYPE write-skew (the gate's missed-conflict repro — the
+/// load-bearing test). A Date column is READ with a `TIMESTAMP` literal
+/// (microseconds) and the *crossed* WRITE keys it with a `DATE` literal
+/// (days). The binder allows the temporal-vs-temporal comparison without
+/// coercing the literal (`comparable` in expr_type.rs), so the read lock
+/// and the crossed write lock land on the same Date column but in
+/// different i64 unit-classes.
+///
+/// Genuine write-skew structure: A reads row 2000-01-02 and writes row
+/// 2000-01-01; B reads row 2000-01-01 and writes row 2000-01-02. Each
+/// transaction writes the row the *other* read, so a serializable schedule
+/// must abort one.
+///
+/// Pre-fix (commit 31dc3a70) the Date column took a tight *micro-space*
+/// read lock (`[86_400_000_000, …]`) and a tight *day-space* write lock
+/// (`[0,0]` / `[1,1]`); those ranges never overlap, so the real
+/// rw-conflict was MISSED and BOTH transactions committed — a
+/// non-serializable schedule (silent corruption). Post-fix the cross-class
+/// read falls back to a relation-wide lock, the conflict is caught, and
+/// exactly one transaction aborts with SQLSTATE 40001.
+#[tokio::test]
+async fn serializable_date_col_vs_timestamp_literal_write_skew_aborts_one_wire() {
+    let running = start_sample_server("serializable_date_cross_ts").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "serializable_date_cross_ts_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_date_cross (d DATE NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_date_cross \
+                VALUES (DATE '2000-01-01', 10), (DATE '2000-01-02', 20)",
+        )
+        .await
+        .expect("seed cross-type date table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // READ a date point keyed with a TIMESTAMP literal (microseconds):
+    // A reads 2000-01-02, B reads 2000-01-01.
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_date_cross \
+             WHERE d = TIMESTAMP '2000-01-02 00:00:00'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_date_cross \
+             WHERE d = TIMESTAMP '2000-01-01 00:00:00'",
+        )
+        .await,
+        1
+    );
+
+    // CROSS WRITES keyed with a DATE literal (days) into the row the *peer*
+    // read: A writes 2000-01-01 (B read it); B writes 2000-01-02 (A read it).
+    running
+        .client
+        .batch_execute("UPDATE serializable_date_cross SET v = v + 1 WHERE d = DATE '2000-01-01'")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_date_cross SET v = v + 1 WHERE d = DATE '2000-01-02'")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one cross-type (Date-col/TIMESTAMP-lit read, DATE-lit write) \
+         serializable tx must commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "exactly one cross-type serializable tx must fail with 40001 \
+         (the missed-conflict must be caught): a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+/// REVERSE cross-type write-skew: a `Timestamp` column (microseconds) is
+/// READ with a `DATE` literal (days) and the crossed WRITE keys it with a
+/// `TIMESTAMP` literal — the mirror of the gate's repro. Same genuine
+/// write-skew structure (each writes the row the other read). The same
+/// cross-unit-class hazard applies, so exactly one transaction must abort
+/// with 40001.
+#[tokio::test]
+async fn serializable_timestamp_col_vs_date_literal_write_skew_aborts_one_wire() {
+    let running = start_sample_server("serializable_ts_cross_date").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "serializable_ts_cross_date_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_ts_cross (ts TIMESTAMP NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_ts_cross \
+                VALUES (TIMESTAMP '2000-01-01 00:00:00', 10), \
+                       (TIMESTAMP '2000-01-02 00:00:00', 20)",
+        )
+        .await
+        .expect("seed reverse cross-type table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // READ keyed with a DATE literal against the TIMESTAMP column:
+    // A reads 2000-01-02, B reads 2000-01-01.
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_ts_cross WHERE ts = DATE '2000-01-02'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_ts_cross WHERE ts = DATE '2000-01-01'",
+        )
+        .await,
+        1
+    );
+
+    // CROSS WRITES keyed with a TIMESTAMP literal into the row the peer read:
+    // A writes 2000-01-01 (B read it); B writes 2000-01-02 (A read it).
+    running
+        .client
+        .batch_execute(
+            "UPDATE serializable_ts_cross SET v = v + 1 \
+             WHERE ts = TIMESTAMP '2000-01-01 00:00:00'",
+        )
+        .await
+        .expect("update a");
+    peer.batch_execute(
+        "UPDATE serializable_ts_cross SET v = v + 1 \
+         WHERE ts = TIMESTAMP '2000-01-02 00:00:00'",
+    )
+    .await
+    .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one reverse cross-type serializable tx must commit: \
+         a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "exactly one reverse cross-type serializable tx must fail with 40001: \
+         a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+/// NO-REGRESSION (TS cross-compat preserved): a `Timestamp` column READ
+/// with a `TIMESTAMPTZ` literal and the crossed WRITE keyed with a
+/// `TIMESTAMP` literal is a *same-unit-class* pair (both micros since
+/// epoch, interchangeable). The tight column-range lock is retained, so a
+/// genuine write-skew (A writes the row B read; B writes the row A read)
+/// is still caught — exactly one transaction aborts with 40001. Proves the
+/// unit-class guard did NOT regress the sound Timestamp ↔ TimestampTz
+/// cross-compat.
+#[tokio::test]
+async fn serializable_timestamp_col_vs_timestamptz_literal_write_skew_aborts_one_wire() {
+    let running = start_sample_server("serializable_ts_tstz").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "serializable_ts_tstz_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_ts_tstz (ts TIMESTAMP NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_ts_tstz \
+                VALUES (TIMESTAMP '2000-01-01 00:00:00', 10), \
+                       (TIMESTAMP '2000-01-02 00:00:00', 20)",
+        )
+        .await
+        .expect("seed ts/tstz table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // READ keyed with a TIMESTAMPTZ literal against the TIMESTAMP column
+    // (same unit-class — micros since epoch): A reads 2000-01-02, B reads
+    // 2000-01-01.
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_ts_tstz \
+             WHERE ts = TIMESTAMPTZ '2000-01-02 00:00:00+00'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_ts_tstz \
+             WHERE ts = TIMESTAMPTZ '2000-01-01 00:00:00+00'",
+        )
+        .await,
+        1
+    );
+
+    // CROSS WRITES keyed with a TIMESTAMP literal into the row the peer read:
+    // A writes 2000-01-01 (B read it); B writes 2000-01-02 (A read it).
+    running
+        .client
+        .batch_execute(
+            "UPDATE serializable_ts_tstz SET v = v + 1 \
+             WHERE ts = TIMESTAMP '2000-01-01 00:00:00'",
+        )
+        .await
+        .expect("update a");
+    peer.batch_execute(
+        "UPDATE serializable_ts_tstz SET v = v + 1 \
+         WHERE ts = TIMESTAMP '2000-01-02 00:00:00'",
+    )
+    .await
+    .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one Timestamp/TimestampTz serializable tx must commit \
+         (TS cross-compat tight lock preserved): a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "exactly one Timestamp/TimestampTz serializable tx must fail with 40001: \
+         a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
+/// NO-REGRESSION (same-class TIME tight lock): a genuine `Time`/`Time`
+/// write-skew (each transaction writes the row-of-time the other read)
+/// must still abort one transaction with 40001. The `Time` ↔ `Timestamp`
+/// cross-class hazard is exercised at the unit level
+/// (`serializable_read_lock_time_col_vs_timestamp_literal_falls_back_to_relation`
+/// in serializable.rs) because a `Time`-vs-`Timestamp` comparison is not
+/// evaluable at execution; here we pin that same-class Time locks still
+/// catch real conflicts.
+#[tokio::test]
+async fn serializable_time_same_class_write_skew_aborts_one_wire() {
+    let running = start_sample_server("serializable_time_same").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "serializable_time_same_peer").await;
+
+    running
+        .client
+        .batch_execute(
+            "CREATE TABLE serializable_time_same (t TIME NOT NULL, v INT NOT NULL);\
+             INSERT INTO serializable_time_same \
+                VALUES (TIME '01:00:00', 10), (TIME '02:00:00', 20)",
+        )
+        .await
+        .expect("seed time same-class table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // READ keyed with a TIME literal: A reads 02:00, B reads 01:00.
+    assert_eq!(
+        scalar_i64(
+            &running.client,
+            "SELECT COUNT(*) FROM serializable_time_same WHERE t = TIME '02:00:00'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            &peer,
+            "SELECT COUNT(*) FROM serializable_time_same WHERE t = TIME '01:00:00'",
+        )
+        .await,
+        1
+    );
+
+    // CROSS WRITES into the row the peer read: A writes 01:00 (B read it);
+    // B writes 02:00 (A read it).
+    running
+        .client
+        .batch_execute("UPDATE serializable_time_same SET v = v + 1 WHERE t = TIME '01:00:00'")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE serializable_time_same SET v = v + 1 WHERE t = TIME '02:00:00'")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "exactly one same-class Time write-skew tx must commit: \
+         a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "exactly one same-class Time write-skew tx must fail with 40001: \
+         a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 async fn setup_hermitage_table(client: &Client) {
     client
         .batch_execute("CREATE TABLE isolation_hermitage (id INT NOT NULL, value INT)")

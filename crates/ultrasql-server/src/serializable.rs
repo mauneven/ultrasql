@@ -169,7 +169,14 @@ fn insert_write_conflict_tags(
             if !column_supports_range_lock(entry, target_idx) {
                 continue;
             }
-            if let Some(key) = pipeline::literal_as_i64(expr) {
+            // Only take a tight point lock when the inserted literal is in
+            // the same i64 unit-class as the target column; a cross-class
+            // literal (e.g. a Timestamp value into a Date column) would
+            // lock a mis-scaled key and silently miss conflicts, so fall
+            // back to the safe full-range lock for that column.
+            if let Some(key) = pipeline::literal_as_i64(expr)
+                .filter(|_| literal_matches_column_unit_class(entry, target_idx, expr))
+            {
                 if let Some(tag) = column_range_tag(entry, target_idx, Some(key), Some(key)) {
                     tags.push(tag);
                 }
@@ -425,6 +432,20 @@ fn column_supports_range_lock(entry: &TableEntry, column: usize) -> bool {
         .is_some_and(|field| data_type_supports_range_lock(&field.data_type))
 }
 
+/// Whether `expr`'s literal value shares the i64 unit-class of column
+/// `column` — the precondition for an `INSERT` to take a tight point
+/// lock instead of degrading to the safe full-range lock. Returns `false`
+/// for non-literals or cross-class temporal pairs.
+fn literal_matches_column_unit_class(entry: &TableEntry, column: usize, expr: &ScalarExpr) -> bool {
+    let Some(field) = entry.schema.fields().get(column) else {
+        return false;
+    };
+    let ScalarExpr::Literal { value, .. } = expr else {
+        return false;
+    };
+    pipeline::literal_in_same_unit_class_as_column(&field.data_type, value)
+}
+
 const fn data_type_supports_range_lock(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -434,6 +455,8 @@ const fn data_type_supports_range_lock(data_type: &DataType) -> bool {
             | DataType::Int64
             | DataType::Timestamp
             | DataType::TimestampTz
+            | DataType::Date
+            | DataType::Time
     )
 }
 
@@ -457,7 +480,14 @@ mod tests {
     }
 
     fn test_snapshot() -> CatalogSnapshot {
-        let entry = TableEntry::new(Oid::new(42), "t", "public", test_schema());
+        snapshot_for_schema(test_schema())
+    }
+
+    /// Build a single-table catalog snapshot named `t` (oid 42) over an
+    /// arbitrary schema, so Date/Time tests can reuse the same plumbing
+    /// the Int32 tests use without hard-coding the column types.
+    fn snapshot_for_schema(schema: Schema) -> CatalogSnapshot {
+        let entry = TableEntry::new(Oid::new(42), "t", "public", schema);
         let mut tables = HashMap::new();
         tables.insert("t".to_owned(), entry.clone());
         let mut tables_by_oid = HashMap::new();
@@ -783,6 +813,519 @@ mod tests {
                 low: Some(7),
                 high: Some(7),
             }]
+        );
+    }
+
+    // ── Date / Time predicate-range precision ────────────────────────────────
+    //
+    // These tests pin the i64 ranges the SSI lock computes for `Date` and
+    // `Time` predicates. The conflict-detection machinery
+    // (`ranges_overlap` in the txn crate) is type-agnostic and already
+    // proven for the integer family; what these tests guard is that a
+    // Date/Time predicate now produces the *tight* `ColumnRange` tag
+    // (column-scoped, exact i64 bounds) instead of the relation-wide
+    // fallback — and that the strict-bound `±1` normalisation is
+    // integer-exact for the discrete day / microsecond domains.
+
+    /// Two-column schema: a `Date` column and a `Time` column, mirroring
+    /// the Int32 `test_schema` so the Date/Time tests reuse `scan()`-style
+    /// plumbing through `snapshot_for_schema`.
+    fn date_time_schema() -> Schema {
+        Schema::new([
+            Field::required("d", DataType::Date),
+            Field::required("t", DataType::Time),
+        ])
+        .expect("date/time test schema is valid")
+    }
+
+    fn date_time_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".to_owned(),
+            schema: date_time_schema(),
+            projection: None,
+        }
+    }
+
+    fn date_col(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "d".to_owned(),
+            index,
+            data_type: DataType::Date,
+        }
+    }
+
+    fn time_col(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "t".to_owned(),
+            index,
+            data_type: DataType::Time,
+        }
+    }
+
+    /// `Value::Date` is `i32` days since 2000-01-01.
+    fn lit_date(days: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Date(days),
+            data_type: DataType::Date,
+        }
+    }
+
+    /// `Value::Time` is `i64` microseconds since midnight.
+    fn lit_time(micros: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Time(micros),
+            data_type: DataType::Time,
+        }
+    }
+
+    fn read_locks(plan: &LogicalPlan, snapshot: &CatalogSnapshot) -> Vec<PredicateLockTag> {
+        let mut tags = Vec::new();
+        collect_serializable_read_locks(plan, snapshot, &mut tags);
+        dedup_predicate_tags(&mut tags);
+        tags
+    }
+
+    /// `WHERE d = DATE '...'` now takes a tight point ColumnRange on the
+    /// date column — not a relation-wide lock. Proves the tightening
+    /// benefit: a date-equality reader no longer blankets the relation.
+    #[test]
+    fn serializable_read_lock_date_equality_is_point_range() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(BinaryOp::Eq, date_col(0), lit_date(8821)),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(8821),
+                high: Some(8821),
+            }],
+            "date equality must yield a tight column-point lock"
+        );
+    }
+
+    /// Strict upper bound on a `Date`: `d < DATE '2000-01-02'` (day 1)
+    /// must normalise to the inclusive `high = 0` (i.e. exactly
+    /// '2000-01-01' and earlier). The `-1` adjustment is integer-exact
+    /// because the date domain is whole days.
+    #[test]
+    fn serializable_read_lock_date_strict_upper_bound_is_integer_exact() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(BinaryOp::Lt, date_col(0), lit_date(1)),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: None,
+                high: Some(0),
+            }],
+            "d < day 1 must cover exactly day 0 and earlier (high = 0)"
+        );
+    }
+
+    /// Negative / pre-2000 `Date` values sign-extend correctly: a
+    /// half-open `d >= DATE '1999-12-31'` (day -1) locks `low = Some(-1)`
+    /// with no upper bound, the same way a negative `Int32` would.
+    #[test]
+    fn serializable_read_lock_date_negative_pre_2000_sign_extends() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(BinaryOp::GtEq, date_col(0), lit_date(-1)),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(-1),
+                high: None,
+            }],
+            "pre-2000 date must sign-extend to a negative i64 bound"
+        );
+    }
+
+    /// `Time` at microsecond boundaries: `t > TIME '00:00:00.000001'`
+    /// (1 µs) normalises to the inclusive `low = 2` — the `+1` adjustment
+    /// is integer-exact at µs granularity.
+    #[test]
+    fn serializable_read_lock_time_strict_lower_bound_at_micro_boundary() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(BinaryOp::Gt, time_col(1), lit_time(1)),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 1,
+                low: Some(2),
+                high: None,
+            }],
+            "t > 1µs must cover exactly 2µs and later (low = 2)"
+        );
+    }
+
+    /// A `Date` BETWEEN-shaped conjunction (`d >= lo AND d <= hi`) folds
+    /// into a single bounded ColumnRange — the canonical tightening for a
+    /// date-range serializable read.
+    #[test]
+    fn serializable_read_lock_date_between_folds_to_bounded_range() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(
+                BinaryOp::And,
+                binary(BinaryOp::GtEq, date_col(0), lit_date(8800)),
+                binary(BinaryOp::LtEq, date_col(0), lit_date(8810)),
+            ),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(8800),
+                high: Some(8810),
+            }],
+            "date BETWEEN must fold into one bounded column range"
+        );
+    }
+
+    /// The write side tightens symmetrically: a DELETE keyed on a tight
+    /// `Date` range locks the precise date column range *plus* a
+    /// full-range tag for every other column — preserving the write-skew
+    /// safety net. This is the same shape the Int32 disjunction test
+    /// asserts, now driven by a Date predicate.
+    #[test]
+    fn serializable_delete_date_range_tightens_with_full_range_safety_net() {
+        let input = LogicalPlan::Filter {
+            input: Box::new(date_time_scan()),
+            predicate: binary(BinaryOp::Eq, date_col(0), lit_date(8821)),
+        };
+        let snapshot = snapshot_for_schema(date_time_schema());
+        let entry = snapshot.tables.get("t").expect("table exists");
+
+        assert_eq!(
+            delete_write_conflict_tags(entry, &input, &snapshot),
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: Some(8821),
+                    high: Some(8821),
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 1,
+                    low: None,
+                    high: None,
+                },
+            ],
+            "date-keyed delete locks the tight date range plus a \
+             full-range tag on the other column"
+        );
+    }
+
+    // ── Cross-unit-class temporal guard (missed-conflict / silent corruption) ──
+    //
+    // A temporal column compared against a literal of a *different* i64
+    // unit-class (e.g. a `Date` column — days — vs a `Timestamp` literal —
+    // microseconds) must NOT take a tight, mis-scaled `ColumnRange` lock.
+    // The binder allows any temporal-vs-temporal comparison without
+    // coercing the literal (`comparable` in expr_type.rs), so such a plan
+    // really reaches us. A tight micro-space lock on a Date column would
+    // never overlap a concurrent writer's day-space Date lock, so the real
+    // rw-conflict would be silently missed (non-serializable schedule).
+    // The matcher therefore returns None for cross-class pairs and SSI
+    // falls back to the safe relation-wide lock, which DOES overlap.
+
+    fn ts_date_schema() -> Schema {
+        Schema::new([
+            Field::required("d", DataType::Date),
+            Field::required("ts", DataType::Timestamp),
+        ])
+        .expect("ts/date test schema is valid")
+    }
+
+    fn ts_date_scan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "t".to_owned(),
+            schema: ts_date_schema(),
+            projection: None,
+        }
+    }
+
+    fn ts_date_col(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "d".to_owned(),
+            index,
+            data_type: DataType::Date,
+        }
+    }
+
+    fn ts_col(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "ts".to_owned(),
+            index,
+            data_type: DataType::Timestamp,
+        }
+    }
+
+    /// `Value::Timestamp` is `i64` microseconds since the epoch.
+    fn lit_timestamp(micros: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Timestamp(micros),
+            data_type: DataType::Timestamp,
+        }
+    }
+
+    /// `Value::TimestampTz` is `i64` microseconds since the epoch.
+    fn lit_timestamptz(micros: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::TimestampTz(micros),
+            data_type: DataType::TimestampTz,
+        }
+    }
+
+    fn time_only_col(index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "t".to_owned(),
+            index,
+            data_type: DataType::Time,
+        }
+    }
+
+    fn lit_time_value(micros: i64) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Time(micros),
+            data_type: DataType::Time,
+        }
+    }
+
+    /// The gate's repro (READ side): `WHERE d = TIMESTAMP '...'` on a Date
+    /// column. The literal is in microseconds, the column in days — a
+    /// cross-class pair. The tight micro-space lock would miss a concurrent
+    /// day-space Date writer, so the matcher MUST fall back to a
+    /// relation-wide lock (which overlaps and catches the conflict).
+    #[test]
+    fn serializable_read_lock_date_col_vs_timestamp_literal_falls_back_to_relation() {
+        // 2000-01-02 00:00 as micros = 86_400_000_000; as a tight Date
+        // lock this would (wrongly) read day 86_400_000_000.
+        let plan = LogicalPlan::Filter {
+            input: Box::new(ts_date_scan()),
+            predicate: binary(BinaryOp::Eq, ts_date_col(0), lit_timestamp(86_400_000_000)),
+        };
+        let snapshot = snapshot_for_schema(ts_date_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))],
+            "Date column vs Timestamp literal must fall back to the \
+             relation-wide lock, not a mis-scaled micro-space range"
+        );
+    }
+
+    /// The gate's repro (WRITE side): a DELETE keyed on `d = TIMESTAMP '...'`
+    /// on a Date column must NOT take a tight, mis-scaled Date lock. The
+    /// matcher returns None, so the write path degrades to the safe
+    /// table-wide fallback: a *full-range* ColumnRange on every column
+    /// (`low/high = None`). A full-range column lock overlaps a concurrent
+    /// reader's day-space Date lock on the same column, so the rw-conflict
+    /// is still caught — exactly the missing safety the bug removed. Proves
+    /// the write path is guarded too. (The key property is that NO tight
+    /// micro-space Date range is produced for column 0.)
+    #[test]
+    fn serializable_delete_date_col_vs_timestamp_literal_falls_back_to_full_range() {
+        let input = LogicalPlan::Filter {
+            input: Box::new(ts_date_scan()),
+            predicate: binary(BinaryOp::Eq, ts_date_col(0), lit_timestamp(86_400_000_000)),
+        };
+        let snapshot = snapshot_for_schema(ts_date_schema());
+        let entry = snapshot.tables.get("t").expect("table exists");
+
+        let tags = delete_write_conflict_tags(entry, &input, &snapshot);
+
+        // Safe fallback: every column locked full-range; specifically the
+        // Date column (0) is full-range, NOT the mis-scaled micro point.
+        assert_eq!(
+            tags,
+            vec![
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 0,
+                    low: None,
+                    high: None,
+                },
+                PredicateLockTag::ColumnRange {
+                    relation: RelationId(Oid::new(42)),
+                    column: 1,
+                    low: None,
+                    high: None,
+                },
+            ],
+            "cross-class Date-vs-Timestamp delete must degrade to a \
+             full-range write lock on every column, never a tight \
+             micro-space Date range"
+        );
+        assert!(
+            !tags.iter().any(|tag| matches!(
+                tag,
+                PredicateLockTag::ColumnRange {
+                    column: 0,
+                    low: Some(_),
+                    ..
+                }
+            )),
+            "the Date column must never carry a tight (mis-scaled) bound"
+        );
+    }
+
+    /// Reverse direction: a `Timestamp` column (micros) compared against a
+    /// `Date` literal (days) is also cross-class and must fall back.
+    #[test]
+    fn serializable_read_lock_timestamp_col_vs_date_literal_falls_back_to_relation() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(ts_date_scan()),
+            predicate: binary(BinaryOp::Eq, ts_col(1), lit_date(1)),
+        };
+        let snapshot = snapshot_for_schema(ts_date_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))],
+            "Timestamp column vs Date literal must fall back to the \
+             relation-wide lock"
+        );
+    }
+
+    /// `Time` column (micros since midnight) vs `Timestamp` literal (micros
+    /// since epoch) is cross-class — same units numerically but a different
+    /// origin, so the lock would still be wrong. Must fall back.
+    #[test]
+    fn serializable_read_lock_time_col_vs_timestamp_literal_falls_back_to_relation() {
+        let schema = Schema::new([
+            Field::required("t", DataType::Time),
+            Field::required("v", DataType::Int32),
+        ])
+        .expect("time schema valid");
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: "t".to_owned(),
+                schema: schema.clone(),
+                projection: None,
+            }),
+            predicate: binary(BinaryOp::Eq, time_only_col(0), lit_timestamp(3_600_000_000)),
+        };
+        let snapshot = snapshot_for_schema(schema);
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::Relation(RelationId(Oid::new(42)))],
+            "Time column vs Timestamp literal must fall back to the \
+             relation-wide lock"
+        );
+    }
+
+    /// No-regression: a `Timestamp` column vs a `TimestampTz` literal stays
+    /// in the same unit-class (both micros since epoch, interchangeable), so
+    /// it MUST still take the tight column-point lock. Proves TS cross-compat
+    /// is preserved by the guard.
+    #[test]
+    fn serializable_read_lock_timestamp_col_vs_timestamptz_literal_stays_tight() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(ts_date_scan()),
+            predicate: binary(BinaryOp::Eq, ts_col(1), lit_timestamptz(86_400_000_000)),
+        };
+        let snapshot = snapshot_for_schema(ts_date_schema());
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 1,
+                low: Some(86_400_000_000),
+                high: Some(86_400_000_000),
+            }],
+            "Timestamp/TimestampTz share a unit-class and must stay tight"
+        );
+    }
+
+    /// No-regression: same-class `Time` column vs `Time` literal stays tight.
+    #[test]
+    fn serializable_read_lock_time_col_vs_time_literal_stays_tight() {
+        let schema = Schema::new([
+            Field::required("t", DataType::Time),
+            Field::required("v", DataType::Int32),
+        ])
+        .expect("time schema valid");
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: "t".to_owned(),
+                schema: schema.clone(),
+                projection: None,
+            }),
+            predicate: binary(
+                BinaryOp::Eq,
+                time_only_col(0),
+                lit_time_value(3_600_000_000),
+            ),
+        };
+        let snapshot = snapshot_for_schema(schema);
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(3_600_000_000),
+                high: Some(3_600_000_000),
+            }],
+            "same-class Time/Time must stay tight"
+        );
+    }
+
+    /// No-regression: INT-class width-crossing stays tight — an `Int32`
+    /// column compared against an `Int64` literal shares the integer
+    /// unit-class (raw integer value), so it keeps the tight lock.
+    #[test]
+    fn serializable_read_lock_int32_col_vs_int64_literal_stays_tight() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan()),
+            predicate: binary(
+                BinaryOp::Eq,
+                col(0, "a"),
+                ScalarExpr::Literal {
+                    value: Value::Int64(7),
+                    data_type: DataType::Int64,
+                },
+            ),
+        };
+        let snapshot = test_snapshot();
+
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![PredicateLockTag::ColumnRange {
+                relation: RelationId(Oid::new(42)),
+                column: 0,
+                low: Some(7),
+                high: Some(7),
+            }],
+            "Int32 column vs Int64 literal shares the INT unit-class and \
+             must stay tight (width-crossing allowed)"
         );
     }
 }

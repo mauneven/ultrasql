@@ -624,6 +624,110 @@ fn match_simple_comparison_clamps_strict_overflow_to_empty_range() {
     );
 }
 
+/// Cross-unit-class temporal comparison must NOT match: a `Date` column
+/// (days) vs a `Timestamp` literal (microseconds) maps to different i64
+/// scales, so a tight range would be mis-scaled. The matcher returns
+/// `None`, forcing the index-scan path to SeqScan and the SSI path to the
+/// relation-wide lock.
+#[test]
+fn match_simple_comparison_rejects_cross_unit_class_temporal() {
+    let date_col = ScalarExpr::Column {
+        name: "d".into(),
+        index: 0,
+        data_type: DataType::Date,
+    };
+    // 2000-01-02 00:00 in micros; as days this would wrongly be day 86.4e9.
+    let ts_lit = ScalarExpr::Literal {
+        value: Value::Timestamp(86_400_000_000),
+        data_type: DataType::Timestamp,
+    };
+    let eq = ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(date_col.clone()),
+        right: Box::new(ts_lit.clone()),
+        data_type: DataType::Bool,
+    };
+    assert!(
+        match_simple_comparison(&eq).is_none(),
+        "Date column vs Timestamp literal must not produce a tight range"
+    );
+    assert!(
+        match_indexable_predicate(&eq).is_none(),
+        "match_indexable_predicate must also reject the cross-class pair"
+    );
+
+    // Reverse direction: Timestamp column (micros) vs Date literal (days).
+    let ts_col = ScalarExpr::Column {
+        name: "ts".into(),
+        index: 1,
+        data_type: DataType::Timestamp,
+    };
+    let date_lit = ScalarExpr::Literal {
+        value: Value::Date(1),
+        data_type: DataType::Date,
+    };
+    let eq_rev = ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(ts_col),
+        right: Box::new(date_lit),
+        data_type: DataType::Bool,
+    };
+    assert!(
+        match_simple_comparison(&eq_rev).is_none(),
+        "Timestamp column vs Date literal must not produce a tight range"
+    );
+}
+
+/// Same-unit-class temporal comparisons MUST still match tightly: a
+/// `Timestamp` column vs a `TimestampTz` literal share the micros-since-
+/// epoch class (interchangeable), and `Date`/`Date` is trivially same
+/// class. Proves the guard does not over-reject.
+#[test]
+fn match_simple_comparison_keeps_same_unit_class_temporal() {
+    // Timestamp column vs TimestampTz literal — TS cross-compat preserved.
+    let ts_col = ScalarExpr::Column {
+        name: "ts".into(),
+        index: 0,
+        data_type: DataType::Timestamp,
+    };
+    let tstz_lit = ScalarExpr::Literal {
+        value: Value::TimestampTz(86_400_000_000),
+        data_type: DataType::TimestampTz,
+    };
+    let eq = ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(ts_col),
+        right: Box::new(tstz_lit),
+        data_type: DataType::Bool,
+    };
+    let (idx, range) =
+        match_simple_comparison(&eq).expect("Timestamp vs TimestampTz must stay tight");
+    assert_eq!(idx, 0);
+    assert_eq!(range.low, Some(86_400_000_000));
+    assert_eq!(range.high, Some(86_400_000_000));
+
+    // Date column vs Date literal — trivially same class.
+    let date_col = ScalarExpr::Column {
+        name: "d".into(),
+        index: 1,
+        data_type: DataType::Date,
+    };
+    let date_lit = ScalarExpr::Literal {
+        value: Value::Date(8821),
+        data_type: DataType::Date,
+    };
+    let eq_date = ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(date_col),
+        right: Box::new(date_lit),
+        data_type: DataType::Bool,
+    };
+    let (idx, range) = match_simple_comparison(&eq_date).expect("Date vs Date must stay tight");
+    assert_eq!(idx, 1);
+    assert_eq!(range.low, Some(8821));
+    assert_eq!(range.high, Some(8821));
+}
+
 // ---------------------------------------------------------------------
 // CTE lowering tests
 //

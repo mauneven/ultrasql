@@ -125,7 +125,8 @@ mod xml_table_scan;
 mod tests;
 
 pub(crate) use index_scan::{
-    late_materialization_summary_for_plan, literal_as_i64, match_indexable_predicate,
+    late_materialization_summary_for_plan, literal_as_i64, literal_in_same_unit_class_as_column,
+    match_indexable_predicate,
 };
 pub use lower_query::lower_query;
 pub use lower_simple::{build_sample_database, lower_plan};
