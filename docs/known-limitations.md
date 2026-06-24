@@ -48,9 +48,18 @@ completed evidence.
   [Transactional DDL Design](transactional-ddl-design.md).
 - Serializable transactions use column-range SSI for supported scalar
   comparisons and fully supported `AND` / `OR` predicate trees plus
-  relation-level fallback, but not fully predicate-precise SSI. The covered
-  Hermitage write-skew case aborts one transaction with SQLSTATE `40001`, but
-  broader isolation schedules remain open.
+  relation-level fallback, but not fully predicate-precise SSI. Tight column-range
+  predicate locks are taken for `Bool`/`Int16`/`Int32`/`Int64`/`Timestamp`/
+  `TimestampTz`/`Date`/`Time` columns, only when the literal is in the same
+  i64 unit-class as the column (a cross-type temporal predicate such as a `Date`
+  column compared against a `Timestamp` literal — different units, days vs
+  microseconds — falls back to a relation-wide lock so it can never miss a
+  conflict). Every other type (text/numeric/float/uuid), joins, function
+  predicates, and subqueries degrade to a relation-wide lock — correct but coarse,
+  the source of spurious `40001` aborts. The covered Hermitage write-skew case
+  aborts one transaction with SQLSTATE `40001`, but broader isolation schedules
+  (the upstream `src/test/isolation` schedules) and fully predicate-precise
+  (PostgreSQL-style physical SIREAD tuple/page) locking remain open.
 - `SAVEPOINT` / subtransaction *visibility* is implemented for DML: a
   transaction sees its own writes made under an active `SAVEPOINT`, `ROLLBACK
   TO` hides a savepoint's inserts and restores its deletes / in-place-update
