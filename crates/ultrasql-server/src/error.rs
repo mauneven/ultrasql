@@ -315,6 +315,11 @@ impl ServerError {
             // invalid_xml_document — XML cast parser rejected a document
             // value.
             Self::Execute(ultrasql_executor::ExecError::InvalidXmlDocument(_)) => "2200M",
+            // serialization_failure — a concurrent transaction held an
+            // unresolved in-place write on a tuple this UPDATE/DELETE
+            // touched. Mirrors the SSI `Self::SerializationFailure` 40001
+            // path above so retry-aware clients classify both alike.
+            Self::Execute(ultrasql_executor::ExecError::SerializationFailure(_)) => "40001",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.

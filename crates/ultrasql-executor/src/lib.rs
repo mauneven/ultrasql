@@ -316,6 +316,16 @@ pub enum ExecError {
     /// SQLSTATE `22013` (`invalid_preceding_or_following_size`).
     #[error("{0}")]
     WindowFrameError(String),
+
+    /// A concurrent transaction held an unresolved in-place write on a
+    /// tuple this statement tried to UPDATE/DELETE, so the heap raised a
+    /// write conflict. The string carries the conflict reason. The server
+    /// maps this to PostgreSQL SQLSTATE `40001` (`serialization_failure`),
+    /// matching how PostgreSQL surfaces a concurrent-update conflict so a
+    /// retry-aware client/driver/ORM can classify and retry it. This only
+    /// relabels the aborted statement; it does not add wait/retry.
+    #[error("could not serialize access due to concurrent update: {0}")]
+    SerializationFailure(String),
 }
 
 /// Convert scalar-expression interpreter errors into stable executor errors.

@@ -389,6 +389,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
 fn heap_update_error_to_exec_error(error: HeapError) -> ExecError {
     match error {
         HeapError::NumericOverflow(detail) => ExecError::NumericFieldOverflow(detail.to_owned()),
+        // A concurrent transaction holds an unresolved in-place write on a
+        // tuple this UPDATE touched. Relabel it as a retryable
+        // serialization failure (SQLSTATE 40001) instead of swallowing it
+        // in the generic catch-all, so retry-aware clients can classify it.
+        HeapError::WriteConflict(reason) => ExecError::SerializationFailure(reason.to_owned()),
         other => ExecError::TypeMismatch(other.to_string()),
     }
 }
