@@ -1003,7 +1003,7 @@ impl TransactionManager {
     /// in the durable Commit WAL record (exactly as single-phase commit does via
     /// [`Self::commit`]), so a row written under a released/open savepoint inside
     /// a prepared transaction survives a crash that follows `COMMIT PREPARED`.
-    /// This reuses [`Self::merged_up_family`] — the same set single-phase commit
+    /// This reuses `merged_up_family` — the same set single-phase commit
     /// folds.
     ///
     /// The `Transaction` handle is consumed so it cannot be double-committed
