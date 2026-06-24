@@ -1445,8 +1445,9 @@ async fn repeatable_read_snapshot_frozen_wire_level() {
 async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
 
-    // A base table to index, created in autocommit so the only in-txn DDL is
-    // the still-rejected CREATE INDEX.
+    // A base table, created in autocommit so the in-txn DDL is the
+    // still-rejected DROP TABLE (CREATE TABLE / CREATE INDEX are now
+    // transactional; DROP is a later milestone).
     client
         .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
         .await
@@ -1455,9 +1456,9 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
     client.batch_execute("BEGIN").await.expect("BEGIN");
 
     let err = client
-        .batch_execute("CREATE INDEX ddl_in_txn_ix ON ddl_in_txn (id)")
+        .batch_execute("DROP TABLE ddl_in_txn")
         .await
-        .expect_err("non-CREATE-TABLE DDL inside an explicit transaction must be rejected");
+        .expect_err("a still-unsupported DDL inside an explicit transaction must be rejected");
 
     // PG-faithful classification: feature_not_supported, not a generic
     // internal error, so ORM/migration tooling can route on it.
