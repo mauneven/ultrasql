@@ -28,6 +28,18 @@
 //! {"gid":"<gid>","xid":<xid_raw>,"prepared_at_secs":<unix_secs>}
 //! ```
 //!
+//! A prepared transaction that held savepoints additionally carries the
+//! committed-subxid family (the released/open-at-prepare savepoint subxids):
+//!
+//! ```json
+//! {"gid":"<gid>","xid":<xid_raw>,"prepared_at_secs":<unix_secs>,"committed_subxids":[<sub>,...]}
+//! ```
+//!
+//! The `committed_subxids` field is **omitted entirely** when the family is
+//! empty, so a savepoint-free prepared transaction writes the exact legacy
+//! bytes and a legacy state file (no field) recovers to an empty family — the
+//! format is back-compatible in both directions.
+//!
 //! On [`TwoPhaseCoordinator::recover_from_disk`] every file is read and parsed,
 //! and the prepared set is repopulated.  This makes durability survive a process
 //! restart without a full WAL replay path.
@@ -102,6 +114,17 @@ pub struct PreparedTxn {
     pub gid: String,
     /// The XID of the original transaction.
     pub xid: Xid,
+    /// Subtransaction XIDs that committed atomically with the parent at
+    /// `PREPARE` time — the released (merged-up) savepoint subxids plus the
+    /// open-savepoint-stack subxids that implicitly release at commit,
+    /// **excluding** `ROLLBACK TO`-aborted subxids. Captured at `PREPARE`
+    /// (before the originating transaction's savepoint stack is dropped) and
+    /// carried durably in the state file so phase-2 `COMMIT PREPARED` can embed
+    /// the whole family in its single Commit WAL record. Recovery then marks
+    /// the family `Committed`, so a row written under a released/open savepoint
+    /// inside a prepared transaction does not vanish after a crash that follows
+    /// `COMMIT PREPARED`.
+    pub committed_subxids: Vec<Xid>,
     /// Wall-clock time at which the transaction was prepared.
     pub prepared_at: SystemTime,
     /// Path to the durable state file on disk.
@@ -149,9 +172,21 @@ impl TwoPhaseCoordinator {
     /// If a transaction with the same `gid` is already prepared, returns
     /// [`TwoPhaseError::DuplicateGid`].
     ///
+    /// `committed_subxids` is the savepoint family that committed atomically
+    /// with the parent (see [`PreparedTxn::committed_subxids`]). It is captured
+    /// at `PREPARE` time, before the originating transaction's savepoint stack
+    /// is dropped, and persisted in the state file so phase-2 `COMMIT PREPARED`
+    /// can re-embed it in the durable Commit WAL record. Pass an empty slice for
+    /// a transaction with no savepoints.
+    ///
     /// The caller must have already flushed the transaction's WAL records
     /// (if applicable) before calling this method.
-    pub fn prepare(&self, gid: &str, xid: Xid) -> Result<(), TwoPhaseError> {
+    pub fn prepare(
+        &self,
+        gid: &str,
+        xid: Xid,
+        committed_subxids: &[Xid],
+    ) -> Result<(), TwoPhaseError> {
         // Reject duplicate GIDs.
         if self.prepared.contains_key(gid) {
             return Err(TwoPhaseError::DuplicateGid {
@@ -161,7 +196,7 @@ impl TwoPhaseCoordinator {
 
         let prepared_at = SystemTime::now();
         let state_file = self.state_file_path(gid);
-        write_state_file(&state_file, gid, xid, prepared_at)?;
+        write_state_file(&state_file, gid, xid, committed_subxids, prepared_at)?;
 
         // Insert using the entry API for a final race-free duplicate check.
         // If another thread raced us and inserted first, we roll back by
@@ -172,6 +207,7 @@ impl TwoPhaseCoordinator {
             .or_insert_with(|| PreparedTxn {
                 gid: gid.to_owned(),
                 xid,
+                committed_subxids: committed_subxids.to_vec(),
                 prepared_at,
                 state_file: state_file.clone(),
             })
@@ -304,6 +340,7 @@ impl TwoPhaseCoordinator {
                 .or_insert(PreparedTxn {
                     gid: record.gid,
                     xid: record.xid,
+                    committed_subxids: record.committed_subxids,
                     prepared_at: record.prepared_at,
                     state_file: path,
                 });
@@ -357,11 +394,59 @@ fn remove_state_file(txn: &PreparedTxn) -> Result<(), TwoPhaseError> {
 
 // ─── state file I/O ──────────────────────────────────────────────────────────
 
+/// Build the canonical JSON text for a state file.
+///
+/// # Back-compatibility
+///
+/// When `committed_subxids` is empty the text omits the `committed_subxids`
+/// field entirely, so it is **byte-identical** to the legacy format
+/// (`{"gid":...,"xid":...,"prepared_at_secs":...}`). A transaction with no
+/// savepoints therefore writes exactly what older builds wrote, and an older
+/// state file (no field) parses back to an empty family. Only a prepared
+/// transaction that actually held savepoints appends the
+/// `"committed_subxids":[...]` array.
+fn canonical_state_file_content(
+    gid: &str,
+    xid: Xid,
+    committed_subxids: &[Xid],
+    prepared_at_secs: u64,
+) -> String {
+    let mut content = format!(
+        "{{\"gid\":\"{}\",\"xid\":{},\"prepared_at_secs\":{}",
+        escape_json_string(gid),
+        xid.raw(),
+        prepared_at_secs
+    );
+    if !committed_subxids.is_empty() {
+        content.push_str(",\"committed_subxids\":");
+        content.push_str(&encode_subxid_array(committed_subxids));
+    }
+    content.push('}');
+    content
+}
+
+/// Encode a subxid list as a canonical JSON array of unsigned integers, e.g.
+/// `[10,11,12]`. No spaces; this exact text is what the parser's round-trip
+/// check reproduces.
+fn encode_subxid_array(subxids: &[Xid]) -> String {
+    let mut out = String::with_capacity(2 + subxids.len() * 4);
+    out.push('[');
+    for (i, sub) in subxids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&sub.raw().to_string());
+    }
+    out.push(']');
+    out
+}
+
 /// Write a minimal JSON state file for a prepared transaction.
 fn write_state_file(
     path: &PathBuf,
     gid: &str,
     xid: Xid,
+    committed_subxids: &[Xid],
     prepared_at: SystemTime,
 ) -> Result<(), TwoPhaseError> {
     let secs = prepared_at
@@ -369,13 +454,10 @@ fn write_state_file(
         .unwrap_or(Duration::ZERO)
         .as_secs();
 
-    // Manual JSON; no serde dependency required.
-    let content = format!(
-        "{{\"gid\":\"{}\",\"xid\":{},\"prepared_at_secs\":{}}}",
-        escape_json_string(gid),
-        xid.raw(),
-        secs
-    );
+    // Manual JSON; no serde dependency required. The canonical form is built by
+    // `canonical_state_file_content` so the writer and the parser's exact-match
+    // check stay in lock-step.
+    let content = canonical_state_file_content(gid, xid, committed_subxids, secs);
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -499,13 +581,23 @@ fn open_state_file_for_read(path: &Path) -> std::io::Result<File> {
 struct ParsedRecord {
     gid: String,
     xid: Xid,
+    committed_subxids: Vec<Xid>,
     prepared_at: SystemTime,
 }
 
 /// Parse the minimal JSON written by [`write_state_file`].
 ///
 /// Accepts only the exact format produced by the writer; this is not a
-/// general JSON parser.  Returns an error string on parse failure.
+/// general JSON parser. Returns an error string on parse failure.
+///
+/// # Back-compatibility
+///
+/// A legacy state file (written before the savepoint family was carried) has
+/// no `committed_subxids` field; it parses to an **empty** family and matches
+/// the canonical legacy text, so older `.txn` files still recover. The
+/// round-trip check is rebuilt via [`canonical_state_file_content`], which
+/// omits the field for an empty family — keeping legacy and current formats
+/// byte-identical when there are no savepoints.
 fn parse_state_file(content: &str) -> Result<ParsedRecord, String> {
     let content = content.trim();
 
@@ -521,15 +613,17 @@ fn parse_state_file(content: &str) -> Result<ParsedRecord, String> {
     let secs = extract_json_number(content, "prepared_at_secs")
         .ok_or_else(|| "missing or invalid \"prepared_at_secs\" field".to_owned())?;
 
+    // Extract the optional `"committed_subxids":[...]` array. Absent on legacy
+    // files → empty family.
+    let committed_subxids_raw = extract_json_u64_array(content, "committed_subxids")
+        .ok_or_else(|| "invalid \"committed_subxids\" field".to_owned())?;
+
     let prepared_at = UNIX_EPOCH
         .checked_add(Duration::from_secs(secs))
         .ok_or_else(|| "prepared_at_secs overflows SystemTime".to_owned())?;
-    let expected = format!(
-        "{{\"gid\":\"{}\",\"xid\":{},\"prepared_at_secs\":{}}}",
-        escape_json_string(&gid),
-        xid_raw,
-        secs
-    );
+
+    let committed_subxids: Vec<Xid> = committed_subxids_raw.iter().map(|&n| Xid::new(n)).collect();
+    let expected = canonical_state_file_content(&gid, Xid::new(xid_raw), &committed_subxids, secs);
     if content != expected {
         return Err("state file does not match canonical 2PC format".to_owned());
     }
@@ -537,6 +631,7 @@ fn parse_state_file(content: &str) -> Result<ParsedRecord, String> {
     Ok(ParsedRecord {
         gid,
         xid: Xid::new(xid_raw),
+        committed_subxids,
         prepared_at,
     })
 }
@@ -577,6 +672,46 @@ fn extract_json_number(json: &str, key: &str) -> Option<u64> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+/// Extract a JSON array of unsigned integers `"key":[n0,n1,...]` from a JSON
+/// fragment.
+///
+/// Returns:
+/// - `Some(vec![])` when the key is **absent** (the legacy case — an old state
+///   file has no `committed_subxids` field, which means an empty family), or
+///   when the value is the literal empty array `[]`.
+/// - `Some(values)` when the key is present and the array parses cleanly.
+/// - `None` when the key is present but the array is malformed (unterminated,
+///   non-digit element, etc.), so the caller can reject a corrupt file.
+///
+/// Only the compact, space-free canonical form produced by
+/// [`encode_subxid_array`] is accepted (`[10,11,12]`); the surrounding
+/// round-trip check in [`parse_state_file`] enforces exact equality anyway.
+fn extract_json_u64_array(json: &str, key: &str) -> Option<Vec<u64>> {
+    let needle = format!("\"{key}\":[");
+    let Some(open) = json.find(&needle) else {
+        // Absent field → empty family (back-compat with legacy state files).
+        return Some(Vec::new());
+    };
+    let start = open + needle.len();
+    let rest = &json[start..];
+    let end = rest.find(']')?;
+    let body = &rest[..end];
+    if body.is_empty() {
+        // `"committed_subxids":[]` — explicit empty array.
+        return Some(Vec::new());
+    }
+    let mut values = Vec::new();
+    for part in body.split(',') {
+        // Reject any whitespace or non-digit content: the canonical form is
+        // compact and digit-only.
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        values.push(part.parse::<u64>().ok()?);
+    }
+    Some(values)
 }
 
 /// Escape special characters in a JSON string value.
@@ -633,7 +768,7 @@ mod tests {
     fn prepare_then_commit_prepared_succeeds() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("txn-1", xid(100)).unwrap();
+        coord.prepare("txn-1", xid(100), &[]).unwrap();
 
         // State file must exist on disk.
         let listed = coord.list_prepared();
@@ -660,7 +795,7 @@ mod tests {
     fn prepare_then_rollback_prepared_succeeds() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("txn-2", xid(200)).unwrap();
+        coord.prepare("txn-2", xid(200), &[]).unwrap();
         let rolled_xid = coord.rollback_prepared("txn-2").unwrap();
         assert_eq!(rolled_xid, xid(200));
         assert!(coord.list_prepared().is_empty());
@@ -670,7 +805,7 @@ mod tests {
     fn rollback_prepared_keeps_entry_when_state_file_removal_fails() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("stuck", xid(201)).unwrap();
+        coord.prepare("stuck", xid(201), &[]).unwrap();
         let state_file = coord.list_prepared()[0].state_file.clone();
         std::fs::remove_file(&state_file).expect("remove state file");
         std::fs::create_dir(&state_file).expect("replace state file with directory");
@@ -686,7 +821,7 @@ mod tests {
     fn begin_resolution_blocks_second_resolver_until_abort() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("resolving", xid(202)).unwrap();
+        coord.prepare("resolving", xid(202), &[]).unwrap();
         let prepared = coord.begin_resolution("resolving").unwrap();
         assert_eq!(prepared.xid, xid(202));
 
@@ -709,8 +844,8 @@ mod tests {
     fn duplicate_gid_rejected() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("my-gid", xid(300)).unwrap();
-        let err = coord.prepare("my-gid", xid(301)).unwrap_err();
+        coord.prepare("my-gid", xid(300), &[]).unwrap();
+        let err = coord.prepare("my-gid", xid(301), &[]).unwrap_err();
         assert_eq!(
             err,
             TwoPhaseError::DuplicateGid {
@@ -757,8 +892,8 @@ mod tests {
         // First coordinator: prepare two transactions.
         {
             let coord = TwoPhaseCoordinator::new(path.clone());
-            coord.prepare("recover-1", xid(400)).unwrap();
-            coord.prepare("recover-2", xid(401)).unwrap();
+            coord.prepare("recover-1", xid(400), &[]).unwrap();
+            coord.prepare("recover-2", xid(401), &[]).unwrap();
             // Drop without resolving — simulates crash.
         }
 
@@ -783,9 +918,9 @@ mod tests {
     fn list_prepared_returns_all_entries() {
         let (coord, _dir) = make_coordinator();
 
-        coord.prepare("a", xid(1)).unwrap();
-        coord.prepare("b", xid(2)).unwrap();
-        coord.prepare("c", xid(3)).unwrap();
+        coord.prepare("a", xid(1), &[]).unwrap();
+        coord.prepare("b", xid(2), &[]).unwrap();
+        coord.prepare("c", xid(3), &[]).unwrap();
 
         let mut gids: Vec<_> = coord
             .list_prepared()
@@ -802,7 +937,7 @@ mod tests {
     fn state_file_round_trips_gid_and_xid() {
         let (coord, _dir) = make_coordinator();
         let gid = "round-trip-test";
-        coord.prepare(gid, xid(9999)).unwrap();
+        coord.prepare(gid, xid(9999), &[]).unwrap();
 
         let listed = coord.list_prepared();
         let file_content =
@@ -811,6 +946,111 @@ mod tests {
         let parsed = parse_state_file(&file_content).expect("must parse");
         assert_eq!(parsed.gid, gid);
         assert_eq!(parsed.xid, xid(9999));
+        assert!(parsed.committed_subxids.is_empty());
+    }
+
+    // ── committed-subxid family round-trips through the state file ────────────
+
+    #[test]
+    fn state_file_round_trips_committed_subxid_family() {
+        let (coord, _dir) = make_coordinator();
+        let gid = "family-round-trip";
+        let family = [xid(10_001), xid(10_002), xid(10_003)];
+        coord.prepare(gid, xid(10_000), &family).unwrap();
+
+        let listed = coord.list_prepared();
+        assert_eq!(listed[0].committed_subxids, family.to_vec());
+        let file_content =
+            std::fs::read_to_string(&listed[0].state_file).expect("state file must be readable");
+        assert!(
+            file_content.contains("\"committed_subxids\":[10001,10002,10003]"),
+            "unexpected state file content: {file_content}"
+        );
+
+        let parsed = parse_state_file(&file_content).expect("must parse");
+        assert_eq!(parsed.committed_subxids, family.to_vec());
+    }
+
+    #[test]
+    fn empty_family_writes_legacy_byte_identical_state_file() {
+        // A savepoint-free prepared transaction must write exactly the legacy
+        // bytes (no `committed_subxids` field), so older builds still parse it.
+        let (coord, _dir) = make_coordinator();
+        coord.prepare("no-savepoints", xid(7), &[]).unwrap();
+
+        let listed = coord.list_prepared();
+        let content = std::fs::read_to_string(&listed[0].state_file).expect("state file readable");
+        assert!(
+            !content.contains("committed_subxids"),
+            "empty family must omit the field entirely: {content}"
+        );
+    }
+
+    #[test]
+    fn recover_from_disk_restores_committed_subxid_family() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let family = [xid(20_001), xid(20_002)];
+        {
+            let coord = TwoPhaseCoordinator::new(path.clone());
+            coord.prepare("fam-recover", xid(20_000), &family).unwrap();
+        }
+        let coord2 = TwoPhaseCoordinator::new(path);
+        assert_eq!(coord2.recover_from_disk().unwrap(), 1);
+        let recovered = coord2.begin_resolution("fam-recover").expect("recovered");
+        assert_eq!(recovered.xid, xid(20_000));
+        assert_eq!(recovered.committed_subxids, family.to_vec());
+    }
+
+    #[test]
+    fn legacy_state_file_without_family_recovers_to_empty() {
+        // A `.txn` file in the pre-family format must still recover, with an
+        // empty committed-subxid family (back-compat).
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("legacy.txn"),
+            "{\"gid\":\"legacy\",\"xid\":808,\"prepared_at_secs\":0}",
+        )
+        .expect("legacy state file");
+
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        assert_eq!(coord.recover_from_disk().expect("recover legacy"), 1);
+        let recovered = coord.begin_resolution("legacy").expect("legacy recovered");
+        assert_eq!(recovered.xid, xid(808));
+        assert!(recovered.committed_subxids.is_empty());
+    }
+
+    #[test]
+    fn state_file_with_explicit_empty_array_is_rejected_as_noncanonical() {
+        // The canonical form omits the field for an empty family, so an
+        // explicit `[]` does not round-trip and must be rejected as corrupt —
+        // matching the strict exact-match policy of every other field.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("explicit-empty.txn"),
+            "{\"gid\":\"explicit-empty\",\"xid\":909,\"prepared_at_secs\":0,\"committed_subxids\":[]}",
+        )
+        .expect("state file");
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        let err = coord
+            .recover_from_disk()
+            .expect_err("non-canonical explicit empty array must be rejected");
+        assert!(matches!(err, TwoPhaseError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn state_file_with_malformed_family_array_is_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("bad-array.txn"),
+            "{\"gid\":\"bad-array\",\"xid\":910,\"prepared_at_secs\":0,\"committed_subxids\":[1,x,3]}",
+        )
+        .expect("state file");
+        let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
+        let err = coord
+            .recover_from_disk()
+            .expect_err("malformed subxid array must be rejected");
+        assert!(matches!(err, TwoPhaseError::Corrupt { .. }));
     }
 
     // ── GID with special characters sanitizes correctly ───────────────────────
@@ -819,7 +1059,7 @@ mod tests {
     fn gid_with_special_chars_is_sanitized_in_filename() {
         let (coord, _dir) = make_coordinator();
         // A GID with path-hostile characters.
-        coord.prepare("my/gid:with spaces", xid(500)).unwrap();
+        coord.prepare("my/gid:with spaces", xid(500), &[]).unwrap();
 
         let listed = coord.list_prepared();
         let file_name = listed[0]
@@ -841,7 +1081,7 @@ mod tests {
 
         {
             let coord = TwoPhaseCoordinator::new(path.clone());
-            coord.prepare("idem", xid(600)).unwrap();
+            coord.prepare("idem", xid(600), &[]).unwrap();
         }
 
         let coord = TwoPhaseCoordinator::new(path);
@@ -866,7 +1106,7 @@ mod tests {
         symlink(&target, dir.path().join("evil.txn")).expect("state symlink");
 
         let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
-        assert!(coord.prepare("evil", xid(700)).is_err());
+        assert!(coord.prepare("evil", xid(700), &[]).is_err());
         assert_eq!(std::fs::read(&target).expect("target unchanged"), b"keep");
         assert!(coord.list_prepared().is_empty());
     }
@@ -879,7 +1119,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let coord = TwoPhaseCoordinator::new(dir.path().to_path_buf());
 
-        coord.prepare("private", xid(701)).expect("prepare");
+        coord.prepare("private", xid(701), &[]).expect("prepare");
         let state_file = coord.list_prepared()[0].state_file.clone();
         let mode = std::fs::metadata(state_file)
             .expect("state metadata")

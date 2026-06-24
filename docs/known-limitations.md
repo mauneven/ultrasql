@@ -84,14 +84,15 @@ completed evidence.
   TABLE` heap-rewrite DDL stamps the parent transaction id rather than the
   active subtransaction id, so exact own-write rollback of a table rewrite
   performed under a savepoint is out of scope; run schema rewrites outside a
-  savepoint when exact subtransaction rollback is required. Two-phase commit
-  does not yet carry the subtransaction family: `COMMIT PREPARED` writes an
-  empty committed-subxid list and `PREPARE TRANSACTION` drops the subtransaction
-  stack, so a row written under a released or still-open `SAVEPOINT` inside a
-  prepared transaction can be lost on crash recovery after the prepared commit
-  (single-phase `COMMIT` durably records the subxid family in its commit record
-  and recovers correctly). Avoid savepoints in two-phase-committed transactions
-  until subxid durability is threaded through the prepare/commit-prepared path.
+  savepoint when exact subtransaction rollback is required. Two-phase commit now
+  carries the committed-subxid family end to end: `PREPARE TRANSACTION` captures
+  the released/open-at-prepare savepoint subxids before the subtransaction stack
+  is dropped and persists them durably in the prepared state file, and
+  `COMMIT PREPARED` re-embeds that family in its single Commit WAL record (just
+  as single-phase `COMMIT` does), so a row written under a released or still-open
+  `SAVEPOINT` inside a two-phase-committed transaction survives crash recovery
+  after the prepared commit. (`ROLLBACK PREPARED` carries no family, so those
+  savepoint rows correctly stay aborted.)
 - Broader aggregate coverage remains open beyond the covered `STDDEV`,
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,

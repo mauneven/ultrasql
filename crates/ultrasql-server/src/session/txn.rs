@@ -186,15 +186,22 @@ where
                 .txn_manager
                 .validate_prepared(xid)
                 .map_err(|e| ServerError::Ddl(format!("validate_prepared({gid}): {e}")))?;
-            // A prepared (2PC) transaction carries no folded subxid family
-            // here; savepoint subxids inside a prepared txn are out of scope
-            // for the durable commit-record family.
-            if let Some(commit_lsn) = self.state.append_commit_record(xid, Vec::new())? {
+            // The prepared transaction's committed-subxid family (released and
+            // open-at-prepare savepoint subxids) was captured at PREPARE and
+            // carried durably in the 2PC state file. Embed it in this single
+            // Commit WAL record — exactly as single-phase COMMIT does — so a
+            // pure-WAL restart after COMMIT PREPARED marks the whole family
+            // Committed and rows written under a savepoint do not vanish.
+            let committed_subxids = prepared.committed_subxids.clone();
+            if let Some(commit_lsn) = self
+                .state
+                .append_commit_record(xid, committed_subxids.clone())?
+            {
                 self.state.wait_for_wal_durable(commit_lsn)?;
             }
             self.state
                 .txn_manager
-                .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Committed)
+                .finalise_prepared(xid, &committed_subxids, ultrasql_mvcc::XidStatus::Committed)
                 .map_err(|e| {
                     ServerError::Ddl(format!("finalise_prepared({gid} committed): {e}"))
                 })?;
@@ -250,9 +257,17 @@ where
             if let Some(abort_lsn) = self.state.append_abort_record(xid)? {
                 self.state.wait_for_wal_durable(abort_lsn)?;
             }
+            // A rolled-back prepared transaction's savepoint family is aborted:
+            // it appears in no committed list, so recovery's default-abort sweep
+            // discards their rows durably. Force-abort the family in memory too
+            // so the same live process agrees with that durable outcome — in the
+            // same-process happy path (no restart) the subxids are still
+            // InProgress and must be folded to Aborted; after a prepare-restart
+            // they are already Aborted and force-abort is idempotent.
+            let family = prepared.committed_subxids.clone();
             self.state
                 .txn_manager
-                .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Aborted)
+                .finalise_prepared(xid, &family, ultrasql_mvcc::XidStatus::Aborted)
                 .map_err(|e| ServerError::Ddl(format!("finalise_prepared({gid} aborted): {e}")))?;
             Ok(())
         })();
@@ -859,7 +874,7 @@ mod tests {
         session
             .state
             .two_phase
-            .prepare("orphan-commit", ultrasql_core::Xid::new(99_001))
+            .prepare("orphan-commit", ultrasql_core::Xid::new(99_001), &[])
             .expect("prepare orphan");
 
         let err = session
@@ -878,7 +893,7 @@ mod tests {
         session
             .state
             .two_phase
-            .prepare("orphan-rollback", ultrasql_core::Xid::new(99_002))
+            .prepare("orphan-rollback", ultrasql_core::Xid::new(99_002), &[])
             .expect("prepare orphan");
 
         let err = session

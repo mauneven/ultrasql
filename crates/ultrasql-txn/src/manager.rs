@@ -533,7 +533,7 @@ impl TransactionManager {
         // `in_progress` lock, so a concurrent `build_snapshot` sees the
         // whole family committed or none of it (test H).
         let folded = self.merged_up_family(&txn);
-        self.terminate_with_subxids(xid, &folded, XidStatus::Committed)?;
+        self.terminate_with_subxids(xid, &folded, XidStatus::Committed, false)?;
 
         // Release all row-level and relation-level locks.
         self.lock_manager.release_all(xid);
@@ -586,7 +586,7 @@ impl TransactionManager {
         // Aborted under the `in_progress` lock. Rolled-back subxids are
         // already Aborted; re-aborting them is a no-op.
         let folded = self.abort_family(&txn);
-        self.terminate_with_subxids(xid, &folded, XidStatus::Aborted)?;
+        self.terminate_with_subxids(xid, &folded, XidStatus::Aborted, false)?;
 
         // Release all row-level and relation-level locks.
         self.lock_manager.release_all(xid);
@@ -652,11 +652,22 @@ impl TransactionManager {
     /// The parent flips first (preserving commit-at-most-once via the
     /// `InProgress` precondition); subxids that are already terminal (e.g.
     /// rolled back) are skipped. Returns the parent's terminate result.
+    ///
+    /// `force_family` controls how a non-`InProgress` subxid is handled. With
+    /// `false` (single-phase `commit`/`abort`) a subxid is upgraded only if it
+    /// is still `InProgress`, so a `ROLLBACK TO`-aborted subxid keeps its
+    /// `Aborted` status. With `true` (2PC phase-2 `finalise_prepared`) every
+    /// subxid in `folded` is **force-set** to `new_status` regardless of its
+    /// current value: after an in-doubt restart recovery's default-abort sweep
+    /// marks the still-uncommitted savepoint subxids `Aborted`, and the
+    /// authoritative 2PC decision (`COMMIT`/`ROLLBACK PREPARED`) must override
+    /// that to match the durable Commit/Abort WAL record for the family.
     fn terminate_with_subxids(
         &self,
         parent: Xid,
         folded: &[Xid],
         new_status: XidStatus,
+        force_family: bool,
     ) -> Result<(), TxnError> {
         // Hold the in_progress lock for the whole family so the active-set
         // transition is observed atomically by snapshot construction.
@@ -683,16 +694,26 @@ impl TransactionManager {
         }
         active.remove(&parent);
 
-        // Fold each subxid that is still InProgress. A subxid already
-        // Aborted (rolled back) or otherwise terminal keeps its status.
+        // Fold each subxid. In the single-phase path (`force_family == false`)
+        // only a still-`InProgress` subxid is upgraded — a subxid already
+        // Aborted (rolled back via ROLLBACK TO) or otherwise terminal keeps its
+        // status. In the 2PC phase-2 path (`force_family == true`) the family's
+        // outcome is fixed by the durable COMMIT/ROLLBACK PREPARED decision, so
+        // each subxid is force-set to `new_status` even if recovery's
+        // default-abort sweep had marked it Aborted in memory.
         for &sub in folded {
             if sub == parent {
                 continue;
             }
             if let Some(mut entry) = self.clog.get_mut(&sub) {
-                if matches!(*entry.value(), XidStatus::InProgress) {
+                if force_family || matches!(*entry.value(), XidStatus::InProgress) {
                     *entry.value_mut() = new_status;
                 }
+            } else if force_family {
+                // The subxid had no CLOG entry at all (e.g. recovery never
+                // observed a record for it). Seed it directly to the
+                // authoritative terminal status.
+                self.clog.insert(sub, new_status);
             }
             active.remove(&sub);
         }
@@ -973,6 +994,18 @@ impl TransactionManager {
     /// CLOG as `InProgress` until the coordinator resolves it with
     /// `commit_prepared` or `rollback_prepared`.
     ///
+    /// The committed-subxid **family** — every released (merged-up) savepoint
+    /// subxid plus every still-open-savepoint subxid that implicitly releases
+    /// at commit, excluding `ROLLBACK TO`-aborted ones — is captured here,
+    /// **before** the `txn` handle (and its savepoint stack) is dropped, and
+    /// handed to the coordinator so it is persisted durably in the prepared
+    /// state file. Phase-2 `COMMIT PREPARED` re-reads that family and embeds it
+    /// in the durable Commit WAL record (exactly as single-phase commit does via
+    /// [`Self::commit`]), so a row written under a released/open savepoint inside
+    /// a prepared transaction survives a crash that follows `COMMIT PREPARED`.
+    /// This reuses [`Self::merged_up_family`] — the same set single-phase commit
+    /// folds.
+    ///
     /// The `Transaction` handle is consumed so it cannot be double-committed
     /// via the normal path.
     ///
@@ -988,31 +1021,12 @@ impl TransactionManager {
         txn: Transaction,
         coordinator: &crate::two_phase::TwoPhaseCoordinator,
     ) -> Result<(), crate::two_phase::TwoPhaseError> {
-        coordinator.prepare(gid, txn.xid)
+        // Capture the committed-subxid family BEFORE `txn` (and its savepoint
+        // stack) is dropped — the same family single-phase COMMIT folds.
+        let committed_subxids = self.merged_up_family(&txn);
+        coordinator.prepare(gid, txn.xid, &committed_subxids)
         // `txn` is dropped here; the CLOG entry remains `InProgress` until
         // the coordinator resolves via `commit_prepared` / `rollback_prepared`.
-    }
-
-    fn terminate(&self, xid: Xid, new_status: XidStatus) -> Result<(), TxnError> {
-        // Use a single shard-locked mutation: look up the entry mutably
-        // and validate that it is still `InProgress` before flipping
-        // it. This makes commit / abort idempotent under contention —
-        // exactly one caller observes `InProgress` and wins the
-        // transition.
-        let Some(mut entry) = self.clog.get_mut(&xid) else {
-            return Err(TxnError::Unknown { xid });
-        };
-        match *entry.value() {
-            XidStatus::InProgress => {
-                *entry.value_mut() = new_status;
-                // Drop the shard lock before touching `in_progress`
-                // to keep lock order: clog → in_progress.
-                drop(entry);
-                self.in_progress.lock().remove(&xid);
-                Ok(())
-            }
-            other => Err(TxnError::AlreadyTerminated { xid, status: other }),
-        }
     }
 
     /// Force-set the CLOG entry for `xid` to `Aborted`, regardless of the
@@ -1043,13 +1057,44 @@ impl TransactionManager {
     /// CLOG since [`Self::prepare_transaction`] consumed the
     /// `Transaction` handle without flipping status; this method
     /// closes the loop.
-    pub fn finalise_prepared(&self, xid: Xid, final_status: XidStatus) -> Result<(), TxnError> {
+    ///
+    /// `family` is the prepared transaction's savepoint family (carried durably
+    /// from `PREPARE` in the 2PC state file). It is flipped to `final_status`
+    /// **atomically with the parent** under the `in_progress` lock — mirroring
+    /// single-phase [`Self::commit`] — so the in-memory CLOG agrees with the
+    /// durable Commit/Abort WAL record for the family.
+    ///
+    /// Crucially the family is **force-set** to `final_status` (not upgraded
+    /// only when `InProgress`): after a restart in the in-doubt window
+    /// (PREPARE done, phase-2 not yet) recovery re-seeds only the *parent* as
+    /// `InProgress` and its default-abort sweep marks the still-uncommitted
+    /// savepoint subxids `Aborted`. The authoritative 2PC decision must
+    /// override that stale in-memory status so a `COMMIT PREPARED`'d savepoint
+    /// row is visible in the same live process, without waiting for a further
+    /// restart to re-apply the durable Commit record. On a `ROLLBACK PREPARED`
+    /// force-setting the family to `Aborted` is idempotent with the recovered
+    /// default but also correct in the same-process happy path where the
+    /// subxids were still `InProgress`.
+    ///
+    /// The parent flip retains its `InProgress`-only precondition (commit-at-
+    /// most-once); only the family — whose outcome is fixed by the durable 2PC
+    /// record — is force-set.
+    pub fn finalise_prepared(
+        &self,
+        xid: Xid,
+        family: &[Xid],
+        final_status: XidStatus,
+    ) -> Result<(), TxnError> {
         debug_assert!(matches!(
             final_status,
             XidStatus::Committed | XidStatus::Aborted
         ));
-        self.terminate(xid, final_status)?;
+        // Flip the parent and the whole savepoint family in one atomic
+        // active-set transition, exactly like single-phase commit, force-setting
+        // the family to the durably-decided terminal status.
+        self.terminate_with_subxids(xid, family, final_status, true)?;
         self.lock_manager.release_all(xid);
+        self.forget_subxid_parents(family);
         Ok(())
     }
 

@@ -134,7 +134,7 @@ fn bench_2pc_prepare_commit(c: &mut Criterion) {
             let xid = Xid::new(counter);
             counter += 1;
 
-            coord.prepare(&gid, xid).expect("prepare must succeed");
+            coord.prepare(&gid, xid, &[]).expect("prepare must succeed");
             let resolved = coord.commit_prepared(&gid).expect("commit must succeed");
             std::hint::black_box(resolved);
         });
