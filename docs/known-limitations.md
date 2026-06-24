@@ -19,25 +19,31 @@ completed evidence.
 - Some SQL data types are partial or missing, including full XML namespace /
   full `XMLTABLE` coverage beyond the first secure projection subset, full
   locale/collation behavior, and domain/composite type breadth.
-- Transactional DDL is partial (milestones 1–2). `CREATE TABLE` — including with
-  `PRIMARY KEY` / `UNIQUE` — now works inside an explicit `BEGIN…COMMIT` block via a
-  per-transaction catalog overlay: the issuing transaction sees the table it created,
-  other sessions do not until `COMMIT`, the durable catalog rows ride the user xid
-  (so `ROLLBACK` and crash recovery discard them — MVCC-invisible and hidden by the
+- Transactional DDL is partial (milestones 1–3). `CREATE TABLE` (including with
+  `PRIMARY KEY` / `UNIQUE`) and `CREATE INDEX` (plain single/composite B-tree, on an
+  existing table) now work inside an explicit `BEGIN…COMMIT` block via a
+  per-transaction catalog overlay: the issuing transaction sees the change, other
+  sessions do not until `COMMIT`, the durable catalog rows ride the user xid (so
+  `ROLLBACK` and crash recovery discard them — MVCC-invisible and hidden by the
   visibility-filtered bootstrap), and a per-name `AccessExclusive` lock serializes
-  concurrent same-name creation. A `PRIMARY KEY` / `UNIQUE` index btree is **built at
-  `COMMIT`, not at `CREATE`** (deferred build): uniqueness over rows inserted in the
-  same transaction is enforced once at the COMMIT build, and a duplicate fails the
-  `COMMIT` with SQLSTATE `23505` and a full rollback (no half-committed table); a
-  `ROLLBACK` or crash before `COMMIT` builds nothing, so no index segment leaks.
-  Still rejected (SQLSTATE `0A000` + `HINT`, block then `Failed`/`25P02`) inside a
-  transaction: `FOREIGN KEY`, `serial`/`IDENTITY`/`DEFAULT nextval` (sequence),
-  `CREATE TABLE AS SELECT`, `TEMP`, `PARTITION BY`, and `PREPARE TRANSACTION` over an
-  uncommitted in-txn DDL. **All other DDL** (`DROP`, `CREATE INDEX`, `ALTER`, `GRANT`,
-  `CREATE ROLE`, etc.) is still rejected `0A000` inside a transaction; autocommit DDL
-  is unchanged. Later milestones add the remaining statement types and two-phase
-  commit, per [Transactional DDL Design](transactional-ddl-design.md), each behind
-  the adversarial battery.
+  concurrent same-target DDL. Index btrees are **built at `COMMIT`, not at `CREATE`**
+  (deferred build): uniqueness is enforced once at the COMMIT build, a duplicate fails
+  the `COMMIT` with SQLSTATE `23505` and a full rollback (no half-committed schema),
+  and a `ROLLBACK` or crash before `COMMIT` builds nothing so no index segment leaks;
+  a committed index is re-persisted with its real root so it is built (uniqueness
+  enforced) after restart. **One schema-changing statement per transaction** so far —
+  a second overlay-producing DDL in the same block is rejected `0A000`
+  (multi-statement accumulation is a later milestone). Still rejected (SQLSTATE
+  `0A000` + `HINT`, block then `Failed`/`25P02`) inside a transaction: `FOREIGN KEY`,
+  `serial`/`IDENTITY`/`DEFAULT nextval`, `CREATE TABLE AS SELECT`, `TEMP`,
+  `PARTITION BY`, expression/partial/INCLUDE or non-B-tree `CREATE INDEX`,
+  `CREATE INDEX … CONCURRENTLY`, `CREATE INDEX` on a same-transaction-created table,
+  DDL under an active `SAVEPOINT`, and `PREPARE TRANSACTION` over an uncommitted
+  in-txn DDL. **All other DDL** (`DROP`, `ALTER`, `GRANT`, `CREATE ROLE`, etc.) is
+  still rejected `0A000` inside a transaction; autocommit DDL is unchanged. Later
+  milestones add `DROP`/`ALTER`, multi-statement accumulation, and two-phase commit,
+  per [Transactional DDL Design](transactional-ddl-design.md), each behind the
+  adversarial battery.
 - Latent catalog-bootstrap corruption vector (crash-recovery durability): even
   for an **autocommit** DDL, a crash *between* the statement's catalog rows
   becoming durable and its commit marker becoming durable can resurrect
