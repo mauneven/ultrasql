@@ -87,6 +87,26 @@ where
             }
             _ => None,
         };
+        // Overlay-clobber guard (milestones 1–3): the session catalog overlay
+        // (`pending_catalog_ddl`) holds ONE schema-changing statement's staged
+        // rows. A SECOND in-txn DDL statement here would overwrite the overlay
+        // below (`extra_indexes: Vec::new()`), discarding the first statement's
+        // staged (UNBUILT) index — which then reaches durable commit unbuilt: a
+        // silently-unenforced index, forever. Reject the second statement with
+        // `0A000` BEFORE any durable persist (no pg_class / pg_index rows) and
+        // BEFORE the name lock or overlay is touched, so the first statement's
+        // overlay is preserved intact for a subsequent ROLLBACK/COMMIT. The
+        // within-ONE-statement case (a `CREATE TABLE … PRIMARY KEY` staging its
+        // implicit index in this single call) is unaffected: the overlay is
+        // still `None` on entry.
+        if in_txn_xid.is_some() && self.pending_catalog_ddl.is_some() {
+            return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
+                "a second schema-changing statement inside an explicit transaction is not yet \
+                 supported\nHINT:  only one schema-changing statement is supported per \
+                 transaction so far; commit and start a new transaction"
+                    .to_string(),
+            )));
+        }
         self.ensure_schema_exists(namespace)?;
         self.ensure_schema_create_privilege(namespace)?;
         let table_key = ultrasql_catalog::table_lookup_key(namespace, table_name);
@@ -696,10 +716,12 @@ where
             };
             self.pending_catalog_ddl = Some(super::super::catalog_overlay::CatalogOverlay {
                 xid: user_xid,
-                table: entry.clone(),
+                table: Some(entry.clone()),
                 indexes: created_unique_indexes,
                 constraints: persistent_constraint_rows,
-                staged,
+                extra_indexes: Vec::new(),
+                extra_index_constraints: Vec::new(),
+                staged: Some(staged),
             });
             // Mark the new table modified so `commit_transaction`'s
             // `modified_tables` is non-empty → a durable commit marker is
@@ -864,7 +886,11 @@ const CREATE_TABLE_NAME_LOCK_CLASSID: u32 = 0xDD11_C7AB;
 /// Build the AccessExclusive name-lock tag for an in-transaction
 /// `CREATE TABLE`, keyed on the case-folded qualified table key so two
 /// transactions racing to create the same relation serialize.
-fn create_table_name_lock_tag(table_key: &str) -> ultrasql_txn::LockTag {
+///
+/// Also used by transactional `CREATE INDEX` (milestone 3), keyed on the
+/// TARGET table's key, so two in-txn `CREATE INDEX` on the same table — and a
+/// race against a same-name `CREATE TABLE` — serialize on the same tag.
+pub(super) fn create_table_name_lock_tag(table_key: &str) -> ultrasql_txn::LockTag {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     table_key.hash(&mut hasher);

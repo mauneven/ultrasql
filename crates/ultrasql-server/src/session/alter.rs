@@ -69,7 +69,7 @@ where
     ///   follow-up will route DDL through the lock manager
     ///   (`AccessExclusiveLock`).
     pub(crate) fn execute_alter_table(
-        &self,
+        &mut self,
         plan: &LogicalPlan,
         snapshot: &CatalogSnapshot,
     ) -> Result<SelectResult, ServerError> {
@@ -467,7 +467,7 @@ where
     }
 
     fn execute_alter_add_unique_constraint(
-        &self,
+        &mut self,
         table_name: &str,
         constraint: &ultrasql_planner::LogicalUniqueConstraint,
         snapshot: &CatalogSnapshot,

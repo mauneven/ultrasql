@@ -357,33 +357,43 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    /// Return a clone of this snapshot with `table`, its `indexes`, and its
-    /// `constraints` overlaid as if already committed.
+    /// Return a clone of this snapshot with the supplied in-transaction-DDL
+    /// entries overlaid as if already committed.
     ///
     /// This is the read-side primitive for transactional DDL: the issuing
-    /// session resolves the in-transaction-created relation through a
+    /// session resolves the in-transaction-created relation / index through a
     /// snapshot built by this method, while every other session keeps
     /// reading the unmodified committed snapshot. Keys are computed with the
     /// same `table_lookup_key` / `index_lookup_key` helpers the live
     /// DashMaps use, so a name resolved through the overlay matches the one
     /// resolved after the change commits.
     ///
-    /// The entries are inserted, never removed: milestone 1 covers only
-    /// `CREATE TABLE`, so the overlay is additive.
+    /// `table` is the in-txn `CREATE TABLE` entry (with its implicit
+    /// constraint `indexes` and `constraints`); it is `None` for a pure
+    /// `CREATE INDEX` overlay where the target table is already committed.
+    /// `extra_indexes` / `extra_index_constraints` (milestone 3) overlay an
+    /// in-txn `CREATE INDEX` on an EXISTING table.
+    ///
+    /// The entries are inserted, never removed: the supported transactional
+    /// DDL (`CREATE TABLE`, `CREATE INDEX`) is purely additive.
     #[must_use]
     pub fn with_overlay(
         &self,
-        table: &TableEntry,
+        table: Option<&TableEntry>,
         indexes: &[IndexEntry],
         constraints: &[ConstraintRow],
+        extra_indexes: &[IndexEntry],
+        extra_index_constraints: &[ConstraintRow],
     ) -> Self {
         let mut snap = self.clone();
-        snap.tables.insert(
-            table_lookup_key(&table.schema_name, &table.name),
-            table.clone(),
-        );
-        snap.tables_by_oid.insert(table.oid, table.clone());
-        for index in indexes {
+        if let Some(table) = table {
+            snap.tables.insert(
+                table_lookup_key(&table.schema_name, &table.name),
+                table.clone(),
+            );
+            snap.tables_by_oid.insert(table.oid, table.clone());
+        }
+        for index in indexes.iter().chain(extra_indexes) {
             snap.indexes.insert(
                 index_lookup_key(&index.schema_name, &index.name),
                 index.clone(),
@@ -393,7 +403,7 @@ impl CatalogSnapshot {
                 .or_default()
                 .push(index.clone());
         }
-        for row in constraints {
+        for row in constraints.iter().chain(extra_index_constraints) {
             snap.constraints.insert(row.oid, row.clone());
         }
         snap

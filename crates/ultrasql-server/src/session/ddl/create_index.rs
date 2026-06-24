@@ -72,7 +72,7 @@ where
     ///   indexes with duplicates would error here, which is a known
     ///   limitation we accept until the B-tree gains a non-unique mode.
     pub(crate) fn execute_create_index(
-        &self,
+        &mut self,
         plan: &LogicalPlan,
         snapshot: &CatalogSnapshot,
     ) -> Result<SelectResult, ServerError> {
@@ -99,15 +99,36 @@ where
             ));
         };
 
+        // Transactional-DDL milestone 3: when an explicit transaction is open
+        // this `CREATE INDEX` must defer its B-tree build to COMMIT and stage
+        // the `IndexEntry` in the session overlay rather than mutating the
+        // global catalog. `None` here means autocommit — the legacy
+        // self-committing builder path runs byte-for-byte unchanged.
+        //
+        // A `CREATE INDEX` issued while a SAVEPOINT is active is out of scope:
+        // the durable `pg_index` rows ride the parent xid (not the subtxn xid)
+        // and the overlay is whole-transaction-scoped, so a `ROLLBACK TO
+        // SAVEPOINT` could NOT undo the index. Reject with the gate's `0A000`
+        // (mirrors the milestone-1 `CREATE TABLE` reject).
+        let in_txn_xid = match &self.txn_state {
+            crate::TxnState::InTransaction(txn) => {
+                if txn.subtxn_stack.depth() > 0 {
+                    return Err(self.fail_if_in_transaction(ServerError::DdlInTransaction));
+                }
+                Some(txn.xid)
+            }
+            _ => None,
+        };
+
         // 1a. IF NOT EXISTS short-circuit.
         let index_key = ultrasql_catalog::index_lookup_key(index_namespace, index_name);
         if snapshot.indexes.contains_key(&index_key) {
             if *if_not_exists {
                 return Ok(run_ddl_command("CREATE INDEX"));
             }
-            return Err(ServerError::Catalog(
+            return Err(self.fail_if_in_transaction(ServerError::Catalog(
                 ultrasql_catalog::CatalogError::already_exists(index_key),
-            ));
+            )));
         }
 
         // 1b. Resolve the parent table.
@@ -117,6 +138,17 @@ where
             ))
         })?;
         self.ensure_table_owner_or_superuser(table.oid, table_name)?;
+
+        // Transactional-DDL milestone 3: route the in-transaction case to the
+        // deferred builder. It rejects the out-of-scope shapes (`0A000`) and
+        // the same-txn-created-table scope boundary, takes AccessExclusive on
+        // the target table, persists the `pg_index` rows UNBUILT under the user
+        // xid, and stages the entry in the overlay (built at COMMIT). The
+        // borrow on `snapshot.tables` is dropped before the `&mut self` call.
+        if let Some(user_xid) = in_txn_xid {
+            let table = table.clone();
+            return self.execute_create_index_in_txn(plan, &table, user_xid);
+        }
 
         // 1c. Dispatch to the per-access-method builder. Each builder
         //     owns the index build plus `pg_index` registration; logic is

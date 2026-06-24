@@ -461,18 +461,59 @@ where
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None, allow_streaming)
     }
 
-    /// Whether `plan` is a DDL statement that transactional-DDL milestone 1
-    /// supports running inside an explicit transaction block.
+    /// Whether `plan` is a DDL statement that transactional DDL supports
+    /// running inside an explicit transaction block.
     ///
-    /// Milestone 1 covers `CREATE TABLE` only, and only when it creates no
-    /// non-MVCC sidecar that cannot be transactionally rolled back. The
-    /// per-handler in-transaction path applies the final scoping check
-    /// (e.g. a serial/sequence-bearing `CREATE TABLE` is still rejected
-    /// because the sequence-create WAL is replayed unconditionally on
-    /// restart and would resurrect a rolled-back sequence). Every other DDL
-    /// stays rejected-in-transaction with SQLSTATE `0A000`.
+    /// Covers `CREATE TABLE` (milestone 1/2) and a `txn-safe` `CREATE INDEX`
+    /// (milestone 3), and only when neither creates a non-MVCC sidecar that
+    /// cannot be transactionally rolled back. The per-handler in-transaction
+    /// path applies the final scoping check (e.g. a serial/sequence-bearing
+    /// `CREATE TABLE` is still rejected because the sequence-create WAL is
+    /// replayed unconditionally on restart; a `CREATE INDEX` on a same-txn
+    /// created table or while a SAVEPOINT is active is rejected there too).
+    /// Every other DDL stays rejected-in-transaction with SQLSTATE `0A000`.
     pub(crate) fn is_transactional_ddl_supported(plan: &LogicalPlan) -> bool {
-        matches!(plan, LogicalPlan::CreateTable { .. })
+        match plan {
+            LogicalPlan::CreateTable { .. } => true,
+            LogicalPlan::CreateIndex { .. } => Self::create_index_is_txn_safe(plan),
+            _ => false,
+        }
+    }
+
+    /// Whether a `CREATE INDEX` plan is a shape transactional DDL can stage in
+    /// the session overlay and build at COMMIT (milestone 3).
+    ///
+    /// Only a plain B-tree index — no expression keys, no partial predicate, no
+    /// `INCLUDE`, no `CONCURRENTLY` — qualifies. Every other shape writes a
+    /// durable artifact the whole-transaction overlay cannot roll back:
+    /// expression / partial / `INCLUDE` indexes and the non-B-tree access
+    /// methods (Hash / BRIN / Aggregating / IvfFlat / Hnsw) install the
+    /// non-MVCC `RuntimeIndexMetadata` sidecar, and `CONCURRENTLY` is a
+    /// multi-transaction protocol that cannot run inside one. Those keep the
+    /// gate's `0A000` in-transaction and remain fully supported in autocommit.
+    ///
+    /// This is a syntactic shape check only; the in-txn handler additionally
+    /// rejects a target table created earlier in the same transaction and an
+    /// active SAVEPOINT (mirroring the `CREATE TABLE` reject).
+    pub(crate) fn create_index_is_txn_safe(plan: &LogicalPlan) -> bool {
+        let LogicalPlan::CreateIndex {
+            columns,
+            include_columns,
+            predicate,
+            method,
+            concurrently,
+            ..
+        } = plan
+        else {
+            return false;
+        };
+        // A bare-column B-tree carries its key columns in `columns`; an
+        // expression index leaves `columns` empty and stores `key_exprs`.
+        !columns.is_empty()
+            && include_columns.is_empty()
+            && predicate.is_none()
+            && !*concurrently
+            && matches!(method, ultrasql_planner::LogicalIndexMethod::Btree)
     }
 
     pub(crate) fn is_ddl_plan(plan: &LogicalPlan) -> bool {
