@@ -66,7 +66,7 @@ unless quoting a prohibited claim in the claim-policy section.
 
 ## First-Party Markdown Audit Ledger
 
-The audit covers these 97 files. "Checked" means the file was inspected for
+The audit covers these 98 files. "Checked" means the file was inspected for
 stale maturity language, unsupported production-readiness claims, and broad
 benchmark claims that are not backed by committed artifacts.
 
@@ -108,6 +108,7 @@ benchmark claims that are not backed by committed artifacts.
 | `docs/documentation-status-audit.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/driver-certification.md` | project documentation; checked for stale maturity/overclaim terms |
 | `docs/engineering-report-2026-06.md` | project documentation; checked for stale maturity/overclaim terms |
+| `docs/evalplanqual-design.md` | internal design doc (TODO #3); no project maturity claim |
 | `docs/external-audits.md` | release evidence gate; not-ready wording checked |
 | `docs/external-validation-outreach.md` | status/claim surface; updated or checked against current evidence |
 | `docs/filtered-ann.md` | project documentation; checked for stale maturity/overclaim terms |
