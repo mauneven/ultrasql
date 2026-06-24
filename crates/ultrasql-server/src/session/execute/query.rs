@@ -22,11 +22,14 @@ where
         sql: &str,
         allow_streaming: bool,
     ) -> Result<SelectResult, ServerError> {
-        // Capture a per-statement catalog snapshot — wait-free arc-swap load.
-        // The binder reads this snapshot first; if a name is not found there
-        // (a runtime CREATE TABLE never landed it), the in-memory sample
-        // catalog provides the legacy fallback.
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        // Capture a per-statement catalog snapshot — wait-free arc-swap load
+        // when no transactional-DDL overlay is pending, else the committed
+        // snapshot with this session's in-transaction-created relation
+        // overlaid (self-yes / others-no). The binder reads this snapshot
+        // first; if a name is not found there (a runtime CREATE TABLE never
+        // landed it), the in-memory sample catalog provides the legacy
+        // fallback.
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
 
         // Wire-level statement no-ops kept for SQL tooling
         // while the real plumbing lands behind the same names:
@@ -301,7 +304,10 @@ where
                 | LogicalPlan::AlterView { .. }
                 | LogicalPlan::Truncate { .. }
         );
-        if is_ddl && matches!(self.txn_state, TxnState::InTransaction(_)) {
+        if is_ddl
+            && !Self::is_transactional_ddl_supported(&plan)
+            && matches!(self.txn_state, TxnState::InTransaction(_))
+        {
             return Err(self.fail_if_in_transaction(ServerError::DdlInTransaction));
         }
         match &plan {
@@ -453,6 +459,20 @@ where
         // Cold path: `optimised_plan` is a freshly-allocated local with no
         // stable identity to cache against.
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot, None, allow_streaming)
+    }
+
+    /// Whether `plan` is a DDL statement that transactional-DDL milestone 1
+    /// supports running inside an explicit transaction block.
+    ///
+    /// Milestone 1 covers `CREATE TABLE` only, and only when it creates no
+    /// non-MVCC sidecar that cannot be transactionally rolled back. The
+    /// per-handler in-transaction path applies the final scoping check
+    /// (e.g. a serial/sequence-bearing `CREATE TABLE` is still rejected
+    /// because the sequence-create WAL is replayed unconditionally on
+    /// restart and would resurrect a rolled-back sequence). Every other DDL
+    /// stays rejected-in-transaction with SQLSTATE `0A000`.
+    pub(crate) fn is_transactional_ddl_supported(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::CreateTable { .. })
     }
 
     pub(crate) fn is_ddl_plan(plan: &LogicalPlan) -> bool {

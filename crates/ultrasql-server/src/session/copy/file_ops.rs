@@ -157,7 +157,9 @@ where
     }
 
     fn copy_reject_table_entry(&self, table_name: &str) -> Result<TableEntry, ServerError> {
-        let catalog_snapshot = self.state.catalog_snapshot();
+        // Overlay-aware so a REJECT_TABLE target this session created earlier in
+        // its open transaction resolves the same way the COPY target does.
+        let catalog_snapshot = self.effective_catalog_snapshot();
         let folded = table_name.to_ascii_lowercase();
         match crate::parse_pg_identifier_path(&folded).as_deref() {
             Some([relation_name]) => {

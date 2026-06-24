@@ -40,10 +40,11 @@ where
                 object_schema,
             } => {
                 let key = ultrasql_catalog::table_lookup_key(namespace, name);
+                // Overlay-aware so DESCRIBE of a table this session created in
+                // its open transaction resolves it (self-visibility).
                 let is_view = self.state.regular_views.contains_key(&key)
                     || self
-                        .state
-                        .catalog_snapshot()
+                        .effective_catalog_snapshot()
                         .tables
                         .get(&key)
                         .is_some_and(crate::is_regular_view_entry);

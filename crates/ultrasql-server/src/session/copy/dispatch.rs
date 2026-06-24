@@ -69,7 +69,7 @@ where
         if !matches!(stmt, ultrasql_parser::ast::Statement::Copy(_)) {
             return Ok(None);
         }
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
@@ -194,7 +194,11 @@ where
         let relation = relation
             .as_ref()
             .ok_or(ServerError::Unsupported("COPY table target missing"))?;
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        // Route through the overlay-aware snapshot so a COPY into a table this
+        // session created earlier in the same open transaction resolves it
+        // (self-yes); other sessions still read the unmodified committed
+        // snapshot (others-no).
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let entry = catalog_snapshot
             .tables
             .get(relation)

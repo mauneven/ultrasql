@@ -93,6 +93,29 @@ where
                 rows: 0,
             }),
             TxnState::InTransaction(mut txn) => {
+                // Two-phase commit of an in-transaction CREATE TABLE is out of
+                // scope for transactional-DDL milestone 1. The overlay is
+                // session-local and the per-name AccessExclusive lock is held
+                // for the whole user transaction; PREPARE TRANSACTION would
+                // terminate the txn (handing the xid to the 2PC coordinator and
+                // releasing the lock) WITHOUT a publish hook for the overlay, so
+                // the committed catalog rows would be lost in the live process
+                // and a second same-name CREATE TABLE could then commit too —
+                // duplicate-name pg_class corruption. Reject PREPARE while a
+                // pending in-txn DDL overlay exists rather than silently drop or
+                // commit it, transitioning the block to Failed. The durable
+                // catalog rows ride the user xid (still InProgress); they stay
+                // MVCC-invisible and are cleaned up when the user finally
+                // ROLLBACKs the now-failed block.
+                if self.pending_catalog_ddl.is_some() {
+                    self.txn_state = TxnState::InTransaction(txn);
+                    return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
+                        "PREPARE TRANSACTION of a transaction containing CREATE TABLE is not yet \
+                         supported\nHINT:  transactional DDL cannot be two-phase-committed yet; \
+                         COMMIT the transaction directly, or run the CREATE TABLE in autocommit"
+                            .to_string(),
+                    )));
+                }
                 self.state
                     .workload_recorder
                     .clear_session_transaction_start(self.pid);
@@ -106,6 +129,10 @@ where
                         "PREPARE TRANSACTION rollback after deferred FK violation",
                         true,
                     );
+                    // The transaction rolled back: discard any pending
+                    // transactional-DDL overlay and revert its staged in-memory
+                    // side effects, mirroring the COMMIT deferred-FK path.
+                    self.discard_pending_catalog_ddl();
                     self.clear_pending_dml_effects();
                     return Err(err);
                 }
@@ -148,9 +175,14 @@ where
                     "PREPARE TRANSACTION failed-block",
                 ) {
                     self.clear_pending_dml_effects();
+                    self.discard_pending_catalog_ddl();
                     return Err(e);
                 }
                 self.clear_pending_dml_effects();
+                // A Failed-block PREPARE aborts the txn; discard any staged
+                // in-txn DDL overlay so its in-memory side effects do not leak
+                // into shared global catalog maps (mirrors COMMIT/ROLLBACK).
+                self.discard_pending_catalog_ddl();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "ROLLBACK".to_string(),
@@ -425,6 +457,10 @@ where
                             "COMMIT rollback after deferred FK violation",
                             true,
                         );
+                        // The transaction rolled back: discard any pending
+                        // transactional-DDL overlay and revert its staged
+                        // in-memory side effects.
+                        self.discard_pending_catalog_ddl();
                         self.clear_pending_dml_effects();
                         return Err(err);
                     }
@@ -435,9 +471,17 @@ where
                     "explicit COMMIT",
                 ) {
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
+                    // The commit did not finalise durably; treat the catalog
+                    // overlay as rolled back so no uncommitted schema leaks
+                    // into the global catalog.
+                    self.discard_pending_catalog_ddl();
                     self.clear_pending_dml_effects();
                     return Err(e);
                 } else {
+                    // The user xid is durably committed (its commit marker
+                    // makes the catalog heap rows visible after restart);
+                    // publish the overlay into the global in-memory catalog.
+                    self.commit_pending_catalog_ddl();
                     self.state.note_commit_for_gc();
                     if let Err(e) =
                         self.maintain_aggregating_indexes_for_tables_after_commit(&modified_tables)
@@ -484,9 +528,13 @@ where
                     durable_abort_marker,
                     "explicit COMMIT rollback",
                 ) {
+                    self.discard_pending_catalog_ddl();
                     self.clear_pending_dml_effects();
                     return Err(e);
                 }
+                // A failed block treats COMMIT as ROLLBACK: discard the
+                // transactional-DDL overlay and revert its staged side effects.
+                self.discard_pending_catalog_ddl();
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
                 Ok(SelectResult {
@@ -527,6 +575,12 @@ where
                         "explicit ROLLBACK in-place updates: {e}"
                     )));
                 }
+                // Discard any pending transactional-DDL overlay and revert its
+                // staged in-memory side effects. The durable catalog heap rows
+                // stay on disk under the now-aborted user xid: MVCC-invisible
+                // at runtime and hidden by the visibility-filtered bootstrap on
+                // restart, so no global catalog state was ever published.
+                self.discard_pending_catalog_ddl();
                 // Recovery treats WAL-observed, non-prepared XIDs with no
                 // commit record as aborted, so ordinary explicit rollback does
                 // not need a synchronous abort marker.

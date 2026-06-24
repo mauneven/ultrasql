@@ -19,6 +19,7 @@ use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
 mod advisory;
 mod alter;
+mod catalog_overlay;
 mod copy;
 mod ddl;
 mod embedded;
@@ -149,6 +150,13 @@ pub(crate) struct Session<RW> {
     /// transaction block. Flushed to server-level maintenance hooks on
     /// COMMIT, cleared on ROLLBACK.
     pub(super) pending_table_modifications: std::collections::HashMap<String, u64>,
+    /// Transaction-scoped catalog overlay holding an in-progress
+    /// `CREATE TABLE` issued inside an explicit transaction block. `None`
+    /// outside a transaction or when no transactional DDL has run; the hot
+    /// catalog read path stays wait-free in that case. Merged into the
+    /// global catalog on COMMIT, discarded on ROLLBACK (transactional-DDL
+    /// milestone 1; see [`catalog_overlay`]).
+    pub(super) pending_catalog_ddl: Option<catalog_overlay::CatalogOverlay>,
     /// Pending logical CDC changes emitted only after COMMIT succeeds.
     pub(super) pending_logical_changes: Vec<PendingLogicalChange>,
     /// Materialized-view row counters accumulated inside the current
@@ -209,6 +217,7 @@ where
             simple_batch_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),
+            pending_catalog_ddl: None,
             pending_logical_changes: Vec::new(),
             pending_materialized_view_rows: Vec::new(),
             sequence_state: crate::SequenceSessionState::default(),
@@ -237,6 +246,14 @@ impl<RW> Drop for Session<RW> {
     /// cancel registry on drop so the per-pid sender is released and any
     /// orphaned subscriptions are removed.
     fn drop(&mut self) {
+        // A client that disconnects mid-transaction after an in-txn
+        // CREATE TABLE (no COMMIT/ROLLBACK) must not leave the staged,
+        // non-MVCC global side maps (runtime constraints / RLS / privileges)
+        // dirty for the lifetime of the process. The durable catalog rows
+        // ride the now-orphaned user xid (swept to aborted by recovery) and
+        // were never published to the global catalog, so only the staged
+        // in-memory side effects need reverting here.
+        self.revert_staged_catalog_ddl_side_effects();
         self.advisory_state
             .release_all(&self.state.txn_manager.lock_manager);
         self.state.notify_hub.deregister_connection(self.pid);

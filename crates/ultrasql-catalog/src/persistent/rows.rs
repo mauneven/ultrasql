@@ -355,3 +355,47 @@ pub struct CatalogSnapshot {
     /// `pg_statistic_ext` rows keyed by statistic object OID.
     pub statistic_ext: std::collections::HashMap<Oid, StatisticExtRow>,
 }
+
+impl CatalogSnapshot {
+    /// Return a clone of this snapshot with `table`, its `indexes`, and its
+    /// `constraints` overlaid as if already committed.
+    ///
+    /// This is the read-side primitive for transactional DDL: the issuing
+    /// session resolves the in-transaction-created relation through a
+    /// snapshot built by this method, while every other session keeps
+    /// reading the unmodified committed snapshot. Keys are computed with the
+    /// same `table_lookup_key` / `index_lookup_key` helpers the live
+    /// DashMaps use, so a name resolved through the overlay matches the one
+    /// resolved after the change commits.
+    ///
+    /// The entries are inserted, never removed: milestone 1 covers only
+    /// `CREATE TABLE`, so the overlay is additive.
+    #[must_use]
+    pub fn with_overlay(
+        &self,
+        table: &TableEntry,
+        indexes: &[IndexEntry],
+        constraints: &[ConstraintRow],
+    ) -> Self {
+        let mut snap = self.clone();
+        snap.tables.insert(
+            table_lookup_key(&table.schema_name, &table.name),
+            table.clone(),
+        );
+        snap.tables_by_oid.insert(table.oid, table.clone());
+        for index in indexes {
+            snap.indexes.insert(
+                index_lookup_key(&index.schema_name, &index.name),
+                index.clone(),
+            );
+            snap.indexes_by_table
+                .entry(index.table_oid)
+                .or_default()
+                .push(index.clone());
+        }
+        for row in constraints {
+            snap.constraints.insert(row.oid, row.clone());
+        }
+        snap
+    }
+}

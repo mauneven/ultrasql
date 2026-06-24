@@ -1430,26 +1430,34 @@ async fn repeatable_read_snapshot_frozen_wire_level() {
     shutdown(client, server_handle).await;
 }
 
-/// DDL inside an explicit transaction block is rejected deterministically
-/// with SQLSTATE `0A000` (feature_not_supported) and an autocommit HINT.
+/// Out-of-scope DDL inside an explicit transaction block is rejected
+/// deterministically with SQLSTATE `0A000` (feature_not_supported) and an
+/// autocommit HINT.
 ///
-/// PostgreSQL implements transactional DDL; UltraSQL does not yet (the
-/// catalog is mutated globally-in-place and committed durably mid-statement
-/// under a private `ddl_txn`, with no per-transaction overlay — see
-/// `docs/transactional-ddl-design.md`). Until that lands, the gate must
-/// fail honestly: a classifiable SQLSTATE plus a hint, the block then
-/// transitioning to Failed (25P02) per PostgreSQL's in-failed-block rule,
-/// and the session fully usable again after ROLLBACK.
+/// Transactional-DDL milestone 1 supports only `CREATE TABLE` in an explicit
+/// transaction; every other DDL (here `CREATE INDEX`) stays rejected because
+/// its effects are not yet transactionally reversible (e.g. the btree build
+/// and the non-MVCC sidecars). Until those land, the gate must fail honestly:
+/// a classifiable SQLSTATE plus a hint, the block then transitioning to
+/// Failed (25P02) per PostgreSQL's in-failed-block rule, and the session
+/// fully usable again after ROLLBACK.
 #[tokio::test]
 async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
 
+    // A base table to index, created in autocommit so the only in-txn DDL is
+    // the still-rejected CREATE INDEX.
+    client
+        .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
+        .await
+        .expect("create base table in autocommit");
+
     client.batch_execute("BEGIN").await.expect("BEGIN");
 
     let err = client
-        .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
+        .batch_execute("CREATE INDEX ddl_in_txn_ix ON ddl_in_txn (id)")
         .await
-        .expect_err("DDL inside an explicit transaction must be rejected");
+        .expect_err("non-CREATE-TABLE DDL inside an explicit transaction must be rejected");
 
     // PG-faithful classification: feature_not_supported, not a generic
     // internal error, so ORM/migration tooling can route on it.
@@ -1500,10 +1508,10 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
         .expect("session usable after rollback");
     assert_eq!(rows.len(), 1, "session recovered after rollback");
 
-    // And the rejected DDL did not leak: the table does not exist, and it
+    // And the rejected DDL did not leak: the index does not exist, and it
     // can now be created in autocommit (the documented workaround).
     client
-        .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
+        .batch_execute("CREATE INDEX ddl_in_txn_ix ON ddl_in_txn (id)")
         .await
         .expect("DDL succeeds in autocommit after the rejected in-txn attempt");
 

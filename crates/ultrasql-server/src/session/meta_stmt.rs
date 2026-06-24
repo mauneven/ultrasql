@@ -141,7 +141,11 @@ where
         }
 
         let substituted = substitute_parameters_in_plan(&plan, &values);
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        // Re-resolve against the overlay-aware snapshot: a prepared statement
+        // referencing a table this session created earlier in the same open
+        // transaction must still find it at EXECUTE time (self-visibility),
+        // while other sessions keep reading the committed snapshot.
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let executable = self.prepare_regular_view_plan(&substituted, &catalog_snapshot)?;
         // `executable` is a per-EXECUTE plan with substituted parameters and
         // no stable identity, so it is not eligible for the precheck cache.

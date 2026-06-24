@@ -55,7 +55,7 @@ where
         // re-bound at Execute time, so concurrent DDL between Parse and
         // Execute is invisible to the prepared statement (PostgreSQL
         // exhibits the same behaviour with `pg_proc` snapshotting).
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
@@ -176,7 +176,7 @@ where
         if self.extended.pipeline_failed {
             return Ok(());
         }
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
@@ -212,7 +212,7 @@ where
         if self.extended.pipeline_failed {
             return Ok(());
         }
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let combined = CombinedCatalog {
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
@@ -399,7 +399,10 @@ where
             // RowDescription because Extended Query delivers it via a
             // separate Describe message.
             if matches!(plan, LogicalPlan::Explain { .. }) {
-                let catalog_snapshot = self.state.catalog_snapshot();
+                // Use the overlay-aware snapshot so EXPLAIN ANALYZE over the
+                // extended protocol can resolve a table created earlier in this
+                // same open transaction (it re-lowers/executes the inner plan).
+                let catalog_snapshot = self.effective_catalog_snapshot();
                 match self.execute_explain(plan, &catalog_snapshot) {
                     Ok(result) => {
                         for m in &result.messages {
@@ -460,8 +463,10 @@ where
         if let Some(ref plan) = plan_clone
             && Self::is_ddl_plan(plan)
         {
-            let catalog_snapshot = self.state.catalog_snapshot();
-            let result = if matches!(self.txn_state, TxnState::InTransaction(_)) {
+            let catalog_snapshot = self.effective_catalog_snapshot();
+            let result = if matches!(self.txn_state, TxnState::InTransaction(_))
+                && !Self::is_transactional_ddl_supported(plan)
+            {
                 Err(self.fail_if_in_transaction(ServerError::DdlInTransaction))
             } else {
                 self.execute_ddl_plan(plan, &catalog_snapshot)
@@ -543,7 +548,7 @@ where
         portal: &str,
         max_rows: i32,
     ) -> Result<crate::extended::ExecuteOutcome, ServerError> {
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let portal_plan = self
             .extended
             .portals
