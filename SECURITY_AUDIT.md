@@ -104,6 +104,15 @@ mandatory `'N'` decline (commit `e613c09`) so stock clients connect in plaintext
 instead of seeing a dropped socket — connections remain cleartext (no TLS
 upgrade), which is tracked as an open limitation.
 
+> **Superseded (v0.0.9):** TLS was subsequently implemented. `SSLRequest` is now
+> answered with `'S'` and the stream upgraded to TLS (rustls) in place when a
+> server certificate is configured — with the CVE-2021-23214 buffered-plaintext
+> guard — otherwise declined with `'N'` so a `prefer` client continues in
+> plaintext. `GSSENCRequest` is still declined. See
+> `crates/ultrasql-server/src/session/startup.rs` (`SslRequest` arm) and
+> `docs/known-limitations.md`. The cleartext-only statement above is retained as
+> the dated record of the 2026-06-17 pass.
+
 ---
 
 ## 1. Summary

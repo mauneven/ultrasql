@@ -104,7 +104,7 @@ In scope:
   documented isolation levels.
 - Wire protocol implementation flaws (message parsing, auth handshake,
   copy protocol).
-- Cryptographic flaws in SCRAM-SHA-256, TLS termination (when added),
+- Cryptographic flaws in SCRAM-SHA-256, TLS termination,
   or any other cryptographic primitive used in UltraSQL.
 
 Not in scope:
