@@ -136,21 +136,65 @@ impl Server {
     }
 
     /// Run `ANALYZE` for one table and publish progress under `pid`.
+    ///
+    /// Resolves the table via the GLOBAL committed catalog. A SESSION holding a
+    /// transactional-DDL overlay must NOT use this entry point for an
+    /// in-txn-created table — `Server` has no access to the overlay — and
+    /// instead resolves the [`TableEntry`] from its own
+    /// `effective_catalog_snapshot()` and calls
+    /// [`Self::analyze_table_entry_with_pid`] directly.
     pub fn analyze_table_with_pid(&self, table: &str, pid: u32) -> Result<bool, ServerError> {
         let folded = table.to_ascii_lowercase();
-        self.pending_analyze_tables.remove(&folded);
         let snapshot = self.catalog_snapshot();
         let Some(entry) = snapshot.tables.get(&folded) else {
+            // A missing table still clears any pending-analyze flag for the
+            // name, matching the original entry-resolution ordering.
+            self.pending_analyze_tables.remove(&folded);
             return Ok(false);
         };
         let entry = entry.clone();
         drop(snapshot);
+        // Resolved from the committed catalog, so the OID is published and the
+        // durable OID-keyed writes are valid.
+        self.analyze_table_entry_with_pid(&folded, &entry, pid, true)
+    }
 
+    /// Run `ANALYZE` for one already-resolved [`TableEntry`] and publish
+    /// progress under `pid`.
+    ///
+    /// Factored out of [`Self::analyze_table_with_pid`] so a session can supply
+    /// an entry resolved through its per-txn catalog overlay (an
+    /// in-txn-created relation that the global catalog does not yet carry)
+    /// without giving `Server` access to the overlay. `folded` is the
+    /// case-folded lookup name used for the pending-analyze flag and the
+    /// AnalyzeRunner label.
+    ///
+    /// `persist_durably` MUST be `false` when `entry` is an overlay-only
+    /// (in-txn-created) relation whose OID is not yet published to the
+    /// committed persistent catalog: the OID-keyed durable writes
+    /// (`update_table_size` / `persist_statistic_rows` / `replace_statistics`)
+    /// would fail "not found" against the uncommitted OID. With it `false`,
+    /// ANALYZE still scans the heap and registers the computed stats in the
+    /// in-memory `stats_catalog` (keyed by folded name) so the issuing
+    /// session's optimizer sees them, but skips the durable OID-keyed writes —
+    /// a later autocommit `ANALYZE` after COMMIT persists them. Committed
+    /// tables (autocommit, or in-txn ALTER of an already-committed table) pass
+    /// `true`, preserving the original behavior byte-for-byte.
+    pub fn analyze_table_entry_with_pid(
+        &self,
+        folded: &str,
+        entry: &TableEntry,
+        pid: u32,
+        persist_durably: bool,
+    ) -> Result<bool, ServerError> {
+        self.pending_analyze_tables.remove(folded);
         let rel = RelationId(entry.oid);
         let block_count = self.heap.block_count(rel).max(entry.n_blocks);
-        self.persistent_catalog
-            .update_table_size(entry.oid, block_count)
-            .map_err(ServerError::Catalog)?;
+        if persist_durably {
+            self.persistent_catalog
+                .update_table_size(entry.oid, block_count)
+                .map_err(ServerError::Catalog)?;
+        }
 
         self.workload_recorder
             .begin_analyze(pid, entry.oid.raw(), block_count);
@@ -194,7 +238,7 @@ impl Server {
                 }
             }
             let stats = AnalyzeRunner::new(AnalyzeOptions::default())
-                .run(&folded, &entry.schema, rows.into_iter())
+                .run(folded, &entry.schema, rows.into_iter())
                 .map_err(|e| ServerError::Ddl(format!("ANALYZE statistics failed: {e}")))?;
             let mut stat_rows = Vec::with_capacity(stats.columns.len());
             for col in &stats.columns {
@@ -218,19 +262,32 @@ impl Server {
             }
             self.workload_recorder
                 .update_analyze(pid, "writing statistics", block_count);
-            let catalog_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-            if let Err(e) = self.persistent_catalog.persist_statistic_rows(
-                &stat_rows,
-                self.heap.as_ref(),
-                catalog_txn.xid,
-                catalog_txn.current_command,
-            ) {
-                return Err(self.abort_analyze_catalog_statistics_transaction(catalog_txn, e));
+            // Durable, OID-keyed persistence is skipped for an overlay-only
+            // (uncommitted-OID) relation: the committed persistent catalog has
+            // no row for `entry.oid` yet, so these writes would fail. The
+            // in-memory `stats_catalog.register` below still runs so the
+            // session's optimizer sees the fresh stats.
+            if persist_durably {
+                let catalog_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+                if let Err(e) = self.persistent_catalog.persist_statistic_rows(
+                    &stat_rows,
+                    self.heap.as_ref(),
+                    catalog_txn.xid,
+                    catalog_txn.current_command,
+                ) {
+                    return Err(self.abort_analyze_catalog_statistics_transaction(catalog_txn, e));
+                }
+                self.commit_transaction(
+                    catalog_txn,
+                    true,
+                    "ANALYZE catalog statistics transaction",
+                )?;
             }
-            self.commit_transaction(catalog_txn, true, "ANALYZE catalog statistics transaction")?;
             self.stats_catalog.write().register(stats);
-            self.persistent_catalog
-                .replace_statistics(entry.oid, stat_rows);
+            if persist_durably {
+                self.persistent_catalog
+                    .replace_statistics(entry.oid, stat_rows);
+            }
             self.plan_cache.invalidate_all();
             Ok(true)
         })();

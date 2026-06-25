@@ -162,7 +162,10 @@ where
         &mut self,
         table: Option<&str>,
     ) -> Result<SelectResult, ServerError> {
-        let snapshot = self.state.catalog_snapshot();
+        // Resolve through the per-txn catalog overlay so `VACUUM <table>` over
+        // an in-txn-created relation finds it rather than 42P01. Autocommit
+        // sessions (no overlay) get the committed snapshot unchanged.
+        let snapshot = self.effective_catalog_snapshot();
         let tables: Vec<TableEntry> = match table {
             Some(name) => vec![snapshot.tables.get(name).cloned().ok_or_else(|| {
                 self.fail_if_in_transaction(ServerError::Plan(
@@ -383,19 +386,44 @@ where
         &mut self,
         table: Option<&str>,
     ) -> Result<SelectResult, ServerError> {
+        // Resolve through the per-txn catalog overlay so ANALYZE finds an
+        // in-txn-created relation (and skips an in-txn-dropped one) rather than
+        // 42P01. The Server-global `analyze_table_with_pid` resolves names off
+        // the committed catalog only, so the session resolves the `TableEntry`
+        // here and hands the resolved entry to `analyze_table_entry_with_pid`.
+        // Autocommit sessions (no overlay) see the committed snapshot, so
+        // behavior is unchanged there.
+        //
+        // The durable OID-keyed stat writes are valid only for an OID already
+        // published to the committed catalog; an overlay-only (in-txn-created)
+        // relation's OID is not, so `persist_durably` is gated on the committed
+        // snapshot carrying the entry's OID.
+        let snapshot = self.effective_catalog_snapshot();
+        let committed = self.state.catalog_snapshot();
         match table {
             Some(t) => {
-                if !self.state.analyze_table_with_pid(t, self.pid)? {
+                let folded = t.to_ascii_lowercase();
+                let Some(entry) = snapshot.tables.get(&folded) else {
                     return Err(self.fail_if_in_transaction(ServerError::Plan(
                         ultrasql_planner::PlanError::TableNotFound(t.to_string()),
                     )));
-                }
+                };
+                let entry = entry.clone();
+                let persist = committed.tables_by_oid.contains_key(&entry.oid);
+                self.state
+                    .analyze_table_entry_with_pid(&folded, &entry, self.pid, persist)?;
             }
             None => {
-                let snapshot = self.state.catalog_snapshot();
-                let tables: Vec<String> = snapshot.tables.keys().map(|k| k.to_string()).collect();
-                for name in tables {
-                    let _ = self.state.analyze_table_with_pid(&name, self.pid);
+                let entries: Vec<(String, TableEntry)> = snapshot
+                    .tables
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (folded, entry) in entries {
+                    let persist = committed.tables_by_oid.contains_key(&entry.oid);
+                    let _ = self
+                        .state
+                        .analyze_table_entry_with_pid(&folded, &entry, self.pid, persist);
                 }
             }
         }

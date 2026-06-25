@@ -443,7 +443,12 @@ where
                 "binary COPY for query targets is not yet supported",
             ));
         }
-        let snapshot = self.state.catalog_snapshot();
+        // Resolve through the per-txn catalog overlay so a `COPY (SELECT …
+        // FROM t) TO …` over an in-txn-created (or in-txn-altered) relation `t`
+        // sees the issuing session's own uncommitted schema rather than 42P01.
+        // Autocommit sessions (no overlay) get the committed snapshot
+        // unchanged.
+        let snapshot = self.effective_catalog_snapshot();
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let ctx = crate::pipeline::LowerCtx {
             tables: &self.state.tables,

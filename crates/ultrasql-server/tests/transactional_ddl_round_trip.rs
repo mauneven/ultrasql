@@ -5503,3 +5503,204 @@ async fn in_txn_alter_session_sees_own_schema_not_stale_cached_plan() {
     client.batch_execute("COMMIT").await.expect("commit");
     shutdown(running).await;
 }
+
+// ───────────── ROOT-A: utility / COPY paths route through the overlay ─────────
+// COPY-query / VACUUM / ANALYZE resolved through the RAW committed snapshot,
+// not the per-txn overlay, so each failed 42P01 (or aborted the txn) for the
+// session's OWN in-txn-created table. The fix routes them through
+// `effective_catalog_snapshot()`.
+
+/// Drain a `tokio_postgres::CopyOutStream` to a single `Vec<u8>`.
+async fn drain_copy_out(stream: tokio_postgres::CopyOutStream) -> Vec<u8> {
+    use futures::StreamExt;
+    let mut stream = Box::pin(stream);
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk.expect("CopyData chunk"));
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_query_to_over_in_txn_created_table_is_self_visible() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_copyq_self").await;
+    let client = &running.client;
+
+    // Seed COMMITTED rows so the COPY query's own ReadCommitted snapshot has
+    // visible rows to emit, proving schema resolution + row emission end to end.
+    client
+        .batch_execute("CREATE TABLE cq (id INT NOT NULL)")
+        .await
+        .expect("autocommit create");
+    client
+        .batch_execute("INSERT INTO cq VALUES (1), (2), (3)")
+        .await
+        .expect("autocommit insert (committed rows)");
+
+    // In-txn ALTER-RENAME, then a COPY query selecting the NEW (overlay) column
+    // name must resolve the schema through the overlay — pre-fix this failed
+    // 42P01 (the COPY-query path re-fetched the RAW committed snapshot). The
+    // rows are the COMMITTED rows under the renamed column.
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE cq RENAME COLUMN id TO renamed_id")
+        .await
+        .expect("in-txn rename column");
+    let stream = client
+        .copy_out("COPY (SELECT renamed_id FROM cq ORDER BY renamed_id) TO STDOUT")
+        .await
+        .expect("COPY query resolves the in-txn-renamed column (no 42P01/42703)");
+    let bytes = drain_copy_out(stream).await;
+    assert_eq!(
+        bytes,
+        b"1\n2\n3\n".to_vec(),
+        "COPY query emits the committed rows under the overlay-renamed column"
+    );
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    // In-txn CREATE variant: `COPY (SELECT … FROM t) TO …` over an
+    // in-txn-CREATED table must resolve the schema (no 42P01). The COPY query
+    // runs in its own ReadCommitted txn, so the session's still-uncommitted
+    // INSERTs are not visible to it (COPY-query txn-atomicity is a separate,
+    // deferred concern); the assertion here is the ROOT-A schema-resolution
+    // fix: the table is FOUND and the COPY completes cleanly instead of 42P01.
+    client.batch_execute("BEGIN").await.expect("begin 2");
+    client
+        .batch_execute("CREATE TABLE cq2 (id INT NOT NULL)")
+        .await
+        .expect("in-txn create");
+    client
+        .batch_execute("INSERT INTO cq2 VALUES (7), (8)")
+        .await
+        .expect("in-txn insert");
+    let stream = client
+        .copy_out("COPY (SELECT id FROM cq2 ORDER BY id) TO STDOUT")
+        .await
+        .expect("COPY query over self-created in-txn table resolves (no 42P01)");
+    // Drains cleanly; row visibility under the session's own xid is the
+    // deferred atomicity concern, so we only assert no error here.
+    let _ = drain_copy_out(stream).await;
+    client.batch_execute("COMMIT").await.expect("commit 2");
+
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vacuum_in_txn_created_table_no_42p01() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_vac_self").await;
+    let client = &running.client;
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("CREATE TABLE vac_t (id INT NOT NULL)")
+        .await
+        .expect("in-txn create");
+    client
+        .batch_execute("INSERT INTO vac_t VALUES (10), (20)")
+        .await
+        .expect("in-txn insert");
+
+    // `VACUUM <table>` over the in-txn-created table must resolve it — pre-fix
+    // this failed 42P01 and aborted the transaction.
+    client
+        .batch_execute("VACUUM vac_t")
+        .await
+        .expect("VACUUM resolves the self-created in-txn table");
+
+    // The transaction is still live and the table still readable.
+    let rows = client
+        .query("SELECT id FROM vac_t ORDER BY id", &[])
+        .await
+        .expect("table readable after in-txn VACUUM (txn not aborted)");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 10);
+
+    client.batch_execute("COMMIT").await.expect("commit");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analyze_in_txn_created_table_no_42p01() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_ana_self").await;
+    let client = &running.client;
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("CREATE TABLE ana_t (id INT NOT NULL)")
+        .await
+        .expect("in-txn create");
+    client
+        .batch_execute("INSERT INTO ana_t VALUES (1), (2), (3)")
+        .await
+        .expect("in-txn insert");
+
+    // `ANALYZE <table>` over the in-txn-created table must resolve it — pre-fix
+    // the Server-global resolver missed the overlay and ANALYZE failed 42P01.
+    client
+        .batch_execute("ANALYZE ana_t")
+        .await
+        .expect("ANALYZE resolves the self-created in-txn table");
+
+    let rows = client
+        .query("SELECT count(*) FROM ana_t", &[])
+        .await
+        .expect("table readable after in-txn ANALYZE (txn not aborted)");
+    assert_eq!(rows[0].get::<_, i64>(0), 3);
+
+    client.batch_execute("COMMIT").await.expect("commit");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_analyze_in_txn_sees_created_and_skips_dropped() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_bare_ana").await;
+    let client = &running.client;
+
+    // A committed table that will be DROPPED in-txn — bare ANALYZE must NOT
+    // touch it through the overlay (the overlay hides it).
+    client
+        .batch_execute("CREATE TABLE bare_dropped (id INT NOT NULL)")
+        .await
+        .expect("autocommit create of soon-dropped table");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("CREATE TABLE bare_created (id INT NOT NULL)")
+        .await
+        .expect("in-txn create");
+    client
+        .batch_execute("INSERT INTO bare_created VALUES (1)")
+        .await
+        .expect("in-txn insert");
+    client
+        .batch_execute("DROP TABLE bare_dropped")
+        .await
+        .expect("in-txn drop");
+
+    // Bare `ANALYZE` iterates the overlay snapshot: it sees `bare_created` and
+    // skips the overlay-dropped `bare_dropped`, and must not abort the txn.
+    client
+        .batch_execute("ANALYZE")
+        .await
+        .expect("bare ANALYZE iterates the overlay snapshot without 42P01");
+
+    // The transaction is still live: the in-txn-created table is still there,
+    // the in-txn-dropped one is gone for this session.
+    let rows = client
+        .query("SELECT count(*) FROM bare_created", &[])
+        .await
+        .expect("in-txn-created table readable after bare ANALYZE");
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    let err = client
+        .query("SELECT * FROM bare_dropped", &[])
+        .await
+        .expect_err("in-txn-dropped table is gone for this session");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+
+    client.batch_execute("COMMIT").await.expect("commit");
+    shutdown(running).await;
+}
