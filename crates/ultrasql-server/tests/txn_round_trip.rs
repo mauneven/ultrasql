@@ -1446,8 +1446,8 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
 
     // A base table, created in autocommit so the in-txn DDL is the
-    // still-rejected DROP TABLE (CREATE TABLE / CREATE INDEX are now
-    // transactional; DROP is a later milestone).
+    // still-rejected TRUNCATE (CREATE TABLE / CREATE INDEX / ALTER TABLE / plain
+    // DROP TABLE are now transactional; TRUNCATE is a later milestone).
     client
         .batch_execute("CREATE TABLE ddl_in_txn (id INT NOT NULL)")
         .await
@@ -1456,7 +1456,7 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
     client.batch_execute("BEGIN").await.expect("BEGIN");
 
     let err = client
-        .batch_execute("DROP TABLE ddl_in_txn")
+        .batch_execute("TRUNCATE ddl_in_txn")
         .await
         .expect_err("a still-unsupported DDL inside an explicit transaction must be rejected");
 

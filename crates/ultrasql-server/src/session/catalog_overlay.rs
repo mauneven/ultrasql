@@ -93,6 +93,54 @@ pub(crate) struct CatalogOverlay {
     /// ROLLBACK), in issue order. Empty for an overlay that stages no in-txn
     /// `ALTER TABLE`.
     pub(crate) altered_staged: Vec<AlteredSideEffects>,
+    /// Negative mask of table OIDs an in-txn `DROP TABLE` (milestone 5) removed
+    /// from the issuing session's effective view. Applied LAST in
+    /// [`CatalogSnapshot::with_overlay`] (after the created + altered folds), so
+    /// the dropped table, its indexes, and its constraints stop resolving for
+    /// this session while the global catalog stays untouched until COMMIT. A
+    /// same-txn `CREATE … ; DROP …` nets to absent (the create fold inserts, the
+    /// mask removes by OID). Empty for an overlay with no in-txn DROP.
+    pub(crate) dropped_oids: std::collections::HashSet<Oid>,
+    /// Per-`DROP TABLE` record, in issue order. Carries everything COMMIT needs
+    /// to publish the durable drop and ROLLBACK needs to confirm nothing was
+    /// mutated globally. NO before-images are captured because the in-txn DROP
+    /// handler mutates NOTHING in the global catalog (the mask alone provides
+    /// self-visibility) — the inverse of CREATE/ALTER. Empty for an overlay with
+    /// no in-txn DROP.
+    pub(crate) dropped: Vec<DroppedTableState>,
+}
+
+/// Record of one in-txn `DROP TABLE` (milestone 5).
+///
+/// The in-txn DROP handler never touches the global catalog. In BOTH cases a
+/// `pg_class` `RelKind::Dropped` tombstone is written under the USER xid (so
+/// ROLLBACK/crash leaves it MVCC-invisible and bootstrap-hidden, and COMMIT
+/// makes it durable atomically with the commit marker). The cases differ only
+/// in what COMMIT publishes globally:
+///
+/// - committed-before (`was_same_txn_created == false`): the table is live in
+///   the global catalog, so COMMIT runs the real `catalog.drop_table` + minimal
+///   in-memory teardown for it (Step A).
+/// - same-txn-created (`was_same_txn_created == true`): the table was never in
+///   the global catalog (it lived only in `created_tables`, which the DROP
+///   un-staged), so COMMIT publishes/drops NOTHING for it. The tombstone is
+///   STILL required: the table's `pg_class` CREATE rows are already on disk
+///   under the user xid, and without a later Dropped row for the same OID a
+///   restart's latest-row-per-OID bootstrap would resurrect it.
+pub(crate) struct DroppedTableState {
+    /// OID of the dropped relation (the mask key + the COMMIT-time in-memory
+    /// teardown key).
+    pub(crate) oid: Oid,
+    /// Folded qualified key the table is filed under in the GLOBAL catalog
+    /// (the PRE-ALTER name for a committed-before table), used for the
+    /// COMMIT-time global `drop_table`.
+    pub(crate) table_key: String,
+    /// `true` → the table was CREATED earlier in THIS transaction, so the DROP
+    /// nets it out of `created_tables` and COMMIT publishes/drops NOTHING for it
+    /// globally (the tombstone alone makes it net-absent on restart). `false` →
+    /// the table was committed before this transaction, so COMMIT runs the
+    /// global `drop_table` teardown.
+    pub(crate) was_same_txn_created: bool,
 }
 
 /// The catalog-mutation intent of one in-txn `ALTER TABLE`, replayed against
@@ -237,6 +285,7 @@ where
             &overlay.extra_indexes,
             &overlay.extra_index_constraints,
             &overlay.altered_tables,
+            &overlay.dropped_oids,
         ))
     }
 
@@ -498,6 +547,38 @@ where
             return;
         };
         let catalog = &self.state.persistent_catalog;
+        // Transactional-DDL milestone 5: APPLY DROPS FIRST, before the create
+        // loop, so a DROP-then-recreate of the SAME name frees the by-name key
+        // before the recreate publishes the new OID under it. A
+        // `was_same_txn_created` drop was already un-staged from `created_tables`
+        // at DROP time, so nothing here publishes it; only a committed-before
+        // drop runs the global teardown. The durable `RelKind::Dropped`
+        // tombstone for a committed-before drop was already persisted under the
+        // user xid at DROP-statement time, made durable atomically by the commit
+        // marker; this is the in-memory publish of that drop. A failure here is
+        // logged, not propagated (the user xid is durably committed; a fresh
+        // bootstrap reconstructs the same net-absent state from the heap).
+        for dropped in &overlay.dropped {
+            if dropped.was_same_txn_created {
+                continue;
+            }
+            if let Err(e) = catalog.drop_table(&dropped.table_key) {
+                tracing::error!(
+                    error = %e,
+                    table = %dropped.table_key,
+                    "transactional DROP TABLE commit: removing table from global catalog failed; \
+                     the durable tombstone is authoritative and a restart rebuilds the same state"
+                );
+            }
+            // Minimal in-memory teardown for the in-scope subset (the reject
+            // predicate excludes sequence/RLS/FK/view/partition/columnar
+            // targets, so only the always-run maps remain): drop the runtime
+            // constraints entry and any descriptions for the OID.
+            self.state.table_constraints.remove(&dropped.oid);
+            self.state
+                .persistent_catalog
+                .clear_descriptions_for_object(dropped.oid);
+        }
         // Publish every in-txn `CREATE TABLE` first (empty for a pure `CREATE
         // INDEX` overlay), then their implicit constraint indexes.
         for table in &overlay.created_tables {
@@ -593,8 +674,16 @@ where
         // are no-ops there (and both staged vecs are empty). An in-txn ALTER
         // (milestone 4) defers the same runtime-constraints / RLS / privilege
         // file writes to here for the same crash-safety reason.
-        let has_staged_side_effects =
-            !overlay.staged.is_empty() || !overlay.altered_staged.is_empty();
+        // A committed-before DROP removed the table's runtime-constraints entry
+        // (Step A above) and must flush the runtime-constraints metadata file so
+        // the dropped table's constraints are not re-read on restart.
+        let has_committed_before_drop = overlay
+            .dropped
+            .iter()
+            .any(|dropped| !dropped.was_same_txn_created);
+        let has_staged_side_effects = !overlay.staged.is_empty()
+            || !overlay.altered_staged.is_empty()
+            || has_committed_before_drop;
         if has_staged_side_effects {
             if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
                 tracing::error!(error = %e, "transactional DDL commit: persist runtime-constraints metadata failed");
@@ -664,11 +753,15 @@ impl<RW> Session<RW> {
         let Some(overlay) = self.pending_catalog_ddl.take() else {
             return;
         };
-        // A pure `CREATE INDEX` overlay (milestone 3) staged no in-memory side
-        // map — the durable unbuilt `pg_index` rows ride the aborted user xid
-        // and the segment was never built — so there is nothing to revert here.
-        // A `CREATE TABLE` (`staged`) or `ALTER TABLE` (`altered_staged`) overlay
-        // DID stage in-memory side maps that must be reverted.
+        // A pure `CREATE INDEX` overlay (milestone 3) or a pure `DROP TABLE`
+        // overlay (milestone 5) staged NO in-memory side map: the durable rows
+        // (unbuilt `pg_index` for CREATE INDEX; the `RelKind::Dropped` tombstone
+        // for DROP) ride the aborted user xid and are MVCC-invisible +
+        // bootstrap-hidden, and a committed-before DROP never touched the global
+        // catalog — so the negative mask simply vanishes with the overlay and
+        // the committed table reappears in `base` automatically. Nothing to
+        // revert. A `CREATE TABLE` (`staged`) or `ALTER TABLE` (`altered_staged`)
+        // overlay DID stage in-memory side maps that must be reverted.
         if overlay.staged.is_empty() && overlay.altered_staged.is_empty() {
             return;
         }

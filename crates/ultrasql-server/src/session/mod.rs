@@ -23,6 +23,7 @@ mod alter_in_txn;
 mod catalog_overlay;
 mod copy;
 mod ddl;
+mod drop_in_txn;
 mod embedded;
 mod execute;
 mod explain;

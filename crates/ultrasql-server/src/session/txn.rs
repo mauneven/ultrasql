@@ -111,9 +111,9 @@ where
                     self.txn_state = TxnState::InTransaction(txn);
                     return Err(self.fail_if_in_transaction(ServerError::UnsupportedOwned(
                         "PREPARE TRANSACTION of a transaction containing transactional DDL \
-                         (CREATE TABLE / CREATE INDEX) is not yet supported\nHINT:  transactional \
-                         DDL cannot be two-phase-committed yet; COMMIT the transaction directly, \
-                         or run the DDL in autocommit"
+                         (CREATE TABLE / CREATE INDEX / ALTER TABLE / DROP TABLE) is not yet \
+                         supported\nHINT:  transactional DDL cannot be two-phase-committed yet; \
+                         COMMIT the transaction directly, or run the DDL in autocommit"
                             .to_string(),
                     )));
                 }

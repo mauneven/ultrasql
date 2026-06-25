@@ -713,6 +713,8 @@ where
                     staged: Vec::new(),
                     altered_tables: Vec::new(),
                     altered_staged: Vec::new(),
+                    dropped_oids: std::collections::HashSet::new(),
+                    dropped: Vec::new(),
                 }
             });
             debug_assert_eq!(overlay.xid, user_xid);

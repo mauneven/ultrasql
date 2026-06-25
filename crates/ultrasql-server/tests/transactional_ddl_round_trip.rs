@@ -494,10 +494,31 @@ async fn assert_ddl_rejected_in_txn(application_name: &str, setup: &[&str], ddl:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_scope_ddl_still_rejected_in_transaction() {
+    // A plain RESTRICT DROP TABLE is now SUPPORTED in-txn (milestone 5) and is
+    // covered by the M5 battery below; only the out-of-scope DROP forms must
+    // still reject. CASCADE expands into a transitive closure of dependents the
+    // negative-mask overlay cannot model; a sequence-owning (SERIAL) table emits
+    // an unconditionally-replayed `SequenceOp::Drop` WAL; a view-dependent table
+    // touches non-MVCC view runtime sidecars.
     assert_ddl_rejected_in_txn(
-        "txddl_reg_drop",
-        &["CREATE TABLE reg_drop (id INT)"],
-        "DROP TABLE reg_drop",
+        "txddl_reg_drop_cascade",
+        &["CREATE TABLE reg_drop_c (id INT)"],
+        "DROP TABLE reg_drop_c CASCADE",
+    )
+    .await;
+    assert_ddl_rejected_in_txn(
+        "txddl_reg_drop_serial",
+        &["CREATE TABLE reg_drop_s (id SERIAL)"],
+        "DROP TABLE reg_drop_s",
+    )
+    .await;
+    assert_ddl_rejected_in_txn(
+        "txddl_reg_drop_view",
+        &[
+            "CREATE TABLE reg_drop_v (id INT)",
+            "CREATE VIEW reg_drop_vv AS SELECT id FROM reg_drop_v",
+        ],
+        "DROP TABLE reg_drop_v",
     )
     .await;
     // A plain B-tree CREATE INDEX is now SUPPORTED in-txn (milestone 3) and is
@@ -4451,5 +4472,895 @@ async fn m4_set_not_null_still_catches_earlier_committed_null() {
         .await
         .expect("column still nullable after the rejected SET NOT NULL");
 
+    shutdown(running).await;
+}
+
+// ═══════════════════ Transactional-DDL milestone 5 ═══════════════════
+// In-txn `DROP TABLE` (plain RESTRICT) via a NEGATIVE-MASK catalog overlay.
+//
+// The in-txn DROP handler mutates NOTHING in the global catalog and emits NO
+// `SequenceOp::Drop` WAL: it stages a `RelKind::Dropped` tombstone under the
+// USER xid (for a committed-before table) plus a session-local mask that hides
+// the table + its indexes + its constraints from the issuing session, while
+// other sessions keep seeing it until COMMIT. COMMIT applies the real global
+// drop; ROLLBACK/crash discard the overlay (free) and the table resurrects.
+//
+// The corruption gates: M5 #1 (ROLLBACK / crash RESURRECTS the table WITH its
+// data + index — a rolled-back DROP that stays gone is silent loss of a
+// committed table), M5 #2 (COMMIT — gone everywhere incl. restart, no orphans),
+// M5 #3 (a rolled-back DROP leaves NO half-state).
+
+/// Run an in-txn DROP that must reject with 0A000 + transition to Failed (25P02),
+/// asserting the table SURVIVES a ROLLBACK (the reject fired before any durable
+/// mutation). Used for the (iv) rejected-set battery.
+async fn assert_in_txn_drop_rejected_and_survives(
+    application_name: &str,
+    setup: &[&str],
+    drop_stmt: &str,
+    survives_table: &str,
+) {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), application_name).await;
+    let client = &running.client;
+    for stmt in setup {
+        client.batch_execute(stmt).await.expect("setup");
+    }
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute(drop_stmt)
+        .await
+        .expect_err("out-of-scope in-txn DROP must reject");
+    assert_eq!(
+        sqlstate(&err),
+        "0A000",
+        "`{drop_stmt}` in-txn must be feature_not_supported, got {err}"
+    );
+    let in_failed = client
+        .batch_execute("SELECT 1")
+        .await
+        .expect_err("statement after rejected DROP must be 25P02");
+    assert_eq!(
+        sqlstate(&in_failed),
+        "25P02",
+        "in-failed-block after `{drop_stmt}` must be 25P02, got {in_failed}"
+    );
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    // The target table survives the rejected-then-rolled-back DROP.
+    client
+        .query(&format!("SELECT * FROM {survives_table}"), &[])
+        .await
+        .unwrap_or_else(|e| panic!("table `{survives_table}` must survive a rejected DROP: {e}"));
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #1 ─────────────────────────────
+// ROLLBACK RESURRECTS the committed table WITH its rows + secondary index;
+// a 2nd connection sees the table live THROUGHOUT (mask is session-local).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_in_txn_drop_resurrects_table_data_and_index() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_rb_a").await;
+    let client = &running.client;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "m5_drop_rb_b").await;
+
+    // Seed a committed table with N rows + a secondary index.
+    client
+        .batch_execute("CREATE TABLE drb (id INT PRIMARY KEY, v INT)")
+        .await
+        .expect("seed table");
+    client
+        .batch_execute("CREATE INDEX drb_v_ix ON drb (v)")
+        .await
+        .expect("seed secondary index");
+    for i in 0..5 {
+        client
+            .batch_execute(&format!("INSERT INTO drb VALUES ({i}, {})", i * 10))
+            .await
+            .expect("seed row");
+    }
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("DROP TABLE drb")
+        .await
+        .expect("in-txn DROP accepted (milestone 5)");
+    // Same session: the table is now invisible.
+    let err = client
+        .query("SELECT * FROM drb", &[])
+        .await
+        .expect_err("issuing session must not see the dropped table");
+    assert!(
+        is_undefined_table(&err),
+        "expected 42P01 for self, got {err}"
+    );
+
+    // 2nd connection sees the table LIVE throughout (mask is session-local).
+    let rows_b = client_b
+        .query("SELECT count(*) FROM drb", &[])
+        .await
+        .expect("B sees the table live during A's uncommitted DROP");
+    assert_eq!(rows_b[0].get::<_, i64>(0), 5, "B sees all rows");
+
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // After ROLLBACK the table fully RESURRECTS for the issuing session:
+    // count == N, the index probe works, the index is present.
+    let rows = client
+        .query("SELECT count(*) FROM drb", &[])
+        .await
+        .expect("table resurrects after rollback");
+    assert_eq!(rows[0].get::<_, i64>(0), 5, "all rows resurrect");
+    let probe = client
+        .query("SELECT id FROM drb WHERE v = 30", &[])
+        .await
+        .expect("secondary index probe works after resurrection");
+    assert_eq!(probe.len(), 1);
+    assert_eq!(probe[0].get::<_, i32>(0), 3);
+    assert!(
+        running
+            .server
+            .catalog_snapshot()
+            .indexes
+            .contains_key("drb_v_ix"),
+        "secondary index resurrects in the committed snapshot",
+    );
+    // B still sees it live.
+    let rows_b = client_b
+        .query("SELECT count(*) FROM drb", &[])
+        .await
+        .expect("B still sees the table after A's rollback");
+    assert_eq!(rows_b[0].get::<_, i64>(0), 5);
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #1b ─────────────────────────────
+// CRASH after DROP before COMMIT → restart → table fully RESURRECTS with N rows
+// + index (the tombstone rode the aborted user xid; bootstrap hides it).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_after_in_txn_drop_before_commit_resurrects_table() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "m5_drop_crash_a").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE dcr (id INT PRIMARY KEY, v INT)")
+            .await
+            .expect("seed table");
+        client
+            .batch_execute("CREATE INDEX dcr_v_ix ON dcr (v)")
+            .await
+            .expect("seed index");
+        client
+            .batch_execute("INSERT INTO dcr VALUES (1, 100), (2, 200)")
+            .await
+            .expect("seed rows");
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("DROP TABLE dcr")
+            .await
+            .expect("in-txn DROP (tombstone under user xid, NO commit)");
+        // Crash: drop the server with the transaction still open.
+        shutdown(running).await;
+    }
+
+    // Restart: the table must RESURRECT with its rows + index.
+    let running = start_persistent_server(data_dir.path(), "m5_drop_crash_a2").await;
+    assert!(
+        running.server.catalog_snapshot().tables.contains_key("dcr"),
+        "crash-before-commit DROP must resurrect the table on restart",
+    );
+    let rows = running
+        .client
+        .query("SELECT count(*) FROM dcr", &[])
+        .await
+        .expect("resurrected table is queryable after restart");
+    assert_eq!(
+        rows[0].get::<_, i64>(0),
+        2,
+        "all rows resurrect after restart"
+    );
+    assert!(
+        running
+            .server
+            .catalog_snapshot()
+            .indexes
+            .contains_key("dcr_v_ix"),
+        "secondary index resurrects after restart",
+    );
+    let probe = running
+        .client
+        .query("SELECT id FROM dcr WHERE v = 200", &[])
+        .await
+        .expect("index probe works after restart resurrection");
+    assert_eq!(probe[0].get::<_, i32>(0), 2);
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #2 ─────────────────────────────
+// COMMIT — gone everywhere (both connections + restart), no orphan pg_class /
+// index rows.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_in_txn_drop_is_gone_everywhere_and_after_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "m5_drop_commit_a").await;
+        let client = &running.client;
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "m5_drop_commit_b").await;
+        client
+            .batch_execute("CREATE TABLE dco (id INT PRIMARY KEY, v INT)")
+            .await
+            .expect("seed table");
+        client
+            .batch_execute("INSERT INTO dco VALUES (1, 10)")
+            .await
+            .expect("seed row");
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("DROP TABLE dco")
+            .await
+            .expect("in-txn DROP accepted");
+        client.batch_execute("COMMIT").await.expect("commit");
+
+        // Both connections see 42P01 after commit.
+        let err_a = client
+            .query("SELECT * FROM dco", &[])
+            .await
+            .expect_err("A sees the table gone after commit");
+        assert!(
+            is_undefined_table(&err_a),
+            "expected 42P01 for A, got {err_a}"
+        );
+        let err_b = client_b
+            .query("SELECT * FROM dco", &[])
+            .await
+            .expect_err("B sees the table gone after commit");
+        assert!(
+            is_undefined_table(&err_b),
+            "expected 42P01 for B, got {err_b}"
+        );
+        assert!(
+            !running.server.catalog_snapshot().tables.contains_key("dco"),
+            "committed DROP removes the table from the global snapshot",
+        );
+
+        drop(client_b);
+        let _ = b_handle.await;
+        shutdown(running).await;
+    }
+
+    // Restart: still gone — the RelKind::Dropped tombstone wins latest-per-OID.
+    let running = start_persistent_server(data_dir.path(), "m5_drop_commit_a2").await;
+    assert!(
+        !running.server.catalog_snapshot().tables.contains_key("dco"),
+        "committed DROP stays gone after restart",
+    );
+    let err = running
+        .client
+        .query("SELECT * FROM dco", &[])
+        .await
+        .expect_err("dropped table absent after restart");
+    assert!(
+        is_undefined_table(&err),
+        "expected 42P01 after restart, got {err}"
+    );
+    // No live pg_class row for the table relkind 'r'; no orphan index.
+    let live = running
+        .client
+        .query(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'dco' AND relkind = 'r'",
+            &[],
+        )
+        .await
+        .expect("probe pg_class");
+    assert_eq!(
+        live[0].get::<_, i64>(0),
+        0,
+        "no live pg_class row for the dropped table"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #3 ─────────────────────────────
+// A rolled-back DROP leaves NO half-state: index resolves, constraints intact,
+// effective snapshot == committed base.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_in_txn_drop_leaves_no_half_state() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_half").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE dhs (id INT PRIMARY KEY, v INT UNIQUE)")
+        .await
+        .expect("seed table with PK + UNIQUE");
+    client
+        .batch_execute("INSERT INTO dhs VALUES (1, 100)")
+        .await
+        .expect("seed row");
+    let indexes_before = running.server.catalog_snapshot().indexes.len();
+    let constraints_before = running.server.catalog_snapshot().constraints.len();
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("DROP TABLE dhs")
+        .await
+        .expect("in-txn DROP");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The committed base is fully intact: same index + constraint counts, the
+    // unique index still enforces (a duplicate fails 23505), PK probe works.
+    let snap = running.server.catalog_snapshot();
+    assert_eq!(
+        snap.indexes.len(),
+        indexes_before,
+        "no index lost or orphaned"
+    );
+    assert_eq!(
+        snap.constraints.len(),
+        constraints_before,
+        "no constraint lost or orphaned",
+    );
+    assert!(
+        snap.tables.contains_key("dhs"),
+        "table back in committed base"
+    );
+    let dup = client
+        .batch_execute("INSERT INTO dhs VALUES (2, 100)")
+        .await
+        .expect_err("the UNIQUE index still enforces after a rolled-back DROP");
+    assert_eq!(
+        sqlstate(&dup),
+        "23505",
+        "expected unique_violation, got {dup}"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #4 ─────────────────────────────
+// The rejected set stays 0A000 + the table survives ROLLBACK; for the SERIAL
+// case, no SequenceOp::Drop WAL was emitted (the sequence survives).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_scope_in_txn_drop_rejects_and_survives() {
+    // CASCADE.
+    assert_in_txn_drop_rejected_and_survives(
+        "m5_rej_cascade",
+        &["CREATE TABLE rj_c (id INT)"],
+        "DROP TABLE rj_c CASCADE",
+        "rj_c",
+    )
+    .await;
+    // Sequence-owning (SERIAL).
+    assert_in_txn_drop_rejected_and_survives(
+        "m5_rej_serial",
+        &["CREATE TABLE rj_s (id SERIAL, v INT)"],
+        "DROP TABLE rj_s",
+        "rj_s",
+    )
+    .await;
+    // Dependent view.
+    assert_in_txn_drop_rejected_and_survives(
+        "m5_rej_view",
+        &[
+            "CREATE TABLE rj_v (id INT)",
+            "CREATE VIEW rj_vv AS SELECT id FROM rj_v",
+        ],
+        "DROP TABLE rj_v",
+        "rj_v",
+    )
+    .await;
+    // Inbound FK (rj_child references rj_parent).
+    assert_in_txn_drop_rejected_and_survives(
+        "m5_rej_fk_in",
+        &[
+            "CREATE TABLE rj_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE rj_child (id INT, p INT REFERENCES rj_parent (id))",
+        ],
+        "DROP TABLE rj_parent",
+        "rj_parent",
+    )
+    .await;
+    // Outbound FK (rj_child2 carries an FK).
+    assert_in_txn_drop_rejected_and_survives(
+        "m5_rej_fk_out",
+        &[
+            "CREATE TABLE rj_parent2 (id INT PRIMARY KEY)",
+            "CREATE TABLE rj_child2 (id INT, p INT REFERENCES rj_parent2 (id))",
+        ],
+        "DROP TABLE rj_child2",
+        "rj_child2",
+    )
+    .await;
+    // System table — rejected (either by the owner/privilege guard with 42501,
+    // which fires first for a non-superuser, or by the in-txn handler's
+    // system-schema reject with 0A000). Either way it must NOT be tombstoned and
+    // must survive.
+    {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let running = start_persistent_server(data_dir.path(), "m5_rej_system").await;
+        let client = &running.client;
+        client.batch_execute("BEGIN").await.expect("begin");
+        let err = client
+            .batch_execute("DROP TABLE pg_catalog.pg_class")
+            .await
+            .expect_err("in-txn DROP of a system table must reject");
+        let code = sqlstate(&err);
+        assert!(
+            code == "0A000" || code == "42501",
+            "system-table DROP must be rejected (0A000 or 42501), got {code}: {err}",
+        );
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+        client
+            .query("SELECT count(*) FROM pg_catalog.pg_class", &[])
+            .await
+            .expect("pg_class survives the rejected DROP");
+        shutdown(running).await;
+    }
+}
+
+// ───────────────────────────── M5 #4b ─────────────────────────────
+// The SERIAL reject must not have emitted a SequenceOp::Drop WAL: the sequence
+// survives the ROLLBACK and still advances.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_in_txn_drop_of_serial_table_leaves_sequence_intact() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_serial_seq").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE sseq (id SERIAL, v INT)")
+        .await
+        .expect("seed serial table");
+    client
+        .batch_execute("INSERT INTO sseq (v) VALUES (1)")
+        .await
+        .expect("first serial insert");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute("DROP TABLE sseq")
+        .await
+        .expect_err("serial-owning DROP rejects in-txn");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The sequence survived (no WAL Drop emitted): the table is usable and the
+    // sequence keeps advancing past its prior value.
+    client
+        .batch_execute("INSERT INTO sseq (v) VALUES (2)")
+        .await
+        .expect("serial insert after rejected DROP");
+    let rows = client
+        .query("SELECT id FROM sseq ORDER BY id", &[])
+        .await
+        .expect("query serial ids");
+    assert_eq!(rows.len(), 2, "both serial rows present");
+    let first: i32 = rows[0].get(0);
+    let second: i32 = rows[1].get(0);
+    assert!(
+        second > first,
+        "the owned sequence advanced (not vaporized by a WAL Drop): {first} -> {second}",
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #5 ─────────────────────────────
+// Accumulation matrix (§6): every sequence nets correctly in-txn AND durably.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_drop_accumulation_matrix() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "m5_accum_a").await;
+        let client = &running.client;
+
+        // (1) CREATE+DROP → nothing committed.
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE acc_cd (id INT)")
+            .await
+            .expect("create");
+        // Self-visible before the drop.
+        client
+            .query("SELECT * FROM acc_cd", &[])
+            .await
+            .expect("same-txn-created table is self-visible before the drop");
+        client
+            .batch_execute("DROP TABLE acc_cd")
+            .await
+            .expect("drop same-txn-created");
+        // NOTE: a masked self-SELECT here would error 42P01 and FAIL the block,
+        // turning COMMIT into a ROLLBACK; self-visibility of the mask is covered
+        // by M5 #1. Here we COMMIT a genuine CREATE+DROP net-out.
+        client.batch_execute("COMMIT").await.expect("commit");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("acc_cd"),
+            "CREATE+DROP publishes nothing",
+        );
+
+        // (2) CREATE+INSERT+DROP → gone.
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE acc_cid (id INT)")
+            .await
+            .expect("create");
+        client
+            .batch_execute("INSERT INTO acc_cid VALUES (1)")
+            .await
+            .expect("insert");
+        client
+            .batch_execute("DROP TABLE acc_cid")
+            .await
+            .expect("drop");
+        client.batch_execute("COMMIT").await.expect("commit");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("acc_cid"),
+            "CREATE+INSERT+DROP publishes nothing",
+        );
+
+        // (3) DROP committed + CREATE same name → new table commits, old gone.
+        client
+            .batch_execute("CREATE TABLE acc_dc (id INT, old_col INT)")
+            .await
+            .expect("seed committed table");
+        client
+            .batch_execute("INSERT INTO acc_dc VALUES (1, 1)")
+            .await
+            .expect("seed row");
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("DROP TABLE acc_dc")
+            .await
+            .expect("drop committed");
+        client
+            .batch_execute("CREATE TABLE acc_dc (id INT, new_col TEXT)")
+            .await
+            .expect("recreate same name, new shape");
+        client.batch_execute("COMMIT").await.expect("commit");
+        // The new shape is what survives.
+        client
+            .batch_execute("INSERT INTO acc_dc (id, new_col) VALUES (2, 'x')")
+            .await
+            .expect("new column usable");
+        let old = client.query("SELECT old_col FROM acc_dc", &[]).await;
+        assert!(old.is_err(), "old column must be gone after recreate");
+
+        // (4a) SAME-TXN CREATE + ALTER + DROP → gone, no stale ALTER replay.
+        // A same-txn-created table that is renamed then dropped nets out via the
+        // un-stage fast path (its altered staging is stripped too).
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("CREATE TABLE acc_ad (id INT)")
+            .await
+            .expect("create same-txn");
+        client
+            .batch_execute("ALTER TABLE acc_ad RENAME TO acc_ad2")
+            .await
+            .expect("rename in-txn");
+        client
+            .batch_execute("DROP TABLE acc_ad2")
+            .await
+            .expect("drop the altered same-txn table");
+        client.batch_execute("COMMIT").await.expect("commit");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("acc_ad")
+                && !running
+                    .server
+                    .catalog_snapshot()
+                    .tables
+                    .contains_key("acc_ad2"),
+            "same-txn CREATE+ALTER+DROP publishes nothing under either name",
+        );
+
+        // (4b) COMMITTED-BEFORE ALTER + DROP → rejected (0A000). Dropping a
+        // committed table that was ALTERed earlier in the same txn would have to
+        // unwind the ALTER's in-memory side-map edits — out of the minimal M5
+        // scope. The ALTER and the DROP each work fine in autocommit.
+        client
+            .batch_execute("CREATE TABLE acc_abd (id INT)")
+            .await
+            .expect("seed committed table");
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("ALTER TABLE acc_abd RENAME TO acc_abd2")
+            .await
+            .expect("rename committed-before table in-txn");
+        let alter_drop_err = client
+            .batch_execute("DROP TABLE acc_abd2")
+            .await
+            .expect_err("dropping a committed-before ALTERed table in-txn rejects");
+        assert_eq!(
+            sqlstate(&alter_drop_err),
+            "0A000",
+            "committed-before ALTER+DROP must be feature_not_supported, got {alter_drop_err}",
+        );
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+        // The original committed table survives the rejected DROP.
+        client
+            .query("SELECT * FROM acc_abd", &[])
+            .await
+            .expect("committed table survives the rejected ALTER+DROP");
+
+        // (5) DROP + DROP bare → 42P01.
+        client
+            .batch_execute("CREATE TABLE acc_dd (id INT)")
+            .await
+            .expect("seed");
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("DROP TABLE acc_dd")
+            .await
+            .expect("first drop");
+        let second = client
+            .batch_execute("DROP TABLE acc_dd")
+            .await
+            .expect_err("second bare DROP of a masked table is 42P01");
+        assert!(is_undefined_table(&second), "expected 42P01, got {second}");
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+
+        // (6) DROP + DROP IF EXISTS → no-op (the IF EXISTS second drop succeeds).
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("DROP TABLE acc_dd")
+            .await
+            .expect("first drop");
+        client
+            .batch_execute("DROP TABLE IF EXISTS acc_dd")
+            .await
+            .expect("second IF EXISTS drop is a no-op success");
+        client.batch_execute("COMMIT").await.expect("commit");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("acc_dd"),
+            "DROP+DROP-IF-EXISTS commits the single drop",
+        );
+        shutdown(running).await;
+    }
+
+    // Restart: the committed nets survive (nothing resurrects, recreate persists).
+    let running = start_persistent_server(data_dir.path(), "m5_accum_a2").await;
+    let snap = running.server.catalog_snapshot();
+    assert!(
+        !snap.tables.contains_key("acc_cd"),
+        "CREATE+DROP stays gone after restart"
+    );
+    assert!(
+        !snap.tables.contains_key("acc_cid"),
+        "CREATE+INSERT+DROP stays gone after restart"
+    );
+    assert!(
+        !snap.tables.contains_key("acc_dd"),
+        "drop stays gone after restart"
+    );
+    // The DROP+CREATE-same-name recreate persists with the NEW shape.
+    let rows = running
+        .client
+        .query("SELECT id, new_col FROM acc_dc ORDER BY id", &[])
+        .await
+        .expect("recreated table present after restart with new shape");
+    assert_eq!(rows.len(), 1, "only the post-recreate row survives");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #6 ─────────────────────────────
+// Concurrent serialization: two sessions DROP the same name → loser 40001;
+// DROP-then-recreate same name in ONE txn → no self-deadlock, commits.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_in_txn_drop_same_name_serializes() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_race_a").await;
+    let client = &running.client;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "m5_drop_race_b").await;
+    client
+        .batch_execute("CREATE TABLE drace (id INT)")
+        .await
+        .expect("seed table");
+
+    client.batch_execute("BEGIN").await.expect("A begin");
+    client
+        .batch_execute("DROP TABLE drace")
+        .await
+        .expect("A in-txn DROP takes the name lock");
+
+    client_b.batch_execute("BEGIN").await.expect("B begin");
+    let err = client_b
+        .batch_execute("DROP TABLE drace")
+        .await
+        .expect_err("B's same-name DROP must fail while A holds the lock");
+    assert_eq!(
+        sqlstate(&err),
+        "40001",
+        "concurrent same-name DROP must report serialization_failure, got {err}"
+    );
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("B rollback");
+    client.batch_execute("ROLLBACK").await.expect("A rollback");
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_drop_then_recreate_same_name_no_self_deadlock() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_recreate").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE drr (id INT, old_col INT)")
+        .await
+        .expect("seed table");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("DROP TABLE drr")
+        .await
+        .expect("drop takes the name lock keyed on user xid");
+    // Re-acquiring the SAME name lock on the same xid must not self-deadlock.
+    client
+        .batch_execute("CREATE TABLE drr (id INT, new_col TEXT)")
+        .await
+        .expect("recreate same name (re-entrant lock, no self-deadlock)");
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    client
+        .batch_execute("INSERT INTO drr (id, new_col) VALUES (1, 'x')")
+        .await
+        .expect("recreated table usable with new shape");
+    let old = client.query("SELECT old_col FROM drr", &[]).await;
+    assert!(old.is_err(), "old column gone after recreate");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #7 ─────────────────────────────
+// IF EXISTS absent → no-op; SAVEPOINT → 0A000; PREPARE over a drop → rejected.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_drop_if_exists_absent_is_noop() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_ifexists").await;
+    let client = &running.client;
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("DROP TABLE IF EXISTS never_existed")
+        .await
+        .expect("DROP IF EXISTS of an absent table is a no-op success in-txn");
+    // The block is NOT failed: a subsequent statement runs fine.
+    client
+        .query("SELECT 1", &[])
+        .await
+        .expect("block is healthy after the no-op DROP IF EXISTS");
+    client.batch_execute("COMMIT").await.expect("commit");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_drop_under_savepoint_is_rejected() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_sp").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE dsp (id INT)")
+        .await
+        .expect("seed");
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("SAVEPOINT s1")
+        .await
+        .expect("savepoint");
+    let err = client
+        .batch_execute("DROP TABLE dsp")
+        .await
+        .expect_err("DROP under an active SAVEPOINT must reject");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    // Table survives.
+    client
+        .query("SELECT * FROM dsp", &[])
+        .await
+        .expect("table survives the rejected DROP");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_transaction_over_in_txn_drop_is_rejected() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_prepare").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE dpr (id INT)")
+        .await
+        .expect("seed");
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("DROP TABLE dpr")
+        .await
+        .expect("in-txn DROP");
+    let err = client
+        .batch_execute("PREPARE TRANSACTION 'm5dp'")
+        .await
+        .expect_err("PREPARE over a drop overlay must reject");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    // Table survives the rejected PREPARE + rollback.
+    client
+        .query("SELECT * FROM dpr", &[])
+        .await
+        .expect("table survives");
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M5 #8 ─────────────────────────────
+// Extended/portal path: an in-txn DROP staged + committed via the prepared
+// (extended-query) protocol behaves identically (the gate is shared).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_drop_via_extended_protocol_commits() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "m5_drop_ext").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE dext (id INT)")
+        .await
+        .expect("seed");
+    client
+        .batch_execute("INSERT INTO dext VALUES (1)")
+        .await
+        .expect("seed row");
+    client.batch_execute("BEGIN").await.expect("begin");
+    // `execute` uses the extended (parse/bind/execute) protocol. (A masked
+    // self-SELECT would error 42P01 and FAIL the block — turning COMMIT into a
+    // ROLLBACK — so self-visibility of the mask is covered by the simple-query
+    // batteries; here we only prove the extended-path stage + commit publishes.)
+    client
+        .execute("DROP TABLE dext", &[])
+        .await
+        .expect("in-txn DROP via extended protocol");
+    client.batch_execute("COMMIT").await.expect("commit");
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("dext"),
+        "extended-path DROP commits the drop",
+    );
+    // Gone for a fresh statement too.
+    let err = client
+        .query("SELECT * FROM dext", &[])
+        .await
+        .expect_err("dropped table absent after commit");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
     shutdown(running).await;
 }

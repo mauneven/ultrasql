@@ -477,8 +477,30 @@ where
             LogicalPlan::CreateTable { .. } => true,
             LogicalPlan::CreateIndex { .. } => Self::create_index_is_txn_safe(plan),
             LogicalPlan::AlterTable { .. } => Self::alter_table_is_txn_safe(plan),
+            LogicalPlan::DropTable { .. } => Self::drop_table_is_txn_safe(plan),
             _ => false,
         }
+    }
+
+    /// Whether a `DROP TABLE` plan is a shape transactional DDL can stage in the
+    /// session overlay as a negative mask and publish at COMMIT (milestone 5).
+    ///
+    /// Only the SYNTACTIC reject lives here: `CASCADE` expands one DROP into a
+    /// transitive closure of dependent views / matviews / chunks and severs FK
+    /// edges on SURVIVING tables in place — non-MVCC cross-table mutation the
+    /// negative-mask overlay cannot model — so it keeps the gate's `0A000` and
+    /// stays fully supported in autocommit. A plain `RESTRICT` (non-CASCADE)
+    /// `DROP TABLE` (with or without `IF EXISTS`) is admitted here; the in-txn
+    /// handler ([`Session::execute_drop_table_in_txn`]) applies the full
+    /// STATE-dependent reject predicate against the resolved target (owned
+    /// sequence, RLS, dependent view, time-partition parent/chunk, inbound /
+    /// outbound FK, columnar shadow / custom stats / comments, a system table,
+    /// or an active SAVEPOINT) — each of which keeps `0A000`.
+    pub(crate) fn drop_table_is_txn_safe(plan: &LogicalPlan) -> bool {
+        let LogicalPlan::DropTable { cascade, .. } = plan else {
+            return false;
+        };
+        !*cascade
     }
 
     /// Whether an `ALTER TABLE` plan is a sub-action transactional DDL can stage

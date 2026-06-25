@@ -386,6 +386,22 @@ impl CatalogSnapshot {
     /// new key — then re-inserting under the entry's current name and OID. The
     /// altered fold runs AFTER the created fold so an ALTER of a same-txn-created
     /// table overrides that table's just-folded `created_tables` entry.
+    ///
+    /// `dropped_oids` (transactional-DDL milestone 5) is a NEGATIVE MASK: the
+    /// set of table OIDs an in-txn `DROP TABLE` removed from the issuing
+    /// session's effective view. It is applied as the LAST fold (created →
+    /// altered → MASK) so a same-txn `CREATE TABLE … ; DROP TABLE …` and an
+    /// `ALTER TABLE … ; DROP TABLE …` both net to ABSENT: the created/altered
+    /// folds insert the entry (plus its implicit indexes/constraints), then the
+    /// mask retains it (and every relation-keyed row it owns) OUT by OID. The
+    /// global catalog is never mutated in-txn; other sessions keep seeing the
+    /// table until COMMIT. Empty for any overlay with no in-txn DROP, in which
+    /// case the mask block is a guarded no-op.
+    // Each argument is one independent overlay fold slice (created tables /
+    // indexes / constraints / extra indexes / extra-index constraints / altered
+    // tables / dropped-OID mask); bundling them into a struct would only move the
+    // same field list one indirection away without improving call sites.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_overlay(
         &self,
@@ -395,6 +411,7 @@ impl CatalogSnapshot {
         extra_indexes: &[IndexEntry],
         extra_index_constraints: &[ConstraintRow],
         altered_tables: &[TableEntry],
+        dropped_oids: &std::collections::HashSet<Oid>,
     ) -> Self {
         let mut snap = self.clone();
         for table in tables {
@@ -429,6 +446,28 @@ impl CatalogSnapshot {
                 table.clone(),
             );
             snap.tables_by_oid.insert(table.oid, table.clone());
+        }
+        // MASK LAST: retain OUT every relation-keyed row owned by a dropped OID,
+        // mirroring the autocommit `MutableCatalog::drop_table` cascade (tables,
+        // tables_by_oid, indexes, indexes_by_table, constraints) plus the
+        // forward-safe stat/description scrubs. Running after the created/altered
+        // folds is what makes CREATE+DROP and ALTER+DROP net to ABSENT.
+        if !dropped_oids.is_empty() {
+            snap.tables.retain(|_, t| !dropped_oids.contains(&t.oid));
+            snap.tables_by_oid
+                .retain(|oid, _| !dropped_oids.contains(oid));
+            snap.indexes
+                .retain(|_, ix| !dropped_oids.contains(&ix.table_oid));
+            snap.indexes_by_table
+                .retain(|oid, _| !dropped_oids.contains(oid));
+            snap.constraints
+                .retain(|_, row| !dropped_oids.contains(&row.conrelid));
+            snap.statistic_ext
+                .retain(|_, row| !dropped_oids.contains(&row.stxrelid));
+            snap.statistics
+                .retain(|(starelid, _), _| !dropped_oids.contains(starelid));
+            snap.descriptions
+                .retain(|(objoid, _, _), _| !dropped_oids.contains(objoid));
         }
         snap
     }

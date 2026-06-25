@@ -170,17 +170,44 @@ where
     /// inserts will reuse the relation-id space without colliding
     /// because OIDs are monotonic.
     pub(crate) fn execute_drop_table(
-        &self,
+        &mut self,
         plan: &LogicalPlan,
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::DropTable {
-            tables, cascade, ..
+            tables,
+            cascade,
+            if_exists,
+            ..
         } = plan
         else {
             return Err(ServerError::Unsupported(
                 "execute_drop_table called with non-DropTable plan",
             ));
         };
+        // Transactional-DDL milestone 5: when an explicit transaction is open
+        // route this `DROP TABLE` onto the in-transaction negative-mask staging
+        // path rather than the legacy self-committing autocommit body below.
+        // `None` here means autocommit — the legacy path runs byte-for-byte
+        // unchanged. A DROP issued while a SAVEPOINT is active is out of scope:
+        // the durable tombstone rides the PARENT xid (not the subtransaction
+        // xid) and the overlay is whole-transaction-scoped, so a later
+        // `ROLLBACK TO SAVEPOINT` could not resurrect the table — the same
+        // corruption class CREATE/ALTER reject. Reject with the gate's `0A000`.
+        let in_txn_xid = match &self.txn_state {
+            crate::TxnState::InTransaction(txn) => {
+                if txn.subtxn_stack.depth() > 0 {
+                    return Err(self.fail_if_in_transaction(ServerError::DdlInTransaction));
+                }
+                Some(txn.xid)
+            }
+            _ => None,
+        };
+        if let Some(user_xid) = in_txn_xid {
+            // The gate (`drop_table_is_txn_safe`) already rejected CASCADE
+            // syntactically before this point; the in-txn handler runs the
+            // state-dependent reject predicate per target.
+            return self.execute_drop_table_in_txn(tables, *if_exists, user_xid);
+        }
         let initial_drop_set: HashSet<String> = tables
             .iter()
             .map(|name| name.to_ascii_lowercase())
@@ -427,7 +454,7 @@ where
         out
     }
 
-    pub(super) fn regular_view_dependents(
+    pub(crate) fn regular_view_dependents(
         &self,
         target_table: &str,
         drop_set: &HashSet<String>,
