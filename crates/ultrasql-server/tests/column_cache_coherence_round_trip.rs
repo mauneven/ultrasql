@@ -252,14 +252,17 @@ async fn autocommit_reader_still_publishes_and_reuses_cache() {
             "no-concurrency snapshot must have an empty in-progress set"
         );
         assert!(
-            server.heap.column_cache.is_snapshot_coherent(rel, &snap),
+            server
+                .heap
+                .column_cache
+                .is_snapshot_coherent(rel, &snap, server.txn_manager.as_ref()),
             "quiescent snapshot must be allowed to use the cache"
         );
         assert!(
             server
                 .heap
                 .column_cache
-                .get_for_snapshot(rel, &snap)
+                .get_for_snapshot(rel, &snap, server.txn_manager.as_ref())
                 .is_some(),
             "quiescent snapshot must be served the live cache entry"
         );

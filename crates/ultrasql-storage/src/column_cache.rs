@@ -47,7 +47,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use ultrasql_core::{DataType, RelationId, Schema, Value, Xid};
-use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_vec::column::Column;
 
 /// Target row count per in-memory columnar segment.
@@ -366,7 +366,8 @@ impl ColumnCache {
     /// snapshot.xip().is_empty()
     ///   && ( last_writer == Xid::INVALID
     ///        || snapshot.is_current_xid(last_writer)
-    ///        || !snapshot.xid_in_progress(last_writer) )
+    ///        || ( !snapshot.xid_in_progress(last_writer)
+    ///             && oracle.is_committed(last_writer) ) )
     /// ```
     ///
     /// - `xip().is_empty()` — no *other* transaction was in progress when
@@ -377,24 +378,49 @@ impl ColumnCache {
     ///   reader has X in its in-progress set, so every other reader's gate
     ///   fails and it walks the heap rather than consuming a projection X
     ///   published from its own read-after-write snapshot.
-    /// - The writer predicate means the snapshot is not *behind* the latest
-    ///   writer reflected in the version: a reader frozen before that writer
-    ///   committed has it in-progress (or newer than `xmax`), so the gate
-    ///   fails and the reader walks the heap — never consuming a projection
-    ///   that includes rows committed after its snapshot.
+    /// - `!xid_in_progress(last_writer)` — the snapshot is not *behind* the
+    ///   latest writer reflected in the version: a reader frozen before that
+    ///   writer committed has it in-progress (or newer than `xmax`), so the
+    ///   gate fails and the reader walks the heap — never consuming a
+    ///   projection that includes rows committed after its snapshot.
+    /// - `oracle.is_committed(last_writer)` — the **abort backstop**. The
+    ///   relation's version is bumped at *physical* mutation time — before
+    ///   the writer terminates — and the recorded `last_writer_xid` reflects
+    ///   that writer. A writer that warmed the cache from its own
+    ///   read-after-write uncommitted view and then **aborted** (plain
+    ///   `ROLLBACK`, `ROLLBACK PREPARED`, or an SSI force-abort) is no longer
+    ///   in progress, so `!xid_in_progress` alone would wrongly admit its
+    ///   phantom rows. Requiring the writer to be **committed** per the same
+    ///   [`XidStatusOracle`] the heap visibility path (`scan_visible` /
+    ///   [`ultrasql_mvcc::is_visible`]) consults means the cache and the heap
+    ///   can never disagree about the writer's fate; an aborted writer forces
+    ///   a fresh heap scan, which itself skips the aborted tuples.
+    ///
+    /// The two writer conditions are **AND**-ed (not either/or): both that
+    /// the snapshot is within the writer's horizon *and* that the writer
+    /// committed must hold for a non-self reader.
     ///
     /// Together they admit the cache only when the relation is effectively
     /// quiescent for this snapshot (the read-mostly workload the cache
     /// targets) and fall back to a correct heap scan under any concurrency.
+    ///
+    /// `oracle` must be the transaction-status oracle backing this process's
+    /// CLOG (in production the `TransactionManager`); it costs one status
+    /// lookup per gate hit, which is negligible on the read-mostly path.
     #[must_use]
-    pub fn is_snapshot_coherent(&self, rel: RelationId, snapshot: &Snapshot) -> bool {
+    pub fn is_snapshot_coherent(
+        &self,
+        rel: RelationId,
+        snapshot: &Snapshot,
+        oracle: &dyn XidStatusOracle,
+    ) -> bool {
         if !snapshot.xip().is_empty() {
             return false;
         }
         let writer = self.last_writer_xid(rel);
         writer == Xid::INVALID
             || snapshot.is_current_xid(writer)
-            || !snapshot.xid_in_progress(writer)
+            || (!snapshot.xid_in_progress(writer) && oracle.is_committed(writer))
     }
 
     /// Coherence-gated [`Self::get`]: return the cached projection for `rel`
@@ -407,6 +433,7 @@ impl ColumnCache {
         &self,
         rel: RelationId,
         snapshot: &Snapshot,
+        oracle: &dyn XidStatusOracle,
     ) -> Option<Arc<CachedColumns>> {
         // Read everything under one lock so the version, last writer, and
         // entry are mutually consistent — a concurrent `bump_version` either
@@ -418,9 +445,16 @@ impl ColumnCache {
             return None;
         }
         let writer = g.last_writer_xid.get(&rel).copied().unwrap_or(Xid::INVALID);
+        // Serve a non-self reader only a writer whose effect is both within
+        // this snapshot's horizon (`!xid_in_progress` — the snapshot is not
+        // frozen *before* the writer, which would hide rows committed after
+        // it) AND real (`is_committed` per the same oracle the heap
+        // visibility path consults — never merely "no longer in progress",
+        // which an ABORTED writer also satisfies, the phantom-row hole). A
+        // reader that IS the writer is served its own in-progress projection.
         let snapshot_sees_writer = writer == Xid::INVALID
             || snapshot.is_current_xid(writer)
-            || !snapshot.xid_in_progress(writer);
+            || (!snapshot.xid_in_progress(writer) && oracle.is_committed(writer));
         if !snapshot_sees_writer {
             return None;
         }
@@ -445,5 +479,229 @@ impl ColumnCache {
             return;
         }
         g.entries.insert(rel, Arc::new(entry));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use parking_lot::RwLock;
+    use ultrasql_core::{CommandId, Field, RelationId, Schema, Xid};
+    use ultrasql_mvcc::{Snapshot, XidStatus, XidStatusOracle};
+    use ultrasql_vec::column::{Column, NumericColumn};
+
+    use super::{CachedColumns, ColumnCache};
+
+    const REL: RelationId = RelationId::new(7);
+
+    /// In-crate stand-in for the CLOG-backed oracle. Defaults unset XIDs to
+    /// `InProgress`, exactly like the production `TransactionManager` for an
+    /// XID with no terminal CLOG entry.
+    #[derive(Default)]
+    struct MapOracle {
+        states: RwLock<HashMap<Xid, XidStatus>>,
+    }
+
+    impl MapOracle {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn set_committed(&self, xid: Xid) {
+            self.states.write().insert(xid, XidStatus::Committed);
+        }
+
+        fn set_aborted(&self, xid: Xid) {
+            self.states.write().insert(xid, XidStatus::Aborted);
+        }
+
+        fn set_in_progress(&self, xid: Xid) {
+            self.states.write().insert(xid, XidStatus::InProgress);
+        }
+    }
+
+    impl XidStatusOracle for MapOracle {
+        fn status(&self, xid: Xid) -> XidStatus {
+            *self
+                .states
+                .read()
+                .get(&xid)
+                .unwrap_or(&XidStatus::InProgress)
+        }
+    }
+
+    fn schema() -> Schema {
+        Schema::new([
+            Field::required("id", ultrasql_core::DataType::Int32),
+            Field::required("val", ultrasql_core::DataType::Int32),
+        ])
+        .expect("schema")
+    }
+
+    fn cols() -> Vec<Column> {
+        vec![
+            Column::Int32(NumericColumn::from_data(vec![1, 2, 3])),
+            Column::Int32(NumericColumn::from_data(vec![10, 20, 30])),
+        ]
+    }
+
+    /// Build a cache where `writer` is the relation's last writer and a
+    /// 3-row entry is published at the current version.
+    fn warm(writer: Xid) -> ColumnCache {
+        let cache = ColumnCache::new();
+        cache.bump_version(REL, writer);
+        let version = cache.relation_version(REL);
+        cache.put(REL, CachedColumns::new(version, schema(), cols()));
+        cache
+    }
+
+    /// Reader snapshot with an empty in-progress set (the quiescent case the
+    /// cache targets) and `current_xid`.
+    fn reader_snapshot(current_xid: Xid) -> Snapshot {
+        Snapshot::new(
+            Xid::new(1),
+            Xid::new(1_000),
+            current_xid,
+            CommandId::FIRST,
+            std::iter::empty(),
+        )
+    }
+
+    /// Preserved case (b): a COMMITTED writer's projection is still served to
+    /// a fresh (non-self) reader.
+    #[test]
+    fn committed_writer_projection_is_served() {
+        let writer = Xid::new(100);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_committed(writer);
+
+        let snap = reader_snapshot(Xid::INVALID);
+        assert!(cache.is_snapshot_coherent(REL, &snap, &oracle));
+        assert!(
+            cache.get_for_snapshot(REL, &snap, &oracle).is_some(),
+            "a committed writer's cached projection must be served"
+        );
+    }
+
+    /// The NEW rejection — preserved case (d): an ABORTED writer's projection
+    /// is NEVER served to a fresh reader, regardless of *how* it aborted
+    /// (plain ROLLBACK, ROLLBACK PREPARED, or SSI force-abort all land here
+    /// as `XidStatus::Aborted` in the same CLOG oracle the gate consults).
+    #[test]
+    fn aborted_writer_projection_is_rejected() {
+        let writer = Xid::new(100);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_aborted(writer);
+
+        let snap = reader_snapshot(Xid::INVALID);
+        assert!(
+            !cache.is_snapshot_coherent(REL, &snap, &oracle),
+            "an aborted writer must not pass the coherence gate"
+        );
+        assert!(
+            cache.get_for_snapshot(REL, &snap, &oracle).is_none(),
+            "an aborted writer's cached projection must never be served"
+        );
+    }
+
+    /// Preserved case (a): the writer reading its OWN uncommitted (still
+    /// in-progress) projection is served via `is_current_xid`, without
+    /// consulting the oracle's commit status.
+    #[test]
+    fn own_in_progress_writer_reads_its_projection() {
+        let writer = Xid::new(100);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_in_progress(writer);
+
+        // The reader IS the writer: current_xid == writer.
+        let snap = reader_snapshot(writer);
+        assert!(cache.is_snapshot_coherent(REL, &snap, &oracle));
+        assert!(
+            cache.get_for_snapshot(REL, &snap, &oracle).is_some(),
+            "the writer must see its own in-progress projection (read-after-write)"
+        );
+    }
+
+    /// Preserved case (c): an in-progress OTHER writer is rejected. With an
+    /// empty in-progress set a non-self reader's snapshot was taken when no
+    /// other txn was running, so an in-progress writer is not committed and
+    /// the committed-status check rejects it.
+    #[test]
+    fn in_progress_other_writer_is_rejected() {
+        let writer = Xid::new(100);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_in_progress(writer);
+
+        let snap = reader_snapshot(Xid::INVALID);
+        assert!(
+            !cache.is_snapshot_coherent(REL, &snap, &oracle),
+            "an in-progress other writer must not pass the gate"
+        );
+        assert!(cache.get_for_snapshot(REL, &snap, &oracle).is_none());
+    }
+
+    /// A snapshot frozen *before* a now-committed writer must NOT consume
+    /// that writer's projection: the `!xid_in_progress` half of the gate
+    /// must survive the committed-status addition (the regression guard for
+    /// the read-side HOLE — a frozen RR reader). Here the writer xid is
+    /// >= the snapshot's `xmax`, so `xid_in_progress` is true even though the
+    /// oracle reports the writer committed.
+    #[test]
+    fn committed_writer_newer_than_snapshot_is_rejected() {
+        let writer = Xid::new(500);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_committed(writer);
+
+        // Snapshot frozen with xmax=200: writer 500 is newer than the
+        // snapshot horizon (xid_in_progress == true).
+        let snap = Snapshot::new(
+            Xid::new(1),
+            Xid::new(200),
+            Xid::INVALID,
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        assert!(snap.xip().is_empty());
+        assert!(
+            !cache.is_snapshot_coherent(REL, &snap, &oracle),
+            "a snapshot frozen before a committed writer must not consume its projection"
+        );
+        assert!(cache.get_for_snapshot(REL, &snap, &oracle).is_none());
+    }
+
+    /// A non-empty in-progress set fails the gate up front (concurrency
+    /// fallback), independent of writer status.
+    #[test]
+    fn non_empty_in_progress_set_fails_gate() {
+        let writer = Xid::new(100);
+        let cache = warm(writer);
+        let oracle = MapOracle::new();
+        oracle.set_committed(writer);
+
+        let snap = Snapshot::new(
+            Xid::new(1),
+            Xid::new(1_000),
+            Xid::INVALID,
+            CommandId::FIRST,
+            [Xid::new(50)],
+        );
+        assert!(!cache.is_snapshot_coherent(REL, &snap, &oracle));
+        assert!(cache.get_for_snapshot(REL, &snap, &oracle).is_none());
+    }
+
+    /// A relation never written (INVALID last writer) is always coherent —
+    /// the oracle is not consulted for `Xid::INVALID`.
+    #[test]
+    fn never_written_relation_is_coherent() {
+        let cache = ColumnCache::new();
+        let oracle = MapOracle::new();
+        let snap = reader_snapshot(Xid::INVALID);
+        assert!(cache.is_snapshot_coherent(REL, &snap, &oracle));
     }
 }

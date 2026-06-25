@@ -91,6 +91,7 @@ where
                 catalog_snapshot,
                 self.state.heap.as_ref(),
                 &autocommit_snapshot,
+                self.state.txn_manager.as_ref(),
                 &mut self.write_buf,
             ) {
                 return Ok(result);
@@ -100,6 +101,7 @@ where
                 catalog_snapshot,
                 self.state.heap.as_ref(),
                 &autocommit_snapshot,
+                self.state.txn_manager.as_ref(),
                 &mut self.write_buf,
             ) {
                 return Ok(result);
@@ -110,6 +112,7 @@ where
                     catalog_snapshot,
                     self.state.heap.as_ref(),
                     &autocommit_snapshot,
+                    self.state.txn_manager.as_ref(),
                     &mut self.write_buf,
                 )
             {
@@ -122,6 +125,7 @@ where
                 catalog_snapshot,
                 self.state.heap.as_ref(),
                 &self.current_txn_snapshot(),
+                self.state.txn_manager.as_ref(),
                 &mut self.write_buf,
             )
         {

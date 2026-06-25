@@ -8,6 +8,7 @@ pub(crate) fn try_run_cached_int32_pair_select(
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
     snapshot: &ultrasql_mvcc::Snapshot,
+    oracle: &dyn ultrasql_mvcc::XidStatusOracle,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
     let (table, output_schema) = match plan {
@@ -45,8 +46,10 @@ pub(crate) fn try_run_cached_int32_pair_select(
     let entry = catalog_snapshot.tables.get(&folded)?;
     let rel = RelationId(entry.oid);
     // Coherence gate: only serve the shared, RAW-replayed projection to a
-    // snapshot that reflects exactly the committed state at this version.
-    let cached = heap.column_cache.get_for_snapshot(rel, snapshot)?;
+    // snapshot that reflects exactly the committed state at this version
+    // (writer committed per the same oracle the heap visibility path uses,
+    // or the reader is the writer itself).
+    let cached = heap.column_cache.get_for_snapshot(rel, snapshot, oracle)?;
     let [Column::Int32(left), Column::Int32(right)] = cached.columns.as_slice() else {
         return None;
     };
@@ -85,6 +88,7 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
     snapshot: &ultrasql_mvcc::Snapshot,
+    oracle: &dyn ultrasql_mvcc::XidStatusOracle,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
     let (aggregate_input, group_by, aggregates, output_schema) = match plan {
@@ -152,9 +156,10 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     let folded = table.to_ascii_lowercase();
     let entry = catalog_snapshot.tables.get(&folded)?;
     let rel = RelationId(entry.oid);
-    // Coherence gate: same quiescent-snapshot requirement as the int32-pair
-    // fast path — these aggregates fold the shared projection RAW.
-    let cached = heap.column_cache.get_for_snapshot(rel, snapshot)?;
+    // Coherence gate: same quiescent-snapshot + committed-writer requirement
+    // as the int32-pair fast path — these aggregates fold the shared
+    // projection RAW.
+    let cached = heap.column_cache.get_for_snapshot(rel, snapshot, oracle)?;
 
     let cache_key = build_cached_scalar_wire_key(agg, output_schema, predicate)?;
     if let Some(encoded) = cached

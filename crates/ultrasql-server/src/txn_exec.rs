@@ -144,6 +144,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         &catalog_snapshot,
         heap.as_ref(),
         &txn.snapshot,
+        oracle.as_ref(),
         stream_buf,
     ) {
         return Ok(result);

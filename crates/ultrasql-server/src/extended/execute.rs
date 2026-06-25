@@ -98,6 +98,7 @@ pub fn execute_portal(
             &ctx.catalog_snapshot,
             ctx.heap.as_ref(),
             &ctx.snapshot,
+            ctx.oracle.as_ref(),
         ) {
         Box::new(scan)
     } else {

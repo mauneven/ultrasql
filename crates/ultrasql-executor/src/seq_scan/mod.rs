@@ -403,7 +403,7 @@ where
         // misses the cache and walks the heap.
         let cache_read = if cache_eligible {
             heap.column_cache
-                .get_for_snapshot(relation, &snapshot_box)
+                .get_for_snapshot(relation, &snapshot_box, oracle.as_ref())
                 .map(|columns| CacheReadState { columns, cursor: 0 })
         } else {
             None
@@ -480,7 +480,7 @@ where
             let target_version = heap.column_cache.relation_version(relation);
             if heap
                 .column_cache
-                .is_snapshot_coherent(relation, &snapshot_box)
+                .is_snapshot_coherent(relation, &snapshot_box, oracle.as_ref())
             {
                 match build_initial_builders(&codec, false) {
                     Ok(builders) => Some(CacheBuildState {
