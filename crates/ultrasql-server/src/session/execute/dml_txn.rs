@@ -392,6 +392,18 @@ where
         // not actually finish.
         let original_text = original.to_string();
         let xid = txn.xid;
+        // Evict the shared column cache for every table this aborting txn
+        // modified. A plain in-txn INSERT/COPY bumps the cache version at
+        // physical insert time but is not undone by `rollback_in_place_updates`
+        // (that only reverts in-place-UPDATE / DELETE-stamp writes), so a
+        // projection the writer published from its own uncommitted read-after-
+        // write snapshot — and the COUNT(*) scalar-aggregate / single-column
+        // wire bodies derived from it — would otherwise linger and be served to
+        // a fresh reader once this xid aborts. Bumping with the parent xid
+        // forces a heap rebuild that hides the rolled-back rows. No-op when no
+        // in-txn write was recorded (the common autocommit single-statement
+        // error). Mirrors the explicit-ROLLBACK / ROLLBACK TO SAVEPOINT paths.
+        self.invalidate_modified_table_column_caches(xid);
         let rollback_err = self
             .state
             .heap

@@ -170,6 +170,11 @@ where
                     )));
                 }
                 let durable_abort_marker = !self.pending_table_modifications.is_empty();
+                // Failed-block PREPARE aborts the txn (ROLLBACK semantics):
+                // evict the column cache for every table it modified before the
+                // modified-table set is cleared, mirroring the explicit-ROLLBACK
+                // path. No-op when no in-txn write occurred.
+                self.invalidate_modified_table_column_caches(xid);
                 if let Err(e) = self.state.abort_transaction(
                     txn,
                     durable_abort_marker,
@@ -554,6 +559,11 @@ where
                 // A failed block treats COMMIT as ROLLBACK: discard the
                 // transactional-DDL overlay and revert its staged side effects.
                 self.discard_pending_catalog_ddl();
+                // Failed-block COMMIT aborts the txn (ROLLBACK semantics): evict
+                // the column cache for every table it modified, mirroring the
+                // explicit-ROLLBACK path, before the modified-table set is
+                // cleared. No-op when no in-txn write occurred.
+                self.invalidate_modified_table_column_caches(xid);
                 self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
                 Ok(SelectResult {
@@ -600,6 +610,22 @@ where
                 // at runtime and hidden by the visibility-filtered bootstrap on
                 // restart, so no global catalog state was ever published.
                 self.discard_pending_catalog_ddl();
+                // Evict the shared column cache for every table this aborted
+                // transaction modified, mirroring the ROLLBACK TO SAVEPOINT
+                // path. A plain in-txn INSERT/COPY bumps the cache version at
+                // physical insert time but never flows through the heap undo
+                // helpers on a full ROLLBACK (`rollback_in_place_updates` only
+                // bumps for in-place-UPDATE / DELETE-stamp undo). The writer's
+                // own read-after-write SELECT can publish a projection (and the
+                // derived COUNT(*) scalar-aggregate / single-column wire bodies)
+                // built from its uncommitted view; once the xid aborts it is no
+                // longer in-progress, so the coherence gate would wrongly serve
+                // that stale entry to a fresh reader. Bumping with the parent
+                // xid evicts the entry and forces the next scan to rebuild from
+                // the heap, where the rolled-back rows are invisible. Must run
+                // BEFORE `clear_pending_dml_effects` empties the modified-table
+                // set; it is a no-op when no in-txn write occurred.
+                self.invalidate_modified_table_column_caches(xid);
                 // Recovery treats WAL-observed, non-prepared XIDs with no
                 // commit record as aborted, so ordinary explicit rollback does
                 // not need a synchronous abort marker.
@@ -749,12 +775,13 @@ where
     /// last-writer so the current transaction can immediately rebuild a
     /// fresh projection from the heap.
     ///
-    /// Used by `ROLLBACK TO SAVEPOINT` so a rolled-back write cannot be
+    /// Used by `ROLLBACK TO SAVEPOINT`, full `ROLLBACK` / failed-block
+    /// `COMMIT`, and the error-abort helper so a rolled-back write cannot be
     /// served from a stale cached projection (design §3 R8). The set of
     /// modified tables is the session's `pending_table_modifications` keys;
     /// invalidating a superset (all tables touched this txn, not just under
     /// the rolled-back subxids) is safe — it only forces a heap rebuild.
-    fn invalidate_modified_table_column_caches(&self, writer_xid: ultrasql_core::Xid) {
+    pub(crate) fn invalidate_modified_table_column_caches(&self, writer_xid: ultrasql_core::Xid) {
         if self.pending_table_modifications.is_empty() {
             return;
         }

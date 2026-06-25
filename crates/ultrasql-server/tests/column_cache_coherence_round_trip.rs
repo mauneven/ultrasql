@@ -448,3 +448,239 @@ async fn lower_xid_writer_rows_not_lost_across_higher_xid_commit() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     server_handle.abort();
 }
+
+/// Row count via an ORDER-BY column scan, which reads the heap directly and so
+/// bypasses the cached scalar-aggregate / single-column projection fast paths.
+/// This is the authoritative MVCC view, used to cross-check that the cached
+/// path agrees with the heap after a rollback.
+async fn ordered_scan_count(client: &tokio_postgres::Client) -> usize {
+    client
+        .query("SELECT id FROM t ORDER BY id", &[])
+        .await
+        .expect("ordered scan")
+        .len()
+}
+
+/// Stream a single-column-int `COPY t FROM STDIN` payload and finish cleanly,
+/// returning the reported row count.
+async fn copy_int_rows(client: &tokio_postgres::Client, ids: &[i32]) -> u64 {
+    use bytes::Bytes;
+    use futures::SinkExt;
+
+    let mut text = String::new();
+    for id in ids {
+        text.push_str(&id.to_string());
+        text.push('\n');
+    }
+    let sink = client
+        .copy_in::<_, Bytes>("COPY t FROM STDIN")
+        .await
+        .expect("copy_in establishes COPY FROM STDIN");
+    futures::pin_mut!(sink);
+    sink.as_mut()
+        .send(Bytes::from(text.into_bytes()))
+        .await
+        .expect("send CopyData");
+    sink.finish().await.expect("finish copy_in")
+}
+
+/// Regression: a full `ROLLBACK` of an in-txn `INSERT` must not leave the
+/// shared scalar-aggregate (`COUNT(*)`) cache stale. The in-txn `SELECT
+/// COUNT(*)` warms the cache from the writer's own snapshot (= 5); after
+/// ROLLBACK the rows are heap-invisible, so a fresh `COUNT(*)` must return 0.
+///
+/// Pre-fix this returned the stale `5` because `execute_rollback` cleared the
+/// pending-DML maps but never evicted the column cache (the INSERT bumped the
+/// version at physical-insert time and the writer published a 5-row
+/// projection, whose derived COUNT wire then survived the abort).
+#[tokio::test]
+async fn full_rollback_evicts_stale_count_cache() {
+    let (_server, conn_str, server_handle) = start().await;
+
+    let c = connect(&conn_str).await;
+    c.batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create t");
+
+    c.batch_execute("BEGIN").await.expect("begin");
+    c.batch_execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .await
+        .expect("insert");
+    // Warm the scalar-aggregate cache from the writer's own snapshot.
+    assert_eq!(scan_count(&c).await, 5, "in-txn COUNT sees own 5 rows");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The aggregate cache must now be evicted: COUNT(*) must reflect the
+    // heap-true post-rollback count (0), not the stale cached 5.
+    assert_eq!(
+        scan_count(&c).await,
+        0,
+        "COUNT(*) after ROLLBACK must be 0, not the stale in-txn 5"
+    );
+    assert_eq!(
+        ordered_scan_count(&c).await,
+        0,
+        "heap scan agrees: 0 rows after rollback"
+    );
+
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}
+
+/// Regression: the single-column / full-projection wire cache (the
+/// `(Int32, Int32)` identity full-scan body) must also be evicted on a full
+/// ROLLBACK. The in-txn `SELECT *` warms the projection; after ROLLBACK a
+/// fresh `SELECT *` must return the pre-txn rows, never the stale projection.
+#[tokio::test]
+async fn full_rollback_evicts_stale_projection_cache() {
+    let (server, conn_str, server_handle) = start().await;
+
+    let c = connect(&conn_str).await;
+    c.batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create t");
+    // Seed + commit two rows and warm the projection cache for the committed
+    // state, so the cache is genuinely live before the aborted txn.
+    c.batch_execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await
+        .expect("seed");
+    server.run_columnarization_cycle();
+    assert_eq!(
+        count_rows(&c, "SELECT * FROM t").await,
+        2,
+        "warm 2-row cache"
+    );
+
+    c.batch_execute("BEGIN").await.expect("begin");
+    c.batch_execute("INSERT INTO t VALUES (3, 30), (4, 40), (5, 50)")
+        .await
+        .expect("insert");
+    // Warm the projection (and its int32-pair wire) from the writer's own
+    // 5-row snapshot.
+    assert_eq!(count_rows(&c, "SELECT * FROM t").await, 5, "in-txn sees 5");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // Projection cache must be evicted: SELECT * must reflect the 2 committed
+    // rows, never the stale 5-row projection.
+    for _ in 0..3 {
+        assert_eq!(
+            count_rows(&c, "SELECT * FROM t").await,
+            2,
+            "SELECT * after ROLLBACK must see 2 committed rows, not stale 5"
+        );
+    }
+
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}
+
+/// Regression: the COPY-in-transaction path must evict the cache on ROLLBACK
+/// identically to a plain INSERT. COPY shares the same `bump_version`
+/// physical-insert warming, so `BEGIN; COPY; SELECT COUNT(*); ROLLBACK` left
+/// the same stale aggregate before the fix.
+#[tokio::test]
+async fn full_rollback_evicts_stale_count_cache_after_copy() {
+    let (_server, conn_str, server_handle) = start().await;
+
+    let c = connect(&conn_str).await;
+    c.batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create t");
+
+    c.batch_execute("BEGIN").await.expect("begin");
+    assert_eq!(copy_int_rows(&c, &[1, 2, 3, 4, 5]).await, 5, "COPY 5 rows");
+    assert_eq!(scan_count(&c).await, 5, "in-txn COUNT sees COPYed 5 rows");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+
+    assert_eq!(
+        scan_count(&c).await,
+        0,
+        "COUNT(*) after COPY ROLLBACK must be 0, not the stale 5"
+    );
+
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}
+
+/// The column cache is server-global (shared `HeapAccess::column_cache`), so a
+/// stale entry poisoned by connection A's aborted in-txn write would be served
+/// to a *different* connection B. After the fix, A's ROLLBACK evicts the entry
+/// and B's `COUNT(*)` sees the pre-txn count — proving the invalidation is on
+/// the shared cache, not a per-session view.
+#[tokio::test]
+async fn full_rollback_does_not_poison_other_connection() {
+    let (_server, conn_str, server_handle) = start().await;
+
+    let a = connect(&conn_str).await;
+    a.batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create t");
+
+    a.batch_execute("BEGIN").await.expect("begin a");
+    a.batch_execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .await
+        .expect("insert a");
+    assert_eq!(scan_count(&a).await, 5, "A sees its own 5 rows");
+    a.batch_execute("ROLLBACK").await.expect("rollback a");
+
+    // B is a separate connection. If the shared cache were still poisoned, B
+    // would read the stale 5. After the fix it sees the heap-true 0.
+    let b = connect(&conn_str).await;
+    assert_eq!(
+        scan_count(&b).await,
+        0,
+        "connection B must not be poisoned by A's aborted in-txn write"
+    );
+
+    drop((a, b));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}
+
+/// No-regression: the COMMIT path's cache handling still serves the committed
+/// count, and a SAVEPOINT rollback inside a committed txn still leaves the
+/// cache coherent. Guards that the new ROLLBACK invalidation did not disturb
+/// the positive paths.
+#[tokio::test]
+async fn commit_and_savepoint_paths_remain_coherent() {
+    let (_server, conn_str, server_handle) = start().await;
+
+    let c = connect(&conn_str).await;
+    c.batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create t");
+
+    // COMMIT path: in-txn warm then commit must leave the committed count live.
+    c.batch_execute("BEGIN").await.expect("begin");
+    c.batch_execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+        .await
+        .expect("insert");
+    assert_eq!(scan_count(&c).await, 5, "in-txn COUNT warms cache");
+    c.batch_execute("COMMIT").await.expect("commit");
+    assert_eq!(scan_count(&c).await, 5, "committed COUNT(*) stays 5");
+
+    // SAVEPOINT rollback: a sub-transaction's rows are rolled back; the
+    // post-rollback COUNT(*) must reflect only the surviving committed rows.
+    c.batch_execute("BEGIN").await.expect("begin 2");
+    c.batch_execute("INSERT INTO t VALUES (6, 60)")
+        .await
+        .expect("insert pre-sp");
+    c.batch_execute("SAVEPOINT sp").await.expect("savepoint");
+    c.batch_execute("INSERT INTO t VALUES (7, 70), (8, 80)")
+        .await
+        .expect("insert in sp");
+    assert_eq!(scan_count(&c).await, 8, "in-sp COUNT sees 8");
+    c.batch_execute("ROLLBACK TO SAVEPOINT sp")
+        .await
+        .expect("rollback to sp");
+    assert_eq!(scan_count(&c).await, 6, "after sp rollback COUNT is 6");
+    c.batch_execute("COMMIT").await.expect("commit 2");
+    assert_eq!(scan_count(&c).await, 6, "committed count is 6");
+
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}

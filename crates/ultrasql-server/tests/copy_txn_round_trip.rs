@@ -45,10 +45,11 @@ async fn select_count(client: &tokio_postgres::Client, table: &str) -> i64 {
 /// ROLLBACK the aborted rows are heap-invisible, so this returns the true
 /// post-rollback count.
 ///
-/// (A separate, pre-existing bug — tracked as a follow-up — leaves those cached
-/// fast paths stale after a full ROLLBACK; it affects plain INSERT identically
-/// and is out of scope for COPY transaction participation. The ORDER BY here
-/// sidesteps it so these tests assert the real heap/MVCC outcome.)
+/// (The full-ROLLBACK cache-staleness this once side-stepped is now fixed —
+/// `execute_rollback` evicts the column cache for the aborted txn's modified
+/// tables, and `column_cache_coherence_round_trip` asserts the cached COUNT(*)
+/// / projection paths agree with the heap after a COPY rollback. The ORDER BY
+/// here is retained as a direct heap cross-check.)
 async fn select_scan_count(client: &tokio_postgres::Client, col: &str, table: &str) -> usize {
     client
         .query(&format!("SELECT {col} FROM {table} ORDER BY {col}"), &[])
