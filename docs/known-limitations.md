@@ -109,9 +109,16 @@ completed evidence.
   (fused fast paths + column cache) and an indexed multi-column shape, plus a
   crash-recovery replay test.
 
-  Remaining gaps: `COPY FROM STDIN` runs in its own autocommit transaction, so
-  it is not transactional with an enclosing block and a `ROLLBACK TO` does not
-  undo rows it inserted (the stamp itself is already the active xid). `ALTER
+  Remaining gaps: `COPY` now participates in the enclosing transaction — its rows
+  ride the session (sub)transaction xid, so `ROLLBACK` (and a `ROLLBACK TO`
+  covering the `COPY`) undo them and `COMMIT` persists them atomically with the
+  rest of the block; a mid-stream `COPY` error transitions the block to `Failed`.
+  However `COPY FROM` still maintains **no secondary indexes** and enforces only
+  `NOT NULL` (not `UNIQUE`/`CHECK`): a `COPY` into a table with a secondary or
+  unique index does not update that index, so load such data with `INSERT` or
+  rebuild the index after `COPY` (a `PRIMARY KEY`/`UNIQUE` index created in the
+  same transaction as the `COPY` is built at `COMMIT` and does see the rows).
+  `ALTER
   TABLE` heap-rewrite DDL stamps the parent transaction id rather than the
   active subtransaction id, so exact own-write rollback of a table rewrite
   performed under a savepoint is out of scope; run schema rewrites outside a
