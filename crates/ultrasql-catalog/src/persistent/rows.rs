@@ -375,8 +375,17 @@ impl CatalogSnapshot {
     /// in-txn `CREATE INDEX` on an EXISTING table or one created earlier in the
     /// same transaction.
     ///
-    /// The entries are inserted, never removed: the supported transactional
-    /// DDL (`CREATE TABLE`, `CREATE INDEX`) is purely additive.
+    /// The created / index entries are inserted, never removed: that subset of
+    /// transactional DDL (`CREATE TABLE`, `CREATE INDEX`) is purely additive.
+    ///
+    /// `altered_tables` (transactional-DDL milestone 4) are post-`ALTER TABLE`
+    /// entries that must OVERRIDE the committed entry for the same OID. Each is
+    /// folded by first dropping ANY entry with that OID by-OID — load-bearing
+    /// for `RENAME TO`, which changes the by-name lookup key, so the stale
+    /// committed (old-name) entry must be removed rather than left shadowing the
+    /// new key — then re-inserting under the entry's current name and OID. The
+    /// altered fold runs AFTER the created fold so an ALTER of a same-txn-created
+    /// table overrides that table's just-folded `created_tables` entry.
     #[must_use]
     pub fn with_overlay(
         &self,
@@ -385,6 +394,7 @@ impl CatalogSnapshot {
         constraints: &[ConstraintRow],
         extra_indexes: &[IndexEntry],
         extra_index_constraints: &[ConstraintRow],
+        altered_tables: &[TableEntry],
     ) -> Self {
         let mut snap = self.clone();
         for table in tables {
@@ -406,6 +416,19 @@ impl CatalogSnapshot {
         }
         for row in constraints.iter().chain(extra_index_constraints) {
             snap.constraints.insert(row.oid, row.clone());
+        }
+        // Override the committed (or same-txn-created) entry for each altered
+        // table. Drop ANY entry carrying this OID by-OID first so a RENAME TO,
+        // which changes the by-name key, does not leave the stale old-name entry
+        // resolving alongside the new one; then insert under the entry's CURRENT
+        // name + OID.
+        for table in altered_tables {
+            snap.tables.retain(|_, t| t.oid != table.oid);
+            snap.tables.insert(
+                table_lookup_key(&table.schema_name, &table.name),
+                table.clone(),
+            );
+            snap.tables_by_oid.insert(table.oid, table.clone());
         }
         snap
     }

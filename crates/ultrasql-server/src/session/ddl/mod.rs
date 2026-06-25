@@ -7,7 +7,7 @@
 mod create_index;
 mod create_index_build;
 mod create_index_build_btree;
-mod create_table;
+pub(crate) mod create_table;
 mod drop;
 mod index_options;
 mod types;

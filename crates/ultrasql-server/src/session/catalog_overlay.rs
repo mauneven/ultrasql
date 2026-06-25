@@ -80,6 +80,96 @@ pub(crate) struct CatalogOverlay {
     /// overlay that stages only `CREATE INDEX` (which stages no non-MVCC
     /// in-memory side map).
     pub(crate) staged: Vec<StagedSideEffects>,
+    /// Post-ALTER `TableEntry` for each in-txn catalog-only `ALTER TABLE`
+    /// (milestone 4), folded by [`CatalogSnapshot::with_overlay`] to OVERRIDE
+    /// the committed entry so the issuing session resolves the table in its
+    /// altered shape before COMMIT. An ALTER of a table created EARLIER in the
+    /// same transaction overrides that table's `created_tables` entry too (both
+    /// folds drop the stale entry by OID first, so a RENAME's new lookup key
+    /// wins). Multiple ALTERs of one OID each push the cumulative post-ALTER
+    /// entry; the latest one for an OID wins the fold.
+    pub(crate) altered_tables: Vec<TableEntry>,
+    /// Per-`ALTER TABLE` replay intent (for COMMIT) plus before-images (for
+    /// ROLLBACK), in issue order. Empty for an overlay that stages no in-txn
+    /// `ALTER TABLE`.
+    pub(crate) altered_staged: Vec<AlteredSideEffects>,
+}
+
+/// The catalog-mutation intent of one in-txn `ALTER TABLE`, replayed against
+/// the GLOBAL catalog at COMMIT via the same mutator the autocommit path uses.
+///
+/// The in-txn handler never touches the global catalog; it stages this intent
+/// so [`Session::commit_pending_catalog_ddl`] can apply it once the user xid is
+/// durably committed. Coalescing multiple ALTERs of one table to a final state
+/// is unnecessary because each mutator is idempotent on replay from the prior
+/// committed state — they apply in issue order, each reading the result of the
+/// previous one (the table is already in the global catalog by replay time).
+pub(crate) enum AlterTableOp {
+    /// `ALTER TABLE … RENAME TO new_name`: rekey the by-name catalog entry and
+    /// the privilege grants from `old_name` to `new_name`.
+    Rename {
+        /// Folded qualified key the table is currently filed under in the
+        /// global catalog at replay time (the name BEFORE this rename).
+        old_name: String,
+        /// New (unqualified) relation name passed to `alter_table_rename`.
+        new_name: String,
+    },
+    /// `ALTER TABLE … RENAME COLUMN` / `ALTER COLUMN SET/DROP NOT NULL`:
+    /// publish a replaced schema. Replayed with `alter_table_replace_schema`.
+    ReplaceSchema {
+        /// Folded qualified key the table is filed under at replay time.
+        name: String,
+        /// The post-ALTER schema to publish globally.
+        schema: ultrasql_core::Schema,
+    },
+    /// `ALTER TABLE … SET (...)`: publish replaced storage options. Replayed
+    /// with `alter_table_options`.
+    Options {
+        /// Folded qualified key the table is filed under at replay time.
+        name: String,
+        /// The post-ALTER storage options to publish globally.
+        opts: Vec<(String, String)>,
+    },
+    /// `ALTER COLUMN SET/DROP DEFAULT`: the schema is unchanged (the default
+    /// lives in the runtime side map), but `pg_attribute.atthasdef` was
+    /// re-persisted under the user xid. No global catalog mutation is needed —
+    /// the runtime default was already staged in-memory and is persisted to the
+    /// metadata file by the COMMIT path. Carried so the replay loop is total.
+    DefaultOnly,
+}
+
+/// Non-MVCC, in-memory before-images of one in-txn `ALTER TABLE` (milestone 4),
+/// captured so a ROLLBACK restores the exact pre-ALTER side-map state. The
+/// durable user-xid catalog rows ride the aborted xid (MVCC-invisible + hidden
+/// by the bootstrap on restart), so only these in-memory maps need reverting.
+pub(crate) struct AlteredSideEffects {
+    /// OID of the altered relation.
+    pub(crate) oid: Oid,
+    /// The COMMIT replay intent.
+    pub(crate) op: AlterTableOp,
+    /// `Server::table_constraints` entry for `oid` BEFORE the ALTER, restored
+    /// verbatim on rollback (`Some` → reinsert, `None` → remove).
+    pub(crate) runtime_constraints_before: Option<Arc<TableRuntimeConstraints>>,
+    /// Whether the ALTER mutated `Server::table_constraints` for `oid` (so the
+    /// revert can skip when nothing changed there — e.g. a pure RENAME TO).
+    pub(crate) runtime_constraints_changed: bool,
+    /// `Server::time_partitions` entry for `oid`'s pre-ALTER `table_key` BEFORE
+    /// the ALTER. A catalog-only ALTER of a NON-partitioned table leaves this
+    /// `None` and `time_partition_key_before` empty (the in-txn handler rejects
+    /// a partitioned target with `0A000`, so this is always `None` today; the
+    /// before-image is captured for forward-safety and the assertion).
+    pub(crate) time_partition_before: Option<Arc<crate::time_partition::TimePartitionRuntime>>,
+    /// The pre-ALTER `table_key` the `time_partition_before` entry was filed
+    /// under (empty when no time-partition entry existed).
+    pub(crate) time_partition_key_before: String,
+    /// Privilege-catalog grant snapshot captured before the ALTER, restored on
+    /// rollback (only RENAME TO mutates grants via `rename_object_grants`).
+    pub(crate) privilege_grants_before: Vec<PrivilegeGrant>,
+    /// Default-privilege snapshot captured before the ALTER.
+    pub(crate) privilege_default_grants_before: Vec<DefaultPrivilegeGrant>,
+    /// Whether the ALTER actually changed the privilege catalog (so
+    /// commit/rollback can skip the persist / restore when nothing moved).
+    pub(crate) privileges_changed: bool,
 }
 
 /// Non-MVCC, in-memory side effects of a `CREATE TABLE` that were applied
@@ -146,6 +236,7 @@ where
             &overlay.constraints,
             &overlay.extra_indexes,
             &overlay.extra_index_constraints,
+            &overlay.altered_tables,
         ))
     }
 
@@ -447,25 +538,81 @@ where
         constraint_rows.extend(overlay.extra_index_constraints.iter().cloned());
         catalog.install_constraint_rows(constraint_rows);
 
-        // The tables are now in the global snapshot, so the metadata sidecars
-        // (deferred at create time) can be written including them. A pure
-        // `CREATE INDEX` overlay staged no in-memory side maps, so these are
-        // no-ops there (and `staged` is empty).
-        if !overlay.staged.is_empty() {
-            if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
-                tracing::error!(error = %e, "transactional CREATE TABLE commit: persist runtime-constraints metadata failed");
-            }
-            if let Err(e) = self.state.persist_row_security_metadata() {
-                tracing::error!(error = %e, "transactional CREATE TABLE commit: persist row-security metadata failed");
+        // Transactional-DDL milestone 4: replay each staged `ALTER TABLE` op on
+        // the GLOBAL catalog using the SAME mutator the autocommit path uses,
+        // in issue order. The created tables are already published above, so an
+        // ALTER of a same-txn-created table mutates the just-published entry.
+        // Multiple ALTERs of one table apply cumulatively (each reads the prior
+        // op's result, which is already in the global catalog). A mutator error
+        // here is logged, not propagated — the user xid is durably committed, so
+        // the catalog heap rows are authoritative and a restart rebuilds the
+        // same state.
+        for staged in &overlay.altered_staged {
+            match &staged.op {
+                AlterTableOp::Rename { old_name, new_name } => {
+                    if let Err(e) = catalog.alter_table_rename(old_name, new_name) {
+                        tracing::error!(
+                            error = %e,
+                            old = %old_name,
+                            new = %new_name,
+                            "transactional ALTER TABLE RENAME commit: publishing to global catalog \
+                             failed; heap rows are durable and will be rebuilt on restart"
+                        );
+                    }
+                }
+                AlterTableOp::ReplaceSchema { name, schema } => {
+                    if let Err(e) = catalog.alter_table_replace_schema(name, schema.clone()) {
+                        tracing::error!(
+                            error = %e,
+                            table = %name,
+                            "transactional ALTER TABLE schema-replace commit: publishing to global \
+                             catalog failed"
+                        );
+                    }
+                }
+                AlterTableOp::Options { name, opts } => {
+                    if let Err(e) = catalog.alter_table_options(name, opts.clone()) {
+                        tracing::error!(
+                            error = %e,
+                            table = %name,
+                            "transactional ALTER TABLE SET options commit: publishing to global \
+                             catalog failed"
+                        );
+                    }
+                }
+                // The runtime default was already published in-memory at ALTER
+                // time and the metadata file is flushed below; the global
+                // catalog schema is unchanged, so there is nothing to replay.
+                AlterTableOp::DefaultOnly => {}
             }
         }
-        if overlay
+
+        // The tables are now in the global snapshot, so the metadata sidecars
+        // (deferred at create / alter time) can be written including them. A
+        // pure `CREATE INDEX` overlay staged no in-memory side maps, so these
+        // are no-ops there (and both staged vecs are empty). An in-txn ALTER
+        // (milestone 4) defers the same runtime-constraints / RLS / privilege
+        // file writes to here for the same crash-safety reason.
+        let has_staged_side_effects =
+            !overlay.staged.is_empty() || !overlay.altered_staged.is_empty();
+        if has_staged_side_effects {
+            if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
+                tracing::error!(error = %e, "transactional DDL commit: persist runtime-constraints metadata failed");
+            }
+            if let Err(e) = self.state.persist_row_security_metadata() {
+                tracing::error!(error = %e, "transactional DDL commit: persist row-security metadata failed");
+            }
+        }
+        let privileges_changed = overlay
             .staged
             .iter()
             .any(|staged| staged.privileges_changed)
-            && let Err(e) = self.state.persist_privilege_metadata()
-        {
-            tracing::error!(error = %e, "transactional CREATE TABLE commit: persist privilege metadata failed");
+            || overlay
+                .altered_staged
+                .iter()
+                .any(|staged| staged.privileges_changed);
+        if privileges_changed && let Err(e) = self.state.persist_privilege_metadata() {
+            tracing::error!(error = %e, "transactional DDL commit: persist privilege metadata failed");
         }
 
         // The committed table/index can shadow names a cached plan rewrote
@@ -520,8 +667,56 @@ impl<RW> Session<RW> {
         // A pure `CREATE INDEX` overlay (milestone 3) staged no in-memory side
         // map — the durable unbuilt `pg_index` rows ride the aborted user xid
         // and the segment was never built — so there is nothing to revert here.
-        if overlay.staged.is_empty() {
+        // A `CREATE TABLE` (`staged`) or `ALTER TABLE` (`altered_staged`) overlay
+        // DID stage in-memory side maps that must be reverted.
+        if overlay.staged.is_empty() && overlay.altered_staged.is_empty() {
             return;
+        }
+
+        // Transactional-DDL milestone 4: revert each staged in-txn `ALTER TABLE`
+        // before-image. The global catalog was never mutated in-txn (the ALTER
+        // op is replayed only at COMMIT), so only the in-memory side maps the
+        // ALTER touched in place need restoring; the durable user-xid catalog
+        // rows ride the aborted xid (MVCC-invisible + bootstrap-hidden) and the
+        // committed pre-ALTER row wins on restart. Apply in REVERSE issue order
+        // so cumulative edits unwind to the exact pre-transaction state.
+        for staged in overlay.altered_staged.iter().rev() {
+            if staged.runtime_constraints_changed {
+                match &staged.runtime_constraints_before {
+                    Some(prev) => {
+                        self.state
+                            .table_constraints
+                            .insert(staged.oid, Arc::clone(prev));
+                    }
+                    None => {
+                        self.state.table_constraints.remove(&staged.oid);
+                    }
+                }
+            }
+            if !staged.time_partition_key_before.is_empty() {
+                match &staged.time_partition_before {
+                    Some(prev) => {
+                        self.state
+                            .time_partitions
+                            .insert(staged.time_partition_key_before.clone(), Arc::clone(prev));
+                    }
+                    None => {
+                        self.state
+                            .time_partitions
+                            .remove(&staged.time_partition_key_before);
+                    }
+                }
+            }
+            // Privileges: only RENAME TO mutates them, and the per-op
+            // `privilege_grants_before` snapshot is the state immediately BEFORE
+            // that op. Reverting in reverse issue order restores each rename's
+            // pre-image in turn, landing on the exact pre-transaction grants.
+            if staged.privileges_changed {
+                self.state.privilege_catalog.install_snapshot(
+                    staged.privilege_grants_before.clone(),
+                    staged.privilege_default_grants_before.clone(),
+                );
+            }
         }
 
         // Revert each created table's per-OID side maps (runtime constraints,

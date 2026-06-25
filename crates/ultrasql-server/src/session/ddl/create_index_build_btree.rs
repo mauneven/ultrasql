@@ -412,6 +412,8 @@ where
                 extra_indexes: Vec::new(),
                 extra_index_constraints: Vec::new(),
                 staged: Vec::new(),
+                altered_tables: Vec::new(),
+                altered_staged: Vec::new(),
             }
         });
         debug_assert_eq!(overlay.xid, user_xid);

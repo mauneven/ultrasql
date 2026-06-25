@@ -476,8 +476,49 @@ where
         match plan {
             LogicalPlan::CreateTable { .. } => true,
             LogicalPlan::CreateIndex { .. } => Self::create_index_is_txn_safe(plan),
+            LogicalPlan::AlterTable { .. } => Self::alter_table_is_txn_safe(plan),
             _ => false,
         }
+    }
+
+    /// Whether an `ALTER TABLE` plan is a sub-action transactional DDL can stage
+    /// in the session overlay and publish at COMMIT (milestone 4).
+    ///
+    /// Only the CATALOG-ONLY subset qualifies — the sub-actions whose entire
+    /// durable effect is a `pg_class` / `pg_attribute` row (plus an in-memory
+    /// runtime-default / privilege-grant / time-partition side map the overlay
+    /// can revert from a before-image):
+    ///
+    /// - `RENAME TO` / `RENAME COLUMN` (name-only catalog edits),
+    /// - `ALTER COLUMN SET/DROP DEFAULT` (runtime default + `atthasdef`),
+    /// - `ALTER COLUMN SET/DROP NOT NULL` (a nullability flag; `SET NOT NULL`
+    ///   validate-scans existing rows under the user snapshot),
+    /// - `SET (...)` storage options.
+    ///
+    /// Every other action — `ADD`/`DROP COLUMN` (heap rewrite),
+    /// `ADD`/`DROP CONSTRAINT` (a backing index / runtime predicate that is a
+    /// separate durable artifact), `ENABLE ROW LEVEL SECURITY`, and any future
+    /// `ALTER TYPE` — writes state the whole-transaction overlay cannot
+    /// transactionally undo, so it keeps the gate's `0A000` in-transaction and
+    /// stays fully supported in autocommit.
+    ///
+    /// Syntactic shape check only; the in-txn handler applies the final scoping
+    /// check (an active SAVEPOINT and a time-partitioned target table are
+    /// rejected there too).
+    pub(crate) fn alter_table_is_txn_safe(plan: &LogicalPlan) -> bool {
+        let LogicalPlan::AlterTable { action, .. } = plan else {
+            return false;
+        };
+        matches!(
+            action,
+            ultrasql_planner::LogicalAlterTableAction::RenameTable { .. }
+                | ultrasql_planner::LogicalAlterTableAction::RenameColumn { .. }
+                | ultrasql_planner::LogicalAlterTableAction::AlterColumnSetDefault { .. }
+                | ultrasql_planner::LogicalAlterTableAction::AlterColumnDropDefault { .. }
+                | ultrasql_planner::LogicalAlterTableAction::AlterColumnSetNotNull { .. }
+                | ultrasql_planner::LogicalAlterTableAction::AlterColumnDropNotNull { .. }
+                | ultrasql_planner::LogicalAlterTableAction::SetOptions { .. }
+        )
     }
 
     /// Whether a `CREATE INDEX` plan is a shape transactional DDL can stage in

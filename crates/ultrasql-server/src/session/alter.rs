@@ -87,6 +87,27 @@ where
             ))
         })?;
         self.ensure_table_owner_or_superuser(entry.oid, table_name)?;
+        // Transactional-DDL milestone 4: when an explicit transaction is open
+        // and this is one of the catalog-only sub-actions the gate
+        // (`alter_table_is_txn_safe`) admitted, stage the effects in the
+        // session overlay bound to the user xid rather than mutating the global
+        // catalog. `None` here means autocommit — the legacy self-committing
+        // dispatch below runs byte-for-byte unchanged.
+        //
+        // An ALTER issued while a SAVEPOINT is active is out of scope for the
+        // same reason `CREATE TABLE` rejects it (the durable rows ride the
+        // parent xid; `ROLLBACK TO SAVEPOINT` could not undo them) → `0A000`.
+        //
+        // `Failed` cannot reach here (the dispatcher rejects statements in a
+        // failed block before execution); autocommit / idle fall through to the
+        // legacy self-committing dispatch below.
+        if let crate::TxnState::InTransaction(txn) = &self.txn_state {
+            if txn.subtxn_stack.depth() > 0 {
+                return Err(self.fail_if_in_transaction(ServerError::DdlInTransaction));
+            }
+            let user_xid = txn.xid;
+            return self.execute_alter_table_in_txn(table_name, action, snapshot, user_xid);
+        }
         match action {
             LogicalAlterTableAction::AddColumn { column, default } => {
                 self.execute_alter_add_column(table_name, column.clone(), default.clone(), snapshot)
@@ -2069,7 +2090,7 @@ where
 /// `pg_constraint.conkey` stores 1-based attribute numbers, so the
 /// target column matches `column_index + 1`. Used to reject
 /// `DROP NOT NULL` on a primary-key column, as PostgreSQL does.
-fn column_in_primary_key(
+pub(super) fn column_in_primary_key(
     snapshot: &CatalogSnapshot,
     table_oid: ultrasql_core::Oid,
     column_index: usize,
@@ -2107,7 +2128,7 @@ fn alter_add_column_default_value(
     Ok(value)
 }
 
-fn alter_attr_has_defaults(
+pub(super) fn alter_attr_has_defaults(
     runtime: Option<&crate::TableRuntimeConstraints>,
     width: usize,
 ) -> Vec<bool> {

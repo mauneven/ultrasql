@@ -3500,3 +3500,956 @@ async fn single_schema_statement_per_txn_still_builds_index() {
     assert_eq!(sqlstate(&dup_ix), "23505", "expected 23505, got {dup_ix}");
     shutdown(running).await;
 }
+
+// ════════════════════════════ Milestone 4 ════════════════════════════
+// Transactional ALTER TABLE — the catalog-only sub-action subset
+// (RENAME TO / RENAME COLUMN / SET|DROP DEFAULT / SET|DROP NOT NULL / SET opts).
+//
+// A rolled-back ALTER whose catalog edit survives — or a committed ALTER lost on
+// restart — is silent schema corruption (the same class this whole battery
+// guards). M4 #1 (ROLLBACK undoes the ALTER), M4 #2 (second-connection
+// isolation), and M4 #4 (crash mid-txn-ALTER) are the corruption gates.
+
+/// Whether a `tokio_postgres` error is an "undefined column" (42703).
+fn is_undefined_column(err: &tokio_postgres::Error) -> bool {
+    err.code().map(|c| c.code() == "42703").unwrap_or(false)
+}
+
+// ───────────────────────────── M4 #1 ─────────────────────────────
+// ROLLBACK undoes the in-txn ALTER, same session — for every sub-action.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_rollback_undoes_in_txn_alter_same_session() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_rb").await;
+    let client = &running.client;
+
+    // Seed (autocommit) a two-column table — `id` is always supplied, `c` is the
+    // column the ALTERs target. A second column lets an INSERT omit `c` so a
+    // column default actually takes effect (a single-column `INSERT DEFAULT
+    // VALUES` inserts no row in this engine).
+    client
+        .batch_execute("CREATE TABLE m4_rb (id INT, c INT)")
+        .await
+        .expect("seed table");
+
+    // --- RENAME COLUMN c -> d, then ROLLBACK: column is c, not d. ---
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_rb RENAME COLUMN c TO d")
+        .await
+        .expect("in-txn rename column accepted");
+    // Self-visible in-txn: d resolves, c does not.
+    client
+        .query("SELECT d FROM m4_rb", &[])
+        .await
+        .expect("renamed column visible to self in-txn");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    client
+        .query("SELECT c FROM m4_rb", &[])
+        .await
+        .expect("rolled-back rename: column is c again");
+    let err = client
+        .query("SELECT d FROM m4_rb", &[])
+        .await
+        .expect_err("rolled-back rename: d must not exist");
+    assert!(is_undefined_column(&err), "expected 42703, got {err}");
+
+    // --- RENAME TO m4_rb2, then ROLLBACK: table is m4_rb, not m4_rb2. ---
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_rb RENAME TO m4_rb2")
+        .await
+        .expect("in-txn rename table accepted");
+    client
+        .query("SELECT c FROM m4_rb2", &[])
+        .await
+        .expect("renamed table visible to self in-txn");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    client
+        .query("SELECT c FROM m4_rb", &[])
+        .await
+        .expect("rolled-back rename: table is m4_rb again");
+    let err = client
+        .query("SELECT c FROM m4_rb2", &[])
+        .await
+        .expect_err("rolled-back rename: m4_rb2 must not exist");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+    assert!(
+        running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("m4_rb")
+            && !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("m4_rb2"),
+        "global snapshot must keep the pre-ALTER name after rollback",
+    );
+
+    // --- SET DEFAULT 5, then ROLLBACK: a later INSERT omitting c gets NULL,
+    //     not 5. ---
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_rb ALTER COLUMN c SET DEFAULT 5")
+        .await
+        .expect("in-txn set default accepted");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    client
+        .batch_execute("INSERT INTO m4_rb (id) VALUES (1)")
+        .await
+        .expect("insert after rolled-back default");
+    let row = client
+        .query_one("SELECT c FROM m4_rb WHERE id = 1", &[])
+        .await
+        .expect("read back");
+    assert!(
+        row.try_get::<_, i32>(0).is_err(),
+        "rolled-back default must leave the column NULL",
+    );
+    client
+        .batch_execute("DELETE FROM m4_rb")
+        .await
+        .expect("clean up the NULL row");
+
+    // --- SET NOT NULL, then ROLLBACK: a NULL insert still succeeds after. ---
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_rb ALTER COLUMN c SET NOT NULL")
+        .await
+        .expect("in-txn set not null accepted (table empty)");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    client
+        .batch_execute("INSERT INTO m4_rb (id, c) VALUES (2, NULL)")
+        .await
+        .expect("rolled-back NOT NULL: NULL insert must still be allowed");
+    client
+        .batch_execute("DELETE FROM m4_rb")
+        .await
+        .expect("clean up");
+
+    // --- SET (autovacuum_vacuum_threshold = 100), then ROLLBACK: option not
+    //     present after. ---
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_rb SET (autovacuum_vacuum_threshold = 100)")
+        .await
+        .expect("in-txn set options accepted");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    let entry = running
+        .server
+        .catalog_snapshot()
+        .tables
+        .get("m4_rb")
+        .expect("table still present")
+        .clone();
+    assert!(
+        !entry
+            .options
+            .iter()
+            .any(|(k, _)| k == "autovacuum_vacuum_threshold"),
+        "rolled-back SET options must leave no autovacuum_vacuum_threshold: {:?}",
+        entry.options,
+    );
+
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #2 ─────────────────────────────
+// Second-connection isolation: B never sees A's uncommitted RENAME, and after
+// A ROLLBACK B still sees the old name. (The COMMIT-visibility half is covered
+// by M4 #4's committed-survives-restart and M4 #7.)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_uncommitted_in_txn_alter_invisible_to_other_connection() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_iso_a").await;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_m4_iso_b").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE m4_iso (c INT)")
+        .await
+        .expect("seed");
+
+    running
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("A begin");
+    running
+        .client
+        .batch_execute("ALTER TABLE m4_iso RENAME TO m4_iso2")
+        .await
+        .expect("A in-txn rename (uncommitted)");
+
+    // B still sees the OLD name and NOT the new one.
+    client_b
+        .query("SELECT c FROM m4_iso", &[])
+        .await
+        .expect("B still sees the old name while A's rename is uncommitted");
+    let err = client_b
+        .query("SELECT c FROM m4_iso2", &[])
+        .await
+        .expect_err("B must not see A's uncommitted new name");
+    assert!(is_undefined_table(&err), "expected 42P01 for B, got {err}");
+
+    // A rolls back; B still sees the old name, never the new one.
+    running
+        .client
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("A rollback");
+    client_b
+        .query("SELECT c FROM m4_iso", &[])
+        .await
+        .expect("B still sees the old name after A rollback");
+    let err = client_b
+        .query("SELECT c FROM m4_iso2", &[])
+        .await
+        .expect_err("B must never see the rolled-back new name");
+    assert!(is_undefined_table(&err), "expected 42P01 for B, got {err}");
+
+    // A commits a rename on a fresh txn; now B sees the new name.
+    running
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("A begin 2");
+    running
+        .client
+        .batch_execute("ALTER TABLE m4_iso RENAME TO m4_iso2")
+        .await
+        .expect("A in-txn rename 2");
+    running
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("A commit");
+    client_b
+        .query("SELECT c FROM m4_iso2", &[])
+        .await
+        .expect("B sees the committed new name");
+    let err = client_b
+        .query("SELECT c FROM m4_iso", &[])
+        .await
+        .expect_err("old name gone after commit");
+    assert!(is_undefined_table(&err), "expected 42P01 for B, got {err}");
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #3 ─────────────────────────────
+// Self-visible before commit: SET DEFAULT then INSERT DEFAULT VALUES sees the
+// new default in-txn; RENAME COLUMN then SELECT the new name works in-txn.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_in_txn_alter_self_visible_before_commit() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_self").await;
+    let client = &running.client;
+
+    // Two columns so an INSERT can omit `c` and let its default apply.
+    client
+        .batch_execute("CREATE TABLE m4_self (id INT, c INT)")
+        .await
+        .expect("seed");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_self ALTER COLUMN c SET DEFAULT 5")
+        .await
+        .expect("in-txn set default");
+    client
+        .batch_execute("INSERT INTO m4_self (id) VALUES (1)")
+        .await
+        .expect("in-txn insert omitting c");
+    let row = client
+        .query_one("SELECT c FROM m4_self WHERE id = 1", &[])
+        .await
+        .expect("in-txn select");
+    assert_eq!(
+        row.get::<_, i32>(0),
+        5,
+        "in-txn INSERT omitting c must use the in-txn SET DEFAULT",
+    );
+    // Now rename the column in the same txn and read it back by the new name.
+    client
+        .batch_execute("ALTER TABLE m4_self RENAME COLUMN c TO d")
+        .await
+        .expect("in-txn rename column");
+    let row = client
+        .query_one("SELECT d FROM m4_self WHERE id = 1", &[])
+        .await
+        .expect("in-txn select by renamed column");
+    assert_eq!(row.get::<_, i32>(0), 5, "renamed column carries the value");
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    // After commit the renamed column + default both stand.
+    let row = client
+        .query_one("SELECT d FROM m4_self WHERE id = 1", &[])
+        .await
+        .expect("post-commit select by renamed column");
+    assert_eq!(row.get::<_, i32>(0), 5);
+    client
+        .batch_execute("INSERT INTO m4_self (id) VALUES (2)")
+        .await
+        .expect("post-commit insert omitting the renamed column");
+    let row = client
+        .query_one("SELECT d FROM m4_self WHERE id = 2", &[])
+        .await
+        .expect("post-commit select");
+    assert_eq!(row.get::<_, i32>(0), 5, "default persists post-commit");
+
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #4 ─────────────────────────────
+// THE corruption gate: crash mid-txn-ALTER (after the ALTER ran, before COMMIT)
+// → on restart the table reverts to its pre-ALTER name/schema/default (the
+// aborted post-ALTER rows are bootstrap-hidden; the committed pre-ALTER row
+// wins). Symmetric: an ALTER that DID commit durably is present on restart.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_crash_mid_txn_alter_reverts_on_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_crash_a").await;
+        running
+            .client
+            .batch_execute("CREATE TABLE m4_crash (c INT)")
+            .await
+            .expect("seed (autocommit, committed)");
+        running.client.batch_execute("BEGIN").await.expect("begin");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_crash RENAME TO m4_crash2")
+            .await
+            .expect("in-txn rename (durable rows under user xid, NO commit)");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_crash2 RENAME COLUMN c TO d")
+            .await
+            .expect("in-txn rename column too");
+        // Drop server WITHOUT COMMIT/ROLLBACK — the user xid has no commit record.
+        shutdown(running).await;
+    }
+
+    // Restart: the crash-before-commit ALTER must NOT survive.
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_crash_a2").await;
+    let snap = running.server.catalog_snapshot();
+    assert!(
+        snap.tables.contains_key("m4_crash") && !snap.tables.contains_key("m4_crash2"),
+        "crash-before-commit rename must revert to the pre-ALTER name on restart",
+    );
+    // The pre-ALTER column name `c` wins; `d` never existed.
+    running
+        .client
+        .query("SELECT c FROM m4_crash", &[])
+        .await
+        .expect("pre-ALTER column name present after restart");
+    let err = running
+        .client
+        .query("SELECT d FROM m4_crash", &[])
+        .await
+        .expect_err("aborted post-ALTER column must be hidden on restart");
+    assert!(is_undefined_column(&err), "expected 42703, got {err}");
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_committed_in_txn_alter_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_survive_a").await;
+        running
+            .client
+            .batch_execute("CREATE TABLE m4_sv (id INT, c INT)")
+            .await
+            .expect("seed");
+        running
+            .client
+            .batch_execute("INSERT INTO m4_sv (id, c) VALUES (1, 7)")
+            .await
+            .expect("seed row");
+        running.client.batch_execute("BEGIN").await.expect("begin");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_sv RENAME TO m4_sv2")
+            .await
+            .expect("in-txn rename table");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_sv2 RENAME COLUMN c TO d")
+            .await
+            .expect("in-txn rename column");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_sv2 ALTER COLUMN d SET DEFAULT 9")
+            .await
+            .expect("in-txn set default");
+        running
+            .client
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit");
+        shutdown(running).await;
+    }
+
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_survive_a2").await;
+    // New name + new column name survive.
+    let row = running
+        .client
+        .query_one("SELECT d FROM m4_sv2 WHERE id = 1", &[])
+        .await
+        .expect("committed ALTER present after restart");
+    assert_eq!(row.get::<_, i32>(0), 7, "row data preserved across rename");
+    // Old name + old column name gone.
+    assert!(
+        running
+            .client
+            .query("SELECT c FROM m4_sv2", &[])
+            .await
+            .is_err(),
+        "old column name must be gone after restart",
+    );
+    // The default survives restart: an insert omitting d gets 9.
+    running
+        .client
+        .batch_execute("INSERT INTO m4_sv2 (id) VALUES (2)")
+        .await
+        .expect("default insert post-restart");
+    let row = running
+        .client
+        .query_one("SELECT d FROM m4_sv2 WHERE id = 2", &[])
+        .await
+        .expect("read back");
+    assert_eq!(
+        row.get::<_, i32>(0),
+        9,
+        "committed default survives restart"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #5 ─────────────────────────────
+// Concurrent serialized: A holds AccessExclusive on BOTH old and new names; B's
+// concurrent CREATE TABLE of the new name fails 40001 (no torn rename).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_concurrent_rename_serializes_on_both_names() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_race_a").await;
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_m4_race_b").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE m4_race (c INT)")
+        .await
+        .expect("seed");
+
+    running
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("A begin");
+    running
+        .client
+        .batch_execute("ALTER TABLE m4_race RENAME TO m4_race2")
+        .await
+        .expect("A rename takes AccessExclusive on both names");
+
+    // B tries to CREATE the NEW name while A holds its lock → 40001.
+    client_b.batch_execute("BEGIN").await.expect("B begin");
+    let err = client_b
+        .batch_execute("CREATE TABLE m4_race2 (x INT)")
+        .await
+        .expect_err("B's CREATE of the new name must serialize-fail");
+    assert_eq!(sqlstate(&err), "40001", "expected 40001, got {err}");
+    client_b
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("B rollback");
+
+    // A commits; exactly one table under the new name, none under the old.
+    running
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("A commit");
+    let snap = running.server.catalog_snapshot();
+    assert!(
+        snap.tables.contains_key("m4_race2") && !snap.tables.contains_key("m4_race"),
+        "exactly one table, under the new name, after the serialized rename",
+    );
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #6 ─────────────────────────────
+// No orphaned runtime state after ROLLBACK: a SET DEFAULT that rolls back must
+// not leave a runtime-constraints entry that a later INSERT would honour.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_rollback_leaves_no_orphaned_runtime_default() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_orphan").await;
+    let client = &running.client;
+
+    // Table starts with NO runtime constraints at all. Two columns so an INSERT
+    // can omit `c` and reveal whether a default leaked.
+    client
+        .batch_execute("CREATE TABLE m4_orphan (id INT, c INT)")
+        .await
+        .expect("seed");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE m4_orphan ALTER COLUMN c SET DEFAULT 42")
+        .await
+        .expect("in-txn set default");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The runtime side map must have NO entry that survived the rollback: an
+    // INSERT that omits c gets NULL, not 42.
+    client
+        .batch_execute("INSERT INTO m4_orphan (id) VALUES (1)")
+        .await
+        .expect("insert omitting c");
+    let row = client
+        .query_one("SELECT c FROM m4_orphan WHERE id = 1", &[])
+        .await
+        .expect("read back");
+    assert!(
+        row.try_get::<_, i32>(0).is_err(),
+        "rolled-back default must not leak into the runtime side map",
+    );
+
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #7 ─────────────────────────────
+// Accumulation with CREATE: CREATE then ALTER (rename column) then INSERT by the
+// new name, all in one txn — present + consistent on a fresh connection AND
+// after restart. ROLLBACK variant: table absent before + after restart.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_create_then_alter_accumulates_and_commits() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_acc_a").await;
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_m4_acc_b").await;
+
+        running.client.batch_execute("BEGIN").await.expect("begin");
+        running
+            .client
+            .batch_execute("CREATE TABLE m4_acc (c INT)")
+            .await
+            .expect("in-txn create");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_acc RENAME COLUMN c TO d")
+            .await
+            .expect("in-txn alter the same-txn-created table");
+        running
+            .client
+            .batch_execute("INSERT INTO m4_acc (d) VALUES (1)")
+            .await
+            .expect("in-txn insert by the new column name");
+        // B sees nothing yet.
+        let err = client_b
+            .query("SELECT d FROM m4_acc", &[])
+            .await
+            .expect_err("B must not see the uncommitted create+alter");
+        assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+        running
+            .client
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit");
+
+        // A fresh connection sees the committed table with the renamed column.
+        let row = client_b
+            .query_one("SELECT d FROM m4_acc", &[])
+            .await
+            .expect("B sees committed create+alter");
+        assert_eq!(row.get::<_, i32>(0), 1);
+        let err = client_b
+            .query("SELECT c FROM m4_acc", &[])
+            .await
+            .expect_err("the pre-rename column name must be gone");
+        assert!(is_undefined_column(&err), "expected 42703, got {err}");
+
+        drop(client_b);
+        let _ = b_handle.await;
+        shutdown(running).await;
+    }
+
+    // After restart: still present + consistent.
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_acc_a2").await;
+    let row = running
+        .client
+        .query_one("SELECT d FROM m4_acc", &[])
+        .await
+        .expect("create+alter present after restart");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert!(
+        running
+            .client
+            .query("SELECT c FROM m4_acc", &[])
+            .await
+            .is_err(),
+        "renamed-away column must stay gone after restart",
+    );
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_create_then_alter_rollback_absent_before_and_after_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_accrb_a").await;
+        running.client.batch_execute("BEGIN").await.expect("begin");
+        running
+            .client
+            .batch_execute("CREATE TABLE m4_accrb (c INT)")
+            .await
+            .expect("in-txn create");
+        running
+            .client
+            .batch_execute("ALTER TABLE m4_accrb RENAME COLUMN c TO d")
+            .await
+            .expect("in-txn alter");
+        running
+            .client
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("rollback");
+        // Absent in this session immediately after rollback.
+        let err = running
+            .client
+            .query("SELECT d FROM m4_accrb", &[])
+            .await
+            .expect_err("rolled-back create+alter must be absent");
+        assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+        assert!(
+            !running
+                .server
+                .catalog_snapshot()
+                .tables
+                .contains_key("m4_accrb"),
+            "global snapshot must not carry the rolled-back table",
+        );
+        shutdown(running).await;
+    }
+
+    // Absent after restart.
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_accrb_a2").await;
+    assert!(
+        !running
+            .server
+            .catalog_snapshot()
+            .tables
+            .contains_key("m4_accrb"),
+        "rolled-back create+alter must not resurrect after restart",
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────────── M4 #8 ─────────────────────────────
+// Regression: out-of-scope ALTER sub-actions stay 0A000 (→ Failed) in-txn; an
+// in-scope ALTER under an active SAVEPOINT is 0A000; autocommit ALTER unchanged.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_out_of_scope_alter_still_rejected_in_txn() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_oos").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE m4_oos (c INT)")
+        .await
+        .expect("seed");
+
+    // ADD COLUMN inside a txn → 0A000, block goes Failed.
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute("ALTER TABLE m4_oos ADD COLUMN e INT")
+        .await
+        .expect_err("ADD COLUMN in-txn must be rejected");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // DROP COLUMN inside a txn → 0A000.
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute("ALTER TABLE m4_oos DROP COLUMN c")
+        .await
+        .expect_err("DROP COLUMN in-txn must be rejected");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // ADD CONSTRAINT (CHECK) inside a txn → 0A000.
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute("ALTER TABLE m4_oos ADD CONSTRAINT m4_chk CHECK (c > 0)")
+        .await
+        .expect_err("ADD CONSTRAINT in-txn must be rejected");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // ENABLE ROW LEVEL SECURITY inside a txn → 0A000.
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = client
+        .batch_execute("ALTER TABLE m4_oos ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect_err("ENABLE RLS in-txn must be rejected");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // An in-SCOPE ALTER under an active SAVEPOINT → 0A000.
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("SAVEPOINT sp1")
+        .await
+        .expect("savepoint");
+    let err = client
+        .batch_execute("ALTER TABLE m4_oos RENAME TO m4_oos2")
+        .await
+        .expect_err("in-scope ALTER under a SAVEPOINT must be rejected");
+    assert_eq!(sqlstate(&err), "0A000", "expected 0A000, got {err}");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The table is untouched: still named m4_oos with column c, no e.
+    client
+        .query("SELECT c FROM m4_oos", &[])
+        .await
+        .expect("table untouched by the rejected ALTERs");
+    assert!(
+        client.query("SELECT e FROM m4_oos", &[]).await.is_err(),
+        "no leaked ADD COLUMN",
+    );
+
+    // Autocommit ALTER (in-scope) still works unchanged.
+    client
+        .batch_execute("ALTER TABLE m4_oos RENAME TO m4_oos2")
+        .await
+        .expect("autocommit rename still works");
+    client
+        .query("SELECT c FROM m4_oos2", &[])
+        .await
+        .expect("autocommit-renamed table usable");
+
+    shutdown(running).await;
+}
+
+// ───────────────────────── M4 #8 (corruption) ─────────────────────────
+// In-txn `SET NOT NULL` must see the transaction's OWN uncommitted rows.
+//
+// CORRUPTION GATE. The DDL dispatch does not `refresh_snapshot` for an ALTER,
+// so the in-txn `SET NOT NULL` validate-scan ran under `txn.snapshot` whose
+// `current_command` still pointed at the PRIOR statement. A row inserted by the
+// immediately-preceding in-txn INSERT carries that same command id, and the
+// MVCC self-visibility rule (`cmin >= current_command ⇒ Invisible`) hid it: the
+// scan saw 0 rows, a same-txn NULL passed, and COMMIT durably persisted a
+// NOT-NULL column over a NULL row — silent schema corruption (PostgreSQL
+// rejects the original sequence with 23502).
+//
+// Repro is deterministic with NO intervening statement: BEGIN; INSERT a NULL;
+// ALTER … SET NOT NULL; COMMIT. Pre-fix the ALTER (and COMMIT) wrongly succeed;
+// post-fix the ALTER fails 23502 and the column stays nullable.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_set_not_null_sees_own_uncommitted_null_row() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_own_null_a").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE m4_own (id INT, c INT)")
+            .await
+            .expect("seed table");
+
+        // The deterministic corruption sequence, NO intervening statement
+        // between the INSERT and the ALTER.
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("INSERT INTO m4_own (id, c) VALUES (1, NULL)")
+            .await
+            .expect("same-txn NULL insert");
+        let alter_err = client
+            .batch_execute("ALTER TABLE m4_own ALTER COLUMN c SET NOT NULL")
+            .await
+            .expect_err(
+                "in-txn SET NOT NULL must SEE the transaction's own NULL row and reject 23502 \
+                 (pre-fix it wrongly succeeded, durably persisting a NOT-NULL column over a NULL)",
+            );
+        assert_eq!(
+            sqlstate(&alter_err),
+            "23502",
+            "expected 23502 not_null_violation, got {alter_err}",
+        );
+        // The ALTER failed → the block is aborted (25P02). Roll it back; the
+        // staged schema edit must NOT have committed.
+        client.batch_execute("ROLLBACK").await.expect("rollback");
+
+        // The column is still nullable: a later NULL insert succeeds, and there
+        // is no enforced-but-violated NOT NULL.
+        client
+            .batch_execute("INSERT INTO m4_own (id, c) VALUES (2, NULL)")
+            .await
+            .expect("column must remain nullable after the rejected SET NOT NULL");
+
+        // A second connection sees the column as nullable too.
+        let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_m4_own_null_b").await;
+        client_b
+            .batch_execute("INSERT INTO m4_own (id, c) VALUES (3, NULL)")
+            .await
+            .expect("2nd connection: column still nullable");
+        drop(client_b);
+        b_handle.abort();
+
+        shutdown(running).await;
+    }
+
+    // After restart the column is still nullable — the rejected ALTER left no
+    // durable NOT-NULL marker.
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_own_null_a2").await;
+    running
+        .client
+        .batch_execute("INSERT INTO m4_own (id, c) VALUES (4, NULL)")
+        .await
+        .expect("column still nullable after restart (no durable NOT NULL)");
+    shutdown(running).await;
+}
+
+// ───────────────────────── M4 #9 (positive) ─────────────────────────
+// In-txn `SET NOT NULL` over a same-txn INSERT of only NON-NULL rows COMMITs;
+// the column is genuinely NOT NULL afterward (a later NULL insert is rejected
+// 23502) and survives restart.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_set_not_null_commits_over_own_non_null_rows() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    make_data_dir_private(data_dir.path());
+
+    {
+        let running = start_persistent_server(data_dir.path(), "txddl_m4_own_ok_a").await;
+        let client = &running.client;
+        client
+            .batch_execute("CREATE TABLE m4_ok (id INT, c INT)")
+            .await
+            .expect("seed table");
+
+        client.batch_execute("BEGIN").await.expect("begin");
+        client
+            .batch_execute("INSERT INTO m4_ok (id, c) VALUES (1, 10), (2, 20)")
+            .await
+            .expect("same-txn non-null inserts");
+        client
+            .batch_execute("ALTER TABLE m4_ok ALTER COLUMN c SET NOT NULL")
+            .await
+            .expect("SET NOT NULL must succeed when the txn's own rows are all non-null");
+        client.batch_execute("COMMIT").await.expect("commit");
+
+        // The column is genuinely NOT NULL now: a NULL insert is rejected 23502.
+        let null_err = client
+            .batch_execute("INSERT INTO m4_ok (id, c) VALUES (3, NULL)")
+            .await
+            .expect_err("the column must be enforced NOT NULL after commit");
+        assert_eq!(
+            sqlstate(&null_err),
+            "23502",
+            "expected 23502 after commit, got {null_err}",
+        );
+        // A non-null insert still works.
+        client
+            .batch_execute("INSERT INTO m4_ok (id, c) VALUES (4, 40)")
+            .await
+            .expect("non-null insert ok");
+        shutdown(running).await;
+    }
+
+    // Survives restart: still NOT NULL.
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_own_ok_a2").await;
+    let null_err = running
+        .client
+        .batch_execute("INSERT INTO m4_ok (id, c) VALUES (5, NULL)")
+        .await
+        .expect_err("NOT NULL must survive restart");
+    assert_eq!(
+        sqlstate(&null_err),
+        "23502",
+        "expected 23502 after restart, got {null_err}",
+    );
+    let count = running
+        .client
+        .query_one("SELECT count(*) FROM m4_ok", &[])
+        .await
+        .expect("count survives restart");
+    assert_eq!(
+        count.get::<_, i64>(0),
+        3,
+        "the three committed rows survive"
+    );
+    shutdown(running).await;
+}
+
+// ───────────────────────── M4 #10 (committed data) ─────────────────────────
+// The previously-working committed-data case still works: a NULL row committed
+// by an EARLIER autocommit txn is caught by an in-txn `SET NOT NULL` (the
+// refreshed-command-id validate snapshot keeps the same frozen MVCC view, so
+// already-committed rows remain visible).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_set_not_null_still_catches_earlier_committed_null() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_m4_committed_null").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE m4_cn (id INT, c INT)")
+        .await
+        .expect("seed table");
+    // Committed (autocommit) NULL row from an EARLIER transaction.
+    client
+        .batch_execute("INSERT INTO m4_cn (id, c) VALUES (1, NULL)")
+        .await
+        .expect("earlier committed NULL row");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    let alter_err = client
+        .batch_execute("ALTER TABLE m4_cn ALTER COLUMN c SET NOT NULL")
+        .await
+        .expect_err("in-txn SET NOT NULL must still catch an earlier-committed NULL");
+    assert_eq!(
+        sqlstate(&alter_err),
+        "23502",
+        "expected 23502 for the committed NULL, got {alter_err}",
+    );
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // Column remains nullable: another NULL insert succeeds.
+    client
+        .batch_execute("INSERT INTO m4_cn (id, c) VALUES (2, NULL)")
+        .await
+        .expect("column still nullable after the rejected SET NOT NULL");
+
+    shutdown(running).await;
+}

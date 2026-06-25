@@ -711,6 +711,8 @@ where
                     extra_indexes: Vec::new(),
                     extra_index_constraints: Vec::new(),
                     staged: Vec::new(),
+                    altered_tables: Vec::new(),
+                    altered_staged: Vec::new(),
                 }
             });
             debug_assert_eq!(overlay.xid, user_xid);
@@ -885,7 +887,7 @@ const CREATE_TABLE_NAME_LOCK_CLASSID: u32 = 0xDD11_C7AB;
 /// Also used by transactional `CREATE INDEX` (milestone 3), keyed on the
 /// TARGET table's key, so two in-txn `CREATE INDEX` on the same table — and a
 /// race against a same-name `CREATE TABLE` — serialize on the same tag.
-pub(super) fn create_table_name_lock_tag(table_key: &str) -> ultrasql_txn::LockTag {
+pub(crate) fn create_table_name_lock_tag(table_key: &str) -> ultrasql_txn::LockTag {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     table_key.hash(&mut hasher);

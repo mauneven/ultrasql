@@ -19,6 +19,7 @@ use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
 mod advisory;
 mod alter;
+mod alter_in_txn;
 mod catalog_overlay;
 mod copy;
 mod ddl;
