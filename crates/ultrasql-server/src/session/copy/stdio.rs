@@ -54,7 +54,18 @@ where
         self.io.flush().await?;
 
         if opts.format == ServerCopyFormat::Binary {
-            let (payload, rows_sent) = self.encode_table_binary_copy(entry, columns, schema)?;
+            // `COPY ... TO STDOUT` is a read: in an explicit transaction it
+            // scans the session txn's (command-advanced) snapshot and never
+            // commits/aborts it; in autocommit it runs today's implicit read
+            // txn. The encode is synchronous, so the snapshot borrow never
+            // crosses the `.await` below.
+            let (payload, rows_sent) = self.with_copy_read_snapshot(
+                "binary COPY scan commit",
+                "binary COPY rollback after scan error",
+                |session, snapshot| {
+                    session.encode_table_binary_copy(entry, columns, schema, snapshot)
+                },
+            )?;
             let mut wire_buf = BytesMut::with_capacity(payload.len() + 128);
             encode_backend(&BackendMessage::CopyData(payload), &mut wire_buf);
             encode_backend(&BackendMessage::CopyDone, &mut wire_buf);
@@ -77,7 +88,6 @@ where
             return Ok(());
         }
 
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let rel = RelationId(entry.oid);
         let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
         let codec = RowCodec::new(entry.schema.clone());
@@ -85,92 +95,79 @@ where
             &self.session_settings,
         );
 
-        let mut rows_sent: u64 = 0;
-        let mut wire_buf = BytesMut::with_capacity(8 * 1024);
-
-        if opts.header {
-            let header_cells: Vec<Option<Vec<u8>>> = schema
-                .fields()
-                .iter()
-                .map(|f| Some(f.name.as_bytes().to_vec()))
-                .collect();
-            let bytes = match opts.format {
-                ServerCopyFormat::Text => encode_text_row(&header_cells, opts),
-                ServerCopyFormat::Csv => encode_csv_row(&header_cells, opts),
-                ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
-            };
-            encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
-        }
-
-        let scan_result: Result<(), ServerError> = {
-            let scan = self.state.heap.scan_visible(
-                rel,
-                block_count,
-                &txn.snapshot,
-                self.state.txn_manager.as_ref(),
-            );
-            let mut iter_err: Option<ServerError> = None;
-            for result in scan {
-                let tup = match result {
-                    Ok(t) => t,
-                    Err(e) => {
-                        iter_err = Some(ServerError::ddl(format!("COPY TO heap scan: {e}")));
-                        break;
-                    }
-                };
-                let row = match codec.decode(&tup.data) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        iter_err =
-                            Some(ServerError::CopyFormat(format!("COPY TO row decode: {e}")));
-                        break;
-                    }
-                };
-                let cells: Vec<Option<Vec<u8>>> = if columns.is_empty() {
-                    row.iter()
-                        .zip(entry.schema.fields())
-                        .map(|(value, field)| {
-                            value_to_copy_cell_with_options(value, &field.data_type, &text_options)
-                        })
-                        .collect()
-                } else {
-                    columns
+        // Build the full CopyData body synchronously under the read snapshot.
+        // `with_copy_read_snapshot` finalises the implicit read txn (autocommit)
+        // or leaves the session txn open + intact (explicit), and never aborts
+        // the session txn on a scan error.
+        let (wire_buf, rows_sent) = self.with_copy_read_snapshot(
+            "COPY TO autocommit commit",
+            "COPY TO autocommit rollback after scan error",
+            |session, snapshot| {
+                let mut rows_sent: u64 = 0;
+                let mut wire_buf = BytesMut::with_capacity(8 * 1024);
+                if opts.header {
+                    let header_cells: Vec<Option<Vec<u8>>> = schema
+                        .fields()
                         .iter()
-                        .map(|&i| {
-                            let field = entry.schema.field_at(i);
-                            row.get(i).and_then(|value| {
+                        .map(|f| Some(f.name.as_bytes().to_vec()))
+                        .collect();
+                    let bytes = match opts.format {
+                        ServerCopyFormat::Text => encode_text_row(&header_cells, opts),
+                        ServerCopyFormat::Csv => encode_csv_row(&header_cells, opts),
+                        ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
+                    };
+                    encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
+                }
+                let scan = session.state.heap.scan_visible(
+                    rel,
+                    block_count,
+                    snapshot,
+                    session.state.txn_manager.as_ref(),
+                );
+                for result in scan {
+                    let tup =
+                        result.map_err(|e| ServerError::ddl(format!("COPY TO heap scan: {e}")))?;
+                    let row = codec
+                        .decode(&tup.data)
+                        .map_err(|e| ServerError::CopyFormat(format!("COPY TO row decode: {e}")))?;
+                    let cells: Vec<Option<Vec<u8>>> = if columns.is_empty() {
+                        row.iter()
+                            .zip(entry.schema.fields())
+                            .map(|(value, field)| {
                                 value_to_copy_cell_with_options(
                                     value,
                                     &field.data_type,
                                     &text_options,
                                 )
                             })
-                        })
-                        .collect()
-                };
-                let bytes = match opts.format {
-                    ServerCopyFormat::Text => encode_text_row(&cells, opts),
-                    ServerCopyFormat::Csv => encode_csv_row(&cells, opts),
-                    ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
-                };
-                encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
-                increment_copy_rows(&mut rows_sent, "COPY TO STDOUT")?;
-            }
-            if let Some(e) = iter_err {
-                Err(e)
-            } else {
-                Ok(())
-            }
-        };
-
-        if let Err(e) = scan_result {
-            return Err(self.rollback_copy_transaction_after_error(
-                txn,
-                e,
-                "COPY TO autocommit rollback after scan error",
-            ));
-        }
-        self.finalise_read_transaction(txn, "COPY TO autocommit commit")?;
+                            .collect()
+                    } else {
+                        columns
+                            .iter()
+                            .map(|&i| {
+                                let field = entry.schema.field_at(i);
+                                row.get(i).and_then(|value| {
+                                    value_to_copy_cell_with_options(
+                                        value,
+                                        &field.data_type,
+                                        &text_options,
+                                    )
+                                })
+                            })
+                            .collect()
+                    };
+                    let bytes = match opts.format {
+                        ServerCopyFormat::Text => encode_text_row(&cells, opts),
+                        ServerCopyFormat::Csv => encode_csv_row(&cells, opts),
+                        ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
+                    };
+                    encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
+                    increment_copy_rows(&mut rows_sent, "COPY TO STDOUT")?;
+                }
+                Ok((wire_buf, rows_sent))
+            },
+        )?;
+        let mut wire_buf = wire_buf;
 
         encode_backend(&BackendMessage::CopyDone, &mut wire_buf);
         encode_backend(
@@ -219,7 +216,34 @@ where
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        // Shape A: in an explicit transaction block, COPY rides the SESSION
+        // txn so a later ROLLBACK discards its rows and a COMMIT makes them
+        // durable atomically. We `take` the txn out of `self.txn_state` and
+        // hold it as an owned local so the synchronous insert calls can borrow
+        // `&Transaction` while the async wire I/O between them still borrows
+        // `&mut self` — no borrow ever crosses an `.await`. The snapshot is
+        // refreshed ONCE up front (advancing `current_command`) so the COPY
+        // sees prior in-txn writes and stamps rows with the session xid. In
+        // autocommit mode we open today's implicit ReadCommitted txn.
+        let session_mode = self.copy_in_session_txn();
+        let txn = if session_mode {
+            match std::mem::replace(&mut self.txn_state, crate::TxnState::Idle) {
+                crate::TxnState::InTransaction(mut txn) => {
+                    self.state.txn_manager.refresh_snapshot(&mut txn);
+                    txn
+                }
+                // `copy_in_session_txn` already gated InTransaction; the other
+                // arms are unreachable, but restore + bail rather than panic.
+                other => {
+                    self.txn_state = other;
+                    return Err(ServerError::Unsupported(
+                        "COPY FROM session txn vanished mid-dispatch",
+                    ));
+                }
+            }
+        } else {
+            self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
+        };
         let codec = RowCodec::new(entry.schema.clone());
 
         let mut rows_inserted: u64 = 0;
@@ -228,7 +252,24 @@ where
         let mut client_fail_message: Option<String> = None;
 
         loop {
-            let msg = self.read_frontend().await?;
+            // The session txn is held as an owned local here (taken out of
+            // `self.txn_state` above). A bare `?` on this wire read would drop
+            // that local on a socket/EOF error and leave `self.txn_state =
+            // Idle`, silently losing the session's transaction. Park it back as
+            // `Failed(txn)` (via `fail_or_rollback_copy_from`) before
+            // propagating so the take-and-park contract holds on the dying-
+            // connection edge too.
+            let msg = match self.read_frontend().await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    return Err(self.fail_or_rollback_copy_from(
+                        session_mode,
+                        txn,
+                        e,
+                        "COPY FROM autocommit rollback after wire read error",
+                    ));
+                }
+            };
             match msg {
                 FrontendMessage::CopyData(chunk) => {
                     buffer.extend_from_slice(&chunk);
@@ -258,7 +299,8 @@ where
                         match decoded {
                             Ok(payload) => payload_batch.push(payload),
                             Err(e) => {
-                                let err = self.rollback_copy_transaction_after_error(
+                                let err = self.fail_or_rollback_copy_from(
+                                    session_mode,
                                     txn,
                                     e,
                                     "COPY FROM autocommit rollback after row decode error",
@@ -273,7 +315,8 @@ where
                                 payload_batch.len(),
                                 "COPY FROM STDIN",
                             ) {
-                                let err = self.rollback_copy_transaction_after_error(
+                                let err = self.fail_or_rollback_copy_from(
+                                    session_mode,
                                     txn,
                                     e,
                                     "COPY FROM autocommit rollback after row count overflow",
@@ -281,10 +324,14 @@ where
                                 self.drain_copy_remainder().await?;
                                 return Err(err);
                             }
-                            if let Err(e) =
-                                self.flush_copy_insert_batch(entry, &payload_batch, &txn)
-                            {
-                                let err = self.rollback_copy_transaction_after_error(
+                            if let Err(e) = self.flush_copy_insert_batch(
+                                entry,
+                                &payload_batch,
+                                &txn,
+                                !session_mode,
+                            ) {
+                                let err = self.fail_or_rollback_copy_from(
+                                    session_mode,
                                     txn,
                                     e,
                                     "COPY FROM autocommit rollback after insert batch error",
@@ -316,14 +363,16 @@ where
                 // semantics intact.
                 FrontendMessage::Sync | FrontendMessage::Flush => continue,
                 FrontendMessage::Terminate => {
-                    return Err(self.rollback_copy_transaction_after_error(
+                    return Err(self.fail_or_rollback_copy_from(
+                        session_mode,
                         txn,
                         ServerError::UnexpectedEof,
                         "COPY FROM rollback after terminate",
                     ));
                 }
                 other => {
-                    return Err(self.rollback_copy_transaction_after_error(
+                    return Err(self.fail_or_rollback_copy_from(
+                        session_mode,
                         txn,
                         ServerError::CopyFormat(format!(
                             "unexpected frontend message during COPY FROM: {other:?}"
@@ -354,7 +403,8 @@ where
                 match decoded {
                     Ok(payload) => payload_batch.push(payload),
                     Err(e) => {
-                        return Err(self.rollback_copy_transaction_after_error(
+                        return Err(self.fail_or_rollback_copy_from(
+                            session_mode,
                             txn,
                             e,
                             "COPY FROM autocommit rollback after final row decode error",
@@ -367,7 +417,8 @@ where
         }
 
         if let Some(reason) = client_fail_message {
-            return Err(self.rollback_copy_transaction_after_error(
+            return Err(self.fail_or_rollback_copy_from(
+                session_mode,
                 txn,
                 ServerError::CopyAborted(reason),
                 "COPY FROM rollback after CopyFail",
@@ -378,14 +429,17 @@ where
             if let Err(e) =
                 add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM STDIN")
             {
-                return Err(self.rollback_copy_transaction_after_error(
+                return Err(self.fail_or_rollback_copy_from(
+                    session_mode,
                     txn,
                     e,
                     "COPY FROM autocommit rollback after row count overflow",
                 ));
             }
-            if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn) {
-                return Err(self.rollback_copy_transaction_after_error(
+            if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn, !session_mode)
+            {
+                return Err(self.fail_or_rollback_copy_from(
+                    session_mode,
                     txn,
                     e,
                     "COPY FROM autocommit rollback after insert batch error",
@@ -393,20 +447,33 @@ where
             }
         }
 
-        if rows_inserted > 0 {
-            if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                return Err(self.rollback_copy_transaction_after_error(
-                    txn,
-                    e,
-                    "COPY FROM autocommit rollback after deferred FK violation",
-                ));
-            }
+        if session_mode {
+            // Do NOT commit and do NOT validate deferred FKs here — COMMIT's
+            // `execute_commit` validates via `pending_table_modifications` and
+            // rebuilds the column cache for the COPY-touched table. Note the
+            // table so that machinery covers it.
+            //
+            // PARK FIRST, then note: `note_copy_in_session` mutates only
+            // `self.pending_table_modifications` (not the txn), so it is valid
+            // after the park. Parking first guarantees the take-and-park
+            // contract — if `note_copy_in_session` errors (row-count overflow),
+            // the txn is already back in `self.txn_state` as `InTransaction`, so
+            // `fail_if_in_transaction` transitions the block to `Failed(txn)`
+            // instead of silently dropping the txn and leaving the session
+            // `Idle`. Recording the table after the park does not change COMMIT's
+            // deferred-FK + column-cache behaviour: the rows are already inserted
+            // under `txn.xid`; the note just records the table for COMMIT.
+            self.txn_state = crate::TxnState::InTransaction(txn);
+            self.note_copy_in_session(&copy_table_key(entry), rows_inserted)
+                .map_err(|e| self.fail_if_in_transaction(e))?;
+        } else {
+            self.finalise_copy_from_autocommit(
+                txn,
+                &copy_table_key(entry),
+                rows_inserted,
+                "COPY FROM autocommit",
+            )?;
         }
-        self.finalise_copy_from_commit(txn, rows_inserted, "COPY FROM autocommit")?;
-        self.state.note_commit_for_gc();
-        self.state
-            .note_table_modifications(&copy_table_key(entry), rows_inserted);
-        self.plan_cache_invalidate();
 
         let mut wire_buf = BytesMut::with_capacity(64);
         encode_backend(
@@ -477,18 +544,53 @@ where
             )?
         };
         let rows = copy_rows_from_usize(payloads.len(), "binary COPY FROM")?;
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
-        if let Err(e) = self.flush_copy_insert_batch(entry, &payloads, &txn) {
-            return Err(self.rollback_copy_transaction_after_error(
+        // Shape A: ride the session txn in an explicit block, else autocommit.
+        // The whole binary payload is decoded synchronously above (the wire
+        // bytes were already collected), so no `.await` interleaves the insert.
+        let session_mode = self.copy_in_session_txn();
+        let txn = if session_mode {
+            match std::mem::replace(&mut self.txn_state, crate::TxnState::Idle) {
+                crate::TxnState::InTransaction(mut txn) => {
+                    self.state.txn_manager.refresh_snapshot(&mut txn);
+                    txn
+                }
+                other => {
+                    self.txn_state = other;
+                    return Err(ServerError::Unsupported(
+                        "binary COPY FROM session txn vanished mid-dispatch",
+                    ));
+                }
+            }
+        } else {
+            self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
+        };
+        if let Err(e) = self.flush_copy_insert_batch(entry, &payloads, &txn, !session_mode) {
+            return Err(self.fail_or_rollback_copy_from(
+                session_mode,
                 txn,
                 e,
                 "binary COPY FROM rollback after insert batch error",
             ));
         }
-        self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
-        self.state.note_commit_for_gc();
-        self.state
-            .note_table_modifications(&copy_table_key(entry), rows);
+        if session_mode {
+            // Park the session txn back FIRST, then note the table (see the text
+            // STDIN path for the full rationale): `note_copy_in_session` touches
+            // only `self.pending_table_modifications`, so it is valid after the
+            // park, and an overflow error then routes through
+            // `fail_if_in_transaction` (a real `Failed(txn)` transition) rather
+            // than dropping the owned txn and leaving the session `Idle`.
+            self.txn_state = crate::TxnState::InTransaction(txn);
+            self.note_copy_in_session(&copy_table_key(entry), rows)
+                .map_err(|e| self.fail_if_in_transaction(e))?;
+        } else {
+            // Autocommit binary COPY keeps its prior finalisation byte-for-byte
+            // (no deferred-FK pre-validation — the text path differs, but
+            // changing binary's behaviour is out of scope here).
+            self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
+            self.state.note_commit_for_gc();
+            self.state
+                .note_table_modifications(&copy_table_key(entry), rows);
+        }
         self.send_copy_complete(rows, emit_ready_for_query).await
     }
 
@@ -517,11 +619,26 @@ where
         Ok(())
     }
 
+    /// Insert one COPY batch under `txn`.
+    ///
+    /// `mark_all_visible` controls the visibility-map bulk-load optimisation:
+    ///
+    /// - Autocommit COPY (`true`): the implicit txn commits the moment the COPY
+    ///   finishes, so freshly bulk-filled pages can be stamped all-visible — the
+    ///   historical COPY fast path, preserved byte-for-byte.
+    /// - In-session COPY (`false`): the rows are written under the still-open
+    ///   session xid (InProgress). Marking the page all-visible would let a scan
+    ///   skip the MVCC visibility check and SEE the uncommitted rows — and, worse,
+    ///   keep seeing them after a ROLLBACK aborts the xid. So we pass `vm: None`:
+    ///   the rows stay subject to normal MVCC visibility (own-write visible to
+    ///   this txn, invisible to others, gone on ROLLBACK). COMMIT does not need
+    ///   the all-visible bit; it is an optimisation a later VACUUM re-establishes.
     pub(in crate::session) fn flush_copy_insert_batch(
         &self,
         entry: &TableEntry,
         payloads: &[Vec<u8>],
         txn: &Transaction,
+        mark_all_visible: bool,
     ) -> Result<(), ServerError> {
         if payloads.is_empty() {
             return Ok(());
@@ -536,7 +653,7 @@ where
             n_atts,
             wal,
             fsm: None,
-            vm: Some(self.state.vm.as_ref()),
+            vm: mark_all_visible.then(|| self.state.vm.as_ref()),
         };
         self.state
             .heap

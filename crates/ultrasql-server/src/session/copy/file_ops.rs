@@ -16,7 +16,7 @@ use ultrasql_core::{RelationId, Schema, Value};
 use ultrasql_executor::RowCodec;
 use ultrasql_planner::{CopySource, LogicalPlan};
 use ultrasql_protocol::{BackendMessage, encode_backend};
-use ultrasql_txn::{IsolationLevel, Transaction};
+use ultrasql_txn::IsolationLevel;
 
 use super::super::Session;
 use super::binary::{append_binary_copy_header, append_binary_copy_row, append_i16_be};
@@ -29,10 +29,10 @@ use super::fs_io::{
     write_copy_output_file,
 };
 use super::{
-    COPY_INSERT_BATCH_ROWS, CopyOptions, CopyRejectState, CopyRejectTarget, CopyRowDecodeContext,
-    CopyTextFileStreamArgs, ServerCopyFormat, ServerError, add_copy_batch_rows,
-    copy_add_row_counts, copy_out_response_with_format, copy_table_key, encode_csv_row,
-    encode_text_row, increment_copy_rows,
+    COPY_INSERT_BATCH_ROWS, CopyInsertTxn, CopyOptions, CopyRejectState, CopyRejectTarget,
+    CopyRowDecodeContext, CopyTextFileStreamArgs, ServerCopyFormat, ServerError,
+    add_copy_batch_rows, copy_add_row_counts, copy_out_response_with_format, copy_table_key,
+    encode_csv_row, encode_text_row, increment_copy_rows,
 };
 
 impl<RW> Session<RW>
@@ -49,11 +49,20 @@ where
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
         if opts.format == ServerCopyFormat::Parquet {
+            // `copy_from_parquet_file` owns the session-vs-autocommit decision
+            // (it rides the session txn inside an explicit block). In autocommit
+            // it commits the implicit txn, so the post-commit GC + table-mod +
+            // plan-cache notes belong here. In session mode the rows are still
+            // uncommitted (tracked via `pending_table_modifications`); COMMIT
+            // emits those effects, so skip them now.
+            let session_mode = self.copy_in_session_txn();
             let rows = self.copy_from_parquet_file(entry, columns, schema, path)?;
-            self.state.note_commit_for_gc();
-            self.state
-                .note_table_modifications(&copy_table_key(entry), rows);
-            self.plan_cache_invalidate();
+            if !session_mode {
+                self.state.note_commit_for_gc();
+                self.state
+                    .note_table_modifications(&copy_table_key(entry), rows);
+                self.plan_cache_invalidate();
+            }
             return self.send_copy_complete(rows, emit_ready_for_query).await;
         }
         if opts.format == ServerCopyFormat::Binary {
@@ -66,10 +75,36 @@ where
         let effective_opts = self.effective_copy_file_options(path, opts)?;
         let file = open_copy_input_file(path)?;
         let mut reader = BufReader::new(file);
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
+        // Resolve the reject state BEFORE taking the session txn out. This call
+        // is fallible (a missing or invalid REJECT_TABLE errors), and it does
+        // not depend on the txn — building it here keeps the only fallible work
+        // between the take-out and the park-back inside the
+        // `fail_or_rollback_copy_from`-wrapped stream call below, so no bare `?`
+        // can drop the owned txn and leave `self.txn_state = Idle`.
         let mut reject_state = self.copy_reject_state(&effective_opts)?;
+        // Shape A: ride the session txn in an explicit block, else autocommit.
+        // The whole file is read + inserted synchronously below (no `.await`
+        // between the borrow of `&txn` and the inserts), so the session txn
+        // taken out here never has a borrow cross an await.
+        let session_mode = self.copy_in_session_txn();
+        let txn = if session_mode {
+            match std::mem::replace(&mut self.txn_state, crate::TxnState::Idle) {
+                crate::TxnState::InTransaction(mut txn) => {
+                    self.state.txn_manager.refresh_snapshot(&mut txn);
+                    txn
+                }
+                other => {
+                    self.txn_state = other;
+                    return Err(ServerError::Unsupported(
+                        "COPY FROM file session txn vanished mid-dispatch",
+                    ));
+                }
+            }
+        } else {
+            self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
+        };
 
         let stream_result = self.copy_text_file_stream_into_table(CopyTextFileStreamArgs {
             entry,
@@ -82,11 +117,13 @@ where
             payload_batch: &mut payload_batch,
             reject_state: reject_state.as_mut(),
             path,
+            mark_all_visible: !session_mode,
         });
         let rows = match stream_result {
             Ok(rows) => rows,
             Err(err) => {
-                return Err(self.rollback_copy_transaction_after_error(
+                return Err(self.fail_or_rollback_copy_from(
+                    session_mode,
                     txn,
                     err,
                     "COPY FROM file rollback after import error",
@@ -97,17 +134,51 @@ where
             .as_ref()
             .and_then(|state| state.target.as_ref())
             .map_or(0, |target| target.rows);
-        let rows_changed = copy_add_row_counts(rows, reject_rows, "COPY FROM file")?;
-        self.finalise_copy_from_commit(txn, rows_changed, "COPY FROM file")?;
-        self.state.note_commit_for_gc();
-        self.state
-            .note_table_modifications(&copy_table_key(entry), rows);
-        if let Some(reject_target) = reject_state.and_then(|state| state.target) {
-            if reject_target.rows > 0 {
-                self.state.note_table_modifications(
+        if session_mode {
+            // The COPY target and any REJECT_TABLE target both rode `&txn`, so
+            // both are part of the session transaction. Route each through
+            // `pending_table_modifications` so COMMIT's deferred-FK validation
+            // + column-cache invalidation cover them.
+            //
+            // PARK FIRST, then note both tables: `note_copy_in_session` mutates
+            // only `self.pending_table_modifications` (valid after the park),
+            // and `copy_add_row_counts`/`rows_changed` is consumed solely by the
+            // autocommit branch, so it stays there. Parking before the notes
+            // honours the take-and-park contract — if either note errors
+            // (row-count overflow), the txn is already back in `self.txn_state`,
+            // so `fail_if_in_transaction` transitions the block to `Failed(txn)`
+            // rather than dropping the owned txn and leaving the session `Idle`.
+            self.txn_state = crate::TxnState::InTransaction(txn);
+            self.note_copy_in_session(&copy_table_key(entry), rows)
+                .map_err(|e| self.fail_if_in_transaction(e))?;
+            if let Some(reject_target) = reject_state
+                .as_ref()
+                .and_then(|state| state.target.as_ref())
+                && reject_target.rows > 0
+            {
+                self.note_copy_in_session(
                     &copy_table_key(&reject_target.entry),
                     reject_target.rows,
-                );
+                )
+                .map_err(|e| self.fail_if_in_transaction(e))?;
+            }
+        } else {
+            // Autocommit file COPY keeps its prior finalisation byte-for-byte:
+            // commit on `rows_changed` (main + reject), but note only the main
+            // table's `rows` and the reject target's rows separately, with no
+            // deferred-FK pre-validation (the file path never had one).
+            let rows_changed = copy_add_row_counts(rows, reject_rows, "COPY FROM file")?;
+            self.finalise_copy_from_commit(txn, rows_changed, "COPY FROM file")?;
+            self.state.note_commit_for_gc();
+            self.state
+                .note_table_modifications(&copy_table_key(entry), rows);
+            if let Some(reject_target) = reject_state.and_then(|state| state.target) {
+                if reject_target.rows > 0 {
+                    self.state.note_table_modifications(
+                        &copy_table_key(&reject_target.entry),
+                        reject_target.rows,
+                    );
+                }
             }
         }
         self.send_copy_complete(rows, emit_ready_for_query).await
@@ -193,7 +264,7 @@ where
         line_number: u64,
         raw_record: &[u8],
         err: &ServerError,
-        txn: &Transaction,
+        insert: CopyInsertTxn<'_>,
     ) -> Result<(), ServerError> {
         let next_bad_rows = copy_add_row_counts(state.bad_rows, 1, "COPY reject rows")?;
         if next_bad_rows > state.max_errors {
@@ -221,7 +292,7 @@ where
         target.payload_batch.push(payload);
         increment_copy_rows(&mut target.rows, "COPY reject target")?;
         if target.payload_batch.len() == COPY_INSERT_BATCH_ROWS {
-            self.flush_copy_reject_batch(target, txn)?;
+            self.flush_copy_reject_batch(target, insert)?;
         }
         Ok(())
     }
@@ -229,12 +300,17 @@ where
     fn flush_copy_reject_batch(
         &self,
         target: &mut CopyRejectTarget,
-        txn: &Transaction,
+        insert: CopyInsertTxn<'_>,
     ) -> Result<(), ServerError> {
         if target.payload_batch.is_empty() {
             return Ok(());
         }
-        self.flush_copy_insert_batch(&target.entry, &target.payload_batch, txn)?;
+        self.flush_copy_insert_batch(
+            &target.entry,
+            &target.payload_batch,
+            insert.txn,
+            insert.mark_all_visible,
+        )?;
         target.payload_batch.clear();
         Ok(())
     }
@@ -254,7 +330,12 @@ where
             payload_batch,
             mut reject_state,
             path,
+            mark_all_visible,
         } = args;
+        let insert = CopyInsertTxn {
+            txn,
+            mark_all_visible,
+        };
         let mut rows_inserted = 0_u64;
         let mut header_skipped = !opts.header;
         let mut record = Vec::new();
@@ -310,7 +391,7 @@ where
                             record_start_line,
                             &record,
                             &err,
-                            txn,
+                            insert,
                         )?;
                         record.clear();
                         continue;
@@ -322,7 +403,7 @@ where
             payload_batch.push(payload);
             if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
                 add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
-                self.flush_copy_insert_batch(entry, payload_batch, txn)?;
+                self.flush_copy_insert_batch(entry, payload_batch, txn, mark_all_visible)?;
                 payload_batch.clear();
             }
         }
@@ -332,7 +413,7 @@ where
                 let err =
                     ServerError::CopyFormat("unterminated quoted field in CSV input".to_string());
                 if let Some(state) = reject_state.as_deref_mut() {
-                    self.record_copy_reject(state, path, record_start_line, &record, &err, txn)?;
+                    self.record_copy_reject(state, path, record_start_line, &record, &err, insert)?;
                     record.clear();
                 } else {
                     return Err(err);
@@ -363,15 +444,15 @@ where
                                 record_start_line,
                                 &record,
                                 &err,
-                                txn,
+                                insert,
                             )?;
                             record.clear();
                             return self.finish_copy_stream_batches(
                                 entry,
                                 payload_batch,
-                                txn,
                                 rows_inserted,
                                 reject_state,
+                                insert,
                             );
                         }
                         return Err(err);
@@ -381,25 +462,30 @@ where
             }
         }
 
-        self.finish_copy_stream_batches(entry, payload_batch, txn, rows_inserted, reject_state)
+        self.finish_copy_stream_batches(entry, payload_batch, rows_inserted, reject_state, insert)
     }
 
     fn finish_copy_stream_batches(
         &self,
         entry: &TableEntry,
         payload_batch: &mut Vec<Vec<u8>>,
-        txn: &Transaction,
         mut rows_inserted: u64,
         reject_state: Option<&mut CopyRejectState>,
+        insert: CopyInsertTxn<'_>,
     ) -> Result<u64, ServerError> {
         if !payload_batch.is_empty() {
             add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
-            self.flush_copy_insert_batch(entry, payload_batch, txn)?;
+            self.flush_copy_insert_batch(
+                entry,
+                payload_batch,
+                insert.txn,
+                insert.mark_all_visible,
+            )?;
             payload_batch.clear();
         }
         if let Some(state) = reject_state {
             if let Some(target) = state.target.as_mut() {
-                self.flush_copy_reject_batch(target, txn)?;
+                self.flush_copy_reject_batch(target, insert)?;
             }
         }
         Ok(rows_inserted)
@@ -416,11 +502,21 @@ where
         if opts.format == ServerCopyFormat::Parquet {
             return self.copy_to_parquet_file(entry, columns, schema, path);
         }
-        let (bytes, rows) = if opts.format == ServerCopyFormat::Binary {
-            self.encode_table_binary_copy(entry, columns, schema)?
-        } else {
-            self.encode_table_textual_copy(entry, columns, opts)?
-        };
+        // `COPY ... TO '<path>'` is a read: in an explicit transaction it scans
+        // the session txn's (command-advanced) snapshot so it sees this
+        // session's own uncommitted writes, without begin/commit; in autocommit
+        // it runs today's implicit read txn. Borrow is synchronous (no await).
+        let (bytes, rows) = self.with_copy_read_snapshot(
+            "COPY TO file scan commit",
+            "COPY TO file rollback after scan error",
+            |session, snapshot| {
+                if opts.format == ServerCopyFormat::Binary {
+                    session.encode_table_binary_copy(entry, columns, schema, snapshot)
+                } else {
+                    session.encode_table_textual_copy(entry, columns, opts, snapshot)
+                }
+            },
+        )?;
         write_copy_output_file(path, &bytes)?;
         Ok(rows)
     }
@@ -449,7 +545,43 @@ where
         // Autocommit sessions (no overlay) get the committed snapshot
         // unchanged.
         let snapshot = self.effective_catalog_snapshot();
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        // Shape A: in an explicit transaction block the query reads against the
+        // SESSION txn (so it sees this session's own in-txn writes) and never
+        // commits/aborts it; in autocommit it opens today's implicit read txn.
+        // The whole lower+execute is synchronous below, so the session-txn
+        // borrow never crosses the trailing `.await` wire writes.
+        let session_mode = matches!(self.txn_state, crate::TxnState::InTransaction(_));
+        if session_mode && let crate::TxnState::InTransaction(txn) = &mut self.txn_state {
+            self.state.txn_manager.refresh_snapshot(txn);
+        }
+        let read_txn = if session_mode {
+            None
+        } else {
+            Some(self.state.txn_manager.begin(IsolationLevel::ReadCommitted))
+        };
+        // Borrow the read parameters (snapshot / xid / command / isolation) from
+        // whichever txn governs this read.
+        let (mvcc_snapshot, read_isolation, read_xid, read_command) = match &read_txn {
+            Some(txn) => (
+                txn.snapshot.clone(),
+                txn.isolation,
+                txn.current_xid(),
+                txn.current_command,
+            ),
+            None => {
+                let crate::TxnState::InTransaction(txn) = &self.txn_state else {
+                    return Err(ServerError::Unsupported(
+                        "COPY query session txn vanished mid-dispatch",
+                    ));
+                };
+                (
+                    txn.snapshot.clone(),
+                    txn.isolation,
+                    txn.current_xid(),
+                    txn.current_command,
+                )
+            }
+        };
         let ctx = crate::pipeline::LowerCtx {
             tables: &self.state.tables,
             catalog_snapshot: Arc::clone(&snapshot),
@@ -477,11 +609,11 @@ where
             advisory_state: Some(self.advisory_state.clone()),
             heap: Arc::clone(&self.state.heap),
             vm: Arc::clone(&self.state.vm),
-            snapshot: txn.snapshot.clone(),
-            isolation: txn.isolation,
+            snapshot: mvcc_snapshot,
+            isolation: read_isolation,
             oracle: Arc::clone(&self.state.txn_manager),
-            xid: txn.current_xid(),
-            command_id: txn.current_command,
+            xid: read_xid,
+            command_id: read_command,
             cte_buffers: std::collections::HashMap::new(),
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
@@ -497,14 +629,25 @@ where
         }) {
             Ok(result) => result,
             Err(e) => {
-                return Err(self.rollback_copy_transaction_after_error(
-                    txn,
-                    e,
-                    "COPY query rollback after execution error",
-                ));
+                // Session mode: a read error must NOT abort the session txn —
+                // propagate, and the dispatcher transitions the block to Failed
+                // via `fail_if_in_transaction`. Autocommit: roll back the
+                // implicit read txn as before.
+                return match read_txn {
+                    Some(txn) => Err(self.rollback_copy_transaction_after_error(
+                        txn,
+                        e,
+                        "COPY query rollback after execution error",
+                    )),
+                    None => Err(e),
+                };
             }
         };
-        self.finalise_read_transaction(txn, "COPY query transaction commit")?;
+        // Commit only the implicit autocommit read txn; the session txn stays
+        // open and untouched.
+        if let Some(txn) = read_txn {
+            self.finalise_read_transaction(txn, "COPY query transaction commit")?;
+        }
         let (payload, rows) = copy_rows_from_select_result(&result, schema, opts)?;
         match source {
             CopySource::Stdout => {
@@ -544,15 +687,20 @@ where
         }
     }
 
+    /// Encode the table to text/CSV bytes by scanning under `snapshot`.
+    ///
+    /// The transaction lifecycle (session-vs-autocommit begin/commit) is owned
+    /// by the caller via [`Session::with_copy_read_snapshot`]; this function is
+    /// a pure synchronous read against the supplied MVCC snapshot.
     fn encode_table_textual_copy(
         &self,
         entry: &TableEntry,
         columns: &[usize],
         opts: &CopyOptions,
+        snapshot: &ultrasql_mvcc::Snapshot,
     ) -> Result<(Vec<u8>, u64), ServerError> {
         let rel = RelationId(entry.oid);
         let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
         let mut out = Vec::new();
         let stream_schema = projected_schema(entry, columns)?;
@@ -579,7 +727,7 @@ where
         let scan = self.state.heap.scan_visible(
             rel,
             block_count,
-            &txn.snapshot,
+            snapshot,
             self.state.txn_manager.as_ref(),
         );
         for tuple in scan {
@@ -597,19 +745,20 @@ where
             }
             increment_copy_rows(&mut rows, "COPY TO file")?;
         }
-        self.finalise_read_transaction(txn, "COPY TO file scan commit")?;
         Ok((out, rows))
     }
 
+    /// Encode the table to the binary `PGCOPY` wire format by scanning under
+    /// `snapshot`. Like the textual encoder, the txn lifecycle is the caller's.
     pub(super) fn encode_table_binary_copy(
         &self,
         entry: &TableEntry,
         columns: &[usize],
         schema: &Schema,
+        snapshot: &ultrasql_mvcc::Snapshot,
     ) -> Result<(Vec<u8>, u64), ServerError> {
         let rel = RelationId(entry.oid);
         let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
         let mut out = Vec::new();
         append_binary_copy_header(&mut out);
@@ -617,7 +766,7 @@ where
         let scan = self.state.heap.scan_visible(
             rel,
             block_count,
-            &txn.snapshot,
+            snapshot,
             self.state.txn_manager.as_ref(),
         );
         for tuple in scan {
@@ -630,7 +779,6 @@ where
             increment_copy_rows(&mut rows, "binary COPY TO")?;
         }
         append_i16_be(&mut out, -1);
-        self.finalise_read_transaction(txn, "binary COPY scan commit")?;
         Ok((out, rows))
     }
 }

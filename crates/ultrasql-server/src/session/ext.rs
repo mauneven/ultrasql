@@ -428,6 +428,20 @@ where
             // which suppresses the trailing `ReadyForQuery` — the pipeline's
             // own `Sync` will emit one.
             if matches!(plan, LogicalPlan::Copy { .. }) {
+                // Failed-block guard (SQLSTATE 25P02). A COPY in an aborted
+                // transaction block must be rejected before it runs — and,
+                // crucially, before it would (pre-fix) open its own autocommit
+                // txn and durably commit rows inside the aborted block. The
+                // generic Failed-block guard below sits *after* this COPY branch,
+                // so COPY needs its own check here. Mark the extended pipeline
+                // failed (so the client's queued CopyData / next messages are
+                // skipped until Sync) and emit the error without a trailing
+                // ReadyForQuery — the pipeline's own Sync delivers it.
+                if matches!(self.txn_state, TxnState::Failed(_)) {
+                    let err = ServerError::TransactionAborted;
+                    self.extended.mark_failed();
+                    return self.send_error(&err.to_string(), err.sqlstate()).await;
+                }
                 return self.handle_copy_statement_extended(plan).await;
             }
         }

@@ -1144,6 +1144,82 @@ async fn copy_into_in_txn_created_table_is_self_visible() {
     shutdown(running).await;
 }
 
+// Battery #9 (atomicity): an in-txn `CREATE TABLE` + `COPY` that is then
+// ROLLBACK'd must leave neither the table nor the COPYed rows. Pre-fix the COPY
+// opened its OWN autocommit txn and durably committed its rows, so the rows
+// outlived the ROLLBACK (an ACID violation) even though the table itself was
+// discarded — a row surviving ROLLBACK is the bug this guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_into_in_txn_created_table_is_discarded_on_rollback() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "txddl_copy_rb").await;
+    let client = &running.client;
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("CREATE TABLE copy_rb_t (id INT NOT NULL, v TEXT)")
+        .await
+        .expect("in-txn create");
+
+    let sink = client
+        .copy_in::<_, Bytes>("COPY copy_rb_t FROM STDIN")
+        .await
+        .expect("COPY into self-created in-txn table establishes");
+    futures::pin_mut!(sink);
+    sink.as_mut()
+        .send(Bytes::from_static(b"1\ta\n2\tb\n3\tc\n"))
+        .await
+        .expect("send CopyData");
+    let copied = sink.finish().await.expect("finish copy_in");
+    assert_eq!(copied, 3, "COPY reports three rows ingested in-txn");
+
+    // Visible to this session before the rollback (self-visibility). Use a
+    // column scan (not COUNT(*)) so the aggregate cache is not seeded with the
+    // uncommitted count.
+    let rows = client
+        .query("SELECT id FROM copy_rb_t ORDER BY id", &[])
+        .await
+        .expect("self scan before rollback");
+    assert_eq!(rows.len(), 3);
+
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The table is gone (DDL rolled back) AND its COPYed rows did not survive.
+    let err = client
+        .query("SELECT count(*) FROM copy_rb_t", &[])
+        .await
+        .expect_err("rolled-back COPY table must be undefined");
+    assert!(is_undefined_table(&err), "expected 42P01, got {err}");
+
+    // Re-create the same table fresh (autocommit) and confirm it is empty — a
+    // belt-and-braces check that no rows leaked into a same-named relation.
+    client
+        .batch_execute("CREATE TABLE copy_rb_t (id INT NOT NULL, v TEXT)")
+        .await
+        .expect("recreate after rollback");
+    let rows = client
+        .query("SELECT count(*) FROM copy_rb_t", &[])
+        .await
+        .expect("count fresh table");
+    assert_eq!(
+        rows[0].get::<_, i64>(0),
+        0,
+        "no COPY rows survived ROLLBACK"
+    );
+
+    // Fresh connection also sees nothing durable.
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "txddl_copy_rb_b").await;
+    let rows = client_b
+        .query("SELECT count(*) FROM copy_rb_t", &[])
+        .await
+        .expect("fresh connection sees empty recreated table");
+    assert_eq!(rows[0].get::<_, i64>(0), 0);
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepare_execute_resolves_in_txn_created_table() {
     let data_dir = tempfile::TempDir::new().unwrap();

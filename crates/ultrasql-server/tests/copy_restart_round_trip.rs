@@ -107,6 +107,45 @@ async fn copy_from_stdin_rows_survive_restart() {
     shutdown(running).await;
 }
 
+// Battery #8: a crash mid-transaction (COPY issued, no COMMIT) must leave zero
+// rows on restart. The COPYed rows were written under the session xid, which
+// has no commit record, so WAL recovery treats them as aborted — they never
+// become durable. Pre-fix the COPY committed its OWN autocommit txn, so its
+// rows WOULD have survived the crash (durability/atomicity violation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_in_uncommitted_txn_does_not_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "copy_restart_uncommitted").await;
+    running
+        .client
+        .simple_query("CREATE TABLE copy_crash (id INT, label TEXT)")
+        .await
+        .expect("create table");
+    // Open an explicit transaction and COPY rows, but never COMMIT.
+    running.client.simple_query("BEGIN").await.expect("begin");
+    let copied = copy_in_payload(
+        &running.client,
+        "COPY copy_crash (id, label) FROM STDIN WITH (FORMAT csv)",
+        b"1,alpha\n2,bravo\n3,charlie\n",
+    )
+    .await;
+    assert_eq!(copied, 3);
+    assert_eq!(select_count(&running.client, "copy_crash").await, 3);
+    // Simulate a crash: tear the server down with the txn still open (no COMMIT).
+    shutdown(running).await;
+
+    // On restart the uncommitted COPY rows are gone; the table itself was
+    // created+committed by the autocommit DDL before BEGIN, so it survives.
+    let running = start_persistent_server(data_dir.path(), "copy_restart_uncommitted").await;
+    assert_eq!(
+        select_count(&running.client, "copy_crash").await,
+        0,
+        "uncommitted in-txn COPY rows must not survive a crash"
+    );
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_from_parquet_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();

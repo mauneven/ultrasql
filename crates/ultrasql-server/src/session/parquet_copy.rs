@@ -18,7 +18,7 @@ use ultrasql_executor::RowCodec;
 use ultrasql_txn::IsolationLevel;
 
 use super::Session;
-use super::copy::{add_copy_batch_rows, increment_copy_rows};
+use super::copy::{add_copy_batch_rows, copy_table_key, increment_copy_rows};
 use crate::error::ServerError;
 
 const PARQUET_COPY_BATCH_ROWS: usize = 4096;
@@ -41,61 +41,55 @@ where
 
         let rel = RelationId(entry.oid);
         let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
-        let mut batch = ParquetBatchBuilder::new(stream_schema)?;
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
-        let mut rows = 0_u64;
 
-        let scan_result = {
-            let scan = self.state.heap.scan_visible(
-                rel,
-                block_count,
-                &txn.snapshot,
-                self.state.txn_manager.as_ref(),
-            );
-            for tuple in scan {
-                let tuple = tuple
-                    .map_err(|err| ServerError::ddl(format!("COPY TO parquet heap scan: {err}")))?;
-                let row = codec.decode(&tuple.data).map_err(|err| {
-                    ServerError::CopyFormat(format!("COPY TO parquet row decode: {err}"))
-                })?;
-                batch.push_projected_row(&row, &entry.schema, columns)?;
-                if batch.len() == PARQUET_COPY_BATCH_ROWS {
+        // `COPY ... TO '<path>' (FORMAT parquet)` is a read: in an explicit
+        // transaction it scans the session txn's (command-advanced) snapshot so
+        // it sees this session's own in-txn writes, without begin/commit; in
+        // autocommit it runs today's implicit read txn. The whole scan + write
+        // is synchronous (parquet file I/O is blocking), so no borrow crosses an
+        // await. The Arrow writer is moved into the closure and closed there so
+        // a scan/write/close failure routes through the same finalisation.
+        let rows = self.with_copy_read_snapshot(
+            "COPY TO parquet scan commit",
+            "COPY TO parquet rollback after scan error",
+            move |session, snapshot| {
+                let mut batch = ParquetBatchBuilder::new(stream_schema)?;
+                let mut rows = 0_u64;
+                let scan = session.state.heap.scan_visible(
+                    rel,
+                    block_count,
+                    snapshot,
+                    session.state.txn_manager.as_ref(),
+                );
+                for tuple in scan {
+                    let tuple = tuple.map_err(|err| {
+                        ServerError::ddl(format!("COPY TO parquet heap scan: {err}"))
+                    })?;
+                    let row = codec.decode(&tuple.data).map_err(|err| {
+                        ServerError::CopyFormat(format!("COPY TO parquet row decode: {err}"))
+                    })?;
+                    batch.push_projected_row(&row, &entry.schema, columns)?;
+                    if batch.len() == PARQUET_COPY_BATCH_ROWS {
+                        let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
+                        writer.write(&record_batch).map_err(|err| {
+                            ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
+                        })?;
+                    }
+                    increment_copy_rows(&mut rows, "COPY TO parquet")?;
+                }
+                if !batch.is_empty() {
                     let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
                     writer.write(&record_batch).map_err(|err| {
                         ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
                     })?;
                 }
-                increment_copy_rows(&mut rows, "COPY TO parquet")?;
-            }
-            if !batch.is_empty() {
-                let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
-                writer.write(&record_batch).map_err(|err| {
+                writer.close().map_err(|err| {
                     ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
                 })?;
-            }
-            Ok(rows)
-        };
-
-        let rows = match scan_result {
-            Ok(rows) => rows,
-            Err(err) => {
-                return Err(self.rollback_copy_transaction_after_error(
-                    txn,
-                    err,
-                    "COPY TO parquet rollback after scan error",
-                ));
-            }
-        };
-
-        if let Err(err) = writer.close() {
-            return Err(self.rollback_copy_transaction_after_error(
-                txn,
-                ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}")),
-                "COPY TO parquet rollback after writer close error",
-            ));
-        }
-        self.finalise_read_transaction(txn, "COPY TO parquet scan commit")?;
+                Ok(rows)
+            },
+        )?;
         Ok(rows)
     }
 
@@ -118,53 +112,101 @@ where
                 ServerError::CopyFormat(format!("COPY FROM parquet cannot read {path}: {err}"))
             })?;
 
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        // Shape A: in an explicit transaction block the parquet import rides the
+        // SESSION txn so a later ROLLBACK discards its rows and a COMMIT makes
+        // them durable atomically; in autocommit it opens today's implicit txn.
+        // The parquet reader is blocking file I/O (no `.await`), so the session
+        // txn taken out here never has a borrow cross an await.
+        let session_mode = self.copy_in_session_txn();
+        let txn = if session_mode {
+            match std::mem::replace(&mut self.txn_state, crate::TxnState::Idle) {
+                crate::TxnState::InTransaction(mut txn) => {
+                    self.state.txn_manager.refresh_snapshot(&mut txn);
+                    txn
+                }
+                other => {
+                    self.txn_state = other;
+                    return Err(ServerError::Unsupported(
+                        "COPY FROM parquet session txn vanished mid-dispatch",
+                    ));
+                }
+            }
+        } else {
+            self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
+        };
         let codec = RowCodec::new(entry.schema.clone());
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(PARQUET_COPY_BATCH_ROWS);
         let mut rows_inserted = 0_u64;
 
         let import_result = {
-            for batch in reader {
-                let batch = batch.map_err(|err| {
-                    ServerError::CopyFormat(format!("COPY FROM parquet read {path}: {err}"))
-                })?;
-                validate_parquet_copy_schema(batch.schema().as_ref(), stream_schema, path)?;
-                for row_index in 0..batch.num_rows() {
-                    let row = parquet_batch_row_to_values(&batch, row_index, entry, columns)?;
-                    let payload = codec.encode(&row).map_err(|err| {
-                        ServerError::CopyFormat(format!("COPY FROM parquet row encode: {err}"))
+            (|| -> Result<u64, ServerError> {
+                for batch in reader {
+                    let batch = batch.map_err(|err| {
+                        ServerError::CopyFormat(format!("COPY FROM parquet read {path}: {err}"))
                     })?;
-                    payload_batch.push(payload);
-                    if payload_batch.len() == PARQUET_COPY_BATCH_ROWS {
-                        add_copy_batch_rows(
-                            &mut rows_inserted,
-                            payload_batch.len(),
-                            "COPY FROM parquet",
-                        )?;
-                        self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
-                        payload_batch.clear();
+                    validate_parquet_copy_schema(batch.schema().as_ref(), stream_schema, path)?;
+                    for row_index in 0..batch.num_rows() {
+                        let row = parquet_batch_row_to_values(&batch, row_index, entry, columns)?;
+                        let payload = codec.encode(&row).map_err(|err| {
+                            ServerError::CopyFormat(format!("COPY FROM parquet row encode: {err}"))
+                        })?;
+                        payload_batch.push(payload);
+                        if payload_batch.len() == PARQUET_COPY_BATCH_ROWS {
+                            add_copy_batch_rows(
+                                &mut rows_inserted,
+                                payload_batch.len(),
+                                "COPY FROM parquet",
+                            )?;
+                            self.flush_copy_insert_batch(
+                                entry,
+                                &payload_batch,
+                                &txn,
+                                !session_mode,
+                            )?;
+                            payload_batch.clear();
+                        }
                     }
                 }
-            }
-            if !payload_batch.is_empty() {
-                add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM parquet")?;
-                self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
-                payload_batch.clear();
-            }
-            Ok(rows_inserted)
+                if !payload_batch.is_empty() {
+                    add_copy_batch_rows(
+                        &mut rows_inserted,
+                        payload_batch.len(),
+                        "COPY FROM parquet",
+                    )?;
+                    self.flush_copy_insert_batch(entry, &payload_batch, &txn, !session_mode)?;
+                    payload_batch.clear();
+                }
+                Ok(rows_inserted)
+            })()
         };
 
         let rows = match import_result {
             Ok(rows) => rows,
             Err(err) => {
-                return Err(self.rollback_copy_transaction_after_error(
+                return Err(self.fail_or_rollback_copy_from(
+                    session_mode,
                     txn,
                     err,
                     "COPY FROM parquet rollback after import error",
                 ));
             }
         };
-        self.finalise_copy_from_commit(txn, rows, "COPY FROM parquet")?;
+        if session_mode {
+            // Park the session txn back FIRST, then note the table (see the text
+            // STDIN path for the full rationale): `note_copy_in_session` touches
+            // only `self.pending_table_modifications`, valid after the park, and
+            // an overflow error then routes through `fail_if_in_transaction` (a
+            // real `Failed(txn)` transition) rather than dropping the owned txn
+            // and leaving the session `Idle`.
+            self.txn_state = crate::TxnState::InTransaction(txn);
+            self.note_copy_in_session(&copy_table_key(entry), rows)
+                .map_err(|e| self.fail_if_in_transaction(e))?;
+        } else {
+            // Autocommit parquet COPY keeps its prior finalisation byte-for-byte
+            // (the caller `copy_from_file` notes GC + table modifications +
+            // plan-cache invalidation after this returns).
+            self.finalise_copy_from_commit(txn, rows, "COPY FROM parquet")?;
+        }
         Ok(rows)
     }
 }

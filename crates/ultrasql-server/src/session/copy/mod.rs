@@ -78,7 +78,7 @@ fn copy_rows_from_usize(rows: usize, context: &str) -> Result<u64, ServerError> 
     u64::try_from(rows).map_err(|_| copy_row_count_overflow(context))
 }
 
-fn copy_table_key(entry: &TableEntry) -> String {
+pub(in crate::session) fn copy_table_key(entry: &TableEntry) -> String {
     table_lookup_key(&entry.schema_name, &entry.name)
 }
 
@@ -131,6 +131,11 @@ struct CopyTextFileStreamArgs<'a> {
     payload_batch: &'a mut Vec<Vec<u8>>,
     reject_state: Option<&'a mut CopyRejectState>,
     path: &'a str,
+    /// Whether freshly bulk-filled pages may be stamped all-visible. `true`
+    /// only for autocommit COPY (the implicit txn commits immediately); `false`
+    /// when riding the open session txn, whose uncommitted rows must stay
+    /// MVCC-governed so a ROLLBACK still discards them.
+    mark_all_visible: bool,
 }
 
 struct CopyRowDecodeContext<'a> {
@@ -139,4 +144,15 @@ struct CopyRowDecodeContext<'a> {
     schema: &'a Schema,
     codec: &'a RowCodec,
     jsonb_shape_cache: &'a mut JsonbShapeCache,
+}
+
+/// The transaction a COPY batch inserts under, plus whether freshly bulk-filled
+/// pages may be stamped all-visible (autocommit only — see
+/// [`Session::flush_copy_insert_batch`]). The two always travel together, so
+/// they ride in one bundle to keep the reject-row helpers under the argument
+/// budget.
+#[derive(Clone, Copy)]
+struct CopyInsertTxn<'a> {
+    txn: &'a Transaction,
+    mark_all_visible: bool,
 }

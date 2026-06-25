@@ -32,6 +32,144 @@ where
             .commit_transaction(txn, rows_changed > 0, context)
     }
 
+    /// Whether the COPY handler should run inside the open session
+    /// transaction (Shape A) rather than its own autocommit txn.
+    ///
+    /// `true` only when `self.txn_state` is `InTransaction`. `Failed` is
+    /// guarded earlier (25P02) and `Idle` is the autocommit path.
+    pub(in crate::session) fn copy_in_session_txn(&self) -> bool {
+        matches!(self.txn_state, TxnState::InTransaction(_))
+    }
+
+    /// Finalise a `COPY ... FROM` after a successful import.
+    ///
+    /// - Autocommit (`Idle`): today's path — validate deferred FKs against
+    ///   the implicit txn, commit it, then note GC + table modifications so
+    ///   autovacuum/columnar shadows stay in sync.
+    /// - Session (`InTransaction`): do **not** commit and do **not** validate
+    ///   deferred FKs here. COMMIT's `execute_commit` already validates the
+    ///   deferred FKs (via `pending_table_modifications`) and rebuilds the
+    ///   column cache for the COPY-touched table; route the table through
+    ///   `pending_table_modifications` so that machinery covers it, and leave
+    ///   the session txn intact in `self.txn_state`.
+    ///
+    /// `txn` is consumed by value in the autocommit branch; in the session
+    /// branch the caller keeps ownership of the session txn, so this takes
+    /// only the table key + row count.
+    pub(in crate::session) fn finalise_copy_from_autocommit(
+        &mut self,
+        txn: Transaction,
+        table_key: &str,
+        rows_changed: u64,
+        context: &'static str,
+    ) -> Result<(), ServerError> {
+        if rows_changed > 0
+            && let Err(e) = self.state.validate_deferred_foreign_keys(&txn)
+        {
+            return Err(self.rollback_copy_transaction_after_error(
+                txn,
+                e,
+                "COPY FROM autocommit rollback after deferred FK violation",
+            ));
+        }
+        self.finalise_copy_from_commit(txn, rows_changed, context)?;
+        self.state.note_commit_for_gc();
+        self.state.note_table_modifications(table_key, rows_changed);
+        self.plan_cache_invalidate();
+        Ok(())
+    }
+
+    /// Run a `COPY ... TO` read body against the correct MVCC snapshot and
+    /// finalise the read transaction per mode.
+    ///
+    /// - Session mode (`InTransaction`): refresh the session txn's snapshot
+    ///   (advancing `current_command`, so the read sees prior in-txn writes
+    ///   such as a just-issued `INSERT`), then scan against that snapshot. No
+    ///   `begin`/`commit` — the session txn stays open and untouched. On a scan
+    ///   error this function does NOT abort the session txn and does NOT itself
+    ///   transition the block to `Failed`; it simply propagates the error to its
+    ///   caller with the txn left in place. For the STDOUT path the
+    ///   `CopyOutResponse` has already been written to the wire by the time the
+    ///   body runs, so a mid-COPY-out error cannot be cleanly turned into an
+    ///   in-band ErrorResponse + RFQ: it bubbles up out of `handle_copy_statement`
+    ///   and `run()`, terminating the connection (the session txn then dies with
+    ///   the connection — there is no surviving session to leave in a `Failed`
+    ///   block). This is unlike the COPY-FROM write paths, which DO park the txn
+    ///   back as `Failed` on error.
+    /// - Autocommit mode (`Idle`): today's path — open an implicit
+    ///   ReadCommitted read txn, scan against its snapshot, and commit it on
+    ///   success or roll it back on error.
+    ///
+    /// `body` is purely synchronous (heap scan + encode), so the borrow of the
+    /// session txn never crosses an `.await`.
+    pub(in crate::session) fn with_copy_read_snapshot<T>(
+        &mut self,
+        commit_context: &'static str,
+        rollback_context: &'static str,
+        body: impl FnOnce(&Self, &ultrasql_mvcc::Snapshot) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
+        if matches!(self.txn_state, TxnState::InTransaction(_)) {
+            // Refresh in place so `current_command` advances and the read sees
+            // this session's own uncommitted writes.
+            let snapshot = if let TxnState::InTransaction(txn) = &mut self.txn_state {
+                self.state.txn_manager.refresh_snapshot(txn);
+                txn.snapshot.clone()
+            } else {
+                unreachable!("guarded by matches! above")
+            };
+            // The error path must NOT abort the session txn and does NOT
+            // transition the block to `Failed` here — it propagates out (the
+            // CopyOut subprotocol is already on the wire, so the error bubbles
+            // up out of `run()` and terminates the connection; see the doc
+            // comment above). The session txn is left in place; it dies with the
+            // connection.
+            body(self, &snapshot)
+        } else {
+            let txn = self
+                .state
+                .txn_manager
+                .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+            let snapshot = txn.snapshot.clone();
+            match body(self, &snapshot) {
+                Ok(value) => {
+                    self.finalise_read_transaction(txn, commit_context)?;
+                    Ok(value)
+                }
+                Err(err) => {
+                    Err(self.rollback_copy_transaction_after_error(txn, err, rollback_context))
+                }
+            }
+        }
+    }
+
+    /// Record a successful in-session `COPY ... FROM` so the eventual
+    /// COMMIT's deferred-FK validation and column-cache invalidation cover
+    /// the COPY-touched table (R2). Mirrors the bookkeeping
+    /// `note_dml_effect` performs for an in-txn INSERT, but COPY has no
+    /// `LogicalPlan` here so the table key is threaded directly.
+    pub(in crate::session) fn note_copy_in_session(
+        &mut self,
+        table_key: &str,
+        rows_changed: u64,
+    ) -> Result<(), ServerError> {
+        if rows_changed == 0 {
+            return Ok(());
+        }
+        let table = table_key.to_ascii_lowercase();
+        let current = self
+            .pending_table_modifications
+            .get(&table)
+            .copied()
+            .unwrap_or(0);
+        let total = current.checked_add(rows_changed).ok_or_else(|| {
+            ServerError::Execute(ultrasql_executor::ExecError::NumericFieldOverflow(
+                "COPY pending DML row count overflow".to_owned(),
+            ))
+        })?;
+        self.pending_table_modifications.insert(table, total);
+        Ok(())
+    }
+
     pub(in crate::session) fn rollback_copy_transaction_after_error(
         &self,
         txn: Transaction,
@@ -39,6 +177,37 @@ where
         context: &'static str,
     ) -> ServerError {
         self.rollback_transaction_after_error(txn, original, context)
+    }
+
+    /// Error finaliser for a `COPY ... FROM` import.
+    ///
+    /// - Session mode (`InTransaction`, txn taken out into a local): transition
+    ///   the block to `Failed` so the next statement gets 25P02 and the user's
+    ///   ROLLBACK discards every COPY row. Crucially we do **not** abort the
+    ///   session txn here — the rows stay InProgress under the live session xid
+    ///   and are discarded only when the user issues ROLLBACK (or COMMIT, which
+    ///   a failed block treats as ROLLBACK). Returns the original error
+    ///   verbatim; the caller still drains the wire and reports it.
+    /// - Autocommit mode (`Idle`): today's path — roll back and abort the
+    ///   single implicit txn so a mid-stream error leaves zero rows.
+    ///
+    /// `txn` is the owned transaction handle the caller has been threading.
+    pub(in crate::session) fn fail_or_rollback_copy_from(
+        &mut self,
+        session_mode: bool,
+        txn: Transaction,
+        original: ServerError,
+        autocommit_context: &'static str,
+    ) -> ServerError {
+        if session_mode {
+            // The txn was taken out of `self.txn_state`; park it back as the
+            // failed block. Equivalent to `fail_if_in_transaction` but the txn
+            // is owned here rather than living in `self.txn_state`.
+            self.txn_state = TxnState::Failed(txn);
+            original
+        } else {
+            self.rollback_copy_transaction_after_error(txn, original, autocommit_context)
+        }
     }
 
     /// Best-effort parse + bind that returns `Some(plan)` only when `sql`
@@ -153,6 +322,16 @@ where
                 "handle_copy_statement called with non-Copy plan",
             ));
         };
+
+        // Failed-block guard (SQLSTATE 25P02). A statement issued while the
+        // surrounding explicit transaction is aborted must be rejected before
+        // it runs — for COPY this matters doubly because, pre-fix, COPY opened
+        // its OWN autocommit txn and so durably committed rows *inside* an
+        // aborted block. Reject here, before any wire negotiation or txn work,
+        // exactly like the DML/SELECT path does in `execute_query`.
+        if matches!(self.txn_state, TxnState::Failed(_)) {
+            return Err(ServerError::TransactionAborted);
+        }
 
         // Read-only transaction enforcement (SQLSTATE 25006): `COPY ... FROM`
         // writes rows into a table. `COPY ... TO` is a read and is allowed.
