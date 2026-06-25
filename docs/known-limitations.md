@@ -19,9 +19,11 @@ completed evidence.
 - Some SQL data types are partial or missing, including full XML namespace /
   full `XMLTABLE` coverage beyond the first secure projection subset, full
   locale/collation behavior, and domain/composite type breadth.
-- Transactional DDL is partial (milestones 1–3). `CREATE TABLE` (including with
-  `PRIMARY KEY` / `UNIQUE`) and `CREATE INDEX` (plain single/composite B-tree, on an
-  existing table) now work inside an explicit `BEGIN…COMMIT` block via a
+- Transactional DDL is partial (milestones 1–4). `CREATE TABLE` (including with
+  `PRIMARY KEY` / `UNIQUE`), `CREATE INDEX` (plain single/composite B-tree, on an
+  existing table), and the catalog-only `ALTER TABLE` subset (`RENAME TABLE`/`COLUMN`,
+  `ALTER COLUMN SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `SET (options)`) now work
+  inside an explicit `BEGIN…COMMIT` block via a
   per-transaction catalog overlay: the issuing transaction sees the change, other
   sessions do not until `COMMIT`, the durable catalog rows ride the user xid (so
   `ROLLBACK` and crash recovery discard them — MVCC-invisible and hidden by the
@@ -41,11 +43,13 @@ completed evidence.
   `0A000` + `HINT`, block then `Failed`/`25P02`) inside a transaction: `FOREIGN KEY`,
   `serial`/`IDENTITY`/`DEFAULT nextval`, `CREATE TABLE AS SELECT`, `TEMP`,
   `PARTITION BY`, expression/partial/INCLUDE or non-B-tree `CREATE INDEX`,
-  `CREATE INDEX … CONCURRENTLY`,
-  DDL under an active `SAVEPOINT`, and `PREPARE TRANSACTION` over an uncommitted
-  in-txn DDL. **All other DDL** (`DROP`, `ALTER`, `GRANT`, `CREATE ROLE`, etc.) is
-  still rejected `0A000` inside a transaction; autocommit DDL is unchanged. Later
-  milestones add `DROP`/`ALTER` and two-phase commit,
+  `CREATE INDEX … CONCURRENTLY`, the heap-rewriting / index-building `ALTER` actions
+  (`ADD`/`DROP COLUMN`, `ALTER TYPE`, `ADD`/`DROP CONSTRAINT`, `ENABLE RLS`), `ALTER`
+  of a time-partitioned table, DDL under an active `SAVEPOINT`, and
+  `PREPARE TRANSACTION` over an uncommitted in-txn DDL. **All other DDL** (`DROP`,
+  `GRANT`, `CREATE ROLE`, the out-of-subset `ALTER` actions above, etc.) is still
+  rejected `0A000` inside a transaction; autocommit DDL is unchanged. Later
+  milestones add `DROP`, the heap-rewriting `ALTER` actions, and two-phase commit,
   per [Transactional DDL Design](transactional-ddl-design.md), each behind the
   adversarial battery.
 - Latent catalog-bootstrap corruption vector (crash-recovery durability): even
