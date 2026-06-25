@@ -5364,3 +5364,142 @@ async fn in_txn_drop_via_extended_protocol_commits() {
     assert!(is_undefined_table(&err), "expected 42P01, got {err}");
     shutdown(running).await;
 }
+
+// ──────────────────── Plan-cache cross-session isolation ────────────────────
+// The server-wide plan cache is keyed ONLY by raw SQL text, so a plan it stores
+// must be valid for EVERY session that runs that text. When a session has an
+// active in-txn catalog overlay (an in-txn ALTER/CREATE/DROP), its DML plans are
+// built against the UNCOMMITTED overlay schema and must NEVER enter the shared
+// cache — else a concurrent session running the identical SQL text would get a
+// cache hit and execute the uncommitted schema (a cross-session isolation
+// breach). The fix bypasses the shared cache entirely while the overlay is
+// active (no read, no write); COMMIT invalidates the whole cache so other
+// sessions re-plan against the NEW committed schema.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_cache_does_not_leak_in_txn_alter_plan_cross_session() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "plc_leak_a").await;
+    let client = &running.client;
+
+    // Committed baseline: table `plc` with column `c`.
+    client
+        .batch_execute("CREATE TABLE plc(c int)")
+        .await
+        .expect("autocommit create");
+    client
+        .batch_execute("INSERT INTO plc VALUES (1)")
+        .await
+        .expect("seed row");
+
+    // A second connection, never in a transaction.
+    let (client_b, b_handle) = connect_as(running.bound, "tester", "plc_leak_b").await;
+
+    // A begins a txn and renames the column in-txn; the overlay is now active.
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE plc RENAME COLUMN c TO d")
+        .await
+        .expect("in-txn rename column");
+    // A builds + runs an overlay plan for the renamed column (cache-bypassed).
+    let rows = client
+        .query("SELECT d FROM plc", &[])
+        .await
+        .expect("A sees its own in-txn rename");
+    assert_eq!(rows.len(), 1, "A sees the seeded row under the new name");
+
+    // CONCURRENTLY: B (no txn) must see the COMMITTED schema, not A's overlay.
+    // `SELECT c FROM plc` MUST succeed (committed column `c` still exists) —
+    // this is the leak that the bug produced (a cache HIT on A's overlay plan
+    // would surface as 42703 for column `c`). And `SELECT d FROM plc` MUST fail
+    // 42703 — B must not see A's uncommitted rename.
+    let rows_b = client_b
+        .query("SELECT c FROM plc", &[])
+        .await
+        .expect("B sees committed column c (no leak of A's overlay plan)");
+    assert_eq!(rows_b.len(), 1, "B reads the committed row");
+    let err_b = client_b
+        .query("SELECT d FROM plc", &[])
+        .await
+        .expect_err("B must NOT see A's uncommitted rename to d");
+    assert!(
+        is_undefined_column(&err_b),
+        "expected 42703 for B's SELECT d, got {err_b}"
+    );
+
+    // A commits: the rename is now the committed schema; the whole plan cache is
+    // invalidated so B re-plans against the new schema.
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    // After commit, B sees the new column `d` and `c` is gone — proving the
+    // cache was invalidated rather than serving B a plan built over the OLD
+    // schema.
+    let rows_b = client_b
+        .query("SELECT d FROM plc", &[])
+        .await
+        .expect("after commit B sees renamed column d (cache invalidated)");
+    assert_eq!(rows_b.len(), 1, "B reads the row under the committed name");
+    let err_b = client_b
+        .query("SELECT c FROM plc", &[])
+        .await
+        .expect_err("after commit the old column c is gone for B");
+    assert!(
+        is_undefined_column(&err_b),
+        "expected 42703 for B's SELECT c after commit, got {err_b}"
+    );
+
+    drop(client_b);
+    let _ = b_handle.await;
+    shutdown(running).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_txn_alter_session_sees_own_schema_not_stale_cached_plan() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let running = start_persistent_server(data_dir.path(), "plc_stale_a").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE plc(c int)")
+        .await
+        .expect("autocommit create");
+    client
+        .batch_execute("INSERT INTO plc VALUES (7)")
+        .await
+        .expect("seed row");
+
+    // Pre-warm the shared cache with the committed-schema plan for `SELECT c`.
+    let rows = client
+        .query("SELECT c FROM plc", &[])
+        .await
+        .expect("pre-warm committed plan for SELECT c");
+    assert_eq!(rows.len(), 1);
+
+    // In-txn rename, then the SAME-text SELECT against the NEW name must build a
+    // fresh overlay plan (the cache is bypassed while the overlay is active) —
+    // A is NOT served the stale committed plan that ignores its own DDL.
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("ALTER TABLE plc RENAME COLUMN c TO d")
+        .await
+        .expect("in-txn rename column");
+    let rows = client
+        .query("SELECT d FROM plc", &[])
+        .await
+        .expect("A sees its own rename (fresh overlay plan, not stale cache)");
+    assert_eq!(rows.len(), 1, "A reads the seeded row under the new name");
+
+    // The old name `c` is gone for A in-txn: the pre-warmed `SELECT c` plan must
+    // NOT be served from the shared cache while the overlay is active.
+    let err = client
+        .query("SELECT c FROM plc", &[])
+        .await
+        .expect_err("in-txn, the pre-rename column c must be gone for A");
+    assert!(
+        is_undefined_column(&err),
+        "expected 42703 for in-txn SELECT c, got {err}"
+    );
+
+    client.batch_execute("COMMIT").await.expect("commit");
+    shutdown(running).await;
+}

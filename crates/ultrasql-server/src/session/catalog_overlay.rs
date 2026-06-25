@@ -250,6 +250,37 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    /// The transactional-DDL catalog overlay that is ACTIVE for THIS session
+    /// this statement, if any: the pending overlay, but only when it is bound
+    /// to the active transaction's xid.
+    ///
+    /// This is the single source of truth for "the session is reading an
+    /// uncommitted, overlay-resolved catalog". [`Self::effective_catalog_snapshot`]
+    /// folds the overlay only when this returns `Some`, and the DML plan path
+    /// bypasses the server-wide plan cache only when this returns `Some` (an
+    /// overlay-built plan must never enter the shared, SQL-text-keyed cache, or
+    /// a concurrent session running the identical SQL text would be served the
+    /// uncommitted schema — a cross-session isolation breach).
+    fn active_catalog_overlay(&self) -> Option<&CatalogOverlay> {
+        let overlay = self.pending_catalog_ddl.as_ref()?;
+        // The overlay is only valid for the transaction that created it. If the
+        // active transaction's xid does not match (which should not happen —
+        // the overlay is cleared at COMMIT/ROLLBACK), it is inert: callers fall
+        // back to the committed snapshot rather than leak a foreign
+        // transaction's pending schema.
+        let active_xid = match &self.txn_state {
+            TxnState::InTransaction(txn) | TxnState::Failed(txn) => Some(txn.xid),
+            TxnState::Idle => None,
+        };
+        (active_xid == Some(overlay.xid)).then_some(overlay)
+    }
+
+    /// Whether a transactional-DDL catalog overlay is active for THIS session
+    /// this statement (see [`Self::active_catalog_overlay`]).
+    pub(crate) fn catalog_overlay_active(&self) -> bool {
+        self.active_catalog_overlay().is_some()
+    }
+
     /// The catalog snapshot the binder / planner must read for THIS session
     /// this statement.
     ///
@@ -263,21 +294,9 @@ where
     /// how the others-no isolation guarantee holds.
     pub(crate) fn effective_catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
         let base = self.state.catalog_snapshot();
-        let Some(overlay) = self.pending_catalog_ddl.as_ref() else {
+        let Some(overlay) = self.active_catalog_overlay() else {
             return base;
         };
-        // The overlay is only valid for the transaction that created it.
-        // If the active transaction's xid does not match (which should not
-        // happen — the overlay is cleared at COMMIT/ROLLBACK), fall back to
-        // the committed snapshot rather than leak a foreign transaction's
-        // pending schema.
-        let active_xid = match &self.txn_state {
-            TxnState::InTransaction(txn) | TxnState::Failed(txn) => Some(txn.xid),
-            TxnState::Idle => None,
-        };
-        if active_xid != Some(overlay.xid) {
-            return base;
-        }
         Arc::new(base.with_overlay(
             &overlay.created_tables,
             &overlay.indexes,

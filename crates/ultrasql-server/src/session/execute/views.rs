@@ -36,6 +36,26 @@ where
     /// path (see [`Self::plan_cache_invalidate`]), so concurrent DDL
     /// cannot serve a stale plan.
     ///
+    /// # Catalog-overlay bypass (cross-session isolation)
+    ///
+    /// The server-wide plan cache is keyed ONLY by SQL text, so a plan it
+    /// stores must be valid for EVERY session that runs that text. When this
+    /// session has an active transactional-DDL overlay
+    /// ([`Self::catalog_overlay_active`]), the incoming plan was bound against
+    /// the OVERLAY (uncommitted, in-txn schema). Such a plan must never enter
+    /// the shared cache — a concurrent session running the identical SQL would
+    /// get a cache hit and execute the uncommitted schema (an isolation
+    /// breach). Conversely, reading the cache while an overlay is active could
+    /// serve THIS session a stale committed plan that ignores its own in-txn
+    /// DDL. So while the overlay is active we BYPASS the cache entirely — no
+    /// read, no write — and plan fresh against the effective (overlay) catalog
+    /// each time. COMMIT invalidates the whole cache
+    /// (`commit_pending_catalog_ddl` → `plan_cache_invalidate`), so once the
+    /// overlay commits, other sessions re-plan against the new committed schema
+    /// rather than serving a plan built over the old one. Non-overlay sessions
+    /// (autocommit, or in-txn with no pending DDL) use the shared cache exactly
+    /// as before — the hot path is byte-for-byte unchanged.
+    ///
     /// # Errors
     ///
     /// Wraps [`OptimizeError`] into [`ServerError::Plan`] via a synthetic
@@ -50,10 +70,28 @@ where
         plan: LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<LogicalPlan, ServerError> {
-        let key = PlanCacheKey::named(sql.to_owned());
         let stats = ServerStatsSource {
             stats_catalog: &self.state.stats_catalog,
         };
+        let map_err = |e| {
+            ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+                "optimizer failed: {e}"
+            )))
+        };
+        // While a transactional-DDL overlay is active, the incoming plan was
+        // bound against the uncommitted overlay schema. Bypass the shared,
+        // SQL-text-keyed cache entirely (no read, no write) and plan fresh, so
+        // the overlay plan never leaks to a concurrent session and this session
+        // is never served a stale committed plan. See the method doc.
+        if self.catalog_overlay_active() {
+            return ultrasql_optimizer::optimize(
+                plan,
+                catalog_snapshot,
+                &stats as &dyn StatsSource,
+            )
+            .map_err(map_err);
+        }
+        let key = PlanCacheKey::named(sql.to_owned());
         let snapshot = Arc::clone(catalog_snapshot);
         // The closure is invoked only on cache miss; on a hit the cached
         // plan is returned and the plan we received here is dropped.
@@ -65,11 +103,7 @@ where
             .get_or_plan(&key, &[], move |_params| {
                 ultrasql_optimizer::optimize(plan, &snapshot, &stats as &dyn StatsSource)
             })
-            .map_err(|e| {
-                ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
-                    "optimizer failed: {e}"
-                )))
-            })
+            .map_err(map_err)
     }
 
     pub(crate) fn prepare_regular_view_plan(
