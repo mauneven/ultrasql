@@ -884,6 +884,21 @@ fn bind_set_op(
         .collect();
     let schema = Schema::new_with_duplicate_names(fields?);
 
+    // Each side may carry a column whose physical width differs from the
+    // unified `out_ty` (e.g. an `int4` column unified with `int8` into
+    // `int8`). Wrap such a side in a `Project` that casts every differing
+    // column to `out_ty`. Without this both correctness paths break:
+    //   * `UNION`/`UNION ALL` ERROR in the columnar batch builder, which
+    //     refuses to stack two children of different physical width
+    //     ("expected Int64, got Int32"); and
+    //   * `INTERSECT`/`EXCEPT` SILENTLY RETURN WRONG ROWS, because the
+    //     executor's `RowKey`/`Value` equality has no cross-width arm
+    //     (`Int32(1) != Int64(1)`), so equal values across widths never
+    //     match and rows are dropped with no error.
+    // Casting both sides to `out_ty` makes every comparison same-width.
+    let left = cast_set_op_side(left, &schema);
+    let right = cast_set_op_side(right, &schema);
+
     let logical_op = match op {
         SetOp::Union => LogicalSetOp::Union,
         SetOp::Intersect => LogicalSetOp::Intersect,
@@ -901,6 +916,68 @@ fn bind_set_op(
         right: Box::new(right),
         schema,
     })
+}
+
+/// Wrap `side` in a `Project` that casts every column whose type differs
+/// from the matching column in the unified set-op `target` schema.
+///
+/// When every column already matches `target` the side is returned
+/// unchanged, so same-width set operations (the common case) gain no
+/// extra `Project` node and the plan does not bloat.
+fn cast_set_op_side(side: LogicalPlan, target: &Schema) -> LogicalPlan {
+    let side_schema = side.schema();
+    let needs_cast = side_schema
+        .fields()
+        .iter()
+        .zip(target.fields().iter())
+        .any(|(sf, tf)| sf.data_type != tf.data_type);
+    if !needs_cast {
+        return side;
+    }
+
+    let exprs: Vec<(ScalarExpr, String)> = side_schema
+        .fields()
+        .iter()
+        .zip(target.fields().iter())
+        .enumerate()
+        .map(|(index, (sf, tf))| {
+            let column = ScalarExpr::Column {
+                name: sf.name.clone(),
+                index,
+                data_type: sf.data_type.clone(),
+            };
+            // Keep the side's own column name; only the type is unified.
+            let out_name = sf.name.clone();
+            if sf.data_type == tf.data_type {
+                return (column, out_name);
+            }
+            // A `Null`-typed column carries only NULLs, which compare and
+            // hash identically at any width, so `bind_runtime_cast`
+            // declines it. Re-type the column reference to the unified
+            // type so the columnar batch builder still aligns widths.
+            let casted = expr_bind::bind_runtime_cast(column.clone(), &tf.data_type, &sf.data_type)
+                .unwrap_or(ScalarExpr::Column {
+                    name: sf.name.clone(),
+                    index,
+                    data_type: tf.data_type.clone(),
+                });
+            (casted, out_name)
+        })
+        .collect();
+
+    let projected_schema = Schema::new_with_duplicate_names(
+        side_schema
+            .fields()
+            .iter()
+            .zip(target.fields().iter())
+            .map(|(sf, tf)| Field::nullable(sf.name.clone(), tf.data_type.clone())),
+    );
+
+    LogicalPlan::Project {
+        input: Box::new(side),
+        exprs,
+        schema: projected_schema,
+    }
 }
 
 /// The core `SELECT` body binding: FROM → WHERE → GROUP BY → HAVING →
