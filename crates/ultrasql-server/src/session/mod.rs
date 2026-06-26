@@ -58,6 +58,16 @@ pub(crate) struct Session<RW> {
     pub(super) current_user: String,
     pub(super) extended: ExtendedConnState,
     pub(super) txn_state: TxnState,
+    /// Transaction-start instant (engine-epoch micros) for an explicit
+    /// transaction block, captured when the block's first command (`BEGIN`)
+    /// runs and held until the block ends.
+    ///
+    /// PostgreSQL pins `now()` / `current_timestamp` / `current_date` to this
+    /// instant for every statement in the transaction. `None` outside an
+    /// explicit block — autocommit statements use their own statement-start
+    /// instant as the transaction timestamp (each statement is its own
+    /// implicit transaction). Cleared on COMMIT / ROLLBACK / error rollback.
+    pub(super) txn_start_micros: Option<i64>,
     /// Per-session parse+bind cache for Simple Query traffic.
     ///
     /// Key: trimmed SQL text. Value: `Arc`-wrapped `LogicalPlan` — the
@@ -204,6 +214,7 @@ where
             current_user: "tester".to_owned(),
             extended: crate::extended::ExtendedConnState::new(),
             txn_state: TxnState::Idle,
+            txn_start_micros: None,
             pid,
             secret,
             cancel_flag,

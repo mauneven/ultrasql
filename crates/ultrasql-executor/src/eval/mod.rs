@@ -476,6 +476,7 @@ fn eval_function_call(
 mod arithmetic;
 mod bitwise;
 mod compare;
+pub mod eval_clock;
 mod functions_array;
 mod functions_array_ops;
 mod functions_cast;

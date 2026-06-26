@@ -84,7 +84,7 @@ pub(crate) fn eval_now(args: &[Value], return_type: &DataType) -> Result<Value, 
             args.len()
         )));
     }
-    let micros = current_engine_timestamp_micros();
+    let micros = transaction_start_timestamp_micros();
     if matches!(return_type, DataType::Timestamp) {
         Ok(Value::Timestamp(micros))
     } else {
@@ -99,7 +99,7 @@ pub(crate) fn eval_current_date(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let days = current_engine_timestamp_micros().div_euclid(MICROS_PER_DAY);
+    let days = transaction_start_timestamp_micros().div_euclid(MICROS_PER_DAY);
     Ok(Value::Date(i32::try_from(days).unwrap_or(i32::MAX)))
 }
 
@@ -484,6 +484,19 @@ pub(crate) fn current_engine_timestamp_micros() -> i64 {
         .unwrap_or(0);
     let unix_micros = i64::try_from(unix_micros).unwrap_or(i64::MAX);
     unix_micros.saturating_sub(UNIX_TO_ENGINE_EPOCH_MICROS)
+}
+
+/// Engine-epoch micros pinned for the transaction-start builtins
+/// (`now()` / `current_timestamp` / `current_date`).
+///
+/// Reads the statement-scoped [`EvalClock`](super::eval_clock) the server
+/// installs at statement dispatch so every row of every statement in a
+/// transaction observes the same instant (PostgreSQL semantics). Falls back
+/// to the live engine clock when no clock is installed — the path taken by
+/// constraint-default evaluation, embedded helpers, and unit tests, which
+/// preserves the prior live-wall-clock behavior.
+fn transaction_start_timestamp_micros() -> i64 {
+    super::eval_clock::txn_start_micros().unwrap_or_else(current_engine_timestamp_micros)
 }
 
 pub(crate) fn is_leap_year(year: i32) -> bool {

@@ -18,6 +18,42 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Install the statement-scoped evaluation clock for one statement and
+    /// return its RAII guard.
+    ///
+    /// The clock pins the stable date/time builtins for the executor:
+    ///
+    /// - `txn_start_micros`: the transaction-start instant read by `now()` /
+    ///   `current_timestamp` / `current_date`. Inside an explicit block it is
+    ///   the instant captured at `BEGIN` (PostgreSQL: the block's first
+    ///   command), so every statement in the block observes the same value.
+    ///   In autocommit each statement is its own implicit transaction, so the
+    ///   transaction-start instant is this statement's start instant.
+    /// - `stmt_start_micros`: this statement's start instant, captured fresh
+    ///   on every call and always `>= txn_start_micros`.
+    ///
+    /// The guard must be held for the whole statement execution; the clock is
+    /// uninstalled (restoring the live-wall-clock fallback) when it drops.
+    pub(crate) fn install_statement_eval_clock(&mut self) -> ultrasql_executor::EvalClockGuard {
+        let stmt_start_micros = ultrasql_executor::live_engine_timestamp_micros();
+        let txn_start_micros = if matches!(self.txn_state, TxnState::InTransaction(_)) {
+            // Defensive: an explicit block always captures its start at
+            // `BEGIN`, but if it is somehow absent, pin it now so the block
+            // is still internally consistent across its statements.
+            *self.txn_start_micros.get_or_insert(stmt_start_micros)
+        } else {
+            // Autocommit (or a failed block): each statement is its own
+            // implicit transaction, so the transaction timestamp is this
+            // statement's start. Drop any stale block timestamp.
+            self.txn_start_micros = None;
+            stmt_start_micros
+        };
+        ultrasql_executor::EvalClockGuard::install(ultrasql_executor::EvalClock {
+            txn_start_micros,
+            stmt_start_micros,
+        })
+    }
+
     /// Dispatch a transaction-control statement (BEGIN / COMMIT /
     /// ROLLBACK / SAVEPOINT / ROLLBACK TO / RELEASE) against the
     /// session's [`TxnState`].
@@ -345,6 +381,11 @@ where
                 // to read-write; only `READ ONLY` flips the flag.
                 txn.read_only = read_only.unwrap_or(false);
                 self.txn_state = TxnState::InTransaction(txn);
+                // PostgreSQL pins the transaction timestamp to the first
+                // command of the block; `BEGIN` is that command, so capture
+                // it here. Every `now()` / `current_timestamp` / `current_date`
+                // in the block then observes this instant.
+                self.txn_start_micros = Some(ultrasql_executor::live_engine_timestamp_micros());
                 self.state
                     .workload_recorder
                     .set_session_transaction_start(self.pid);
@@ -432,6 +473,11 @@ where
     }
 
     pub(crate) fn execute_commit(&mut self) -> Result<SelectResult, ServerError> {
+        // The block is ending; drop its transaction-start clock. The next
+        // statement re-derives a fresh instant (autocommit) or BEGIN captures
+        // a new one. If an error below re-enters a Failed/InTransaction state,
+        // the dispatch helper re-pins it defensively.
+        self.txn_start_micros = None;
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => Ok(SelectResult {
                 messages: vec![
@@ -580,6 +626,9 @@ where
     }
 
     pub(crate) fn execute_rollback(&mut self) -> Result<SelectResult, ServerError> {
+        // The block is ending; drop its transaction-start clock (see
+        // `execute_commit`).
+        self.txn_start_micros = None;
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => Ok(SelectResult {
                 messages: vec![

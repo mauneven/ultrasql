@@ -263,6 +263,13 @@ where
             return Ok(());
         }
 
+        // Pin the stable date/time builtins for this Execute. Transaction-
+        // control plans below skip the executor entirely (they own the
+        // TxnState transition), but holding the guard for the whole method is
+        // harmless: those branches never evaluate row expressions. The guard
+        // restores the live-wall-clock fallback on drop.
+        let _eval_clock = self.install_statement_eval_clock();
+
         // Peek at the portal's plan up front: txn-control plans skip
         // `execute_portal` entirely so the session's TxnState owns the
         // transition. Cloning is cheap because the txn-control variants

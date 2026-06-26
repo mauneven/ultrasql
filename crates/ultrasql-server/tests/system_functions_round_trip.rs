@@ -582,3 +582,171 @@ async fn pg_relation_size_reports_heap_pages() {
 
     shutdown(running).await;
 }
+
+/// `now()` / `current_timestamp` / `current_date` must observe the
+/// transaction-start instant: identical for every statement and every row of
+/// every statement inside an explicit transaction block (PostgreSQL
+/// semantics), and stable across the rows of a single autocommit statement.
+///
+/// These assertions are expressed entirely in SQL (equality, `count(DISTINCT
+/// ...)`) so they exercise the server's clock plumbing without depending on
+/// the wire encoding of `timestamptz`.
+#[tokio::test]
+async fn now_is_pinned_to_transaction_start_time() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    // A small multi-row table for the cross-row constancy checks.
+    client
+        .batch_execute("CREATE TABLE clock_rows (id INT NOT NULL)")
+        .await
+        .expect("create clock_rows table");
+    client
+        .batch_execute("INSERT INTO clock_rows VALUES (1), (2), (3), (4), (5)")
+        .await
+        .expect("insert clock_rows");
+    // Capture table for the transaction-start now() (created outside the txn
+    // so the test does not depend on transactional DDL).
+    client
+        .batch_execute("CREATE TABLE t_now (n TIMESTAMPTZ NOT NULL)")
+        .await
+        .expect("create t_now table");
+
+    // (2) Within a single autocommit statement, now() is constant across all
+    //     rows: projecting now() over five rows yields one identical value.
+    let rows = client
+        .query("SELECT id, now() FROM clock_rows", &[])
+        .await
+        .expect("per-row now()");
+    assert_eq!(rows.len(), 5, "all five rows are returned");
+    let per_row: Vec<std::time::SystemTime> = rows
+        .iter()
+        .map(|r| r.get::<_, std::time::SystemTime>(1))
+        .collect();
+    assert!(
+        per_row.windows(2).all(|w| w[0] == w[1]),
+        "now() must be identical for every row of one statement"
+    );
+
+    // The same constancy holds when now() is aggregated: min() and max()
+    // over the five rows coincide.
+    let row = client
+        .query_one("SELECT min(now()) = max(now()) FROM clock_rows", &[])
+        .await
+        .expect("min(now()) = max(now()) within one statement");
+    assert!(
+        row.get::<_, bool>(0),
+        "min(now()) and max(now()) must coincide across rows"
+    );
+
+    // (1) + (3) BEGIN; SELECT now(); SELECT now(); COMMIT -> identical.
+    //     Compare each statement's now() against a single value captured in a
+    //     session temp table at the start of the block; every statement in
+    //     the block must equal it.
+    client
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin explicit txn");
+
+    let first = client
+        .query_one("SELECT now() = now()", &[])
+        .await
+        .expect("two now() in one statement compare equal");
+    assert!(
+        first.get::<_, bool>(0),
+        "two now() calls in the same statement must be equal"
+    );
+
+    // Capture the block's now() and compare a *later* statement's now() to it.
+    client
+        .batch_execute("INSERT INTO t_now SELECT now()")
+        .await
+        .expect("capture txn now()");
+    // Advance the wall clock between statements. Pre-fix, each call read the
+    // live clock, so the later now() would differ from the captured one and
+    // this assertion would fail; with the fix both are pinned to the txn start.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let row = client
+        .query_one("SELECT n = now(), n = current_timestamp FROM t_now", &[])
+        .await
+        .expect("later statement now() equals captured txn now()");
+    assert!(
+        row.get::<_, bool>(0),
+        "now() in a later statement of the same txn must equal the txn-start now()"
+    );
+    assert!(
+        row.get::<_, bool>(1),
+        "current_timestamp must equal now() within the same txn"
+    );
+
+    // (6) current_date inside the txn is stable and equals the date of the
+    //     transaction-start now(). Compare year/month/day parts via extract()
+    //     (the binder rejects non-literal CASTs, so avoid `::date`).
+    let row = client
+        .query_one(
+            "SELECT extract(year FROM current_date) = extract(year FROM n), \
+                    extract(month FROM current_date) = extract(month FROM n), \
+                    extract(day FROM current_date) = extract(day FROM n), \
+                    extract(day FROM current_date) = extract(day FROM now()) \
+             FROM t_now",
+            &[],
+        )
+        .await
+        .expect("current_date matches the txn now() date");
+    assert!(
+        row.get::<_, bool>(0),
+        "current_date year must match the txn-start now() year"
+    );
+    assert!(
+        row.get::<_, bool>(1),
+        "current_date month must match the txn-start now() month"
+    );
+    assert!(
+        row.get::<_, bool>(2),
+        "current_date day must match the txn-start now() day"
+    );
+    assert!(
+        row.get::<_, bool>(3),
+        "current_date day must match now()'s day inside the txn"
+    );
+
+    client
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit explicit txn");
+
+    shutdown(running).await;
+}
+
+/// In autocommit, two *separate* `SELECT now()` statements are two implicit
+/// transactions, so PostgreSQL allows their values to differ. The fix must
+/// not pin autocommit statements to a stale earlier instant: a `now()` taken
+/// after a delay must be `>=` an earlier one (never before it), and the
+/// monotonic engine clock must keep advancing between statements.
+#[tokio::test]
+async fn autocommit_now_advances_between_statements() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    let before = client
+        .query_one("SELECT now()", &[])
+        .await
+        .expect("first autocommit now()");
+    let before: std::time::SystemTime = before.get(0);
+
+    // Force wall-clock advancement between the two implicit transactions.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let after = client
+        .query_one("SELECT now()", &[])
+        .await
+        .expect("second autocommit now()");
+    let after: std::time::SystemTime = after.get(0);
+
+    assert!(
+        after >= before,
+        "autocommit now() must not move backwards across statements"
+    );
+
+    shutdown(running).await;
+}

@@ -22,6 +22,13 @@ where
         sql: &str,
         allow_streaming: bool,
     ) -> Result<SelectResult, ServerError> {
+        // Pin the stable date/time builtins (`now()` / `current_timestamp` /
+        // `current_date`) to the transaction-start instant and
+        // `statement_timestamp()` to this statement's start, for the whole
+        // dispatch. The guard restores the live-wall-clock fallback on drop.
+        // This is the single convergence point for the Simple Query path
+        // (single statement, multi-statement batch, and the embedded API).
+        let _eval_clock = self.install_statement_eval_clock();
         // Capture a per-statement catalog snapshot — wait-free arc-swap load
         // when no transactional-DDL overlay is pending, else the committed
         // snapshot with this session's in-transaction-created relation
