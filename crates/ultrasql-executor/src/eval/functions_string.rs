@@ -12,12 +12,23 @@ pub(crate) fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {
         )));
     }
     match &args[0] {
-        Value::Int16(v) => Ok(Value::Int64(i64::from(*v).abs())),
-        Value::Int32(v) => Ok(Value::Int64(i64::from(*v).abs())),
+        // Preserve the argument's integer width so the produced value
+        // type matches the planner-declared type (and PostgreSQL, which
+        // keeps `abs(int4)` as `integer`). `i16::MIN`/`i32::MIN` have no
+        // representable absolute value, hence the checked variants.
+        Value::Int16(v) => v.checked_abs().map(Value::Int16).ok_or(EvalError::Overflow),
+        Value::Int32(v) => v.checked_abs().map(Value::Int32).ok_or(EvalError::Overflow),
         Value::Int64(v) => v.checked_abs().map(Value::Int64).ok_or(EvalError::Overflow),
+        Value::Float32(v) => Ok(Value::Float32(v.abs())),
+        Value::Float64(v) => Ok(Value::Float64(v.abs())),
+        Value::Decimal { value, scale } => Ok(Value::Decimal {
+            value: value.checked_abs().ok_or(EvalError::Overflow)?,
+            scale: *scale,
+        }),
+        Value::Money(c) => Ok(Value::Money(c.checked_abs().ok_or(EvalError::Overflow)?)),
         Value::Null => Ok(Value::Null),
         other => Err(EvalError::Type(format!(
-            "abs: integer argument required, got {:?}",
+            "abs: numeric argument required, got {:?}",
             other.data_type()
         ))),
     }
@@ -154,6 +165,54 @@ pub(crate) fn eval_numeric_binary(
         return Ok(Value::Null);
     };
     Ok(Value::Float64(op(left, right)))
+}
+
+/// `mod(a, b)` with an integer fast path.
+///
+/// When both arguments are integers, the remainder is computed exactly
+/// on `i64` (avoiding the precision loss of a round-trip through `f64`,
+/// e.g. `mod(9007199254740993, 2)` must be `1`, not `0`) and returned in
+/// the wider of the two integer widths. This matches the planner's
+/// declared type (`mod_return_type`) so the produced value type and the
+/// declared type agree. Any other numeric combination falls back to the
+/// `f64` path and returns `Float64`.
+pub(crate) fn eval_mod(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "mod: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    /// Decompose an integer value into `(i64 value, width rank)`; `None`
+    /// for any non-integer value (NULL, float, decimal, ...).
+    fn as_int(v: &Value) -> Option<(i64, u8)> {
+        match v {
+            Value::Int16(x) => Some((i64::from(*x), 0)),
+            Value::Int32(x) => Some((i64::from(*x), 1)),
+            Value::Int64(x) => Some((*x, 2)),
+            _ => None,
+        }
+    }
+
+    match (as_int(&args[0]), as_int(&args[1])) {
+        (Some((left, lrank)), Some((right, rrank))) => {
+            if right == 0 {
+                return Err(EvalError::DivByZero);
+            }
+            // `checked_rem` only fails here on `i64::MIN % -1`, whose true
+            // remainder is 0; substitute it directly.
+            let rem = left.checked_rem(right).unwrap_or(0);
+            // Return the wider integer width. The remainder always fits
+            // in the narrower operand's range, so it fits in the wider.
+            Ok(match lrank.max(rrank) {
+                0 => Value::Int16(i16::try_from(rem).map_err(|_| EvalError::Overflow)?),
+                1 => Value::Int32(i32::try_from(rem).map_err(|_| EvalError::Overflow)?),
+                _ => Value::Int64(rem),
+            })
+        }
+        // NULL or non-integer numeric: route through the f64 path.
+        _ => eval_numeric_binary(args, "mod", |left, right| left % right),
+    }
 }
 
 pub(crate) fn eval_pi(args: &[Value]) -> Result<Value, EvalError> {
@@ -515,6 +574,14 @@ pub(crate) fn eval_split_part(args: &[Value]) -> Result<Value, EvalError> {
         return Err(EvalError::Type(
             "split_part: field position must be greater than zero".to_owned(),
         ));
+    }
+    // PostgreSQL treats an empty delimiter as "no split": field 1 is the
+    // whole string and every other field is empty. Rust's
+    // `"abc".split("")` instead yields `["", "a", "b", "c", ""]`, so we
+    // special-case it to match PG.
+    if delimiter.is_empty() {
+        let result = if field == 1 { text } else { "" };
+        return Ok(Value::Text(result.to_owned()));
     }
     let target = usize::try_from(field.saturating_sub(1)).unwrap_or(usize::MAX);
     Ok(Value::Text(

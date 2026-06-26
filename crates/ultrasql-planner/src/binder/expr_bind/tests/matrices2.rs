@@ -32,7 +32,7 @@ fn builtin_validation_and_type_matrix_covers_catalog_introspection_surface() {
         ("current_date", Vec::new(), DataType::Date),
         ("now", Vec::new(), DataType::TimestampTz),
         ("age", Vec::new(), DataType::Interval),
-        ("abs", Vec::new(), DataType::Int64),
+        ("abs", vec![null_arg(DataType::Int32)], DataType::Int32),
         ("sqrt", Vec::new(), DataType::Float64),
         ("length", Vec::new(), DataType::Int32),
         ("bit_count", Vec::new(), DataType::Int64),
@@ -306,6 +306,72 @@ fn builtin_validation_and_type_matrix_covers_catalog_introspection_surface() {
         dense_vector_family_kind(&DataType::SparseVec { dims: None }),
         None
     );
+}
+
+#[test]
+fn abs_and_mod_return_types_track_argument_types() {
+    let numeric = DataType::Decimal {
+        precision: None,
+        scale: None,
+    };
+
+    // abs preserves the argument's numeric type, including integer width
+    // (matching the executor and PostgreSQL).
+    for (arg, expected) in [
+        (DataType::Int16, DataType::Int16),
+        (DataType::Int32, DataType::Int32),
+        (DataType::Int64, DataType::Int64),
+        (DataType::Float32, DataType::Float32),
+        (DataType::Float64, DataType::Float64),
+        (numeric.clone(), numeric.clone()),
+        (DataType::Money, DataType::Money),
+        (DataType::Null, DataType::Null),
+    ] {
+        assert_eq!(
+            builtin_return_type("abs", &[null_arg(arg.clone())]).unwrap(),
+            expected,
+            "abs({arg})"
+        );
+    }
+    // Non-numeric abs argument is rejected.
+    assert!(builtin_return_type("abs", &[null_arg(DataType::Text { max_len: None })]).is_err());
+    // Wrong arity is rejected.
+    assert!(builtin_return_type("abs", &[]).is_err());
+
+    // mod: two integers stay integer (wider width); anything else is float8.
+    assert_eq!(
+        builtin_return_type(
+            "mod",
+            &[null_arg(DataType::Int32), null_arg(DataType::Int32)]
+        )
+        .unwrap(),
+        DataType::Int32
+    );
+    assert_eq!(
+        builtin_return_type(
+            "mod",
+            &[null_arg(DataType::Int16), null_arg(DataType::Int64)]
+        )
+        .unwrap(),
+        DataType::Int64
+    );
+    assert_eq!(
+        builtin_return_type(
+            "mod",
+            &[null_arg(DataType::Float64), null_arg(DataType::Int32)]
+        )
+        .unwrap(),
+        DataType::Float64
+    );
+    assert_eq!(
+        builtin_return_type(
+            "mod",
+            &[null_arg(numeric.clone()), null_arg(DataType::Int32)]
+        )
+        .unwrap(),
+        DataType::Float64
+    );
+    assert!(builtin_return_type("mod", &[null_arg(DataType::Int32)]).is_err());
 }
 
 #[test]

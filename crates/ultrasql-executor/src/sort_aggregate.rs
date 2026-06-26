@@ -279,10 +279,10 @@ fn accumulate(
             }
         }
         AggState::ArrayAgg(items) => {
+            // PostgreSQL's `array_agg` preserves NULL elements; push
+            // unconditionally (unlike `string_agg`, which skips NULLs).
             if let Some(v) = arg {
-                if !v.is_null() {
-                    items.push(v);
-                }
+                items.push(v);
             }
         }
         AggState::JsonAgg(items) => {
@@ -1490,6 +1490,64 @@ mod tests {
         assert_eq!(rows[0][1], Value::Text("a,b,c".to_owned())); // multi-row join
         assert_eq!(rows[1][1], Value::Text("x".to_owned())); // single row, no delimiter
         assert_eq!(rows[2][1], Value::Text("y".to_owned())); // NULL skipped
+    }
+
+    /// `array_agg` keeps NULL elements (unlike `string_agg`). With a
+    /// GROUP BY this exercises the sort accumulation path: rows
+    /// (1,1),(1,NULL),(1,3) for group 1 must produce {1,NULL,3} and
+    /// (2,2),(2,4) for group 2 must produce {2,4}.
+    #[test]
+    fn sort_agg_array_agg_keeps_null_elements() {
+        let input_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("val", DataType::Int64),
+        ])
+        .expect("schema");
+        // Sorted by group. Group 1: 1, NULL, 3. Group 2: 2, 4.
+        let mut valid = ultrasql_vec::bitmap::Bitmap::new(5, true);
+        valid.set(1, false);
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1, 1, 1, 2, 2])),
+            Column::Int64(
+                NumericColumn::with_nulls(vec![1, 0, 3, 2, 4], valid).expect("int column ok"),
+            ),
+        ])
+        .expect("batch");
+        let scan = MemTableScan::new(input_schema, vec![batch]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("arr", DataType::Array(Box::new(DataType::Int64))),
+        ])
+        .expect("schema");
+        let aggs = vec![agg(
+            AggregateFunc::ArrayAgg,
+            Some(col("val", 1, DataType::Int64)),
+            "arr",
+            DataType::Array(Box::new(DataType::Int64)),
+        )];
+        let mut op = SortAggregate::new(Box::new(scan), vec![col_group()], aggs, out_schema);
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            _ => i32::MAX,
+        });
+
+        assert_eq!(rows.len(), 2);
+        // NULL element is preserved in the middle of the array.
+        assert_eq!(
+            rows[0][1],
+            Value::Array {
+                element_type: DataType::Int64,
+                elements: vec![Value::Int64(1), Value::Null, Value::Int64(3)],
+            }
+        );
+        assert_eq!(
+            rows[1][1],
+            Value::Array {
+                element_type: DataType::Int64,
+                elements: vec![Value::Int64(2), Value::Int64(4)],
+            }
+        );
     }
 
     #[test]

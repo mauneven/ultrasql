@@ -29,8 +29,9 @@ pub(in crate::binder) fn builtin_return_type(
         }
         "timezone" => timezone_return_type(args),
         "age" => Ok(DataType::Interval),
-        "abs" => Ok(DataType::Int64),
-        "ceil" | "floor" | "round" | "trunc" | "mod" | "power" | "sqrt" | "exp" | "ln" | "log"
+        "abs" => abs_return_type(args),
+        "mod" => mod_return_type(args),
+        "ceil" | "floor" | "round" | "trunc" | "power" | "sqrt" | "exp" | "ln" | "log"
         | "random" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "pi" => {
             Ok(DataType::Float64)
         }
@@ -124,6 +125,59 @@ pub(in crate::binder) fn builtin_return_type(
         "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
+    }
+}
+
+/// `abs(x)` preserves the argument's numeric type, matching both the
+/// executor (which keeps each integer width) and PostgreSQL (`abs(int4)`
+/// stays `integer`). Float/decimal/money inputs return themselves.
+fn abs_return_type(args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "abs: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let arg = args[0].data_type();
+    match arg {
+        DataType::Null
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal { .. }
+        | DataType::Money => Ok(arg),
+        other => Err(PlanError::TypeMismatch(format!(
+            "abs: numeric argument required, got {other}"
+        ))),
+    }
+}
+
+/// `mod(a, b)` keeps integer inputs in the integer domain (matching the
+/// executor's integer fast path, which returns the wider integer width);
+/// any other numeric combination routes through `f64` and returns
+/// `Float64`. Keeping this in lockstep with the executor preserves the
+/// declared-type / produced-value agreement the wire encoder relies on.
+fn mod_return_type(args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "mod: expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let left = args[0].data_type();
+    let right = args[1].data_type();
+    if left.is_integer() && right.is_integer() {
+        // Two integers: `numeric_join` yields the wider integer width,
+        // exactly what the executor's integer fast path returns.
+        left.numeric_join(&right).map_err(|_| {
+            PlanError::TypeMismatch(format!(
+                "mod: arguments must share a numeric type, got {left} and {right}"
+            ))
+        })
+    } else {
+        Ok(DataType::Float64)
     }
 }
 

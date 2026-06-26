@@ -336,7 +336,7 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
         .query_one(
             "SELECT \
              ceil(1.2), floor(1.8), round(1.6), trunc(1.9), \
-             mod(7, 3), power(2, 5), sqrt(9), exp(0), ln(1), log(100), \
+             power(2, 5), sqrt(9), exp(0), ln(1), log(100), \
              pi(), sin(0), cos(0), tan(0), asin(0), acos(1), atan(0), random()",
             &[],
         )
@@ -347,7 +347,6 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
         2.0,
         1.0,
         2.0,
-        1.0,
         1.0,
         32.0,
         3.0,
@@ -369,11 +368,80 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
             "column {idx}: expected {expected_value}, got {got}"
         );
     }
-    let random_value: f64 = row.get(17);
+    let random_value: f64 = row.get(16);
     assert!(
         (0.0..1.0).contains(&random_value),
         "random() out of range: {random_value}"
     );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn abs_mod_split_part_return_postgres_values_and_types() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    // FIX 2 — abs() over every numeric category, returning the
+    // argument's own type. tokio-postgres' typed getters double as a
+    // wire-level type check: a planner/executor type disagreement makes
+    // these `get` calls panic.
+    // The numeric `abs` value is read via a `::text` cast to avoid a
+    // decimal client dependency; its declared type is asserted directly.
+    let row = client
+        .query_one(
+            "SELECT \
+             abs(-2::int4), pg_typeof(abs(-2::int4)), \
+             abs(-1.5::float8), pg_typeof(abs(-1.5::float8)), \
+             abs(-1.5::numeric)::text, pg_typeof(abs(-1.5::numeric))",
+            &[],
+        )
+        .await
+        .expect("abs functions");
+    assert_eq!(row.get::<_, i32>(0), 2);
+    assert_eq!(row.get::<_, String>(1), "integer");
+    assert!((row.get::<_, f64>(2) - 1.5).abs() < 1e-12);
+    assert_eq!(row.get::<_, String>(3), "double precision");
+    assert_eq!(row.get::<_, String>(4), "1.5");
+    assert_eq!(row.get::<_, String>(5), "numeric");
+
+    // FIX 4 — mod() keeps integers exact and integer-typed. The 2^53+1
+    // literal would round to an even f64 and yield 0; the integer fast
+    // path returns 1.
+    let row = client
+        .query_one(
+            "SELECT \
+             mod(9007199254740993, 2), pg_typeof(mod(7, 3)), \
+             mod(7.5::float8, 2), pg_typeof(mod(7.5::float8, 2))",
+            &[],
+        )
+        .await
+        .expect("mod functions");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, String>(1), "integer");
+    assert!((row.get::<_, f64>(2) - 1.5).abs() < 1e-12);
+    // Float inputs document the residual f64 behavior.
+    assert_eq!(row.get::<_, String>(3), "double precision");
+
+    // mod() by zero is a division-by-zero error.
+    let err = client
+        .query_one("SELECT mod(7, 0)", &[])
+        .await
+        .expect_err("mod by zero must error");
+    let db_err = err.as_db_error().expect("server-side error");
+    assert_eq!(db_err.code().code(), "22012", "division_by_zero SQLSTATE");
+
+    // FIX 3 — split_part() with an empty delimiter: field 1 is the whole
+    // string, any other field is empty.
+    let row = client
+        .query_one(
+            "SELECT split_part('abc', '', 1), split_part('abc', '', 2)",
+            &[],
+        )
+        .await
+        .expect("split_part empty delimiter");
+    assert_eq!(row.get::<_, String>(0), "abc");
+    assert_eq!(row.get::<_, String>(1), "");
 
     shutdown(running).await;
 }

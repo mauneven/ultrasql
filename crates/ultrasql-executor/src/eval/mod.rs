@@ -296,7 +296,7 @@ fn eval_function_call(
         "floor" => eval_numeric_unary(args, "floor", f64::floor),
         "round" => eval_numeric_unary(args, "round", f64::round),
         "trunc" => eval_numeric_unary(args, "trunc", f64::trunc),
-        "mod" => eval_numeric_binary(args, "mod", |left, right| left % right),
+        "mod" => eval_mod(args),
         "power" => eval_numeric_binary(args, "power", f64::powf),
         "sqrt" => eval_numeric_unary(args, "sqrt", f64::sqrt),
         "exp" => eval_numeric_unary(args, "exp", f64::exp),

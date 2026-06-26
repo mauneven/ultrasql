@@ -345,10 +345,10 @@ pub(crate) fn accumulate_value(
             }
         }
         AggState::ArrayAgg(items) => {
+            // PostgreSQL's `array_agg` preserves NULL elements; push
+            // unconditionally (unlike `string_agg`, which skips NULLs).
             if let Some(v) = arg_val {
-                if !v.is_null() {
-                    items.push(v);
-                }
+                items.push(v);
             }
         }
         AggState::JsonAgg(items) => {

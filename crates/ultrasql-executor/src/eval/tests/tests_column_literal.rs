@@ -178,7 +178,7 @@ fn cast_and_size_helpers_cover_oid_reg_and_text_surfaces() {
 
 #[test]
 fn text_math_regex_and_format_helpers_cover_common_scalar_paths() {
-    assert_eq!(eval_fn("abs", vec![Value::Int32(-7)]), Value::Int64(7));
+    assert_eq!(eval_fn("abs", vec![Value::Int32(-7)]), Value::Int32(7));
     assert_eq!(
         eval_fn("lower", vec![Value::Text("MiXeD".to_owned())]),
         Value::Text("mixed".to_owned())

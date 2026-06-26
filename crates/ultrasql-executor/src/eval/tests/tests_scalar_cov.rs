@@ -385,3 +385,125 @@ fn numeric_and_case_function_dispatch_covers_common_edges() {
         Value::Text("else".to_owned())
     );
 }
+
+#[test]
+fn abs_preserves_argument_numeric_type() {
+    // Integer widths are preserved (matching the planner-declared type
+    // and PostgreSQL, which keeps `abs(int4)` as `integer`).
+    assert_eq!(eval_fn("abs", vec![Value::Int16(-5)]), Value::Int16(5));
+    assert_eq!(eval_fn("abs", vec![Value::Int32(-2)]), Value::Int32(2));
+    assert_eq!(eval_fn("abs", vec![Value::Int64(-7)]), Value::Int64(7));
+    // Float widths are preserved.
+    assert_eq!(
+        eval_fn("abs", vec![Value::Float32(-1.5)]),
+        Value::Float32(1.5)
+    );
+    assert_eq!(
+        eval_fn("abs", vec![Value::Float64(-1.5)]),
+        Value::Float64(1.5)
+    );
+    // Decimal preserves scale.
+    assert_eq!(
+        eval_fn(
+            "abs",
+            vec![Value::Decimal {
+                value: -150,
+                scale: 2,
+            }],
+        ),
+        Value::Decimal {
+            value: 150,
+            scale: 2,
+        }
+    );
+    // Money preserves the Money type.
+    assert_eq!(eval_fn("abs", vec![Value::Money(-250)]), Value::Money(250));
+    // NULL stays NULL.
+    assert_eq!(eval_fn("abs", vec![Value::Null]), Value::Null);
+}
+
+#[test]
+fn mod_integer_fast_path_is_exact_and_keeps_integer_type() {
+    // f64 round-trip would lose the low bit and yield 0.0; the integer
+    // fast path preserves it.
+    assert_eq!(
+        eval_fn(
+            "mod",
+            vec![Value::Int64(9_007_199_254_740_993), Value::Int64(2)]
+        ),
+        Value::Int64(1)
+    );
+    // Two int32s stay int32 (wider-integer rule).
+    assert_eq!(
+        eval_fn("mod", vec![Value::Int32(7), Value::Int32(3)]),
+        Value::Int32(1)
+    );
+    // Mixed widths widen to the wider integer.
+    assert_eq!(
+        eval_fn("mod", vec![Value::Int16(7), Value::Int32(3)]),
+        Value::Int32(1)
+    );
+    assert_eq!(
+        eval_fn("mod", vec![Value::Int32(7), Value::Int64(3)]),
+        Value::Int64(1)
+    );
+    // Two int16s stay int16.
+    assert_eq!(
+        eval_fn("mod", vec![Value::Int16(7), Value::Int16(3)]),
+        Value::Int16(1)
+    );
+    // Zero divisor is a division-by-zero error.
+    assert!(
+        eval_fn_err("mod", vec![Value::Int32(7), Value::Int32(0)]).contains("division by zero")
+    );
+    // Float inputs still route through the f64 path and stay Float64.
+    assert_eq!(
+        eval_fn("mod", vec![Value::Float64(7.5), Value::Float64(2.0)]),
+        Value::Float64(1.5)
+    );
+    // NULL operand yields NULL.
+    assert_eq!(
+        eval_fn("mod", vec![Value::Int32(7), Value::Null]),
+        Value::Null
+    );
+}
+
+#[test]
+fn split_part_empty_delimiter_matches_postgres() {
+    // PG: empty delimiter -> field 1 is the whole string.
+    assert_eq!(
+        eval_fn(
+            "split_part",
+            vec![
+                Value::Text("abc".to_owned()),
+                Value::Text(String::new()),
+                Value::Int32(1),
+            ],
+        ),
+        Value::Text("abc".to_owned())
+    );
+    // PG: any other field with an empty delimiter is empty.
+    assert_eq!(
+        eval_fn(
+            "split_part",
+            vec![
+                Value::Text("abc".to_owned()),
+                Value::Text(String::new()),
+                Value::Int32(2),
+            ],
+        ),
+        Value::Text(String::new())
+    );
+    // A real delimiter is unaffected.
+    assert_eq!(
+        eval_fn(
+            "split_part",
+            vec![
+                Value::Text("a,b,c".to_owned()),
+                Value::Text(",".to_owned()),
+                Value::Int32(2),
+            ],
+        ),
+        Value::Text("b".to_owned())
+    );
+}

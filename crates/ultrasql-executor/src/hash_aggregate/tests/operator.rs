@@ -584,6 +584,38 @@ fn hash_agg_array_agg_returns_native_array() {
     );
 }
 
+#[test]
+fn hash_agg_array_agg_keeps_null_elements() {
+    // PostgreSQL's array_agg keeps NULL elements; rows (1),(NULL),(3)
+    // must produce {1,NULL,3} (length 3, element_type from first
+    // non-null). Exercises the hash accumulation path.
+    let (schema, batch) = make_i64_batch(vec![1, 0, 3], Some(vec![true, false, true]));
+    let scan = MemTableScan::new(schema, vec![batch]);
+    let agg = LogicalAggregateExpr {
+        func: AggregateFunc::ArrayAgg,
+        arg: Some(col("val", 0, DataType::Int64)),
+        direct_arg: None,
+        order_by: None,
+        distinct: false,
+        output_name: "vals".into(),
+        data_type: DataType::Array(Box::new(DataType::Int64)),
+    };
+    let out_schema = Schema::new([Field::required(
+        "vals",
+        DataType::Array(Box::new(DataType::Int64)),
+    )])
+    .expect("schema ok");
+    let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+    let rows = drain_all(&mut op);
+    assert_eq!(
+        rows,
+        vec![vec![Value::Array {
+            element_type: DataType::Int64,
+            elements: vec![Value::Int64(1), Value::Null, Value::Int64(3)],
+        }]]
+    );
+}
+
 // -------------------------------------------------------------------------
 // Test 6: multi-row group (duplicate hash keys handled correctly)
 // -------------------------------------------------------------------------
