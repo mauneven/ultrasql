@@ -421,8 +421,19 @@ fn try_compare_key_vecs(
     for (i, key) in keys.iter().enumerate() {
         let av = &ak[i];
         let bv = &bk[i];
-        let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
-        let ord = if key.asc { ord } else { ord.reverse() };
+        // `try_compare_values_nullable` already resolves the NULL-vs-non-NULL
+        // ordering absolutely, honoring `key.nulls_first` (which the binder
+        // derives as `!asc` by default, so DESC => NULLS FIRST per PostgreSQL,
+        // or as an explicit `NULLS FIRST` / `NULLS LAST` override). The `DESC`
+        // reverse must therefore apply ONLY to the value comparison of two
+        // non-NULL operands; reversing the null placement would flip
+        // `nulls_first` and break the PostgreSQL default for DESC.
+        let ord = if av.is_null() || bv.is_null() {
+            try_compare_values_nullable(av, bv, key.nulls_first)?
+        } else {
+            let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
+            if key.asc { ord } else { ord.reverse() }
+        };
         if ord != Ordering::Equal {
             return Ok(ord);
         }
@@ -941,6 +952,191 @@ mod tests {
             compare_values_nullable(&Value::Int32(1), &Value::Null, false),
             Ordering::Less,
             "nulls_first=false: non-NULL < NULL"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Adversarial battery: ORDER BY null placement through the full Sort
+    // operator, matching PostgreSQL defaults (ASC => NULLS LAST, DESC =>
+    // NULLS FIRST) and honoring explicit NULLS FIRST / NULLS LAST overrides.
+    //
+    // These drive the real `Sort` operator (not just `compare_values_nullable`)
+    // so the `try_compare_key_vecs` DESC-reverse path is exercised — the site
+    // of the reverse-flips-nulls bug. Seed t(c) with {1, NULL, 3, 2, NULL} and
+    // assert the EXACT ordered value sequence PostgreSQL would emit.
+    // -------------------------------------------------------------------------
+
+    fn schema_nullable_c() -> Schema {
+        Schema::new([Field::nullable("c", DataType::Int32)]).expect("schema ok")
+    }
+
+    /// Build a single-column Int32 batch from optional values, where `None`
+    /// lands a `Value::Null` (validity bitmap) into the column.
+    fn nullable_c_batch(vals: &[Option<i32>]) -> Batch {
+        let rows: Vec<Vec<Value>> = vals
+            .iter()
+            .map(|v| vec![v.map_or(Value::Null, Value::Int32)])
+            .collect();
+        build_batch(&rows, &schema_nullable_c()).expect("batch ok")
+    }
+
+    fn key_c(asc: bool, nulls_first: bool) -> SortKey {
+        SortKey {
+            expr: ScalarExpr::Column {
+                name: "c".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc,
+            nulls_first,
+        }
+    }
+
+    /// Sort the seeded `{1, NULL, 3, 2, NULL}` column with `keys` and return
+    /// the ordered values as `Option<i32>` (`None` == NULL).
+    fn sorted_c(keys: Vec<SortKey>) -> Vec<Option<i32>> {
+        let schema = schema_nullable_c();
+        let batch = nullable_c_batch(&[Some(1), None, Some(3), Some(2), None]);
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let mut sort = Sort::new(Box::new(scan), keys, schema);
+        let mut out = Vec::new();
+        while let Some(b) = sort.next_batch().expect("sort ok") {
+            for row in batch_to_rows(&b, sort.schema()).expect("decode rows") {
+                out.push(match &row[0] {
+                    Value::Null => None,
+                    Value::Int32(v) => Some(*v),
+                    other => panic!("unexpected value {other:?}"),
+                });
+            }
+        }
+        out
+    }
+
+    // `nulls_first` here mirrors the binder: ASC default => false (NULLS LAST),
+    // DESC default => true (NULLS FIRST); explicit overrides set it directly.
+    #[test]
+    fn order_by_null_placement_battery_matches_postgres() {
+        // 1. ORDER BY c ASC -> 1,2,3,NULL,NULL (NULLS LAST default).
+        assert_eq!(
+            sorted_c(vec![key_c(true, false)]),
+            vec![Some(1), Some(2), Some(3), None, None],
+            "ASC default => NULLS LAST"
+        );
+
+        // 2. ORDER BY c DESC -> NULL,NULL,3,2,1 (NULLS FIRST default — the bug).
+        assert_eq!(
+            sorted_c(vec![key_c(false, true)]),
+            vec![None, None, Some(3), Some(2), Some(1)],
+            "DESC default => NULLS FIRST"
+        );
+
+        // 3. ORDER BY c ASC NULLS FIRST -> NULL,NULL,1,2,3.
+        assert_eq!(
+            sorted_c(vec![key_c(true, true)]),
+            vec![None, None, Some(1), Some(2), Some(3)],
+            "ASC NULLS FIRST override"
+        );
+
+        // 4. ORDER BY c DESC NULLS LAST -> 3,2,1,NULL,NULL.
+        assert_eq!(
+            sorted_c(vec![key_c(false, false)]),
+            vec![Some(3), Some(2), Some(1), None, None],
+            "DESC NULLS LAST override"
+        );
+
+        // 5. ORDER BY c ASC NULLS LAST -> 1,2,3,NULL,NULL (explicit = default).
+        assert_eq!(
+            sorted_c(vec![key_c(true, false)]),
+            vec![Some(1), Some(2), Some(3), None, None],
+            "ASC NULLS LAST (explicit = default)"
+        );
+
+        // 6. ORDER BY c DESC NULLS FIRST -> NULL,NULL,3,2,1 (explicit = default).
+        assert_eq!(
+            sorted_c(vec![key_c(false, true)]),
+            vec![None, None, Some(3), Some(2), Some(1)],
+            "DESC NULLS FIRST (explicit = default)"
+        );
+    }
+
+    // 7. Multi-key: ORDER BY a ASC, b DESC with NULLs in both keys.
+    //    `a` defaults to NULLS LAST (ASC), `b` defaults to NULLS FIRST (DESC).
+    //    Each key's null placement must resolve independently.
+    #[test]
+    fn order_by_multi_key_null_placement_independent() {
+        let schema = Schema::new([
+            Field::nullable("a", DataType::Int32),
+            Field::nullable("b", DataType::Int32),
+        ])
+        .expect("schema ok");
+        // Rows: (1,10), (1,NULL), (NULL,5), (1,20), (NULL,NULL).
+        // ORDER BY a ASC (NULLS LAST), b DESC (NULLS FIRST):
+        //   a=1 group first: within it b DESC NULLS FIRST => NULL,20,10.
+        //   a=NULL group last: within it b DESC NULLS FIRST => NULL,5.
+        let rows = vec![
+            vec![Value::Int32(1), Value::Int32(10)],
+            vec![Value::Int32(1), Value::Null],
+            vec![Value::Null, Value::Int32(5)],
+            vec![Value::Int32(1), Value::Int32(20)],
+            vec![Value::Null, Value::Null],
+        ];
+        let batch = build_batch(&rows, &schema).expect("batch ok");
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let keys = vec![
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "a".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                },
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "b".into(),
+                    index: 1,
+                    data_type: DataType::Int32,
+                },
+                asc: false,
+                nulls_first: true,
+            },
+        ];
+        let mut sort = Sort::new(Box::new(scan), keys, schema);
+        let mut out: Vec<(Option<i32>, Option<i32>)> = Vec::new();
+        while let Some(b) = sort.next_batch().expect("sort ok") {
+            for row in batch_to_rows(&b, sort.schema()).expect("decode rows") {
+                let to_opt = |v: &Value| match v {
+                    Value::Null => None,
+                    Value::Int32(n) => Some(*n),
+                    other => panic!("unexpected value {other:?}"),
+                };
+                out.push((to_opt(&row[0]), to_opt(&row[1])));
+            }
+        }
+        assert_eq!(
+            out,
+            vec![
+                (Some(1), None),     // a=1, b NULLS FIRST
+                (Some(1), Some(20)), // a=1
+                (Some(1), Some(10)), // a=1
+                (None, None),        // a=NULL last, b NULLS FIRST
+                (None, Some(5)),     // a=NULL last
+            ],
+            "multi-key: each key's null placement resolves independently"
+        );
+    }
+
+    // 8. Composes with LIMIT: ORDER BY c DESC LIMIT 2 -> NULL, NULL.
+    //    Modeled by truncating the DESC-ordered sequence (LIMIT is a separate
+    //    operator above Sort); the two NULLs must come first under DESC.
+    #[test]
+    fn order_by_desc_limit_takes_leading_nulls() {
+        let ordered = sorted_c(vec![key_c(false, true)]);
+        assert_eq!(
+            &ordered[..2],
+            &[None, None],
+            "DESC LIMIT 2 takes the two leading NULLs (NULLS FIRST)"
         );
     }
 

@@ -468,8 +468,17 @@ fn compare_key_vecs_checked(
     for (i, key) in keys.iter().enumerate() {
         let av = &ak[i];
         let bv = &bk[i];
-        let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
-        let ord = if key.asc { ord } else { ord.reverse() };
+        // The DESC reverse must apply ONLY to two non-NULL operands. The
+        // NULL-vs-non-NULL ordering is already resolved absolutely by
+        // `try_compare_values_nullable` honoring `key.nulls_first` (which the
+        // binder derives per direction: DESC => NULLS FIRST by default).
+        // Reversing it would flip the null placement. See `sort.rs`.
+        let ord = if av.is_null() || bv.is_null() {
+            try_compare_values_nullable(av, bv, key.nulls_first)?
+        } else {
+            let ord = try_compare_values_nullable(av, bv, key.nulls_first)?;
+            if key.asc { ord } else { ord.reverse() }
+        };
         if ord != Ordering::Equal {
             return Ok(ord);
         }

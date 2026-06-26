@@ -269,8 +269,17 @@ fn compare_rows(
     for key in keys {
         let left_value = key.eval.eval(left).map_err(eval_error_to_exec_error)?;
         let right_value = key.eval.eval(right).map_err(eval_error_to_exec_error)?;
-        let ord = compare_values_nullable(&left_value, &right_value, key.nulls_first);
-        let ord = if key.asc { ord } else { ord.reverse() };
+        // The DESC reverse must apply ONLY to two non-NULL operands.
+        // `compare_values_nullable` already resolves the NULL-vs-non-NULL
+        // ordering absolutely per `key.nulls_first` (the binder sets DESC =>
+        // NULLS FIRST by default); reversing it would flip null placement and
+        // corrupt the merge order across parallel children. See `sort.rs`.
+        let ord = if left_value.is_null() || right_value.is_null() {
+            compare_values_nullable(&left_value, &right_value, key.nulls_first)
+        } else {
+            let ord = compare_values_nullable(&left_value, &right_value, key.nulls_first);
+            if key.asc { ord } else { ord.reverse() }
+        };
         if ord != Ordering::Equal {
             return Ok(ord);
         }
