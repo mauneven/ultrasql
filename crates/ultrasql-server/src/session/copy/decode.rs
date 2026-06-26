@@ -152,11 +152,26 @@ pub(super) fn decode_copy_cells_to_payload(
         }
     }
 
-    for (col_idx, (value, field)) in row.iter().zip(entry.schema.fields()).enumerate() {
+    for (value, field) in row.iter().zip(entry.schema.fields()) {
         if matches!(value, Value::Null) && !field.nullable {
-            return Err(ServerError::CopyFormat(format!(
-                "column {col_idx}: NULL violates not-null constraint"
-            )));
+            // A NULL into a NOT NULL column is a constraint violation, not a
+            // file-format error. Emit the SAME variant the INSERT/ModifyTable
+            // path surfaces (`ExecError::NotNullViolation`, which carries the
+            // column name and maps to SQLSTATE 23502 `not_null_violation`) so
+            // COPY matches PostgreSQL — and so it matches INSERT, CHECK (23514),
+            // UNIQUE (23505), FK (23503) and EXCLUDE (23P01) parity. The check
+            // stays at the decode layer because the bulk fast path
+            // (`copy_table_needs_maintained_insert == false`) never reaches the
+            // operator, so this is the sole NOT NULL enforcement there. It
+            // still flows through the COPY abort/take-and-park path verbatim:
+            // `Execute(_)` is query-scoped and is not matched on by any COPY
+            // error handler, so the whole COPY aborts atomically and the wire
+            // is drained / the explicit block parked Failed identically to the
+            // former `CopyFormat` error. Genuine format/parse errors stay
+            // `CopyFormat` -> 22P04.
+            return Err(ServerError::Execute(
+                ultrasql_executor::ExecError::NotNullViolation(field.name.clone()),
+            ));
         }
     }
 

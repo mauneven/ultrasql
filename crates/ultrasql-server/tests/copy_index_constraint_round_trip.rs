@@ -676,3 +676,187 @@ async fn copy_parquet_into_indexed_table_is_maintained() {
 
     shutdown(running).await;
 }
+
+// ── NOT NULL via COPY reports 23502 (not_null_violation), not 22P04 ──
+//
+// A NULL into a NOT NULL column is a constraint violation, the same class as
+// CHECK (23514) / UNIQUE (23505) / FK (23503) / EXCLUDE (23P01) which COPY
+// already matches to PostgreSQL. Before the fix the decode layer rejected it as
+// `bad_copy_file_format` (22P04); now it surfaces `ExecError::NotNullViolation`
+// -> SQLSTATE 23502, the exact code (and message shape) INSERT reports. Genuine
+// format/parse errors stay 22P04.
+
+// #A autocommit: NULL into a NOT NULL column -> 23502, zero rows land.
+#[tokio::test]
+async fn copy_null_into_not_null_reports_23502_autocommit() {
+    let running = start_sample_server("copy_nn_autocommit").await;
+    let client = &running.client;
+    // PRIMARY KEY forces the maintained INSERT path; `label` is NOT NULL.
+    client
+        .batch_execute("CREATE TABLE t_nn (id INT PRIMARY KEY, label TEXT NOT NULL)")
+        .await
+        .expect("create table");
+
+    // `\N` is the text-format NULL token; into NOT NULL `label` it must error.
+    let err = copy_in_payload_result(
+        client,
+        "COPY t_nn (id, label) FROM STDIN",
+        b"1\ta\n2\t\\N\n",
+    )
+    .await
+    .expect_err("NULL into NOT NULL must abort the COPY");
+    assert_eq!(
+        sqlstate(&err),
+        "23502",
+        "NULL into NOT NULL via COPY -> not_null_violation (23502), not 22P04"
+    );
+    // PG-faithful message names the offending column. tokio-postgres's
+    // top-level Display collapses to "db error"; the server-supplied text is on
+    // the DbError, which carries `null value in column "label" violates
+    // not-null constraint` — the exact INSERT/ModifyTable message shape.
+    let db_message = err
+        .as_db_error()
+        .map(|e| e.message().to_owned())
+        .unwrap_or_default();
+    assert!(
+        db_message.contains("label") && db_message.contains("not-null"),
+        "message names the NOT NULL column, PG-shaped: {db_message:?}"
+    );
+    assert_eq!(
+        select_count(client, "t_nn").await,
+        0,
+        "a NOT-NULL-failing COPY must land zero rows (all-or-nothing)"
+    );
+
+    shutdown(running).await;
+}
+
+// #B explicit txn: 23502, block goes Failed (next stmt 25P02), ROLLBACK -> 0.
+#[tokio::test]
+async fn copy_null_into_not_null_parks_failed_block_then_rolls_back() {
+    let running = start_sample_server("copy_nn_txn").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE t_nn_txn (id INT PRIMARY KEY, label TEXT NOT NULL)")
+        .await
+        .expect("create table");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    let err = copy_in_payload_result(
+        client,
+        "COPY t_nn_txn (id, label) FROM STDIN",
+        b"1\ta\n2\t\\N\n",
+    )
+    .await
+    .expect_err("NULL into NOT NULL must abort the in-txn COPY");
+    assert_eq!(
+        sqlstate(&err),
+        "23502",
+        "in-txn NULL into NOT NULL -> 23502"
+    );
+
+    // The error parked the block Failed (take-and-park): the next statement is
+    // rejected 25P02 (in_failed_sql_transaction), proving the txn was not
+    // dropped to Idle and the wire is still in sync.
+    let next = client
+        .simple_query("SELECT 1")
+        .await
+        .expect_err("next stmt in a failed block is rejected");
+    assert_eq!(
+        next.code().map(|c| c.code().to_owned()),
+        Some("25P02".to_owned()),
+        "failed block rejects the next statement with 25P02, got {next}"
+    );
+
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(
+        select_count(client, "t_nn_txn").await,
+        0,
+        "ROLLBACK discards the failed in-txn COPY rows"
+    );
+
+    shutdown(running).await;
+}
+
+// #C bulk fast path: an UNINDEXED table whose only constraint is NOT NULL takes
+// `heap.insert_batch` (copy_table_needs_maintained_insert == false), which never
+// reaches the ModifyTable operator. A 23502 here proves the DECODE-layer NOT
+// NULL check still fires on the fast path — it was NOT removed in favour of the
+// operator (which the fast path bypasses).
+#[tokio::test]
+async fn copy_null_into_not_null_on_unindexed_table_still_23502_fast_path() {
+    let running = start_sample_server("copy_nn_fastpath").await;
+    let client = &running.client;
+    // No PRIMARY KEY, no index, no CHECK/FK/EXCLUDE — only NOT NULL. This is the
+    // bulk fast path.
+    client
+        .batch_execute("CREATE TABLE t_nn_fast (id INT, label TEXT NOT NULL)")
+        .await
+        .expect("create unindexed table");
+
+    let err = copy_in_payload_result(
+        client,
+        "COPY t_nn_fast (id, label) FROM STDIN",
+        b"1\ta\n2\t\\N\n",
+    )
+    .await
+    .expect_err("NULL into NOT NULL on the fast path must abort the COPY");
+    assert_eq!(
+        sqlstate(&err),
+        "23502",
+        "the decode-layer NOT NULL check still fires on the unindexed bulk fast path"
+    );
+    assert_eq!(
+        select_count(client, "t_nn_fast").await,
+        0,
+        "fast-path NOT-NULL-failing COPY lands zero rows"
+    );
+
+    shutdown(running).await;
+}
+
+// #D regression: a GENUINE format error still returns 22P04. Switching the
+// NOT NULL case to 23502 must NOT over-broaden — too few columns / an
+// unparseable int are still `bad_copy_file_format`.
+#[tokio::test]
+async fn copy_genuine_format_error_still_22p04() {
+    let running = start_sample_server("copy_nn_format").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE t_fmt (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create table");
+
+    // Too few columns (one cell for a two-column COPY) is a file-format error.
+    let too_few = copy_in_payload_result(client, "COPY t_fmt (id, val) FROM STDIN", b"1\t2\n9\n")
+        .await
+        .expect_err("a short row is a format error");
+    assert_eq!(
+        sqlstate(&too_few),
+        "22P04",
+        "wrong column count stays bad_copy_file_format (22P04)"
+    );
+
+    // An unparseable integer cell is also a file-format error (22P04), not a
+    // constraint violation.
+    let bad_int = copy_in_payload_result(
+        client,
+        "COPY t_fmt (id, val) FROM STDIN",
+        b"1\t2\nnope\t4\n",
+    )
+    .await
+    .expect_err("an unparseable int is a format error");
+    assert_eq!(
+        sqlstate(&bad_int),
+        "22P04",
+        "an unparseable integer stays bad_copy_file_format (22P04)"
+    );
+
+    assert_eq!(
+        select_count(client, "t_fmt").await,
+        0,
+        "a format-failing COPY lands zero rows"
+    );
+
+    shutdown(running).await;
+}

@@ -329,10 +329,11 @@ async fn copy_midstream_error_aborts_block_then_rolls_back() {
         .await
         .expect("send CopyData");
     let copy_err = sink.finish().await.expect_err("COPY must fail on NOT NULL");
-    // The COPY decoder rejects the `\N` into NOT NULL as a bad COPY value
-    // (SQLSTATE 22P04, bad_copy_file_format). The exact code is secondary; the
-    // block-abort + zero-rows invariants below are the contract under test.
-    assert_eq!(copy_err.code().map(|c| c.code()), Some("22P04"));
+    // A NULL into a NOT NULL column is a not-null constraint violation, so the
+    // COPY decoder surfaces SQLSTATE 23502 (`not_null_violation`) — the same
+    // code INSERT reports — not a file-format error (22P04). The block-abort +
+    // zero-rows invariants below are the contract under test.
+    assert_eq!(copy_err.code().map(|c| c.code()), Some("23502"));
 
     // The block is now Failed: the next statement gets 25P02.
     let err = client
@@ -516,7 +517,9 @@ async fn autocommit_copy_midstream_error_lands_zero_rows() {
         .await
         .expect("send CopyData");
     let err = sink.finish().await.expect_err("autocommit COPY must fail");
-    assert_eq!(err.code().map(|c| c.code()), Some("22P04"));
+    // A NULL into a NOT NULL column is a not-null constraint violation (23502),
+    // the same code INSERT reports — not a file-format error (22P04).
+    assert_eq!(err.code().map(|c| c.code()), Some("23502"));
 
     // The connection is NOT in a failed block (autocommit), so the next
     // statement runs normally and sees zero rows.
