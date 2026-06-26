@@ -431,3 +431,109 @@ fn bootstrap_round_trip_preserves_pg_statistic_ext_rows() {
         &row
     );
 }
+
+/// `DROP TABLE` persists a `RelKind::Dropped` pg_class tombstone but no
+/// `ConType::Dropped` pg_constraint tombstone, so a dropped table's still
+/// MVCC-visible constraint rows would otherwise survive into the rebuilt
+/// pg_constraint. Bootstrap must evict them via the `tables_by_oid`
+/// liveness retain (mirroring the pg_statistic retain), while keeping a
+/// live table's constraints (no over-filtering).
+#[test]
+fn bootstrap_drops_constraints_of_dropped_table() {
+    use std::sync::Arc;
+    use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+    use ultrasql_storage::buffer_pool::BufferPool;
+    use ultrasql_storage::heap::HeapAccess;
+    use ultrasql_storage::page::Page;
+
+    let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+    let heap = HeapAccess::new(pool);
+
+    let cat = PersistentCatalog::new();
+
+    // A live table that keeps its constraint.
+    let keep_oid = cat.next_oid();
+    let keep = TableEntry::new(
+        keep_oid,
+        "keep_con".to_owned(),
+        "public".to_owned(),
+        Schema::new(vec![Field::required("id", DataType::Int32)]).expect("schema"),
+    );
+    cat.persist_table_rows(&keep, &heap, Xid::new(1), CommandId::new(0))
+        .expect("persist keep table");
+    let keep_con_oid = cat.next_oid();
+    cat.persist_constraint_row(
+        &ConstraintRow {
+            oid: keep_con_oid,
+            conname: "keep_con_id_check".to_owned(),
+            conrelid: keep_oid,
+            contype: ConType::Check,
+            condeferrable: false,
+            condeferred: false,
+            conkey: vec![1],
+            confrelid: Oid::INVALID,
+            confkey: Vec::new(),
+        },
+        &heap,
+        Xid::new(2),
+        CommandId::new(0),
+    )
+    .expect("persist keep constraint");
+
+    // A table that is created, gets a constraint, then dropped. The drop
+    // tombstones pg_class but leaves the constraint row MVCC-visible.
+    let drop_oid = cat.next_oid();
+    let drop = TableEntry::new(
+        drop_oid,
+        "drop_con".to_owned(),
+        "public".to_owned(),
+        Schema::new(vec![Field::required("id", DataType::Int32)]).expect("schema"),
+    );
+    cat.persist_table_rows(&drop, &heap, Xid::new(3), CommandId::new(0))
+        .expect("persist drop table");
+    let drop_con_oid = cat.next_oid();
+    cat.persist_constraint_row(
+        &ConstraintRow {
+            oid: drop_con_oid,
+            conname: "drop_con_id_check".to_owned(),
+            conrelid: drop_oid,
+            contype: ConType::Check,
+            condeferrable: false,
+            condeferred: false,
+            conkey: vec![1],
+            confrelid: Oid::INVALID,
+            confkey: Vec::new(),
+        },
+        &heap,
+        Xid::new(4),
+        CommandId::new(0),
+    )
+    .expect("persist orphan constraint");
+    // DROP TABLE: pg_class/pg_attribute tombstones only (no constraint
+    // tombstone), matching `persist_table_drop_tombstone`.
+    cat.persist_table_drop_tombstone(&drop, &heap, Xid::new(5), CommandId::new(0))
+        .expect("persist drop tombstone");
+
+    let cat2 = PersistentCatalog::new();
+    let stats = cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+
+    // Only the live table's constraint may survive.
+    assert_eq!(
+        stats.constraints, 1,
+        "dropped table's constraint leaked into bootstrap stats"
+    );
+    let snap = cat2.snapshot();
+    assert!(
+        snap.constraints.contains_key(&keep_con_oid),
+        "live table's constraint must survive bootstrap"
+    );
+    assert!(
+        !snap.constraints.contains_key(&drop_con_oid),
+        "dropped table's constraint must not survive bootstrap"
+    );
+    // No constraint row may reference the dropped table's OID.
+    assert!(
+        snap.constraints.values().all(|c| c.conrelid != drop_oid),
+        "dropped table's conrelid still present in pg_constraint"
+    );
+}

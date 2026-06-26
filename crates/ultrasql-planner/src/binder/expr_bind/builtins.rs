@@ -31,10 +31,9 @@ pub(in crate::binder) fn builtin_return_type(
         "age" => Ok(DataType::Interval),
         "abs" => abs_return_type(args),
         "mod" => mod_return_type(args),
-        "ceil" | "floor" | "round" | "trunc" | "power" | "sqrt" | "exp" | "ln" | "log"
-        | "random" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "pi" => {
-            Ok(DataType::Float64)
-        }
+        "ceil" | "floor" | "round" | "trunc" => round_family_return_type(func_name, args),
+        "power" | "sqrt" | "exp" | "ln" | "log" | "random" | "sin" | "cos" | "tan" | "asin"
+        | "acos" | "atan" | "pi" => Ok(DataType::Float64),
         "length" | "position" | "bit_length" | "octet_length" | "get_bit" => Ok(DataType::Int32),
         "bit_count" => Ok(DataType::Int64),
         "set_bit" => Ok(DataType::VarBit { max_len: None }),
@@ -178,6 +177,39 @@ fn mod_return_type(args: &[ScalarExpr]) -> Result<DataType, PlanError> {
         })
     } else {
         Ok(DataType::Float64)
+    }
+}
+
+/// `round`/`floor`/`ceil`/`trunc` follow PostgreSQL's result-type matrix:
+/// `numeric -> numeric`, `double precision -> double precision`. PostgreSQL
+/// has no integer-domain variants, so an integer argument is cast to its
+/// preferred numeric type (`numeric`) and the result is `numeric`. A
+/// `real`/`float4` argument promotes to `double precision`, matching the
+/// executor's `f64` path. Kept in lockstep with `eval_round_family` so the
+/// declared type equals the produced value type.
+fn round_family_return_type(func_name: &str, args: &[ScalarExpr]) -> Result<DataType, PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let arg = args[0].data_type();
+    if arg.is_float() {
+        // `double precision` (and `real`, which the executor widens to f64).
+        Ok(DataType::Float64)
+    } else if matches!(arg, DataType::Decimal { .. }) || arg.is_integer() {
+        // `numeric` stays numeric; integers cast to numeric in PostgreSQL.
+        Ok(DataType::Decimal {
+            precision: None,
+            scale: None,
+        })
+    } else if matches!(arg, DataType::Null) {
+        Ok(DataType::Null)
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "{func_name}: numeric argument required, got {arg}"
+        )))
     }
 }
 

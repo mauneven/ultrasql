@@ -387,6 +387,155 @@ fn numeric_and_case_function_dispatch_covers_common_edges() {
 }
 
 #[test]
+fn round_family_preserves_input_type_and_pg_rounding() {
+    // numeric -> numeric, integer-valued result (scale 0).
+    // round(1.5::numeric) = 2
+    assert_eq!(
+        eval_fn(
+            "round",
+            vec![Value::Decimal {
+                value: 15,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 2, scale: 0 }
+    );
+    // numeric round is half AWAY from zero (not banker's): round(2.5) = 3.
+    assert_eq!(
+        eval_fn(
+            "round",
+            vec![Value::Decimal {
+                value: 25,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 3, scale: 0 }
+    );
+    assert_eq!(
+        eval_fn(
+            "round",
+            vec![Value::Decimal {
+                value: 35,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 4, scale: 0 }
+    );
+    // round half away from zero for negatives: round(-2.5) = -3.
+    assert_eq!(
+        eval_fn(
+            "round",
+            vec![Value::Decimal {
+                value: -25,
+                scale: 1
+            }]
+        ),
+        Value::Decimal {
+            value: -3,
+            scale: 0
+        }
+    );
+    // floor/ceil/trunc on numeric -> numeric, directional.
+    assert_eq!(
+        eval_fn(
+            "floor",
+            vec![Value::Decimal {
+                value: 17,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 1, scale: 0 }
+    );
+    assert_eq!(
+        eval_fn(
+            "floor",
+            vec![Value::Decimal {
+                value: -17,
+                scale: 1
+            }]
+        ),
+        Value::Decimal {
+            value: -2,
+            scale: 0
+        }
+    );
+    assert_eq!(
+        eval_fn(
+            "ceil",
+            vec![Value::Decimal {
+                value: 12,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 2, scale: 0 }
+    );
+    assert_eq!(
+        eval_fn(
+            "ceil",
+            vec![Value::Decimal {
+                value: -12,
+                scale: 1
+            }]
+        ),
+        Value::Decimal {
+            value: -1,
+            scale: 0
+        }
+    );
+    assert_eq!(
+        eval_fn(
+            "trunc",
+            vec![Value::Decimal {
+                value: 19,
+                scale: 1
+            }]
+        ),
+        Value::Decimal { value: 1, scale: 0 }
+    );
+    assert_eq!(
+        eval_fn(
+            "trunc",
+            vec![Value::Decimal {
+                value: -19,
+                scale: 1
+            }]
+        ),
+        Value::Decimal {
+            value: -1,
+            scale: 0
+        }
+    );
+
+    // double precision -> double precision with banker's (ties-to-even)
+    // rounding: round(2.5::float8) = 2, round(3.5::float8) = 4.
+    assert_eq!(
+        eval_fn("round", vec![Value::Float64(2.5)]),
+        Value::Float64(2.0)
+    );
+    assert_eq!(
+        eval_fn("round", vec![Value::Float64(3.5)]),
+        Value::Float64(4.0)
+    );
+    assert_eq!(
+        eval_fn("ceil", vec![Value::Float64(1.2)]),
+        Value::Float64(2.0)
+    );
+
+    // integer -> numeric (PG casts int to numeric for these functions).
+    assert_eq!(
+        eval_fn("floor", vec![Value::Int32(1)]),
+        Value::Decimal { value: 1, scale: 0 }
+    );
+    assert_eq!(
+        eval_fn("round", vec![Value::Int64(7)]),
+        Value::Decimal { value: 7, scale: 0 }
+    );
+
+    // NULL propagates.
+    assert_eq!(eval_fn("round", vec![Value::Null]), Value::Null);
+}
+
+#[test]
 fn abs_preserves_argument_numeric_type() {
     // Integer widths are preserved (matching the planner-declared type
     // and PostgreSQL, which keeps `abs(int4)` as `integer`).

@@ -69,17 +69,11 @@ impl CommitPayload {
     pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         let count = u32::try_from(self.committed_subxids.len())
             .map_err(|_| PayloadError::Malformed("commit subxid count overflow"))?;
-        let body = checked_offset(
-            self.committed_subxids.len(),
-            self.committed_subxids.len(),
-            "commit subxid bytes overflow",
-        )
-        .and_then(|_| {
-            self.committed_subxids
-                .len()
-                .checked_mul(Self::SUBXID_SIZE)
-                .ok_or(PayloadError::Malformed("commit subxid bytes overflow"))
-        })?;
+        let body = self
+            .committed_subxids
+            .len()
+            .checked_mul(Self::SUBXID_SIZE)
+            .ok_or(PayloadError::Malformed("commit subxid bytes overflow"))?;
         let total = checked_offset(Self::FIXED, body, "commit length overflow")?;
         let mut out = vec![0_u8; total];
         write_u64_le(&mut out[0..8], self.commit_lsn.raw());

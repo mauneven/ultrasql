@@ -332,10 +332,58 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;
 
+    // FIX 7 — round/floor/ceil/trunc preserve the input type. A bare
+    // decimal literal like `1.2` is `numeric` in PostgreSQL, so these
+    // return `numeric`; the value is read via a `::text` cast and the type
+    // is pinned with `pg_typeof`.
+    let round_family = client
+        .query_one(
+            "SELECT \
+             ceil(1.2)::text, pg_typeof(ceil(1.2))::text, \
+             floor(1.8)::text, pg_typeof(floor(1.8))::text, \
+             round(1.6)::text, pg_typeof(round(1.6))::text, \
+             trunc(1.9)::text, pg_typeof(trunc(1.9))::text",
+            &[],
+        )
+        .await
+        .expect("round-family functions");
+    assert_eq!(round_family.get::<_, String>(0), "2");
+    assert_eq!(round_family.get::<_, String>(1), "numeric");
+    assert_eq!(round_family.get::<_, String>(2), "1");
+    assert_eq!(round_family.get::<_, String>(3), "numeric");
+    assert_eq!(round_family.get::<_, String>(4), "2");
+    assert_eq!(round_family.get::<_, String>(5), "numeric");
+    assert_eq!(round_family.get::<_, String>(6), "1");
+    assert_eq!(round_family.get::<_, String>(7), "numeric");
+
+    // round/floor/ceil/trunc over `double precision` stay `double
+    // precision`, and `round(float8)` uses banker's (ties-to-even)
+    // rounding: round(2.5::float8) = 2, round(3.5::float8) = 4.
+    let float_round = client
+        .query_one(
+            "SELECT \
+             round(2.5::float8), pg_typeof(round(2.5::float8))::text, \
+             round(3.5::float8), ceil(1.2::float8)",
+            &[],
+        )
+        .await
+        .expect("float round-family functions");
+    assert!((float_round.get::<_, f64>(0) - 2.0).abs() < 1e-12);
+    assert_eq!(float_round.get::<_, String>(1), "double precision");
+    assert!((float_round.get::<_, f64>(2) - 4.0).abs() < 1e-12);
+    assert!((float_round.get::<_, f64>(3) - 2.0).abs() < 1e-12);
+
+    // numeric round is half away from zero (not banker's):
+    // round(2.5::numeric) = 3.
+    let numeric_round = client
+        .query_one("SELECT round(2.5::numeric)::text", &[])
+        .await
+        .expect("numeric round");
+    assert_eq!(numeric_round.get::<_, String>(0), "3");
+
     let row = client
         .query_one(
             "SELECT \
-             ceil(1.2), floor(1.8), round(1.6), trunc(1.9), \
              power(2, 5), sqrt(9), exp(0), ln(1), log(100), \
              pi(), sin(0), cos(0), tan(0), asin(0), acos(1), atan(0), random()",
             &[],
@@ -344,10 +392,6 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
         .expect("math functions");
 
     let expected = [
-        2.0,
-        1.0,
-        2.0,
-        1.0,
         32.0,
         3.0,
         1.0,
@@ -368,7 +412,7 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
             "column {idx}: expected {expected_value}, got {got}"
         );
     }
-    let random_value: f64 = row.get(16);
+    let random_value: f64 = row.get(12);
     assert!(
         (0.0..1.0).contains(&random_value),
         "random() out of range: {random_value}"

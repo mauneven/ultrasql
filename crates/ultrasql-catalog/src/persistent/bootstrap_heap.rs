@@ -428,6 +428,18 @@ impl PersistentCatalog {
                 _ => {}
             }
         }
+        // Drop constraint rows that belong to a table that no longer exists.
+        // `persist_table_drop_tombstone` does not emit a `ConType::Dropped`
+        // constraint tombstone, so the `Dropped`-only retain above leaves a
+        // dropped table's constraints behind. Now that `tables_by_oid` is
+        // fully populated, keep a constraint row only when its `conrelid` is
+        // a system OID or names a live user table. Mirrors the pg_index /
+        // pg_statistic / pg_statistic_ext liveness retains.
+        constraint_rows.retain(|_, row| {
+            row.conrelid.raw() < crate::memory::FIRST_USER_OID
+                || tables_by_oid.contains_key(&row.conrelid)
+        });
+        total_constraint_rows = u32::try_from(constraint_rows.len()).unwrap_or(u32::MAX);
         for oid in constraint_rows.keys() {
             track_next_oid(&mut highest_oid, *oid, "pg_constraint")?;
         }

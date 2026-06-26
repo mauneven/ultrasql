@@ -375,6 +375,60 @@ fn abs_and_mod_return_types_track_argument_types() {
 }
 
 #[test]
+fn round_family_return_types_match_pg_matrix() {
+    let numeric = DataType::Decimal {
+        precision: None,
+        scale: None,
+    };
+    let scaled = DataType::Decimal {
+        precision: Some(10),
+        scale: Some(2),
+    };
+
+    for func in ["round", "floor", "ceil", "trunc"] {
+        // numeric -> numeric (precision/scale collapse to unconstrained).
+        assert_eq!(
+            builtin_return_type(func, &[null_arg(numeric.clone())]).unwrap(),
+            numeric,
+            "{func}(numeric)"
+        );
+        assert_eq!(
+            builtin_return_type(func, &[null_arg(scaled.clone())]).unwrap(),
+            numeric,
+            "{func}(numeric(10,2))"
+        );
+        // double precision -> double precision; real widens to float8.
+        assert_eq!(
+            builtin_return_type(func, &[null_arg(DataType::Float64)]).unwrap(),
+            DataType::Float64,
+            "{func}(double precision)"
+        );
+        assert_eq!(
+            builtin_return_type(func, &[null_arg(DataType::Float32)]).unwrap(),
+            DataType::Float64,
+            "{func}(real)"
+        );
+        // integer -> numeric (PG casts int to its preferred numeric type).
+        for int in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            assert_eq!(
+                builtin_return_type(func, &[null_arg(int.clone())]).unwrap(),
+                numeric,
+                "{func}({int})"
+            );
+        }
+        // Non-numeric is rejected; wrong arity is rejected.
+        assert!(
+            builtin_return_type(func, &[null_arg(DataType::Text { max_len: None })]).is_err(),
+            "{func}(text) must error"
+        );
+        assert!(
+            builtin_return_type(func, &[]).is_err(),
+            "{func}() must error"
+        );
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn cast_type_and_numeric_helpers_cover_edge_paths() {
     for (name, expected) in [

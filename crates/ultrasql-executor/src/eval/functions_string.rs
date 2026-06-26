@@ -147,6 +147,127 @@ pub(crate) fn eval_numeric_unary(
     Ok(Value::Float64(op(value)))
 }
 
+/// The four PostgreSQL rounding-family functions, used to pick the right
+/// rounding rule per input type.
+#[derive(Clone, Copy)]
+pub(crate) enum RoundMode {
+    /// `round` — ties to even for `double precision` (PG uses `rint`),
+    /// ties away from zero for `numeric`.
+    Round,
+    /// `floor` — toward negative infinity.
+    Floor,
+    /// `ceil`/`ceiling` — toward positive infinity.
+    Ceil,
+    /// `trunc` — toward zero.
+    Trunc,
+}
+
+impl RoundMode {
+    /// Apply this rounding to an `f64` (the `double precision` path). PG's
+    /// `dround` uses round-half-to-even (`rint`), which differs from Rust's
+    /// `f64::round` (half away from zero); ceil/floor/trunc are directional
+    /// and tie-free.
+    fn apply_f64(self, x: f64) -> f64 {
+        match self {
+            Self::Round => x.round_ties_even(),
+            Self::Floor => x.floor(),
+            Self::Ceil => x.ceil(),
+            Self::Trunc => x.trunc(),
+        }
+    }
+
+    /// Apply this rounding to a scaled-integer `Decimal` (the `numeric`
+    /// path), producing the integer result. PG's `numeric` rounding is
+    /// half **away from zero** (not banker's); floor/ceil/trunc are
+    /// directional.
+    fn apply_decimal(self, value: i64, scale: i32) -> Result<i64, EvalError> {
+        if scale <= 0 {
+            // Already an integer (or negative scale, which we do not mint).
+            return Ok(value);
+        }
+        let divisor = 10_i64.checked_pow(u32::try_from(scale).map_err(|_| EvalError::Overflow)?);
+        let Some(divisor) = divisor else {
+            return Err(EvalError::Overflow);
+        };
+        let quotient = value / divisor;
+        let remainder = value % divisor;
+        if remainder == 0 {
+            return Ok(quotient);
+        }
+        let result = match self {
+            Self::Trunc => quotient,
+            Self::Floor => {
+                if value < 0 {
+                    quotient - 1
+                } else {
+                    quotient
+                }
+            }
+            Self::Ceil => {
+                if value > 0 {
+                    quotient + 1
+                } else {
+                    quotient
+                }
+            }
+            Self::Round => {
+                // Half away from zero: compare 2*|remainder| against divisor.
+                let twice = remainder
+                    .checked_abs()
+                    .and_then(|r| r.checked_mul(2))
+                    .ok_or(EvalError::Overflow)?;
+                if twice >= divisor {
+                    if value < 0 {
+                        quotient - 1
+                    } else {
+                        quotient + 1
+                    }
+                } else {
+                    quotient
+                }
+            }
+        };
+        Ok(result)
+    }
+}
+
+/// `round`/`floor`/`ceil`/`trunc` with PostgreSQL's result-type matrix:
+/// `numeric -> numeric`, `double precision -> double precision`, and an
+/// integer argument casts to `numeric` (PG's preferred cast), so it also
+/// yields `numeric`. The produced value type matches the planner's
+/// `round_family_return_type`.
+pub(crate) fn eval_round_family(
+    args: &[Value],
+    func: &str,
+    mode: RoundMode,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        // `double precision` stays `double precision`.
+        Value::Float32(v) => Ok(Value::Float64(mode.apply_f64(f64::from(*v)))),
+        Value::Float64(v) => Ok(Value::Float64(mode.apply_f64(*v))),
+        // `numeric` stays `numeric`; result is an integer-valued numeric.
+        Value::Decimal { value, scale } => Ok(Value::Decimal {
+            value: mode.apply_decimal(*value, *scale)?,
+            scale: 0,
+        }),
+        // Integer arguments cast to `numeric` in PG, so return `numeric`.
+        other => match other.as_i64() {
+            Some(v) => Ok(Value::Decimal { value: v, scale: 0 }),
+            None => Err(EvalError::Type(format!(
+                "{func}: argument must be numeric, got {:?}",
+                other.data_type()
+            ))),
+        },
+    }
+}
+
 pub(crate) fn eval_numeric_binary(
     args: &[Value],
     func: &str,
