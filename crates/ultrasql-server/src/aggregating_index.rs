@@ -391,14 +391,16 @@ fn display_key(row: &[Value]) -> String {
         .join("\u{1f}")
 }
 
-/// Mark every aggregating index on `entry` stale.
+/// Mark every aggregating index on `entry` stale, recording the writing XID
+/// (`ctx.xid`) so the serve gate can later reject a summary rebuilt from this
+/// writer's own snapshot if the writer aborts (the phantom-aggregate hole).
 pub(crate) fn mark_aggregating_indexes_dirty(entry: &TableEntry, ctx: &LowerCtx<'_>) {
     let Some(constraints) = ctx.table_constraints.get(&entry.oid) else {
         return;
     };
     for metadata in constraints.indexes.values() {
         if let Some(runtime) = &metadata.aggregating {
-            runtime.mark_dirty();
+            runtime.mark_dirty_with_writer(ctx.xid);
         }
     }
 }
@@ -558,7 +560,7 @@ fn current_summary_rows(
     {
         return Ok(None);
     }
-    let stale_rebuild_used = rebuild_runtime_if_dirty(
+    let stale_rebuild_used = rebuild_runtime_for_snapshot(
         table,
         runtime,
         ctx.heap.as_ref(),
@@ -593,6 +595,74 @@ fn current_summary_rows(
     let base_rows_skipped = summary_base_rows_represented(&runtime.spec, &rows);
     runtime.record_explain_read(stale_rebuild_used, rows.len(), base_rows_skipped);
     Ok(Some(rows))
+}
+
+/// Bring `runtime`'s summary up to date for a reader on `snapshot`, gated by
+/// the aborted-writer coherence check.
+///
+/// Two layers:
+///
+/// 1. The dirty fast path ([`rebuild_runtime_if_dirty`]) rebuilds a summary
+///    that DML marked stale, exactly as before.
+/// 2. The **serve gate**: after the fast path the summary is clean, but it may
+///    have been rebuilt earlier from an in-txn writer's *own* uncommitted
+///    snapshot. If the recorded `last_writer_xid` is not servable to this
+///    reader — it ABORTED, or is in progress for a non-self reader — per the
+///    same [`TransactionManager`] (`XidStatusOracle`) the heap visibility path
+///    consults, we force a fresh rebuild from this reader's snapshot (heap
+///    truth, which skips aborted tuples) and clear the recorded writer. This
+///    closes the phantom-aggregate hole: a fresh reader after a `ROLLBACK` /
+///    `ROLLBACK PREPARED` / savepoint-rollback / SSI force-abort never sees
+///    the rolled-back writer's aggregate.
+///
+/// Returns `true` if a rebuild ran (for EXPLAIN's `stale_rebuild_used`).
+fn rebuild_runtime_for_snapshot(
+    table: &TableEntry,
+    runtime: &Arc<RuntimeAggregatingIndex>,
+    heap: &ultrasql_storage::heap::HeapAccess<BlankPageLoader>,
+    snapshot: &Snapshot,
+    oracle: &TransactionManager,
+) -> Result<bool, ServerError> {
+    let dirty_rebuilt = rebuild_runtime_if_dirty(table, runtime, heap, snapshot, oracle)?;
+    if dirty_rebuilt {
+        // A fresh rebuild reflects this reader's snapshot. If the rebuild was
+        // driven by this reader's own snapshot of a non-self writer's effect,
+        // the recorded writer is still meaningful (own read-after-write keeps
+        // its is_current_xid path); only a rebuild that consumed committed
+        // truth clears it. We leave the writer intact here: a dirty rebuild
+        // by the writer itself must keep serving via is_current_xid, and a
+        // dirty rebuild by a committed/maintenance snapshot already records
+        // INVALID. The gate below still runs to catch the not-dirty case.
+        if runtime.summary_servable_to(snapshot, oracle) {
+            return Ok(true);
+        }
+        // Rebuilt, but the recorded writer is not servable to this reader
+        // (e.g. an aborted writer's mark_dirty re-dirtied and a concurrent
+        // reader rebuilt). Fall through to the forced rebuild + clear.
+    } else if runtime.summary_servable_to(snapshot, oracle) {
+        // Clean and the recorded writer is servable (no writer, own write, or
+        // committed): the fast path stands.
+        return Ok(false);
+    }
+
+    // The clean summary was built from a writer that is NOT servable to this
+    // reader (aborted, or in progress for a non-self reader). Rebuild from the
+    // reader's committed snapshot and drop the stale writer stamp so the gate
+    // passes on subsequent serves once the heap truth is materialised.
+    let rows = build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle)?;
+    {
+        let mut guard = runtime
+            .rows
+            .write()
+            .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
+        *guard = rows;
+    }
+    runtime.clear_last_writer();
+    // The forced rebuild made the summary clean; ensure the dirty flag is not
+    // left set by a racing mark_dirty between our read and rebuild — a still-
+    // dirty flag is harmless (next serve rebuilds) and we never clear a flag
+    // we did not own, so leave `dirty` as the writer left it.
+    Ok(true)
 }
 
 fn rebuild_runtime_if_dirty(
