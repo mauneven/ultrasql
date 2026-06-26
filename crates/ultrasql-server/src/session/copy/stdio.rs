@@ -643,6 +643,16 @@ where
         if payloads.is_empty() {
             return Ok(());
         }
+        // A table with a secondary/unique index or a CHECK/FK/EXCLUDE
+        // constraint must take the maintained INSERT path so the index is kept
+        // current and the constraints are enforced (parity with INSERT). It
+        // never uses the all-visible bulk shortcut — the operator does normal
+        // MVCC inserts. The bulk fast path below (with its autocommit
+        // `mark_all_visible` optimisation) is preserved ONLY for an
+        // unconstrained, unindexed table.
+        if self.copy_table_needs_maintained_insert(entry) {
+            return self.flush_copy_insert_batch_maintained(entry, payloads, txn);
+        }
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let wal = self.state.heap.wal_sink().map(Arc::as_ref);
         let n_atts = u16::try_from(entry.schema.len())

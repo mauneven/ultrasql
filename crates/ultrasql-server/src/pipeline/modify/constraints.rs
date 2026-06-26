@@ -11,6 +11,7 @@ use ultrasql_planner::{BinaryOp, LogicalReferentialAction};
 
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
+use crate::pipeline::modify::ConstraintCheckDeps;
 
 use super::referential::{
     UpdateChildRowsForDeleteActionArgs, cascade_delete_child_rows, matching_child_rows,
@@ -21,12 +22,24 @@ pub(super) fn build_foreign_key_checks(
     foreign_keys: &[crate::RuntimeForeignKeyConstraint],
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<RowConstraintCheck>, ServerError> {
+    build_foreign_key_checks_from_deps(foreign_keys, &ConstraintCheckDeps::from_lower_ctx(ctx))
+}
+
+/// Build non-deferred FOREIGN KEY row checks from explicit dependencies.
+///
+/// The reuse seam shared by INSERT lowering and `COPY FROM`. Deferred FKs are
+/// validated at COMMIT via the session-txn pending-modifications path, so they
+/// are skipped here for both callers.
+pub(crate) fn build_foreign_key_checks_from_deps(
+    foreign_keys: &[crate::RuntimeForeignKeyConstraint],
+    deps: &ConstraintCheckDeps<'_>,
+) -> Result<Vec<RowConstraintCheck>, ServerError> {
     let mut out = Vec::with_capacity(foreign_keys.len());
     for fk in foreign_keys {
         if fk.deferrable && fk.initially_deferred {
             continue;
         }
-        let parent = ctx
+        let parent = deps
             .catalog_snapshot
             .tables
             .get(&fk.target_table)
@@ -36,9 +49,9 @@ pub(super) fn build_foreign_key_checks(
                     fk.target_table.clone(),
                 ))
             })?;
-        let heap = Arc::clone(&ctx.heap);
-        let snapshot = ctx.snapshot.clone();
-        let oracle = Arc::clone(&ctx.oracle);
+        let heap = Arc::clone(deps.heap);
+        let snapshot = deps.snapshot.clone();
+        let oracle = Arc::clone(deps.oracle);
         let name = fk.name.clone();
         let columns = fk.columns.clone();
         let target_columns = fk.target_columns.clone();
@@ -63,11 +76,29 @@ pub(super) fn build_exclusion_insert_checks(
     exclusions: &[crate::RuntimeExclusionConstraint],
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<RowConstraintCheck>, ServerError> {
+    build_exclusion_insert_checks_from_deps(
+        table,
+        exclusions,
+        &ConstraintCheckDeps::from_lower_ctx(ctx),
+    )
+}
+
+/// Build EXCLUDE insert row checks from explicit dependencies.
+///
+/// The reuse seam shared by INSERT lowering and `COPY FROM`. The closure
+/// dedups within the current batch (the `pending` set) and heap-rechecks
+/// committed/own-write rows under the snapshot — so two conflicting rows in
+/// one COPY are caught just as two rows in one INSERT are.
+pub(crate) fn build_exclusion_insert_checks_from_deps(
+    table: &TableEntry,
+    exclusions: &[crate::RuntimeExclusionConstraint],
+    deps: &ConstraintCheckDeps<'_>,
+) -> Result<Vec<RowConstraintCheck>, ServerError> {
     let mut out = Vec::with_capacity(exclusions.len());
     for exclusion in exclusions {
-        let heap = Arc::clone(&ctx.heap);
-        let snapshot = ctx.snapshot.clone();
-        let oracle = Arc::clone(&ctx.oracle);
+        let heap = Arc::clone(deps.heap);
+        let snapshot = deps.snapshot.clone();
+        let oracle = Arc::clone(deps.oracle);
         let table = table.clone();
         let constraint = exclusion.clone();
         let pending = Arc::new(parking_lot::Mutex::new(Vec::<Vec<Value>>::new()));

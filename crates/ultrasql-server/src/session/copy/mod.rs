@@ -59,6 +59,7 @@ mod decode;
 mod dispatch;
 mod file_ops;
 mod fs_io;
+mod maintain;
 mod stdio;
 #[cfg(test)]
 mod tests;

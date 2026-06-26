@@ -90,7 +90,7 @@ mod join;
 mod json_table_scan;
 mod lower_query;
 mod lower_simple;
-mod modify;
+pub(crate) mod modify;
 mod object_stream;
 mod parquet_scan;
 pub(crate) use parquet_scan::{

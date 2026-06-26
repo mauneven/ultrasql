@@ -14,17 +14,32 @@ use ultrasql_storage::btree::BTree;
 
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
+use crate::pipeline::modify::IndexMaintainerDeps;
 
 pub(super) fn build_insert_index_maintainers(
     entry: &TableEntry,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<InsertIndexMaintainer<crate::BlankPageLoader>>, ServerError> {
-    let Some(indexes) = ctx.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
+    build_insert_index_maintainers_from_deps(entry, IndexMaintainerDeps::from_lower_ctx(ctx))
+}
+
+/// Build the B-tree/hash insert index maintainers from explicit dependencies.
+///
+/// This is the reuse seam shared by the INSERT-lowering path (which passes
+/// [`IndexMaintainerDeps::from_lower_ctx`]) and `COPY FROM` (which assembles
+/// the same dependencies straight off the [`Session`](crate::Session) and the
+/// governing transaction). Keeping the body here means COPY maintains indexes
+/// with the identical encoder/partial-predicate/BRIN logic as INSERT.
+pub(crate) fn build_insert_index_maintainers_from_deps(
+    entry: &TableEntry,
+    deps: IndexMaintainerDeps<'_>,
+) -> Result<Vec<InsertIndexMaintainer<crate::BlankPageLoader>>, ServerError> {
+    let Some(indexes) = deps.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::with_capacity(indexes.len());
     for index in indexes {
-        if let Some(maintainer) = build_one_insert_index_maintainer(entry, index, ctx)? {
+        if let Some(maintainer) = build_one_insert_index_maintainer(entry, index, &deps)? {
             out.push(maintainer);
         }
     }
@@ -34,7 +49,7 @@ pub(super) fn build_insert_index_maintainers(
 fn build_one_insert_index_maintainer(
     entry: &TableEntry,
     index: &IndexEntry,
-    ctx: &LowerCtx<'_>,
+    deps: &IndexMaintainerDeps<'_>,
 ) -> Result<Option<InsertIndexMaintainer<crate::BlankPageLoader>>, ServerError> {
     let columns: Vec<usize> = index
         .columns
@@ -42,7 +57,7 @@ fn build_one_insert_index_maintainer(
         .map(|attnum| usize::from(*attnum))
         .collect();
     let key_columns = columns.clone();
-    let runtime = ctx
+    let runtime = deps
         .table_constraints
         .get(&entry.oid)
         .and_then(|constraints| constraints.indexes.get(&index.oid).cloned());
@@ -80,7 +95,7 @@ fn build_one_insert_index_maintainer(
     };
     let index_rel = RelationId::new(index.oid.raw());
     let tree = BTree::open(
-        Arc::clone(ctx.heap.buffer_pool()),
+        Arc::clone(deps.heap.buffer_pool()),
         index_rel,
         index.root_block,
     );
@@ -143,10 +158,21 @@ pub(super) fn build_vector_index_maintainers(
     entry: &TableEntry,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<VectorIndexMaintainer>, ServerError> {
-    let Some(indexes) = ctx.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
+    build_vector_index_maintainers_from_deps(entry, IndexMaintainerDeps::from_lower_ctx(ctx))
+}
+
+/// Build the HNSW/IVFFlat vector index maintainers from explicit dependencies.
+///
+/// The COPY-maintenance reuse seam for vector (ANN) indexes; mirrors
+/// [`build_insert_index_maintainers_from_deps`].
+pub(crate) fn build_vector_index_maintainers_from_deps(
+    entry: &TableEntry,
+    deps: IndexMaintainerDeps<'_>,
+) -> Result<Vec<VectorIndexMaintainer>, ServerError> {
+    let Some(indexes) = deps.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
         return Ok(Vec::new());
     };
-    let Some(constraints) = ctx.table_constraints.get(&entry.oid) else {
+    let Some(constraints) = deps.table_constraints.get(&entry.oid) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -191,8 +217,8 @@ pub(super) fn build_vector_index_maintainers(
                     index.name.clone(),
                     hnsw,
                     encoder,
-                    ctx.xid,
-                    ctx.heap.wal_sink().cloned(),
+                    deps.xid,
+                    deps.heap.wal_sink().cloned(),
                 ));
             }
             LogicalIndexMethod::IvfFlat => {
@@ -203,8 +229,8 @@ pub(super) fn build_vector_index_maintainers(
                     index.name.clone(),
                     ivfflat,
                     encoder,
-                    ctx.xid,
-                    ctx.heap.wal_sink().cloned(),
+                    deps.xid,
+                    deps.heap.wal_sink().cloned(),
                 ));
             }
             _ => {}
