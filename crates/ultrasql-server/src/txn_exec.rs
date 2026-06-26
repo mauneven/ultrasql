@@ -424,10 +424,14 @@ pub(crate) fn lock_tuple_ids(
                 tag: LockTag::Tuple(*tid),
                 mode: mode.to_lock_mode(),
             })
-            .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+            .map_err(|e| ServerError::Execute(ExecError::SerializationFailure(e.to_string())))?;
         if !acquired {
-            return Err(ServerError::Execute(ExecError::TypeMismatch(
-                "write conflict: row lock not available".to_string(),
+            // serialization_failure (40001) — a concurrent transaction holds
+            // a conflicting row lock and this `FOR UPDATE`/`FOR SHARE` request
+            // cannot proceed. Mirrors PostgreSQL, which aborts the blocked
+            // statement with 40001 so retry-aware clients re-issue the txn.
+            return Err(ServerError::Execute(ExecError::SerializationFailure(
+                "could not serialize access due to concurrent update".to_string(),
             )));
         }
     }

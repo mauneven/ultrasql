@@ -64,6 +64,12 @@ pub enum PlanError {
     /// this to SQLSTATE `42P10` (`invalid_column_reference`).
     #[error("{0}")]
     DistinctOnOrderByMismatch(String),
+
+    /// A scalar function call named a function that does not exist as a
+    /// supported builtin. The server maps this to SQLSTATE `42883`
+    /// (`undefined_function`). The string names the missing function.
+    #[error("function {0} does not exist")]
+    UndefinedFunction(String),
 }
 
 impl PlanError {

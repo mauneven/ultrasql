@@ -1388,12 +1388,19 @@ async fn set_transaction_isolation_level_round_trip() {
         .expect("SHOW transaction isolation level after COMMIT");
     assert_eq!(row.get::<_, String>(0), "read committed");
 
-    // Outside a transaction is allowed to round-trip with a warning;
-    // tokio-postgres surfaces the CommandComplete tag, not the notice.
-    client
+    // Outside a transaction PostgreSQL rejects SET TRANSACTION with
+    // SQLSTATE 25P01 (no_active_sql_transaction) — an error, not a warning.
+    let err = client
         .batch_execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .await
-        .expect("SET TRANSACTION outside tx round-trips with a notice");
+        .expect_err("SET TRANSACTION outside a tx must error");
+    assert_eq!(
+        err.code()
+            .expect("SQLSTATE on SET TRANSACTION outside tx")
+            .code(),
+        "25P01",
+        "SET TRANSACTION outside a transaction must report no_active_sql_transaction: {err:?}"
+    );
 
     shutdown(client, server_handle).await;
 }

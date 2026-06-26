@@ -10,7 +10,7 @@ use ultrasql_parser::ast::{
 };
 use ultrasql_planner::{LogicalPlan, LogicalSequenceChange, LogicalSequenceOptions};
 use ultrasql_protocol::{BackendMessage, FieldDescription};
-use ultrasql_storage::sequence::{Sequence, SequenceOptions};
+use ultrasql_storage::sequence::{Sequence, SequenceError, SequenceOptions};
 use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
@@ -502,7 +502,15 @@ where
                 self.sequence_xid(),
                 self.sequence_wal_sink(),
             )
-            .map_err(|e| ServerError::ddl(format!("nextval: {e}")))?;
+            .map_err(|e| match e {
+                // sequence_generator_limit_exceeded (2200H) — a non-CYCLE
+                // sequence advanced past its bound. PostgreSQL reports this
+                // distinct class rather than a generic internal error.
+                SequenceError::Exhausted => ServerError::SequenceLimitExceeded(format!(
+                    "nextval: reached maximum value of sequence \"{seq_key}\""
+                )),
+                other => ServerError::ddl(format!("nextval: {other}")),
+            })?;
         self.sequence_state.record_nextval(&seq_key, value);
         Ok(value)
     }

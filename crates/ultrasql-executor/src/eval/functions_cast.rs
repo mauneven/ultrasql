@@ -64,11 +64,11 @@ pub(crate) fn eval_cast_float32(args: &[Value]) -> Result<Value, EvalError> {
     let value = raw
         .to_string()
         .parse::<f32>()
-        .map_err(|_| EvalError::Type(format!("real cast: value out of range: {raw}")))?;
+        .map_err(|_| EvalError::Overflow)?;
     if raw.is_finite() && !value.is_finite() {
-        return Err(EvalError::Type(format!(
-            "real cast: value out of range: {raw}"
-        )));
+        // numeric_value_out_of_range — a finite f64 (e.g. 1e40) does not
+        // fit in f32 and overflows to infinity. Mirror PostgreSQL's 22003.
+        return Err(EvalError::Overflow);
     }
     Ok(Value::Float32(value))
 }
@@ -91,11 +91,13 @@ pub(crate) fn numeric_cast_arg_f64(func: &str, args: &[Value]) -> Result<Option<
         Value::Null => Ok(None),
         Value::Int16(v) => Ok(Some(f64::from(*v))),
         Value::Int32(v) => Ok(Some(f64::from(*v))),
-        Value::Int64(v) => v.to_string().parse::<f64>().map(Some).map_err(|_| {
-            EvalError::Type(format!(
-                "{func}: value out of range for double precision: {v}"
-            ))
-        }),
+        Value::Int64(v) => v
+            .to_string()
+            .parse::<f64>()
+            .map(Some)
+            // numeric_value_out_of_range — value does not fit the target
+            // floating-point type. Mirror PostgreSQL's 22003.
+            .map_err(|_| EvalError::Overflow),
         Value::Float32(v) => Ok(Some(f64::from(*v))),
         Value::Float64(v) => Ok(Some(*v)),
         Value::Decimal { value, scale } => decimal_value_to_f64(*value, *scale)

@@ -344,3 +344,104 @@ async fn join_with_where_filter_returns_filtered_rows() {
 
     shutdown(client, server_handle).await;
 }
+
+/// An unqualified column reference that matches a column on both sides of a
+/// comma cross-join is ambiguous. PostgreSQL reports SQLSTATE `42702`
+/// (`ambiguous_column`); previously the planner catch-all swallowed it as
+/// `42P01` (undefined_table).
+#[tokio::test]
+async fn ambiguous_column_reference_reports_42702() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE amb_a (id INT NOT NULL, av INT NOT NULL)")
+        .await
+        .expect("create a");
+    client
+        .batch_execute("CREATE TABLE amb_b (id INT NOT NULL, bv INT NOT NULL)")
+        .await
+        .expect("create b");
+    client
+        .batch_execute("INSERT INTO amb_a VALUES (1, 10)")
+        .await
+        .expect("seed a");
+    client
+        .batch_execute("INSERT INTO amb_b VALUES (1, 20)")
+        .await
+        .expect("seed b");
+
+    let err = client
+        .simple_query("SELECT id FROM amb_a, amb_b")
+        .await
+        .expect_err("ambiguous id must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42702"),
+        "ambiguous column must report ambiguous_column: {err:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// A call to a function that is not a supported builtin reports SQLSTATE
+/// `42883` (`undefined_function`); previously this surfaced as `0A000`
+/// (feature_not_supported).
+#[tokio::test]
+async fn unknown_function_reports_42883() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE uf_t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO uf_t VALUES (1)")
+        .await
+        .expect("seed");
+
+    let err = client
+        .simple_query("SELECT no_such_function(id) FROM uf_t")
+        .await
+        .expect_err("unknown function must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42883"),
+        "unknown function must report undefined_function: {err:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// `char_length` and `character_length` round-trip as aliases of `length`.
+#[tokio::test]
+async fn char_length_aliases_round_trip_as_length() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE cl_t (s TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO cl_t VALUES ('hello')")
+        .await
+        .expect("seed");
+
+    for func in ["length", "char_length", "character_length"] {
+        let rows = client
+            .simple_query(&format!("SELECT {func}(s) FROM cl_t"))
+            .await
+            .unwrap_or_else(|e| panic!("{func} query: {e}"));
+        let value = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    row.get(0).and_then(|s| s.parse::<i32>().ok())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{func} returns a row"));
+        assert_eq!(value, 5, "{func}('hello') == 5");
+    }
+
+    shutdown(client, server_handle).await;
+}

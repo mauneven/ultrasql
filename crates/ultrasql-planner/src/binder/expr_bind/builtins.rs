@@ -123,7 +123,10 @@ pub(in crate::binder) fn builtin_return_type(
         "hybrid_search" => Ok(DataType::Float64),
         "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
-        _ => Err(PlanError::NotSupported("non-aggregate function calls")),
+        // undefined_function (42883) — the call named a function that is not
+        // a supported builtin. PostgreSQL reports this distinct class rather
+        // than feature_not_supported.
+        _ => Err(PlanError::UndefinedFunction(format!("{func_name}()"))),
     }
 }
 
@@ -291,6 +294,19 @@ pub(in crate::binder) fn validate_array_element_argument(
             element_type.as_ref(),
             value_type
         )))
+    }
+}
+
+/// Fold SQL-standard function spellings onto the single name the binder
+/// and executor implement. PostgreSQL exposes `char_length` and
+/// `character_length` as aliases of `length`; normalizing here lets the
+/// scalar dispatch, aggregation-context check, return-type inference, and
+/// the executor's `eval_function_call` all key off one name.
+#[must_use]
+pub(in crate::binder) fn normalize_builtin_alias(func_name: &str) -> &str {
+    match func_name {
+        "char_length" | "character_length" => "length",
+        other => other,
     }
 }
 

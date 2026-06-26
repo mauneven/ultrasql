@@ -7,7 +7,7 @@ use ultrasql_parser::ast::{Expr, NullsOrder, OrderItem, SelectItem, SortDirectio
 use super::expr_bind::{
     bind_collated_expr, builtin_return_type, coerce_args_to_common_type,
     coerce_common_builtin_args, coerce_literal_to_match, common_scalar_return_type,
-    is_supported_builtin, validate_builtin_args,
+    is_supported_builtin, normalize_builtin_alias, validate_builtin_args,
 };
 use super::expr_type::{binary_result_type, comparable};
 use super::util::{ordinal_index, plain_select_exprs, positional_ordinal};
@@ -486,6 +486,7 @@ fn collect_non_aggregate_function_args(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<(), PlanError> {
+    let func_name = normalize_builtin_alias(func_name);
     if !is_supported_builtin(func_name) {
         return Err(PlanError::NotSupported(
             "non-aggregate function calls in aggregation context",

@@ -309,6 +309,26 @@ fn builtin_validation_and_type_matrix_covers_catalog_introspection_surface() {
 }
 
 #[test]
+fn char_length_aliases_normalize_to_length() {
+    // PostgreSQL exposes `char_length` and `character_length` as
+    // SQL-standard aliases of `length`. After normalization all three key
+    // off the single `length` builtin (Int32 return type, supported).
+    for alias in ["char_length", "character_length"] {
+        assert_eq!(normalize_builtin_alias(alias), "length", "{alias}");
+        let normalized = normalize_builtin_alias(alias);
+        assert!(is_supported_builtin(normalized), "{alias}");
+        assert_eq!(
+            builtin_return_type(normalized, &[]).unwrap(),
+            DataType::Int32,
+            "{alias}"
+        );
+    }
+    // A non-alias name is returned unchanged.
+    assert_eq!(normalize_builtin_alias("length"), "length");
+    assert_eq!(normalize_builtin_alias("upper"), "upper");
+}
+
+#[test]
 fn abs_and_mod_return_types_track_argument_types() {
     let numeric = DataType::Decimal {
         precision: None,

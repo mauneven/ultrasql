@@ -51,6 +51,35 @@ async fn create_sequence_nextval_currval_setval_and_drop() {
     graceful_shutdown(running).await;
 }
 
+/// A non-`CYCLE` sequence advanced past its `MAXVALUE` reports SQLSTATE
+/// `2200H` (`sequence_generator_limit_exceeded`) — PostgreSQL's distinct
+/// class for sequence exhaustion — rather than a generic internal error.
+#[tokio::test]
+async fn nextval_past_maxvalue_reports_sequence_limit_exceeded() {
+    let running = start_sample_server("sequence_exhaustion").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE SEQUENCE s START WITH 1 MAXVALUE 2 NO CYCLE")
+        .await
+        .expect("create bounded sequence");
+
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 1);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 2);
+
+    let err = client
+        .simple_query("SELECT nextval('s')")
+        .await
+        .expect_err("exhausted sequence must error");
+    assert_eq!(
+        err.code().expect("SQLSTATE on sequence exhaustion").code(),
+        "2200H",
+        "sequence exhaustion must report sequence_generator_limit_exceeded: {err:?}"
+    );
+
+    graceful_shutdown(running).await;
+}
+
 #[tokio::test]
 async fn sequence_functions_preserve_quoted_dot_in_public_name() {
     let running = start_sample_server("sequence_dotted_public_name").await;

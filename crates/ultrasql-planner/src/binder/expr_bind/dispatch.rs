@@ -98,6 +98,11 @@ pub(in crate::binder) fn bind_expr_with_ctes(
                 .last()
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
+            // PostgreSQL exposes `char_length` and `character_length` as
+            // SQL-standard aliases of `length`. Normalize them here so the
+            // single `length` arm in return-type/validation/eval handles
+            // all three uniformly.
+            let func_name = normalize_builtin_alias(&func_name).to_owned();
             let scalar_min_max = is_scalar_min_max_call(
                 &func_name,
                 args.len(),

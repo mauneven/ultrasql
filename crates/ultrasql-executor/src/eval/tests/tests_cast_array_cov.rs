@@ -346,3 +346,37 @@ fn cast_size_and_array_error_edges_cover_scalar_compat_paths() {
         Value::Bool(false)
     );
 }
+
+#[test]
+fn float4_cast_overflow_is_numeric_overflow() {
+    // `1e40::real` — finite f64 that does not fit in f32 overflows to
+    // infinity. PostgreSQL reports 22003 (numeric_value_out_of_range); we
+    // surface `EvalError::Overflow`, which the server maps to 22003. The
+    // earlier `EvalError::Type` would have mapped to XX000.
+    let err = eval_function_call(
+        "__ultrasql_cast_float4",
+        &[Value::Float64(1e40)],
+        &DataType::Null,
+    )
+    .expect_err("1e40 overflows f32");
+    assert!(
+        matches!(err, EvalError::Overflow),
+        "out-of-range real cast must be Overflow, got {err:?}"
+    );
+}
+
+#[test]
+fn float4_cast_genuine_type_error_still_type() {
+    // Regression: a wrong-type argument must keep `EvalError::Type`
+    // (42xxx/XX000), not be reclassified as numeric overflow.
+    let err = eval_function_call(
+        "__ultrasql_cast_float4",
+        &[Value::Bool(true)],
+        &DataType::Null,
+    )
+    .expect_err("bool is not castable to real here");
+    assert!(
+        matches!(err, EvalError::Type(_)),
+        "wrong-type real cast must stay Type, got {err:?}"
+    );
+}

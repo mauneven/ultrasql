@@ -436,9 +436,11 @@ where
         let mut messages: Vec<BackendMessage> = Vec::with_capacity(2);
         match &mut self.txn_state {
             TxnState::Idle => {
-                messages.push(notice_warning(
-                    "25P01",
-                    "SET TRANSACTION outside a transaction",
+                // no_active_sql_transaction (25P01) — PostgreSQL rejects
+                // `SET TRANSACTION` with no active transaction block as an
+                // error, not a warning, so the statement fails outright.
+                return Err(ServerError::Savepoint(
+                    "SET TRANSACTION can only be used in transaction blocks",
                 ));
             }
             TxnState::InTransaction(txn) => {

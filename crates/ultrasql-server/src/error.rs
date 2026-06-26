@@ -153,6 +153,13 @@ pub enum ServerError {
     #[error("serialization failure: {0}")]
     SerializationFailure(String),
 
+    /// `nextval` advanced a non-`CYCLE` sequence past its declared
+    /// `MAXVALUE`/`MINVALUE`. Maps to PostgreSQL SQLSTATE `2200H`
+    /// (`sequence_generator_limit_exceeded`). The string carries the
+    /// PostgreSQL-matching message text.
+    #[error("{0}")]
+    SequenceLimitExceeded(String),
+
     /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` was issued
     /// outside a transaction block. Maps to PostgreSQL SQLSTATE
     /// `25P01` (`no_active_sql_transaction`). The string names the
@@ -256,6 +263,7 @@ impl ServerError {
                 | Self::InvalidTableDefinition(_)
                 | Self::TransactionAborted
                 | Self::SerializationFailure(_)
+                | Self::SequenceLimitExceeded(_)
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
                 | Self::ReadOnlyTransaction(_)
@@ -289,6 +297,15 @@ impl ServerError {
             // invalid_column_reference — DISTINCT ON expressions must be a
             // prefix of ORDER BY.
             Self::Plan(ultrasql_planner::PlanError::DistinctOnOrderByMismatch(_)) => "42P10",
+            // ambiguous_column — a column reference matched more than one
+            // entry in scope (e.g. unqualified `id` across joined tables).
+            Self::Plan(ultrasql_planner::PlanError::Ambiguous(_)) => "42702",
+            // undefined_object — a referenced index does not exist in the
+            // catalog (DROP INDEX / index hint on a missing name).
+            Self::Plan(ultrasql_planner::PlanError::IndexNotFound(_)) => "42704",
+            // undefined_function — a call named a function that is not a
+            // supported builtin.
+            Self::Plan(ultrasql_planner::PlanError::UndefinedFunction(_)) => "42883",
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
@@ -305,11 +322,14 @@ impl ServerError {
             Self::InvalidTableDefinition(_) => "42P16",  // invalid_table_definition
             Self::Catalog(_) => "42000",                 // generic catalog failure
             Self::SerializationFailure(_) => "40001",    // serialization_failure
-            Self::TransactionAborted => "25P02",         // in_failed_sql_transaction
-            Self::Savepoint(_) => "25P01",               // no_active_sql_transaction
-            Self::SavepointNotFound(_) => "3B001",       // invalid_savepoint_specification
-            Self::ReadOnlyTransaction(_) => "25006",     // read_only_sql_transaction
-            Self::InsufficientPrivilege(_) => "42501",   // insufficient_privilege
+            // sequence_generator_limit_exceeded — nextval ran a non-CYCLE
+            // sequence past its MAXVALUE/MINVALUE.
+            Self::SequenceLimitExceeded(_) => "2200H",
+            Self::TransactionAborted => "25P02", // in_failed_sql_transaction
+            Self::Savepoint(_) => "25P01",       // no_active_sql_transaction
+            Self::SavepointNotFound(_) => "3B001", // invalid_savepoint_specification
+            Self::ReadOnlyTransaction(_) => "25006", // read_only_sql_transaction
+            Self::InsufficientPrivilege(_) => "42501", // insufficient_privilege
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT / UPDATE. Mirrors PostgreSQL's
             // `not_null_violation`.
@@ -453,5 +473,69 @@ mod tests {
 
         assert!(err.is_query_scoped());
         assert_eq!(err.sqlstate(), "3F000");
+    }
+
+    #[test]
+    fn ambiguous_column_is_ambiguous_column_code() {
+        // PG: 42702 ambiguous_column. Must not fall into the 42P01 catch-all.
+        let err = ServerError::Plan(ultrasql_planner::PlanError::Ambiguous("id".to_owned()));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "42702");
+    }
+
+    #[test]
+    fn index_not_found_is_undefined_object_code() {
+        // PG: 42704 undefined_object. Must not fall into the 42P01 catch-all.
+        let err = ServerError::Plan(ultrasql_planner::PlanError::IndexNotFound("idx".to_owned()));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "42704");
+    }
+
+    #[test]
+    fn undefined_function_is_undefined_function_code() {
+        // PG: 42883 undefined_function.
+        let err = ServerError::Plan(ultrasql_planner::PlanError::UndefinedFunction(
+            "foobar()".to_owned(),
+        ));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "42883");
+    }
+
+    #[test]
+    fn table_not_found_still_maps_to_undefined_table() {
+        // Regression guard: the genuine undefined_table path must keep 42P01
+        // after the explicit Ambiguous/IndexNotFound arms were inserted ahead
+        // of the catch-all.
+        let err = ServerError::Plan(ultrasql_planner::PlanError::TableNotFound("t".to_owned()));
+        assert_eq!(err.sqlstate(), "42P01");
+    }
+
+    #[test]
+    fn sequence_limit_exceeded_maps_to_2200h() {
+        // PG: 2200H sequence_generator_limit_exceeded.
+        let err = ServerError::SequenceLimitExceeded(
+            "nextval: reached maximum value of sequence \"s\"".to_owned(),
+        );
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "2200H");
+    }
+
+    #[test]
+    fn row_lock_conflict_maps_to_serialization_failure() {
+        // PG: 40001 serialization_failure for a blocking-lock-conflict abort.
+        let err = ServerError::Execute(ultrasql_executor::ExecError::SerializationFailure(
+            "could not serialize access due to concurrent update".to_owned(),
+        ));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "40001");
+    }
+
+    #[test]
+    fn set_transaction_outside_block_maps_to_no_active_sql_transaction() {
+        // PG: 25P01 no_active_sql_transaction. `execute_set_transaction`
+        // returns `Savepoint` for the Idle case; both share this code.
+        let err = ServerError::Savepoint("SET TRANSACTION can only be used in transaction blocks");
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "25P01");
     }
 }
