@@ -12,6 +12,12 @@
 //! Correctness invariant: after the rewrite the project expressions reference
 //! the same logical columns as before, addressed through their new consecutive
 //! positions in the projected scan schema.
+//!
+//! Constant-only projections (`SELECT 1 FROM t`) reference no scan columns. The
+//! pushed-down scan must still carry the true row count, so the rule retains one
+//! (cheap) scan column rather than emitting an empty projection — a zero-column
+//! scan is structurally forced to zero rows by `Batch::new`. The rule therefore
+//! never produces `projection: Some(vec![])`.
 
 #![allow(clippy::match_same_arms)]
 
@@ -91,6 +97,21 @@ fn push_proj(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             // Build the ordered list of used indices.
             let mut ordered: Vec<usize> = used.into_iter().collect();
             ordered.sort_unstable();
+
+            // Constant-only projection (`SELECT 1 FROM t`, `SELECT now() FROM
+            // t`, …) references no scan columns, so `ordered` is empty. A
+            // zero-column scan is structurally forced to zero rows by
+            // `Batch::new` (row count is derived from the first column), which
+            // silently drops every row. Keep exactly one scan column so the
+            // pushed-down scan stays narrow *and* the batch carries the true
+            // row count; the constant projection above then broadcasts per row.
+            //
+            // On a single-column table `total_columns == 1`, so this retains
+            // column 0 and pushes `projection: Some([0])` — a correct no-op
+            // narrowing (never an empty projection).
+            if ordered.is_empty() {
+                ordered.push(narrowest_scan_column(scan_schema));
+            }
 
             // Build the new (narrowed) scan schema.
             let new_scan_fields: Vec<Field> = ordered
@@ -210,6 +231,24 @@ fn push_proj(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pick the cheapest single scan column to retain when a projection references
+/// no columns at all. Prefers the narrowest fixed-width column (smallest
+/// `fixed_size`), tie-broken by lowest index; falls back to column 0 when no
+/// column is fixed-width. The caller guarantees the scan has at least one
+/// column.
+fn narrowest_scan_column(scan_schema: &Schema) -> usize {
+    scan_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .min_by_key(|(idx, field)| {
+            // Non-fixed-width (varlena) columns sort after every fixed-width
+            // one via `usize::MAX`; ties on width break on the lower index.
+            (field.data_type.fixed_size().unwrap_or(usize::MAX), *idx)
+        })
+        .map_or(0, |(idx, _)| idx)
+}
 
 /// Returns `true` if `expr` contains a scalar subquery, `EXISTS`, `IN`-subquery,
 /// or an `OuterColumn` reference. Such expressions reference outer columns
@@ -478,6 +517,129 @@ mod tests {
         };
         let rule = ProjectionPushdown;
         assert!(rule.apply(&plan).expect("no error").is_none());
+    }
+
+    // --- Constant-only projection: keep one scan column for the row count ---
+
+    fn lit(value: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: ultrasql_core::Value::Int32(value),
+            data_type: DataType::Int32,
+        }
+    }
+
+    #[test]
+    fn constant_only_projection_retains_one_scan_column() {
+        // `SELECT 1 FROM t` over a 3-column table references no columns. The
+        // rule must still narrow the scan to exactly one column (never the
+        // empty projection that would force the batch to zero rows).
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            schema: three_col_schema(),
+            projection: None,
+        };
+        let proj_schema =
+            Schema::new([Field::required("?column?", DataType::Int32)]).expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![(lit(1), "?column?".into())],
+            schema: proj_schema,
+        };
+
+        let rule = ProjectionPushdown;
+        let result = rule.apply(&plan).expect("no error").expect("should push");
+        let LogicalPlan::Project { input, exprs, .. } = result else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Scan {
+            projection,
+            schema: scan_schema,
+            ..
+        } = *input
+        else {
+            panic!("expected Scan");
+        };
+        // Exactly one column retained — narrowest fixed-width, tie on index → 0.
+        assert_eq!(projection, Some(vec![0]));
+        assert_eq!(scan_schema.len(), 1);
+        assert_ne!(
+            projection,
+            Some(vec![]),
+            "must never push an empty projection"
+        );
+        // The constant expression is unchanged (it references no columns).
+        assert_eq!(exprs[0].0, lit(1));
+    }
+
+    #[test]
+    fn constant_only_projection_picks_narrowest_column() {
+        // Mixed widths: a wide Text col[0], a Bool col[1] (1 byte), an Int64
+        // col[2] (8 bytes). The Bool is narrowest, so col[1] is retained.
+        let schema = Schema::new([
+            Field::required("payload", DataType::Text { max_len: None }),
+            Field::required("flag", DataType::Bool),
+            Field::required("big", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            schema,
+            projection: None,
+        };
+        let proj_schema =
+            Schema::new([Field::required("?column?", DataType::Int32)]).expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![(lit(7), "?column?".into())],
+            schema: proj_schema,
+        };
+        let rule = ProjectionPushdown;
+        let result = rule.apply(&plan).expect("no error").expect("should push");
+        let LogicalPlan::Project { input, .. } = result else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Scan { projection, .. } = *input else {
+            panic!("expected Scan");
+        };
+        assert_eq!(
+            projection,
+            Some(vec![1]),
+            "narrowest (Bool) column retained"
+        );
+    }
+
+    #[test]
+    fn constant_only_projection_on_single_column_table_keeps_that_column() {
+        // Edge: a 1-column table. Retaining column 0 must not collapse to an
+        // empty projection; `Some([0])` is a correct no-op narrowing.
+        let schema = Schema::new([Field::required("only", DataType::Int32)]).expect("schema ok");
+        let scan = LogicalPlan::Scan {
+            table: "t".into(),
+            schema,
+            projection: None,
+        };
+        let proj_schema =
+            Schema::new([Field::required("?column?", DataType::Int32)]).expect("schema ok");
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![(lit(1), "?column?".into())],
+            schema: proj_schema,
+        };
+        let rule = ProjectionPushdown;
+        let result = rule.apply(&plan).expect("no error").expect("should push");
+        let LogicalPlan::Project { input, .. } = result else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Scan {
+            projection,
+            schema: scan_schema,
+            ..
+        } = *input
+        else {
+            panic!("expected Scan");
+        };
+        assert_eq!(projection, Some(vec![0]));
+        assert_eq!(scan_schema.len(), 1);
     }
 
     // --- No-op: scan not under project directly ---

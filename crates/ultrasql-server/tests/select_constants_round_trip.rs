@@ -143,3 +143,298 @@ async fn select_where_row_value_in_round_trip() {
 
     shutdown(running).await;
 }
+
+// ===========================================================================
+// Constant-only projection over a base table: `SELECT 1 FROM t` and friends.
+//
+// Regression battery for the WRONG-RESULT bug where a projection of only
+// constant expressions sitting directly over a base-table scan (no intervening
+// Filter) returned 0 rows instead of count(t). Root cause: ProjectionPushdown
+// narrowed the scan to a zero-column projection, and a zero-column batch is
+// structurally forced to zero rows. The fix retains one cheap scan column so
+// the row count survives; the row-count assertions below are the gate.
+// ===========================================================================
+
+/// Seed a fresh two-column table `t` with `N = 5` rows (ids 1..=5).
+async fn seed_t(client: &tokio_postgres::Client) {
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, label TEXT)")
+        .await
+        .expect("create t");
+    client
+        .batch_execute(
+            "INSERT INTO t VALUES \
+             (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+        )
+        .await
+        .expect("seed t");
+}
+
+/// (1) `SELECT 1 FROM t` -> 5 rows, each value 1.
+#[tokio::test]
+async fn select_const_int_from_table_returns_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT 1 FROM t", &[])
+        .await
+        .expect("SELECT 1 FROM t");
+    assert_eq!(rows.len(), 5, "one constant row per base-table row");
+    for row in &rows {
+        assert_eq!(row.get::<_, i32>(0), 1);
+    }
+
+    shutdown(running).await;
+}
+
+/// (2) `SELECT 'x' FROM t` -> 5 rows.
+#[tokio::test]
+async fn select_const_text_from_table_returns_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT 'x' FROM t", &[])
+        .await
+        .expect("SELECT 'x' FROM t");
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert_eq!(row.get::<_, &str>(0), "x");
+    }
+
+    shutdown(running).await;
+}
+
+/// (3) `SELECT now() FROM t` -> 5 rows, all equal (txn-stable now()).
+#[tokio::test]
+async fn select_now_from_table_returns_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT now() FROM t", &[])
+        .await
+        .expect("SELECT now() FROM t");
+    assert_eq!(rows.len(), 5, "one now() row per base-table row");
+    let stamps: Vec<std::time::SystemTime> = rows
+        .iter()
+        .map(|r| r.get::<_, std::time::SystemTime>(0))
+        .collect();
+    assert!(
+        stamps.windows(2).all(|w| w[0] == w[1]),
+        "now() is constant across rows of one statement"
+    );
+
+    shutdown(running).await;
+}
+
+/// (4) `SELECT 1 FROM t LIMIT 1` -> 1 row (existence check).
+#[tokio::test]
+async fn select_const_from_table_limit_one_is_existence_check() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT 1 FROM t LIMIT 1", &[])
+        .await
+        .expect("SELECT 1 FROM t LIMIT 1");
+    assert_eq!(rows.len(), 1, "existence check returns exactly one row");
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+
+    shutdown(running).await;
+}
+
+/// (5) `SELECT 1 FROM t LIMIT 3` -> 3 rows.
+#[tokio::test]
+async fn select_const_from_table_limit_three() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT 1 FROM t LIMIT 3", &[])
+        .await
+        .expect("SELECT 1 FROM t LIMIT 3");
+    assert_eq!(rows.len(), 3);
+
+    shutdown(running).await;
+}
+
+/// (6) `SELECT count(*) FROM (SELECT 1 FROM t) s` -> 1 row, value 5.
+#[tokio::test]
+async fn count_over_constant_subquery_counts_base_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let row = client
+        .query_one("SELECT count(*) FROM (SELECT 1 FROM t) s", &[])
+        .await
+        .expect("count over constant subquery");
+    assert_eq!(row.get::<_, i64>(0), 5);
+
+    shutdown(running).await;
+}
+
+/// (7) `SELECT id, 1 FROM t` -> 5 rows (mixed projection control).
+#[tokio::test]
+async fn select_mixed_column_and_const_returns_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT id, 1 FROM t ORDER BY id", &[])
+        .await
+        .expect("SELECT id, 1 FROM t");
+    assert_eq!(rows.len(), 5);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<_, i32>(0), i32::try_from(i).unwrap() + 1);
+        assert_eq!(row.get::<_, i32>(1), 1);
+    }
+
+    shutdown(running).await;
+}
+
+/// (8) `SELECT 1 FROM t WHERE …` -> Filter path control (5 vs 0 rows).
+#[tokio::test]
+async fn select_const_from_table_with_filter_control() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let all = client
+        .query("SELECT 1 FROM t WHERE id > 0", &[])
+        .await
+        .expect("WHERE id > 0");
+    assert_eq!(all.len(), 5);
+
+    let none = client
+        .query("SELECT 1 FROM t WHERE id > 1000", &[])
+        .await
+        .expect("WHERE id > 1000");
+    assert_eq!(none.len(), 0);
+
+    shutdown(running).await;
+}
+
+/// (9) `SELECT count(*) FROM t` -> 1 row value 5 (Aggregate control, NOT 5 rows).
+#[tokio::test]
+async fn select_count_star_aggregate_control() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    let rows = client
+        .query("SELECT count(*) FROM t", &[])
+        .await
+        .expect("SELECT count(*) FROM t");
+    assert_eq!(rows.len(), 1, "aggregate collapses to a single row");
+    assert_eq!(rows[0].get::<_, i64>(0), 5);
+
+    shutdown(running).await;
+}
+
+/// (10) `INSERT INTO dst SELECT 1 FROM t` -> 5 rows in dst (control).
+#[tokio::test]
+async fn insert_select_const_from_table_inserts_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+    client
+        .batch_execute("CREATE TABLE dst (v INT NOT NULL)")
+        .await
+        .expect("create dst");
+
+    let inserted = client
+        .execute("INSERT INTO dst SELECT 1 FROM t", &[])
+        .await
+        .expect("INSERT … SELECT 1 FROM t");
+    assert_eq!(inserted, 5, "one inserted row per base-table row");
+
+    let row = client
+        .query_one("SELECT count(*) FROM dst", &[])
+        .await
+        .expect("count dst");
+    assert_eq!(row.get::<_, i64>(0), 5);
+
+    shutdown(running).await;
+}
+
+/// (11) `SELECT EXISTS(SELECT 1 FROM t)` -> true; over an empty table -> false.
+#[tokio::test]
+async fn exists_constant_subquery_reflects_table_population() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+    client
+        .batch_execute("CREATE TABLE empty_t (id INT NOT NULL)")
+        .await
+        .expect("create empty_t");
+
+    let populated = client
+        .query_one("SELECT EXISTS(SELECT 1 FROM t)", &[])
+        .await
+        .expect("EXISTS over populated table");
+    assert!(populated.get::<_, bool>(0), "table t has rows");
+
+    let empty = client
+        .query_one("SELECT EXISTS(SELECT 1 FROM empty_t)", &[])
+        .await
+        .expect("EXISTS over empty table");
+    assert!(!empty.get::<_, bool>(0), "empty_t has no rows");
+
+    shutdown(running).await;
+}
+
+/// (12) Constant projection over a self-JOIN -> correct row count (not 0).
+#[tokio::test]
+async fn select_const_over_join_returns_correct_row_count() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    seed_t(client).await;
+
+    // Each of the 5 ids in `a` matches exactly one row in `b` -> 5 rows.
+    let rows = client
+        .query("SELECT 1 FROM t a JOIN t b ON a.id = b.id", &[])
+        .await
+        .expect("constant over self-join");
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert_eq!(row.get::<_, i32>(0), 1);
+    }
+
+    shutdown(running).await;
+}
+
+/// (13) `SELECT 1 FROM t` on a single-column table -> 5 rows (edge: do not
+/// prune to an empty projection on a 1-column table).
+#[tokio::test]
+async fn select_const_from_single_column_table_returns_all_rows() {
+    let running = start_sample_server("select_constants_test").await;
+    let client = &running.client;
+    client
+        .batch_execute("CREATE TABLE single_col (id INT NOT NULL)")
+        .await
+        .expect("create single_col");
+    client
+        .batch_execute("INSERT INTO single_col VALUES (1), (2), (3), (4), (5)")
+        .await
+        .expect("seed single_col");
+
+    let rows = client
+        .query("SELECT 1 FROM single_col", &[])
+        .await
+        .expect("SELECT 1 FROM single_col");
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert_eq!(row.get::<_, i32>(0), 1);
+    }
+
+    shutdown(running).await;
+}
