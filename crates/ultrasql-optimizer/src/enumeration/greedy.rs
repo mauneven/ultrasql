@@ -127,7 +127,12 @@ fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
     for i in 0..right.len() {
         fields.push(right.field_at(i).clone());
     }
-    Schema::new(fields).unwrap_or_else(|_| Schema::empty())
+    // Cross joins routinely concatenate relations that share a column name
+    // (e.g. both sides expose `id`). `Schema::new` rejects duplicate names, so
+    // the old `unwrap_or_else(Schema::empty)` silently collapsed the schema to
+    // zero width. Output schemas here are addressed by ordinal, so preserve the
+    // width (and duplicate labels) with the duplicate-name constructor.
+    Schema::new_with_duplicate_names(fields)
 }
 
 // ============================================================================

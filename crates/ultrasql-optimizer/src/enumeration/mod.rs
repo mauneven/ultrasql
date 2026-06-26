@@ -1201,7 +1201,16 @@ fn concat_schemas(
     for idx in 0..right.len() {
         fields.push(right.field_at(idx).clone());
     }
-    ultrasql_core::Schema::new(fields).unwrap_or_else(|_| ultrasql_core::Schema::empty())
+    // The reordered join executes by column *index*, and
+    // `restore_original_join_schema` re-imposes the binder's deduplicated
+    // `original_schema` via a `Project`, so intermediate field *names* are
+    // irrelevant here; only the *width* (left.len() + right.len()) must be
+    // preserved. `Schema::new` rejects duplicate column names (the common case
+    // for cross joins where both sides expose e.g. `id`) and the old
+    // `unwrap_or_else(Schema::empty)` collapsed the schema to zero width, which
+    // made the restoring `Project` index out of bounds. Use the duplicate-name
+    // constructor so the width is always honoured.
+    ultrasql_core::Schema::new_with_duplicate_names(fields)
 }
 
 fn restore_original_join_schema(
