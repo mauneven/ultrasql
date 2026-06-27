@@ -106,6 +106,7 @@ where
             if self.state.role_catalog.lookup_role(role).is_none() {
                 continue;
             }
+            self.ensure_superuser_target_drop(role)?;
             let dependencies = self.role_drop_dependencies(role);
             if !dependencies.is_empty() {
                 return Err(ServerError::DependentObjectsStillExist(format!(
@@ -403,6 +404,28 @@ where
         Ok(())
     }
 
+    /// PostgreSQL only lets a superuser drop a role that carries SUPERUSER,
+    /// REPLICATION, or BYPASSRLS. A non-superuser with CREATEROLE may drop the
+    /// ordinary roles it administers, but must never be able to remove a
+    /// privileged role (which would let it escalate by recreating that role
+    /// under its own control). Mirrors `ensure_superuser_target_alteration`.
+    fn ensure_superuser_target_drop(&self, role_name: &str) -> Result<(), ServerError> {
+        if self.current_role_is_superuser() {
+            return Ok(());
+        }
+        if self
+            .state
+            .role_catalog
+            .lookup_role(role_name)
+            .is_some_and(|role| role_is_privileged_membership_target(&role))
+        {
+            return Err(ServerError::InsufficientPrivilege(
+                "must be superuser to drop superuser/replication/bypassrls roles".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn auth_role_is_superuser(&self) -> bool {
         match self.state.role_catalog.lookup_role(&self.auth_user) {
             Some(role) => role.is_superuser,
@@ -566,4 +589,125 @@ fn parse_valid_until(value: &str) -> Result<Option<i64>, ServerError> {
     let parsed = chrono::DateTime::parse_from_rfc3339(&normalized)
         .map_err(|_| ServerError::ddl("role VALID UNTIL must be an RFC3339 timestamp"))?;
     Ok(Some(parsed.timestamp_micros()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::RoleEntry;
+    use std::sync::Arc;
+    use tokio::io::duplex;
+
+    fn plain_role(oid: u32, name: &str) -> RoleEntry {
+        RoleEntry {
+            oid,
+            name: name.to_owned(),
+            password: None,
+            is_superuser: false,
+            inherit: true,
+            create_role: false,
+            create_db: false,
+            can_login: true,
+            replication: false,
+            bypass_rls: false,
+            connection_limit: -1,
+            valid_until: None,
+        }
+    }
+
+    fn drop_plan(role: &str) -> LogicalPlan {
+        LogicalPlan::DropRole {
+            kind: LogicalRoleKind::Role,
+            roles: vec![role.to_ascii_lowercase()],
+            if_exists: false,
+            cascade: false,
+            schema: ultrasql_core::Schema::empty(),
+        }
+    }
+
+    #[test]
+    fn createrole_non_superuser_cannot_drop_superuser_role() {
+        // #18: a CREATEROLE non-superuser must not be able to DROP a SUPERUSER
+        // (or REPLICATION / BYPASSRLS) role — that would let it escalate.
+        let server = Arc::new(crate::Server::with_sample_database());
+
+        let mut admin = plain_role(20_001, "admin_cr");
+        admin.create_role = true;
+        server.role_catalog.create_role(admin).expect("admin");
+
+        let mut su = plain_role(20_002, "su_target");
+        su.is_superuser = true;
+        server.role_catalog.create_role(su).expect("su");
+
+        let mut repl = plain_role(20_003, "repl_target");
+        repl.replication = true;
+        server.role_catalog.create_role(repl).expect("repl");
+
+        let mut brls = plain_role(20_004, "brls_target");
+        brls.bypass_rls = true;
+        server.role_catalog.create_role(brls).expect("brls");
+
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "admin_cr".to_owned();
+
+        for target in ["su_target", "repl_target", "brls_target"] {
+            let err = session
+                .execute_drop_role(&drop_plan(target))
+                .expect_err("non-superuser must not drop a privileged role");
+            assert!(
+                matches!(err, ServerError::InsufficientPrivilege(_)),
+                "dropping {target} should be InsufficientPrivilege, got {err:?}"
+            );
+            // The escalation is blocked: the privileged role still exists.
+            assert!(server.role_catalog.lookup_role(target).is_some());
+        }
+    }
+
+    #[test]
+    fn createrole_non_superuser_can_drop_plain_role() {
+        // Legitimate access still works: a CREATEROLE admin drops an ordinary
+        // role it administers.
+        let server = Arc::new(crate::Server::with_sample_database());
+
+        let mut admin = plain_role(21_001, "admin_cr2");
+        admin.create_role = true;
+        server.role_catalog.create_role(admin).expect("admin");
+        server
+            .role_catalog
+            .create_role(plain_role(21_002, "plain_target"))
+            .expect("plain");
+
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "admin_cr2".to_owned();
+
+        session
+            .execute_drop_role(&drop_plan("plain_target"))
+            .expect("dropping a plain role must succeed");
+        assert!(server.role_catalog.lookup_role("plain_target").is_none());
+    }
+
+    #[test]
+    fn superuser_can_drop_superuser_role() {
+        let server = Arc::new(crate::Server::with_sample_database());
+
+        let mut su_admin = plain_role(22_001, "su_admin");
+        su_admin.is_superuser = true;
+        su_admin.create_role = true;
+        server.role_catalog.create_role(su_admin).expect("su_admin");
+
+        let mut su = plain_role(22_002, "su_victim");
+        su.is_superuser = true;
+        server.role_catalog.create_role(su).expect("su");
+
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "su_admin".to_owned();
+
+        session
+            .execute_drop_role(&drop_plan("su_victim"))
+            .expect("a superuser may drop a superuser");
+        assert!(server.role_catalog.lookup_role("su_victim").is_none());
+    }
 }

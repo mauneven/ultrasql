@@ -460,3 +460,100 @@ async fn truncate_accepts_table_truncate_privilege() {
 
     shutdown(running).await;
 }
+
+#[tokio::test]
+async fn column_less_reads_require_table_select_privilege() {
+    // #17: `count(*)`, `SELECT 1`, and `EXISTS (SELECT 1 FROM t)` read a table
+    // without observing any column. Without SELECT they must be denied, not
+    // silently leak row counts / existence.
+    let running = start_sample_server("column_less_select_gate").await;
+    let client = &running.client;
+
+    client
+        .batch_execute(
+            "CREATE ROLE tester SUPERUSER LOGIN; \
+             CREATE ROLE colless_owner LOGIN; \
+             CREATE ROLE colless_user LOGIN; \
+             SET ROLE colless_owner; \
+             CREATE TABLE colless_secret (id INT, val TEXT); \
+             INSERT INTO colless_secret VALUES (1, 'a'), (2, 'b'); \
+             CREATE TABLE colless_other (id INT); \
+             INSERT INTO colless_other VALUES (1); \
+             RESET ROLE",
+        )
+        .await
+        .expect("create column-less select tables");
+    // colless_user may read colless_other but has NO grant on colless_secret.
+    let (owner, owner_conn) =
+        connect_as(running.bound, "colless_owner", "colless_other_grant").await;
+    owner
+        .batch_execute("GRANT SELECT ON TABLE colless_other TO colless_user")
+        .await
+        .expect("owner grants SELECT on other");
+    drop(owner);
+    owner_conn.await.expect("owner-other connection joins");
+
+    // No SELECT on colless_secret: every column-less read must be denied.
+    let (user, user_conn) = connect_as(running.bound, "colless_user", "colless_blocked").await;
+    assert_insufficient_privilege(
+        user.batch_execute("SELECT count(*) FROM colless_secret")
+            .await
+            .expect_err("count(*) needs SELECT"),
+    );
+    assert_insufficient_privilege(
+        user.batch_execute("SELECT 1 FROM colless_secret")
+            .await
+            .expect_err("SELECT 1 needs SELECT"),
+    );
+    assert_insufficient_privilege(
+        user.batch_execute("SELECT EXISTS (SELECT 1 FROM colless_secret)")
+            .await
+            .expect_err("EXISTS subquery needs SELECT"),
+    );
+    // Reading a column the user IS allowed (other) but probing secret via a
+    // correlated EXISTS still requires SELECT on secret.
+    assert_insufficient_privilege(
+        user.batch_execute(
+            "SELECT * FROM colless_other WHERE EXISTS (SELECT 1 FROM colless_secret)",
+        )
+        .await
+        .expect_err("EXISTS over secret needs SELECT on secret"),
+    );
+    drop(user);
+    user_conn.await.expect("blocked connection joins");
+
+    // Grant SELECT on colless_secret: the same reads now succeed.
+    let (owner, owner_conn) = connect_as(running.bound, "colless_owner", "colless_grant").await;
+    owner
+        .batch_execute("GRANT SELECT ON TABLE colless_secret TO colless_user")
+        .await
+        .expect("owner grants SELECT");
+    drop(owner);
+    owner_conn.await.expect("owner connection joins");
+
+    let (user, user_conn) = connect_as(running.bound, "colless_user", "colless_allowed").await;
+    let count = user
+        .query_one("SELECT count(*) FROM colless_secret", &[])
+        .await
+        .expect("count(*) permitted after grant")
+        .get::<_, i64>(0);
+    assert_eq!(count, 2);
+    user.batch_execute("SELECT 1 FROM colless_secret")
+        .await
+        .expect("SELECT 1 permitted after grant");
+    user.batch_execute("SELECT EXISTS (SELECT 1 FROM colless_secret)")
+        .await
+        .expect("EXISTS permitted after grant");
+    drop(user);
+    user_conn.await.expect("allowed connection joins");
+
+    client
+        .batch_execute(
+            "DROP TABLE colless_secret; DROP TABLE colless_other; \
+             DROP ROLE colless_owner; DROP ROLE colless_user",
+        )
+        .await
+        .expect("cleanup column-less select test");
+
+    shutdown(running).await;
+}

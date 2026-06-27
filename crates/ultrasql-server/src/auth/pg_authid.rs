@@ -371,7 +371,12 @@ impl InMemoryAuthCatalog {
         };
         let mut roles = BTreeSet::from([member.clone()]);
         if entry.inherit {
-            collect_memberships(&self.memberships.read(), &member, &mut roles);
+            collect_inherited_memberships(
+                &self.memberships.read(),
+                &self.roles.read(),
+                &member,
+                &mut roles,
+            );
         }
         roles.into_iter().collect()
     }
@@ -467,14 +472,39 @@ fn membership_path_exists(
     false
 }
 
-fn collect_memberships(
+/// Collect the roles whose privileges `member` *inherits*.
+///
+/// This is the inherited-privilege set, which is distinct from the
+/// membership / `SET ROLE` set computed by [`membership_path_exists`]. Both
+/// walk the same membership graph, but privilege inheritance stops at any
+/// role with `rolinherit = false`: PostgreSQL records the direct membership
+/// regardless of `INHERIT` (so `SET ROLE` and `is_member_of` still see it),
+/// yet only follows the chain *through* a role when that intermediate role
+/// itself inherits (`if (!has_rolinherit(memberid)) continue;` in
+/// `roles_is_member_of`).
+///
+/// So every directly granted role is recorded here, but the recursion into a
+/// granted role's own memberships only happens when that role's `inherit`
+/// flag is set. A `NOINHERIT` intermediate therefore contributes its own
+/// privileges (the edge is recorded) but blocks the privileges of roles it is
+/// in turn a member of.
+fn collect_inherited_memberships(
     memberships: &BTreeMap<(String, String), RoleMembership>,
+    roles: &HashMap<String, RoleEntry>,
     member: &str,
     out: &mut BTreeSet<String>,
 ) {
     for membership in memberships.values().filter(|edge| edge.member == member) {
         if out.insert(membership.role.clone()) {
-            collect_memberships(memberships, &membership.role, out);
+            // Recurse only when the granted role itself inherits; a role
+            // missing from the map is treated as non-inheriting (its
+            // privileges, if any, cannot be resolved anyway).
+            let inherits = roles
+                .get(&membership.role)
+                .is_some_and(|entry| entry.inherit);
+            if inherits {
+                collect_inherited_memberships(memberships, roles, &membership.role, out);
+            }
         }
     }
 }
@@ -596,6 +626,93 @@ mod tests {
             vec!["noinherit_member".to_owned()]
         );
         assert!(cat.can_set_role("noinherit_member", "group_role"));
+    }
+
+    #[test]
+    fn inheritance_stops_at_noinherit_intermediate() {
+        // Repro for #32: GRANT c TO b (NOINHERIT); GRANT b TO m (INHERIT).
+        // m must NOT inherit c's privileges through the non-inheriting b, but
+        // membership / SET ROLE must remain intact across the whole chain.
+        let cat = make_catalog();
+        cat.add_role(test_role(3, "r_c", true)); // holds the privilege
+        cat.add_role(test_role(4, "r_b", false)); // intermediate, NOINHERIT
+        cat.add_role(test_role(5, "r_m", true)); // member, INHERIT
+        cat.grant_roles("root", &["r_c".to_owned()], &["r_b".to_owned()], false)
+            .expect("grant c to b");
+        cat.grant_roles("root", &["r_b".to_owned()], &["r_m".to_owned()], false)
+            .expect("grant b to m");
+
+        // Inherited-privilege set: m inherits b (direct edge, recorded
+        // regardless of INHERIT) but NOT c, because b does not inherit.
+        let inherited = cat.inherited_role_names("r_m");
+        assert!(
+            inherited.contains(&"r_b".to_owned()),
+            "m is a member of b, so b's own privileges are inherited"
+        );
+        assert!(
+            !inherited.contains(&"r_c".to_owned()),
+            "m must not inherit c through the NOINHERIT intermediate b"
+        );
+
+        // Membership / SET ROLE ignore INHERIT entirely: m is transitively a
+        // member of both b and c and may SET ROLE to either.
+        assert!(cat.is_member_of("r_m", "r_b"));
+        assert!(cat.is_member_of("r_m", "r_c"));
+        assert!(cat.can_set_role("r_m", "r_b"));
+        assert!(cat.can_set_role("r_m", "r_c"));
+
+        // Flipping b to INHERIT lets the privilege flow through to m.
+        cat.alter_role(
+            "r_b",
+            RoleEntryChanges {
+                inherit: Some(true),
+                ..RoleEntryChanges::default()
+            },
+        )
+        .expect("alter b to inherit");
+        assert!(
+            cat.inherited_role_names("r_m").contains(&"r_c".to_owned()),
+            "with b INHERIT, m inherits c through b"
+        );
+    }
+
+    #[test]
+    fn noinherit_intermediate_still_inherits_its_own_grants() {
+        // A NOINHERIT role blocks privileges of roles it is a member of, but
+        // its own directly granted memberships are still inherited by members
+        // that do inherit it. Chain: GRANT leaf TO mid (mid INHERIT but
+        // reached through a NOINHERIT gate); verify the gate is per-role.
+        let cat = make_catalog();
+        cat.add_role(test_role(3, "deep", true));
+        cat.add_role(test_role(4, "mid", true)); // INHERIT
+        cat.add_role(test_role(5, "gate", false)); // NOINHERIT
+        cat.add_role(test_role(6, "top", true)); // INHERIT
+        cat.grant_roles("root", &["deep".to_owned()], &["mid".to_owned()], false)
+            .expect("deep -> mid");
+        cat.grant_roles("root", &["mid".to_owned()], &["gate".to_owned()], false)
+            .expect("mid -> gate");
+        cat.grant_roles("root", &["gate".to_owned()], &["top".to_owned()], false)
+            .expect("gate -> top");
+
+        let inherited = cat.inherited_role_names("top");
+        // top inherits gate (direct edge), but NOT mid or deep, since gate is
+        // NOINHERIT and blocks the chain beyond it.
+        assert!(inherited.contains(&"gate".to_owned()));
+        assert!(!inherited.contains(&"mid".to_owned()));
+        assert!(!inherited.contains(&"deep".to_owned()));
+
+        // But a role that inherits `mid` directly DOES get deep.
+        cat.add_role(test_role(7, "direct_mid".to_owned().as_str(), true));
+        cat.grant_roles(
+            "root",
+            &["mid".to_owned()],
+            &["direct_mid".to_owned()],
+            false,
+        )
+        .expect("mid -> direct_mid");
+        let direct = cat.inherited_role_names("direct_mid");
+        assert!(direct.contains(&"mid".to_owned()));
+        assert!(direct.contains(&"deep".to_owned()));
     }
 
     #[test]

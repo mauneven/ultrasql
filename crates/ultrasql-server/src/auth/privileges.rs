@@ -493,6 +493,35 @@ impl InMemoryPrivilegeCatalog {
         })
     }
 
+    /// Return whether any listed role (or `public`) holds `privilege` on
+    /// `object` at the object level **or** on any single column.
+    ///
+    /// PostgreSQL grants access to a column-less table reference (for
+    /// example `SELECT count(*) FROM t` or `EXISTS (SELECT 1 FROM t)`) when
+    /// the role holds the whole-table privilege *or* a column-level grant on
+    /// any column of the table. This predicate captures that "at least one
+    /// column" rule so column-less reads are neither over- nor under-denied.
+    #[must_use]
+    pub fn has_any_column_privilege_for_roles(
+        &self,
+        grantees: &[String],
+        object_kind: PrivilegeObjectKind,
+        object: &str,
+        privilege: PrivilegeKind,
+    ) -> bool {
+        let object_name = normalize_object_name(object_kind, object);
+        let grants = self.grants.read();
+        grants.values().any(|grant| {
+            grant.object_kind == object_kind
+                && grant.privilege == privilege
+                && grant.object_name == object_name
+                && (grant.grantee == "public"
+                    || grantees
+                        .iter()
+                        .any(|role| grant.grantee.eq_ignore_ascii_case(role)))
+        })
+    }
+
     /// Return a deterministic snapshot of all grants.
     #[must_use]
     pub fn list_grants(&self) -> Vec<PrivilegeGrant> {
@@ -741,6 +770,84 @@ mod tests {
             PrivilegeObjectKind::Table,
             "t",
             "secret",
+            PrivilegeKind::Select
+        ));
+    }
+
+    #[test]
+    fn any_column_privilege_covers_object_and_column_grants() {
+        let catalog = InMemoryPrivilegeCatalog::new();
+        let roles = vec!["reader".to_owned()];
+
+        // No grant at all: a column-less read must be denied.
+        assert!(!catalog.has_any_column_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Table,
+            "t",
+            PrivilegeKind::Select
+        ));
+
+        // A column-level SELECT on a single column is enough for `count(*)`.
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["t".to_owned()],
+            &["reader".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Select,
+                columns: vec!["a".to_owned()],
+            }],
+            false,
+        );
+        assert!(catalog.has_any_column_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Table,
+            "t",
+            PrivilegeKind::Select
+        ));
+        // But it must not satisfy a different privilege kind.
+        assert!(!catalog.has_any_column_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Table,
+            "t",
+            PrivilegeKind::Update
+        ));
+
+        // A whole-table (object-level) grant also satisfies it.
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["u".to_owned()],
+            &["reader".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Select,
+                columns: Vec::new(),
+            }],
+            false,
+        );
+        assert!(catalog.has_any_column_privilege_for_roles(
+            &roles,
+            PrivilegeObjectKind::Table,
+            "u",
+            PrivilegeKind::Select
+        ));
+
+        // A grant to `public` matches every role.
+        catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["pubt".to_owned()],
+            &["public".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Select,
+                columns: vec!["x".to_owned()],
+            }],
+            false,
+        );
+        assert!(catalog.has_any_column_privilege_for_roles(
+            &["someone_else".to_owned()],
+            PrivilegeObjectKind::Table,
+            "pubt",
             PrivilegeKind::Select
         ));
     }

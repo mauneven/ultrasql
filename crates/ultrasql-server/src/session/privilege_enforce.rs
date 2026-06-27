@@ -37,6 +37,7 @@ where
             requirements: BTreeSet::new(),
             table_requirements: BTreeSet::new(),
             cte_names: Vec::new(),
+            mutation_targets: Vec::new(),
         };
         collector.collect_plan(plan, true);
         let roles = self
@@ -45,15 +46,38 @@ where
             .inherited_role_names(&self.current_user);
         for requirement in &collector.table_requirements {
             self.ensure_table_schema_usage(&requirement.table, catalog_snapshot, &roles)?;
+            if requirement.privilege == PrivilegeKind::Select
+                && self.public_catalog_table(&requirement.table, catalog_snapshot)
+            {
+                continue;
+            }
             if self.owns_table_for_column_privilege(&requirement.table, catalog_snapshot) {
                 continue;
             }
-            if !self.state.privilege_catalog.has_privilege_for_roles(
-                &roles,
-                PrivilegeObjectKind::Table,
-                &requirement.table,
-                requirement.privilege,
-            ) {
+            // A column-less SELECT reference (e.g. `count(*)`, `SELECT 1`,
+            // `EXISTS (...)`) is satisfied by the whole-table SELECT privilege
+            // *or* a SELECT grant on any single column — matching PostgreSQL,
+            // where `GRANT SELECT (col) ON t` is enough to run `count(*)`.
+            // Other table-level requirements (DELETE, and INSERT/UPDATE raised
+            // by MERGE) demand the whole-table privilege.
+            let satisfied = if requirement.privilege == PrivilegeKind::Select {
+                self.state
+                    .privilege_catalog
+                    .has_any_column_privilege_for_roles(
+                        &roles,
+                        PrivilegeObjectKind::Table,
+                        &requirement.table,
+                        PrivilegeKind::Select,
+                    )
+            } else {
+                self.state.privilege_catalog.has_privilege_for_roles(
+                    &roles,
+                    PrivilegeObjectKind::Table,
+                    &requirement.table,
+                    requirement.privilege,
+                )
+            };
+            if !satisfied {
                 return Err(ServerError::InsufficientPrivilege(format!(
                     "{} privilege on table {}",
                     privilege_name(requirement.privilege),
@@ -198,6 +222,14 @@ struct ColumnPrivilegeCollector<'a, RW> {
     requirements: BTreeSet<ColumnPrivilegeRequirement>,
     table_requirements: BTreeSet<TablePrivilegeRequirement>,
     cte_names: Vec<String>,
+    /// Folded names of tables that appear only as the mutation *target* of an
+    /// enclosing `UPDATE`/`DELETE`. The base-table scan of such a target must
+    /// not raise a blanket whole-table SELECT requirement: PostgreSQL needs
+    /// only UPDATE/DELETE for `DELETE FROM t` or `UPDATE t SET c = <const>`.
+    /// Any column actually read from the target (a `WHERE`, a `RETURNING`, or
+    /// a `SET c = c + 1`) still produces its own per-column SELECT requirement
+    /// through the normal expression walk.
+    mutation_targets: Vec<String>,
 }
 
 impl<RW> ColumnPrivilegeCollector<'_, RW>
@@ -206,7 +238,20 @@ where
 {
     fn collect_plan(&mut self, plan: &LogicalPlan, output_observed: bool) {
         match plan {
-            LogicalPlan::Scan { .. } => {
+            LogicalPlan::Scan { table, .. } => {
+                // PostgreSQL requires SELECT (or at least one column privilege)
+                // on every table *read* by a query, even when no column is
+                // output — e.g. `SELECT count(*) FROM t`, `SELECT 1 FROM t`, or
+                // `EXISTS (SELECT 1 FROM t)`. Register a whole-table SELECT
+                // requirement for the scanned base table so column-less reads
+                // cannot bypass the privilege check, but skip the scan that is
+                // only the mutation target of an enclosing UPDATE/DELETE: a
+                // bare `DELETE FROM t` / `UPDATE t SET c = <const>` reads no
+                // column and needs only DELETE/UPDATE (columns it does read
+                // still raise per-column SELECT through the expression walk).
+                if !self.is_mutation_target(table) {
+                    self.require_table(table, PrivilegeKind::Select);
+                }
                 if output_observed {
                     for source in plan_sources(plan).into_iter().flatten() {
                         self.require(source, PrivilegeKind::Select);
@@ -353,7 +398,9 @@ where
                     }
                     self.collect_target_exprs(table, &schema, returning);
                 }
+                self.mutation_targets.push(table.to_ascii_lowercase());
                 self.collect_plan(input, false);
+                self.mutation_targets.pop();
             }
             LogicalPlan::Delete {
                 table,
@@ -365,7 +412,9 @@ where
                 if let Some(schema) = self.table_schema(table) {
                     self.collect_target_exprs(table, &schema, returning);
                 }
+                self.mutation_targets.push(table.to_ascii_lowercase());
                 self.collect_plan(input, false);
+                self.mutation_targets.pop();
             }
             LogicalPlan::Merge {
                 target,
@@ -709,6 +758,14 @@ where
             privilege,
         });
     }
+
+    /// Whether `table` is currently the mutation target of an enclosing
+    /// UPDATE/DELETE (so its bare scan must not auto-require SELECT).
+    fn is_mutation_target(&self, table: &str) -> bool {
+        self.mutation_targets
+            .iter()
+            .any(|target| target.eq_ignore_ascii_case(table))
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +830,7 @@ mod tests {
             requirements: BTreeSet::new(),
             table_requirements: BTreeSet::new(),
             cte_names: Vec::new(),
+            mutation_targets: Vec::new(),
         }
     }
 
@@ -1031,5 +1089,281 @@ mod tests {
             "CTE aliases must not become table privilege requirements"
         );
         assert!(session.privilege_bypass());
+    }
+
+    fn count_star(table: &str) -> LogicalPlan {
+        LogicalPlan::Aggregate {
+            input: Box::new(scan(table)),
+            group_by: Vec::new(),
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::CountStar,
+                arg: None,
+                direct_arg: None,
+                order_by: None,
+                distinct: false,
+                output_name: "count".to_owned(),
+                data_type: DataType::Int64,
+            }],
+            schema: Schema::new([Field::required("count", DataType::Int64)]).expect("count schema"),
+        }
+    }
+
+    fn tbl_req(table: &str, privilege: PrivilegeKind) -> TablePrivilegeRequirement {
+        TablePrivilegeRequirement {
+            table: table.to_owned(),
+            privilege,
+        }
+    }
+
+    #[test]
+    fn column_less_scan_registers_whole_table_select_requirement() {
+        // #17: `SELECT count(*) FROM t`, `SELECT 1 FROM t`, and the EXISTS
+        // forms all read a base table without observing any column. Each must
+        // still register a whole-table SELECT requirement.
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "ultrasql".to_owned();
+
+        // count(*): inner scan visited with output_observed = false.
+        let mut count_collector = collector(&session, &snapshot);
+        count_collector.collect_plan(&count_star("secret"), true);
+        assert!(
+            count_collector
+                .table_requirements
+                .contains(&tbl_req("secret", PrivilegeKind::Select)),
+            "count(*) must require whole-table SELECT on the scanned table"
+        );
+
+        // SELECT 1 FROM t: a Project of a literal over a scan (no column out).
+        let select_one = LogicalPlan::Project {
+            input: Box::new(scan("secret")),
+            exprs: vec![(
+                ScalarExpr::Literal {
+                    value: Value::Int32(1),
+                    data_type: DataType::Int32,
+                },
+                "?column?".to_owned(),
+            )],
+            schema: Schema::new([Field::required("?column?", DataType::Int32)]).expect("schema"),
+        };
+        let mut one_collector = collector(&session, &snapshot);
+        one_collector.collect_plan(&select_one, true);
+        assert!(
+            one_collector
+                .table_requirements
+                .contains(&tbl_req("secret", PrivilegeKind::Select)),
+            "SELECT 1 FROM t must require whole-table SELECT"
+        );
+
+        // EXISTS (SELECT 1 FROM secret) inside another query's filter.
+        let exists = LogicalPlan::Filter {
+            input: Box::new(scan("other")),
+            predicate: ScalarExpr::Exists {
+                subplan: Box::new(count_star("secret")),
+                negated: false,
+                correlated: false,
+            },
+        };
+        let mut exists_collector = collector(&session, &snapshot);
+        exists_collector.collect_plan(&exists, true);
+        assert!(
+            exists_collector
+                .table_requirements
+                .contains(&tbl_req("secret", PrivilegeKind::Select)),
+            "EXISTS(SELECT 1 FROM secret) must require whole-table SELECT on secret"
+        );
+        assert!(
+            exists_collector
+                .table_requirements
+                .contains(&tbl_req("other", PrivilegeKind::Select)),
+            "the outer scanned table must require SELECT too"
+        );
+    }
+
+    #[test]
+    fn column_less_read_denied_without_select_but_allowed_with_grant() {
+        use crate::auth::PrivilegeRequest;
+
+        let server = Arc::new(crate::Server::with_sample_database());
+        // A non-privileged login role with no grant on `users`.
+        server
+            .role_catalog
+            .create_role(crate::auth::RoleEntry {
+                oid: 30_001,
+                name: "nogrant".to_owned(),
+                password: None,
+                is_superuser: false,
+                inherit: true,
+                create_role: false,
+                create_db: false,
+                can_login: true,
+                replication: false,
+                bypass_rls: false,
+                connection_limit: -1,
+                valid_until: None,
+            })
+            .expect("create role");
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "nogrant".to_owned();
+
+        // The sample database grants public SELECT only on `users`; `secret`
+        // has no grant. count(*) over it with no privilege -> denied.
+        let err = session
+            .enforce_column_privileges(&count_star("secret"), &snapshot)
+            .expect_err("column-less read without SELECT must be denied");
+        assert!(matches!(err, ServerError::InsufficientPrivilege(_)));
+
+        // A column-level SELECT on a single column is enough for count(*).
+        server.privilege_catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["secret".to_owned()],
+            &["nogrant".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Select,
+                columns: vec!["id".to_owned()],
+            }],
+            false,
+        );
+        session
+            .enforce_column_privileges(&count_star("secret"), &snapshot)
+            .expect("column-level SELECT must satisfy count(*)");
+    }
+
+    #[test]
+    fn mutation_target_scan_does_not_require_select() {
+        // #17 must not over-reach: a bare `DELETE FROM t` / `UPDATE t SET
+        // c = <const>` reads no column from the target and needs only
+        // DELETE/UPDATE — not SELECT. But a WHERE/SET that reads a column
+        // still raises the per-column SELECT requirement.
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "ultrasql".to_owned();
+
+        // Bare DELETE FROM users: target scan must not require SELECT.
+        let delete = LogicalPlan::Delete {
+            table: "users".to_owned(),
+            input: Box::new(scan("users")),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut delete_collector = collector(&session, &snapshot);
+        delete_collector.collect_plan(&delete, true);
+        assert!(
+            delete_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Delete)),
+            "DELETE must require the DELETE privilege"
+        );
+        assert!(
+            !delete_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Select)),
+            "bare DELETE FROM t must not require whole-table SELECT on the target"
+        );
+        assert!(
+            delete_collector.requirements.is_empty(),
+            "bare DELETE reads no column, so no per-column requirement"
+        );
+
+        // UPDATE users SET score = <const>: only UPDATE on score, no SELECT.
+        let update_const = LogicalPlan::Update {
+            table: "users".to_owned(),
+            assignments: vec![(
+                2,
+                ScalarExpr::Literal {
+                    value: Value::Float64(1.0),
+                    data_type: DataType::Float64,
+                },
+            )],
+            input: Box::new(scan("users")),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut update_collector = collector(&session, &snapshot);
+        update_collector.collect_plan(&update_const, true);
+        assert!(
+            update_collector
+                .requirements
+                .contains(&req("score", PrivilegeKind::Update)),
+            "UPDATE must require UPDATE on the assigned column"
+        );
+        assert!(
+            !update_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Select)),
+            "UPDATE t SET c = <const> must not require whole-table SELECT"
+        );
+        assert!(
+            !update_collector
+                .requirements
+                .iter()
+                .any(|r| r.privilege == PrivilegeKind::Select),
+            "a constant assignment reads no column, so no SELECT requirement"
+        );
+
+        // DELETE FROM users WHERE id = 1: now id is read -> per-column SELECT.
+        let delete_where = LogicalPlan::Delete {
+            table: "users".to_owned(),
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("users")),
+                predicate: ScalarExpr::Binary {
+                    op: ultrasql_planner::BinaryOp::Eq,
+                    left: Box::new(id_col()),
+                    right: Box::new(ScalarExpr::Literal {
+                        value: Value::Int32(1),
+                        data_type: DataType::Int32,
+                    }),
+                    data_type: DataType::Bool,
+                },
+            }),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut where_collector = collector(&session, &snapshot);
+        where_collector.collect_plan(&delete_where, true);
+        assert!(
+            where_collector
+                .requirements
+                .contains(&req("id", PrivilegeKind::Select)),
+            "DELETE ... WHERE id = 1 must require SELECT on the read column id"
+        );
+    }
+
+    #[test]
+    fn column_less_read_of_catalog_table_needs_no_grant() {
+        let server = Arc::new(crate::Server::with_sample_database());
+        server
+            .role_catalog
+            .create_role(crate::auth::RoleEntry {
+                oid: 30_002,
+                name: "nogrant2".to_owned(),
+                password: None,
+                is_superuser: false,
+                inherit: true,
+                create_role: false,
+                create_db: false,
+                can_login: true,
+                replication: false,
+                bypass_rls: false,
+                connection_limit: -1,
+                valid_until: None,
+            })
+            .expect("create role");
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "nogrant2".to_owned();
+
+        // pg_catalog tables are publicly selectable; count(*) needs no grant.
+        session
+            .enforce_column_privileges(&count_star("pg_catalog.pg_class"), &snapshot)
+            .expect("catalog table count(*) requires no grant");
     }
 }
