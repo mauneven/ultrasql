@@ -248,8 +248,7 @@ pub(crate) fn as_f64_for_cmp(value: &Value) -> Option<f64> {
     match value {
         Value::Int16(v) => Some(f64::from(*v)),
         Value::Int32(v) => Some(f64::from(*v)),
-        #[allow(clippy::cast_precision_loss)]
-        Value::Int64(v) => Some(*v as f64),
+        Value::Int64(v) => v.to_f64(),
         Value::Float32(v) => Some(f64::from(*v)),
         Value::Float64(v) => Some(*v),
         _ => None,

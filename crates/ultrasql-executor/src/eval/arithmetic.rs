@@ -158,18 +158,22 @@ pub(crate) fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, 
         (Value::Int16(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
         (Value::Float64(l), Value::Int32(r)) => float64_arith(l, f64::from(r), op),
         (Value::Int32(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
-        #[allow(clippy::cast_precision_loss)]
-        (Value::Float64(l), Value::Int64(r)) => float64_arith(l, r as f64, op),
-        #[allow(clippy::cast_precision_loss)]
-        (Value::Int64(l), Value::Float64(r)) => float64_arith(l as f64, r, op),
+        (Value::Float64(l), Value::Int64(r)) => {
+            float64_arith(l, r.to_f64().ok_or(EvalError::Overflow)?, op)
+        }
+        (Value::Int64(l), Value::Float64(r)) => {
+            float64_arith(l.to_f64().ok_or(EvalError::Overflow)?, r, op)
+        }
         (Value::Float32(l), Value::Int16(r)) => float64_arith(f64::from(l), f64::from(r), op),
         (Value::Int16(l), Value::Float32(r)) => float64_arith(f64::from(l), f64::from(r), op),
         (Value::Float32(l), Value::Int32(r)) => float64_arith(f64::from(l), f64::from(r), op),
         (Value::Int32(l), Value::Float32(r)) => float64_arith(f64::from(l), f64::from(r), op),
-        #[allow(clippy::cast_precision_loss)]
-        (Value::Float32(l), Value::Int64(r)) => float64_arith(f64::from(l), r as f64, op),
-        #[allow(clippy::cast_precision_loss)]
-        (Value::Int64(l), Value::Float32(r)) => float64_arith(l as f64, f64::from(r), op),
+        (Value::Float32(l), Value::Int64(r)) => {
+            float64_arith(f64::from(l), r.to_f64().ok_or(EvalError::Overflow)?, op)
+        }
+        (Value::Int64(l), Value::Float32(r)) => {
+            float64_arith(l.to_f64().ok_or(EvalError::Overflow)?, f64::from(r), op)
+        }
         (l, r) => Err(EvalError::Type(format!(
             "arithmetic type mismatch: {l:?} and {r:?}"
         ))),
@@ -183,8 +187,7 @@ pub(crate) fn as_f64_for_arith(value: &Value) -> Option<f64> {
     match value {
         Value::Int16(v) => Some(f64::from(*v)),
         Value::Int32(v) => Some(f64::from(*v)),
-        #[allow(clippy::cast_precision_loss)]
-        Value::Int64(v) => Some(*v as f64),
+        Value::Int64(v) => v.to_f64(),
         Value::Float32(v) => Some(f64::from(*v)),
         Value::Float64(v) => Some(*v),
         Value::Decimal { value, scale } => decimal_value_to_f64(*value, *scale),
