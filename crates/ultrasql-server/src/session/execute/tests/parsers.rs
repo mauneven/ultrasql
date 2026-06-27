@@ -70,6 +70,28 @@ fn logical_replication_and_guc_parsers_cover_success_and_errors() {
     assert!(parse_statement_timeout_ms("-1").is_err());
     assert!(parse_statement_timeout_ms("abc").is_err());
 
+    // work_mem: a bare integer is kilobytes; explicit units override.
+    assert_eq!(
+        parse_work_mem_bytes("1024").expect("bare kb"),
+        1024 * 1024,
+        "bare integer is interpreted as kB"
+    );
+    assert_eq!(parse_work_mem_bytes("64MB").expect("mb"), 64 * 1024 * 1024);
+    assert_eq!(
+        parse_work_mem_bytes(" 1 GB ").expect("gb with spaces"),
+        1024 * 1024 * 1024
+    );
+    assert_eq!(parse_work_mem_bytes("4096B").expect("bytes"), 64 * 1024); // clamped to min
+    assert_eq!(
+        parse_work_mem_bytes("'8MB'").expect("quoted"),
+        8 * 1024 * 1024
+    );
+    // Below the 64 KiB floor clamps up rather than making everything spill.
+    assert_eq!(parse_work_mem_bytes("1").expect("tiny"), 64 * 1024);
+    assert!(parse_work_mem_bytes("5furlongs").is_err());
+    assert!(parse_work_mem_bytes("MB").is_err());
+    assert!(parse_work_mem_bytes("").is_err());
+
     assert!(starts_with_keyword_pair(
         "create publication pub for table t",
         "CREATE",
@@ -177,6 +199,13 @@ fn session_variable_surface_sets_shows_and_resets_supported_gucs() {
         .expect("set timeout");
     assert_eq!(session.statement_timeout_ms, 50);
     session
+        .apply_session_variable("work_mem", "8MB")
+        .expect("set work_mem");
+    assert_eq!(
+        session.session_settings.get("work_mem").map(String::as_str),
+        Some((8 * 1024 * 1024).to_string().as_str())
+    );
+    session
         .apply_session_variable("extra_float_digits", "3")
         .expect("extra_float_digits");
     session
@@ -264,8 +293,22 @@ fn session_variable_surface_sets_shows_and_resets_supported_gucs() {
         ),
         crate::REPORTED_SERVER_VERSION
     );
+    assert_eq!(
+        first_data_row_text(
+            &session
+                .show_session_variable("work_mem", false)
+                .expect("show work_mem")
+        ),
+        (8 * 1024 * 1024).to_string(),
+        "SHOW work_mem reflects the session value in bytes"
+    );
 
     assert!(session.apply_session_variable("jit", "maybe").is_err());
+    assert!(
+        session
+            .apply_session_variable("work_mem", "10toads")
+            .is_err()
+    );
     assert!(
         session
             .apply_session_variable("jit_above_cost", "bad")
@@ -313,6 +356,7 @@ fn session_variable_surface_sets_shows_and_resets_supported_gucs() {
         "jit",
         "jit_above_cost",
         "statement_timeout",
+        "work_mem",
         "extra_float_digits",
         "application_name",
         "client_min_messages",

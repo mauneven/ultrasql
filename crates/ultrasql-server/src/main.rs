@@ -27,8 +27,10 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing::{error, info};
-use ultrasql_server::{Server, WalArchiveConfig, run_server};
+use tracing::{error, info, warn};
+use ultrasql_server::{
+    Server, WalArchiveConfig, bind_listener, serve_listener_with_graceful_shutdown,
+};
 
 #[path = "main_support/cli.rs"]
 mod cli;
@@ -240,7 +242,7 @@ fn main() -> std::process::ExitCode {
                 run_wal_archiver_loop(data_dir, command, interval_ms, timeout).await;
             });
         }
-        run_server(cli.listen, state).await
+        run_server_with_signals(cli.listen, state, cli.shutdown_drain_timeout_ms).await
     });
     match outcome {
         Ok(()) => std::process::ExitCode::from(0),
@@ -249,4 +251,86 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(1)
         }
     }
+}
+
+/// Bind the PostgreSQL listener and serve it until a shutdown signal,
+/// then drain in-flight sessions gracefully.
+///
+/// Installs SIGTERM and SIGINT (Ctrl-C) handlers. The first signal stops
+/// the accept loop and starts draining; in-flight sessions get up to
+/// `drain_timeout_ms` to finish. A second signal (or the deadline) aborts
+/// whatever remains so the process exits promptly. On a clean return the
+/// `Server` `Arc` is dropped, which flushes the WAL / shuts the
+/// checkpointer down.
+async fn run_server_with_signals(
+    addr: std::net::SocketAddr,
+    state: Arc<Server>,
+    drain_timeout_ms: u64,
+) -> Result<(), ultrasql_server::ServerError> {
+    let (listener, bound) = bind_listener(addr).await?;
+    info!(target: "ultrasqld", listen = %bound, "ultrasqld is ready");
+
+    // A shared signal pump increments a counter on each SIGTERM/SIGINT and
+    // notifies both gates. The first signal trips `begin`; the second trips
+    // `force`. Using a `tokio::sync::Notify` per gate keeps the futures
+    // cheap to await inside `serve_listener_with_graceful_shutdown`.
+    let begin = Arc::new(tokio::sync::Notify::new());
+    let force = Arc::new(tokio::sync::Notify::new());
+    let begin_pump = Arc::clone(&begin);
+    let force_pump = Arc::clone(&force);
+    tokio::spawn(async move {
+        // SIGINT (Ctrl-C) and SIGTERM (kill / k8s) both initiate shutdown.
+        // `ctrl_c` is portable; SIGTERM is registered via the unix-specific
+        // signal stream. On non-unix targets only ctrl_c is wired.
+        #[cfg(unix)]
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(target: "ultrasqld", error = %e, "failed to install SIGTERM handler");
+                    return;
+                }
+            };
+        let mut count: u32 = 0;
+        loop {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+            }
+            count += 1;
+            match count {
+                1 => {
+                    info!(target: "ultrasqld", "shutdown signal received; draining connections");
+                    // `notify_one` latches a permit even if no waiter is
+                    // registered yet, so the gate cannot miss the signal.
+                    begin_pump.notify_one();
+                }
+                _ => {
+                    warn!(target: "ultrasqld", "second shutdown signal received; forcing immediate shutdown");
+                    force_pump.notify_one();
+                    return;
+                }
+            }
+        }
+    });
+
+    let begin_shutdown = async move { begin.notified().await };
+    let force_shutdown = async move { force.notified().await };
+    serve_listener_with_graceful_shutdown(
+        listener,
+        state,
+        begin_shutdown,
+        force_shutdown,
+        std::time::Duration::from_millis(drain_timeout_ms),
+    )
+    .await
 }

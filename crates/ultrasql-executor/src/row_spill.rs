@@ -152,7 +152,10 @@ pub(crate) fn checked_temp_spill_total(
 ) -> Result<u64, ExecError> {
     let next = checked_spill_bytes_add(current, delta, label)?;
     if next > temp_file_limit() {
-        return Err(ExecError::Unsupported("spill exceeded temp_file_limit"));
+        // Both the in-memory work_mem budget and the on-disk spill allowance
+        // are exhausted: surface a recoverable out-of-memory ERROR (SQLSTATE
+        // 53200) rather than letting the heap grow toward a process OOM-kill.
+        return Err(ExecError::OutOfMemory("spill exceeded temp_file_limit"));
     }
     Ok(next)
 }
@@ -182,5 +185,25 @@ mod tests {
     fn spill_byte_add_rejects_u64_overflow() {
         let err = checked_spill_bytes_add(u64::MAX, 1, "test").unwrap_err();
         assert!(matches!(err, ExecError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn temp_spill_total_under_limit_succeeds() {
+        let total = checked_temp_spill_total(0, 4096, "test").expect("within limit");
+        assert_eq!(total, 4096);
+    }
+
+    #[test]
+    fn temp_spill_total_over_temp_file_limit_is_out_of_memory() {
+        // Both the in-memory work_mem budget and the on-disk spill allowance
+        // are exhausted: this must be a recoverable out-of-memory ERROR
+        // (server maps it to SQLSTATE 53200), not a process OOM-kill and not
+        // the spill-retry signal.
+        let err = checked_temp_spill_total(temp_file_limit(), 1, "test")
+            .expect_err("exceeds temp_file_limit");
+        assert!(
+            matches!(err, ExecError::OutOfMemory(_)),
+            "temp_file_limit exhaustion must surface as OutOfMemory, got {err:?}"
+        );
     }
 }

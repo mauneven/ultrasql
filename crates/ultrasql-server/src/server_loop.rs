@@ -95,6 +95,11 @@ pub async fn serve_listener(listener: TcpListener, state: Arc<Server>) -> Result
 /// accepting new sockets and returns `Ok(())` when the shutdown future
 /// completes, allowing the owning task to drop its [`Server`] reference
 /// cleanly instead of aborting the accept loop.
+///
+/// On shutdown it drains all in-flight sessions to completion with no
+/// deadline and no forced abort — the behaviour the integration tests rely
+/// on. The production binary uses [`serve_listener_with_graceful_shutdown`]
+/// to bound the drain and honour a second signal.
 pub async fn serve_listener_with_shutdown<F>(
     listener: TcpListener,
     state: Arc<Server>,
@@ -103,21 +108,53 @@ pub async fn serve_listener_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    serve_listener_with_graceful_shutdown(
+        listener,
+        state,
+        shutdown,
+        std::future::pending::<()>(),
+        // Effectively unbounded: preserve the original "drain to completion"
+        // semantics for callers (tests) that pass no force/deadline.
+        std::time::Duration::from_secs(u64::MAX),
+    )
+    .await
+}
+
+/// Drive an already-bound [`TcpListener`] with a bounded, signal-aware
+/// graceful shutdown.
+///
+/// * `begin_shutdown` resolving stops the accept loop (no new connections)
+///   and starts draining in-flight sessions.
+/// * The drain runs until either every session finishes, `drain_deadline`
+///   elapses, or `force_shutdown` resolves (e.g. a second SIGTERM/SIGINT) —
+///   whichever comes first. Any sessions still running when the drain ends
+///   are aborted so the process can exit promptly.
+///
+/// Returns `Ok(())` in every shutdown case; a drain that times out or is
+/// forced is a clean stop, not an error.
+pub async fn serve_listener_with_graceful_shutdown<B, K>(
+    listener: TcpListener,
+    state: Arc<Server>,
+    begin_shutdown: B,
+    force_shutdown: K,
+    drain_deadline: std::time::Duration,
+) -> Result<(), ServerError>
+where
+    B: Future<Output = ()> + Send,
+    K: Future<Output = ()> + Send,
+{
     // Idempotent: covers test/embedded servers that drive a listener directly.
     crate::install_panic_hook();
-    tokio::pin!(shutdown);
+    tokio::pin!(begin_shutdown);
+    tokio::pin!(force_shutdown);
     let mut sessions = tokio::task::JoinSet::new();
     let conn_limiter = connection_limit_semaphore();
     loop {
         let (stream, peer) = tokio::select! {
             biased;
-            () = &mut shutdown => {
-                info!(target: "ultrasqld", "listener shutdown requested");
-                while let Some(joined) = sessions.join_next().await {
-                    if let Err(e) = joined {
-                        warn!(target: "ultrasqld", error = %e, "session task failed during shutdown");
-                    }
-                }
+            () = &mut begin_shutdown => {
+                info!(target: "ultrasqld", in_flight = sessions.len(), "listener shutdown requested; draining in-flight sessions");
+                drain_sessions(&mut sessions, force_shutdown.as_mut(), drain_deadline).await;
                 return Ok(());
             }
             joined = sessions.join_next(), if !sessions.is_empty() => {
@@ -175,6 +212,61 @@ where
             }
         });
     }
+}
+
+/// Await every in-flight session in `sessions`, bounded by `deadline` and
+/// interruptible by `force`.
+///
+/// Returns once all sessions have joined, the deadline elapses, or `force`
+/// resolves. Any sessions still running at that point are aborted (the
+/// `JoinSet` aborts its remaining tasks on drop), so the caller can exit
+/// promptly even if a session is wedged. The WAL/checkpointer are flushed
+/// separately when the owning `Server` `Arc` is dropped.
+async fn drain_sessions<K>(
+    sessions: &mut tokio::task::JoinSet<()>,
+    mut force: std::pin::Pin<&mut K>,
+    deadline: std::time::Duration,
+) where
+    K: Future<Output = ()> + Send,
+{
+    // Join sessions one at a time, racing each wait against the overall
+    // drain deadline and a forced second-signal shutdown. Looping (rather
+    // than awaiting one combined `drain` future) keeps the `&mut sessions`
+    // borrow scoped to each `join_next()` call so we can still
+    // `abort_all()` whatever remains afterwards.
+    let sleep = tokio::time::sleep(deadline);
+    tokio::pin!(sleep);
+    let mut completed = false;
+    while !sessions.is_empty() {
+        tokio::select! {
+            biased;
+            () = force.as_mut() => {
+                warn!(target: "ultrasqld", "second shutdown signal; aborting in-flight sessions");
+                break;
+            }
+            () = &mut sleep => {
+                warn!(target: "ultrasqld", "drain deadline elapsed; aborting in-flight sessions");
+                break;
+            }
+            joined = sessions.join_next() => {
+                match joined {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        warn!(target: "ultrasqld", error = %e, "session task failed during shutdown");
+                    }
+                    None => {
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if completed || sessions.is_empty() {
+        info!(target: "ultrasqld", "all in-flight sessions drained");
+    }
+    // Abort whatever is left so the JoinSet drop does not block exit.
+    sessions.abort_all();
 }
 
 /// Drive a single PostgreSQL session over `io`.

@@ -125,6 +125,12 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0)]
     pub(crate) idle_session_timeout_ms: u64,
 
+    /// On SIGTERM/SIGINT, stop accepting and drain in-flight sessions for
+    /// this many milliseconds before aborting the rest. A second signal
+    /// forces an immediate shutdown.
+    #[arg(long, default_value_t = 5000)]
+    pub(crate) shutdown_drain_timeout_ms: u64,
+
     /// Background autovacuum/analyze maintenance interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     pub(crate) autovacuum_interval_ms: u64,

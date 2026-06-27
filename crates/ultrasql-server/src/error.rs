@@ -430,6 +430,11 @@ impl ServerError {
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.
             Self::Execute(ultrasql_executor::ExecError::Cancelled) => "57014",
+            // out_of_memory — a memory-heavy operator exhausted both its
+            // in-memory work_mem budget and its on-disk spill allowance
+            // (temp_file_limit). A recoverable per-statement ERROR rather
+            // than a process OOM-kill.
+            Self::Execute(ultrasql_executor::ExecError::OutOfMemory(_)) => "53200",
             // bad_copy_file_format — surfaced when a COPY FROM stream
             // delivers a malformed row.
             Self::CopyFormat(_) => "22P04",
@@ -464,6 +469,21 @@ mod tests {
         let io_err = io::Error::new(io::ErrorKind::BrokenPipe, "client left");
         let err: ServerError = io_err.into();
         assert!(!err.is_query_scoped());
+    }
+
+    #[test]
+    fn out_of_memory_maps_to_53200_and_is_query_scoped() {
+        // A memory-heavy operator that exhausted both work_mem and its
+        // on-disk spill allowance surfaces as a recoverable per-statement
+        // ERROR (53200, out_of_memory) — never a connection-fatal error and
+        // never a process OOM-kill.
+        let err: ServerError =
+            ultrasql_executor::ExecError::OutOfMemory("spill exceeded temp_file_limit").into();
+        assert_eq!(err.sqlstate(), "53200");
+        assert!(
+            err.is_query_scoped(),
+            "out-of-memory must keep the connection alive"
+        );
     }
 
     #[test]

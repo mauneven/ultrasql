@@ -264,6 +264,15 @@ pub enum ExecError {
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
 
+    /// A memory-heavy operator exhausted both its in-memory `work_mem`
+    /// budget *and* its on-disk spill allowance (`temp_file_limit`), so it
+    /// cannot make progress without growing resources without bound. The
+    /// server maps this to PostgreSQL SQLSTATE `53200` (`out_of_memory`),
+    /// turning a would-be process OOM-kill into a recoverable, per-statement
+    /// ERROR. The string names the operator/limit for diagnostics.
+    #[error("out of memory: {0}")]
+    OutOfMemory(&'static str),
+
     /// The in-flight query was cancelled by a client `CancelRequest`.
     ///
     /// Operators that hold a [`CancelFlag`] check it between batches

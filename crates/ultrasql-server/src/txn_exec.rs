@@ -173,6 +173,12 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
     // the predicate matches `Session::current_role_is_superuser` exactly.
     let allow_server_files =
         crate::session::role_is_superuser(role_catalog.as_ref(), &current_user);
+    // Arm the per-statement work-memory budget from the session's `work_mem`
+    // GUC (default 64 MiB) *before* `session_settings` is moved into the
+    // `LowerCtx`. Once a sort / GROUP BY / hash-join working set crosses this
+    // budget the executor spills to disk instead of growing the heap without
+    // bound (OOM DoS).
+    let work_mem = crate::session::work_mem_budget_from_settings(session_settings.as_ref());
     let ctx = LowerCtx {
         tables,
         catalog_snapshot,
@@ -218,7 +224,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         cte_buffers: std::collections::HashMap::new(),
         jit,
         cancel_flag,
-        work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+        work_mem,
         profile_operators: false,
         allow_server_files,
     };

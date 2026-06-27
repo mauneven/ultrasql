@@ -312,7 +312,9 @@ pub(super) fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("work_mem"),
-            v_text("4194304"),
+            // Stored canonically in bytes by the SET handler. Default mirrors
+            // `crate::session::DEFAULT_WORK_MEM_BYTES` (64 MiB = 67108864).
+            v_text(session_setting(ctx, "work_mem", "67108864")),
             v_text("B"),
             v_text("Resource Usage / Memory"),
             v_text("Sets the maximum memory to use for query work areas."),

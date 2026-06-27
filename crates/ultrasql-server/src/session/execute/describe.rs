@@ -184,6 +184,12 @@ where
                 self.session_settings.remove("statement_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "work_mem" => {
+                // Drop the override; the lowering path falls back to
+                // DEFAULT_WORK_MEM_BYTES when the key is absent.
+                self.session_settings.remove("work_mem");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "extra_float_digits" => {
                 self.session_settings.remove("extra_float_digits");
                 Ok(result_encoder::run_ddl_command("RESET"))
@@ -252,6 +258,16 @@ where
                 self.statement_timeout_ms = parsed;
                 self.session_settings
                     .insert("statement_timeout".to_owned(), parsed.to_string());
+                Ok(())
+            }
+            // Per-statement work-memory budget. Stored canonically as a byte
+            // count so the lowering hot path (`Session::work_mem_budget`) can
+            // parse it with a bare `u64::parse` and arm `WorkMemBudget`. A low
+            // value makes sort / GROUP BY / hash-join spill to disk sooner.
+            "work_mem" => {
+                let parsed = parse_work_mem_bytes(value)?;
+                self.session_settings
+                    .insert("work_mem".to_owned(), parsed.to_string());
                 Ok(())
             }
             // pgvector-compatible per-session HNSW exploration budget. Higher
@@ -370,6 +386,11 @@ where
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
             "statement_timeout" => self.statement_timeout_ms.to_string(),
+            "work_mem" => self
+                .session_settings
+                .get("work_mem")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_WORK_MEM_BYTES.to_string()),
             "hnsw.ef_search" => self
                 .session_settings
                 .get("hnsw.ef_search")

@@ -703,9 +703,7 @@ where
                     cte_buffers: std::collections::HashMap::new(),
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
-                    work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
-                        u64::MAX,
-                    )),
+                    work_mem: self.work_mem_budget(),
                     profile_operators: false,
                     // Server-LOCAL external-file reads require superuser,
                     // mirroring the server-side COPY file gate.
@@ -851,9 +849,7 @@ where
                     cte_buffers: std::collections::HashMap::new(),
                     jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
-                    work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
-                        u64::MAX,
-                    )),
+                    work_mem: self.work_mem_budget(),
                     profile_operators: false,
                     // Server-LOCAL external-file reads require superuser,
                     // mirroring the server-side COPY file gate.

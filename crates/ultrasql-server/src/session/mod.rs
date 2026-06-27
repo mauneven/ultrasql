@@ -28,6 +28,7 @@ mod ddl;
 mod drop_in_txn;
 mod embedded;
 mod execute;
+pub(crate) use execute::{DEFAULT_WORK_MEM_BYTES, work_mem_budget_from_settings};
 mod explain;
 mod export_import;
 mod ext;
@@ -246,6 +247,19 @@ where
             enabled: self.jit_enabled,
             above_rows: self.jit_above_rows,
         }
+    }
+
+    /// Build the per-statement `work_mem` budget for this session.
+    ///
+    /// Reads the session-local `work_mem` GUC (stored canonically as a byte
+    /// count in `session_settings` by the SET handler) and falls back to
+    /// [`crate::session::execute::DEFAULT_WORK_MEM_BYTES`] when unset. The
+    /// returned budget is shared by reference across every memory-heavy
+    /// operator in the statement's plan, so once a query's working set
+    /// crosses the budget the executor's spill paths engage instead of
+    /// growing the heap without bound.
+    pub(super) fn work_mem_budget(&self) -> Arc<ultrasql_executor::work_mem::WorkMemBudget> {
+        crate::session::execute::work_mem_budget_from_settings(&self.session_settings)
     }
 }
 

@@ -164,6 +164,45 @@ async fn offset_without_limit_returns_tail() {
     shutdown(client, server_handle).await;
 }
 
+/// PostgreSQL accepts `OFFSET m LIMIT n` (offset before limit) and applies
+/// both, identically to `LIMIT n OFFSET m`. This shape used to be rejected.
+#[tokio::test]
+async fn offset_before_limit_matches_limit_before_offset() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE lo_order (id INT NOT NULL)")
+        .await
+        .expect("create table");
+    let ids: Vec<i32> = (1..=20).collect();
+    insert_ids(&client, "lo_order", &ids).await;
+
+    let offset_first = ids_from(
+        &client
+            .simple_query("SELECT id FROM lo_order ORDER BY id OFFSET 2 LIMIT 3")
+            .await
+            .expect("offset-before-limit query succeeds"),
+    );
+    assert_eq!(
+        offset_first,
+        vec![3, 4, 5],
+        "OFFSET 2 LIMIT 3 skips 2 then takes 3"
+    );
+
+    let limit_first = ids_from(
+        &client
+            .simple_query("SELECT id FROM lo_order ORDER BY id LIMIT 3 OFFSET 2")
+            .await
+            .expect("limit-before-offset query succeeds"),
+    );
+    assert_eq!(
+        offset_first, limit_first,
+        "both clause orders yield the same window"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
 /// `OFFSET m` where `m` exceeds the row count emits zero rows. Confirms
 /// the operator does not over-emit when the skip drains the child
 /// before any output row is produced.

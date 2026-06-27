@@ -232,6 +232,76 @@ fn shown_transaction_isolation(txn_state: &TxnState) -> &'static str {
     }
 }
 
+/// Default per-statement `work_mem` budget in bytes (64 MiB).
+///
+/// PostgreSQL ships a 4 MB default; UltraSQL picks a more generous 64 MiB
+/// so typical analytical queries stay in memory while a single pathological
+/// sort / GROUP BY / hash-join can no longer grow the heap without bound —
+/// the executor's spill paths engage once a query's working set crosses this
+/// budget. Tunable per session via `SET work_mem`.
+pub(crate) const DEFAULT_WORK_MEM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Build a per-statement [`WorkMemBudget`](ultrasql_executor::work_mem::WorkMemBudget)
+/// from a session-settings map.
+///
+/// Reads the canonical byte-count string the `SET work_mem` handler stores
+/// under the `work_mem` key and falls back to [`DEFAULT_WORK_MEM_BYTES`] when
+/// the key is absent or unparsable. Shared by [`Session::work_mem_budget`]
+/// and the `run_plan_in_txn` hot path so both arm the same budget; without
+/// this a large sort / GROUP BY / hash-join would grow the heap unbounded
+/// (OOM DoS) instead of spilling to disk.
+pub(crate) fn work_mem_budget_from_settings(
+    session_settings: &std::collections::HashMap<String, String>,
+) -> Arc<ultrasql_executor::work_mem::WorkMemBudget> {
+    let bytes = session_settings
+        .get("work_mem")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT_WORK_MEM_BYTES);
+    Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(bytes))
+}
+
+/// Parse a `work_mem` value into bytes.
+///
+/// Accepts PostgreSQL-style memory units. A bare integer is interpreted as
+/// kilobytes (PostgreSQL's default unit for `work_mem`); an explicit unit
+/// suffix (`B`, `kB`, `MB`, `GB`, `TB`, case-insensitive, optional space)
+/// overrides that. The result is clamped to a minimum of 64 KiB so a tiny
+/// value cannot make every operator spill immediately on trivial input.
+fn parse_work_mem_bytes(value: &str) -> Result<u64, ServerError> {
+    const MIN_WORK_MEM_BYTES: u64 = 64 * 1024;
+    let trimmed = value.trim();
+    // Optionally surrounded by single quotes, e.g. SET work_mem = '64MB'.
+    let trimmed = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(trimmed)
+        .trim();
+    if trimmed.is_empty() {
+        return Err(ServerError::Unsupported("invalid work_mem"));
+    }
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (num_part, unit_part) = trimmed.split_at(digits_end);
+    let amount = num_part
+        .parse::<u64>()
+        .map_err(|_| ServerError::Unsupported("invalid work_mem"))?;
+    let multiplier: u64 = match unit_part.trim().to_ascii_lowercase().as_str() {
+        // A bare number means kilobytes, matching PostgreSQL's GUC unit.
+        "" | "kb" => 1024,
+        "b" => 1,
+        "mb" => 1024 * 1024,
+        "gb" => 1024 * 1024 * 1024,
+        "tb" => 1024 * 1024 * 1024 * 1024,
+        _ => return Err(ServerError::Unsupported("invalid work_mem unit")),
+    };
+    let bytes = amount
+        .checked_mul(multiplier)
+        .ok_or(ServerError::Unsupported("work_mem value too large"))?;
+    Ok(bytes.max(MIN_WORK_MEM_BYTES))
+}
+
 fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
     let trimmed = value.trim();
     if let Some(stripped) = trimmed.strip_prefix('-') {

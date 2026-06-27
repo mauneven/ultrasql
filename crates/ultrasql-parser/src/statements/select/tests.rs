@@ -663,3 +663,81 @@ fn select_without_locking_has_empty_vec() {
     let Statement::Select(s) = stmt else { panic!() };
     assert!(s.locking.is_empty());
 }
+
+// -------- LIMIT / OFFSET in either textual order ---------------------- //
+
+/// Extract the text of an integer literal expression for assertions.
+fn int_lit_text(expr: &Expr) -> &str {
+    match expr {
+        Expr::Literal(crate::ast::Literal::Integer { text, .. }) => text,
+        other => panic!("expected integer literal, got {other:?}"),
+    }
+}
+
+#[test]
+fn select_limit_then_offset() {
+    let stmt = parse("SELECT c FROM t ORDER BY c LIMIT 3 OFFSET 2");
+    let Statement::Select(s) = stmt else { panic!() };
+    assert_eq!(int_lit_text(s.limit.as_ref().expect("limit")), "3");
+    assert_eq!(int_lit_text(s.offset.as_ref().expect("offset")), "2");
+}
+
+#[test]
+fn select_offset_before_limit_is_accepted() {
+    // PostgreSQL accepts OFFSET before LIMIT and applies both. This was
+    // previously rejected/ignored.
+    let stmt = parse("SELECT c FROM t ORDER BY c OFFSET 2 LIMIT 3");
+    let Statement::Select(s) = stmt else { panic!() };
+    assert_eq!(
+        int_lit_text(s.limit.as_ref().expect("limit")),
+        "3",
+        "LIMIT after OFFSET must still bind"
+    );
+    assert_eq!(int_lit_text(s.offset.as_ref().expect("offset")), "2");
+}
+
+#[test]
+fn select_offset_only() {
+    let stmt = parse("SELECT c FROM t ORDER BY c OFFSET 2");
+    let Statement::Select(s) = stmt else { panic!() };
+    assert!(s.limit.is_none());
+    assert_eq!(int_lit_text(s.offset.as_ref().expect("offset")), "2");
+}
+
+#[test]
+fn select_limit_only() {
+    let stmt = parse("SELECT c FROM t ORDER BY c LIMIT 3");
+    let Statement::Select(s) = stmt else { panic!() };
+    assert_eq!(int_lit_text(s.limit.as_ref().expect("limit")), "3");
+    assert!(s.offset.is_none());
+}
+
+#[test]
+fn select_duplicate_limit_is_error() {
+    let err = parse_err("SELECT c FROM t LIMIT 3 LIMIT 4");
+    assert!(
+        matches!(
+            err,
+            crate::parser::ParseError::Unsupported {
+                what: "duplicate LIMIT clause",
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn select_duplicate_offset_is_error() {
+    let err = parse_err("SELECT c FROM t OFFSET 2 OFFSET 5");
+    assert!(
+        matches!(
+            err,
+            crate::parser::ParseError::Unsupported {
+                what: "duplicate OFFSET clause",
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}

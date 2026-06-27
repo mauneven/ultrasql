@@ -618,7 +618,7 @@ where
             cte_buffers: std::collections::HashMap::new(),
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
-            work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            work_mem: self.work_mem_budget(),
             profile_operators: false,
             allow_server_files: self.current_role_is_superuser(),
         };

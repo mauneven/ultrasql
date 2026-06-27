@@ -82,7 +82,12 @@ impl Server {
                 above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             },
             cancel_flag: None,
-            work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            // Embedded `ultrasql-local` has no session GUCs; arm the default
+            // 64 MiB budget so large sorts / GROUP BY / hash-joins spill to
+            // disk rather than growing the heap without bound.
+            work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
+                crate::session::DEFAULT_WORK_MEM_BYTES,
+            )),
             profile_operators: false,
             // Embedded `ultrasql-local` runs as the bootstrap superuser
             // `ultrasql`, so server-local file reads are permitted.

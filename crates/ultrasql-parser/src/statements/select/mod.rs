@@ -104,19 +104,36 @@ impl Parser<'_> {
             Vec::new()
         };
 
-        // LIMIT
-        let limit = if self.match_kw(TokenKind::KwLimit) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        // OFFSET
-        let offset = if self.match_kw(TokenKind::KwOffset) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+        // LIMIT / OFFSET, in either textual order.
+        //
+        // PostgreSQL accepts `LIMIT m OFFSET n` and `OFFSET n LIMIT m`
+        // interchangeably and applies both regardless of order. We loop,
+        // consuming whichever clause appears next; each may appear at most
+        // once. A repeated clause is a parse error so `LIMIT 1 LIMIT 2`
+        // (ambiguous) is rejected rather than silently dropping one bound.
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if self.match_kw(TokenKind::KwLimit) {
+                if limit.is_some() {
+                    return Err(ParseError::Unsupported {
+                        what: "duplicate LIMIT clause",
+                        offset: self.peek()?.span.start_usize(),
+                    });
+                }
+                limit = Some(self.parse_expr()?);
+            } else if self.match_kw(TokenKind::KwOffset) {
+                if offset.is_some() {
+                    return Err(ParseError::Unsupported {
+                        what: "duplicate OFFSET clause",
+                        offset: self.peek()?.span.start_usize(),
+                    });
+                }
+                offset = Some(self.parse_expr()?);
+            } else {
+                break;
+            }
+        }
 
         // Set-operation tails (UNION / INTERSECT / EXCEPT).
         // Note on precedence: PostgreSQL resolves UNION < INTERSECT in a chain,
