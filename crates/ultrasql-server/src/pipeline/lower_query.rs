@@ -1347,6 +1347,7 @@ pub(super) fn lower_cte(
         isolation: ctx.isolation,
         oracle: Arc::clone(&ctx.oracle),
         xid: ctx.xid,
+        lock_xid: ctx.lock_xid,
         command_id: ctx.command_id,
         cte_buffers: child_buffers,
         jit: ctx.jit,

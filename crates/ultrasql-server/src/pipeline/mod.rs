@@ -308,6 +308,19 @@ pub struct LowerCtx<'a> {
     pub oracle: Arc<TransactionManager>,
     /// XID of the autocommit transaction.
     pub xid: Xid,
+    /// Top-level transaction XID for lock ownership.
+    ///
+    /// Equals [`Self::xid`] when no savepoint is open; while a savepoint is
+    /// active [`Self::xid`] is the inner subxid (so heap stamps are
+    /// `ROLLBACK TO`-hideable) but row LOCKS must be held under the stable
+    /// top-level xid. The lock manager releases by xid only at txn end
+    /// (`release_all`), not at `ROLLBACK TO`, so a lock taken under a subxid
+    /// that is later rolled back would never release and a re-lock of the
+    /// same row in a later statement would self-block. Taking the EvalPlanQual
+    /// row lock under the top-level xid makes every re-lock within the same
+    /// transaction a no-op. Defaults to [`Self::xid`] for callers/fixtures
+    /// with no savepoint nesting.
+    pub lock_xid: Xid,
     /// Command id within `xid` for the current statement.
     pub command_id: CommandId,
     /// Materialised non-recursive CTE bindings, keyed by lower-cased CTE

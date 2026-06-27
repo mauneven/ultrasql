@@ -16,7 +16,7 @@ use crate::pipeline::agg_fuse::extract_int32_col_op_lit;
 
 use super::constraints::{build_referenced_by_delete_checks, has_referenced_by_delete_checks};
 use super::indexes::{build_insert_index_maintainers, build_vector_index_maintainers};
-use super::lowering::build_filtered_tid_scan;
+use super::lowering::{build_eval_plan_qual, build_filtered_tid_scan};
 
 /// Try to detect the `(Int32, Int32) [WHERE col cmp lit]` DELETE
 /// shape and lower it to [`FusedDeleteInt32Pair`]. Mirrors
@@ -145,7 +145,12 @@ pub(crate) fn lower_real_delete(
         ctx.heap.wal_sink().cloned(),
         child,
     )
-    .with_visibility_map(Arc::clone(&ctx.vm));
+    .with_visibility_map(Arc::clone(&ctx.vm))
+    // General write-path locking discipline: every targeted row is locked
+    // (blocking, deadlock-aware) and re-checked against the latest committed
+    // version before it is marked deleted, so a concurrent FOR UPDATE /
+    // UPDATE / DELETE serializes and a concurrently-deleted row is skipped.
+    .with_eval_plan_qual(build_eval_plan_qual(entry, input, ctx));
     let modify = if has_indexes {
         modify
             .with_delete_indexes(build_insert_index_maintainers(entry, ctx)?)

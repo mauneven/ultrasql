@@ -74,6 +74,7 @@ impl Server {
             isolation: txn.isolation,
             oracle: Arc::clone(&self.txn_manager),
             xid: txn.current_xid(),
+            lock_xid: txn.xid,
             command_id: txn.current_command,
             cte_buffers: std::collections::HashMap::new(),
             jit: ultrasql_vec::jit::JitConfig {

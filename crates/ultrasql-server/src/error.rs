@@ -417,6 +417,11 @@ impl ServerError {
             // touched. Mirrors the SSI `Self::SerializationFailure` 40001
             // path above so retry-aware clients classify both alike.
             Self::Execute(ultrasql_executor::ExecError::SerializationFailure(_)) => "40001",
+            // deadlock_detected — the lock manager's wait-for cycle detector
+            // chose this UPDATE/DELETE as the victim while acquiring the
+            // general write path's Exclusive row lock (EvalPlanQual). Mirrors
+            // the FOR UPDATE `Self::DeadlockDetected` 40P01 path.
+            Self::Execute(ultrasql_executor::ExecError::DeadlockDetected(_)) => "40P01",
             // cardinality_violation — a scalar subquery used as an
             // expression returned more than one row. Raised by the
             // `SingleRowAssert` guard the decorrelation rule inserts.

@@ -22,7 +22,7 @@ use crate::pipeline::index_scan::{
 use super::constraints::{build_exclusion_update_checks, build_foreign_key_checks};
 use super::indexes::{build_insert_index_maintainers, build_vector_index_maintainers};
 use super::insert::build_rls_update_checks;
-use super::lowering::build_filtered_tid_scan;
+use super::lowering::{build_eval_plan_qual, build_filtered_tid_scan};
 use super::referential::build_referenced_by_update_checks;
 
 /// Sentinel `SET col = col + <delta>` value that triggers the debug-only
@@ -299,7 +299,7 @@ fn update_requires_index_maintenance(
     false
 }
 
-fn acquire_indexed_update_row_lock(
+pub(super) fn acquire_indexed_update_row_lock(
     lock_manager: &ultrasql_txn::LockManager,
     xid: Xid,
     tid: TupleId,
@@ -315,6 +315,50 @@ fn acquire_indexed_update_row_lock(
         Err(e) => return Err(e.to_string()),
     }
     let acquire = || lock_manager.acquire(req).map_err(|e| e.to_string());
+    if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(acquire)?;
+    } else {
+        acquire()?;
+    }
+    Ok(true)
+}
+
+/// Acquire the blocking, deadlock-aware Exclusive tuple lock for the general
+/// UPDATE / DELETE EvalPlanQual path, classifying the outcome so the server
+/// surfaces the right SQLSTATE: a lock-wait cycle victim becomes
+/// [`ExecError::DeadlockDetected`] (→ 40P01) and every other lock-manager
+/// failure becomes [`ExecError::SerializationFailure`] (→ 40001). Reuses the
+/// same `LockManager` `try_acquire` / blocking `acquire` path the fused fast
+/// path and `SELECT ... FOR UPDATE` use, so all three serialize on the same
+/// `LockTag::Tuple` grants.
+pub(super) fn acquire_eval_plan_qual_row_lock(
+    lock_manager: &ultrasql_txn::LockManager,
+    xid: Xid,
+    tid: TupleId,
+) -> Result<bool, ultrasql_executor::ExecError> {
+    use ultrasql_executor::ExecError;
+    use ultrasql_txn::LockError;
+
+    let req = ultrasql_txn::LockRequest {
+        xid,
+        tag: ultrasql_txn::LockTag::Tuple(tid),
+        mode: ultrasql_txn::LockMode::Exclusive,
+    };
+    let classify = |e: LockError| -> ExecError {
+        match e {
+            LockError::Deadlock { .. } => ExecError::DeadlockDetected(e.to_string()),
+            other => ExecError::SerializationFailure(other.to_string()),
+        }
+    };
+    match lock_manager.try_acquire(req) {
+        Ok(true) => return Ok(false),
+        Ok(false) => {}
+        Err(e) => return Err(classify(e)),
+    }
+    let acquire = || lock_manager.acquire(req).map_err(classify);
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)
@@ -399,7 +443,12 @@ pub(crate) fn lower_real_update(
     .with_uniqueness_recheck(
         ctx.snapshot.clone(),
         Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>,
-    );
+    )
+    // General write-path locking discipline: every targeted row is locked
+    // (blocking, deadlock-aware) and re-checked against the latest committed
+    // version before its new version is written, so a concurrent FOR UPDATE /
+    // UPDATE / DELETE serializes and no update is lost.
+    .with_eval_plan_qual(build_eval_plan_qual(entry, input, ctx));
     let mut check_constraints = rls_update_checks;
     if let Some(constraints) = &constraints {
         check_constraints.extend(

@@ -77,7 +77,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // materialisation, no per-row `Vec<Value>`
                     // intermediate.
                     let (tids, delete_index_changes, delete_vector_index_changes, deleted_rows) =
-                        if !returning_active
+                        if self.eval_plan_qual.is_some() {
+                            // EvalPlanQual: lock + re-check every targeted row,
+                            // then delete only the surviving (still-matching,
+                            // not-concurrently-deleted) rows at their latest
+                            // base TID. Routed through the row-materialising
+                            // extraction so the lock+recheck rewrites the rows
+                            // before the heap delete and index/RETURNING
+                            // bookkeeping run.
+                            self.extract_delete_tids_and_index_changes_epq(
+                                &batch,
+                                returning_active,
+                            )?
+                        } else if !returning_active
                             && self.delete_indexes.is_empty()
                             && self.delete_vector_indexes.is_empty()
                             && self.referenced_by_delete_checks.is_empty()
@@ -121,7 +133,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // column arrays — no `batch_to_rows`, no per-row
                     // `Eval`, no per-row `RowCodec::encode` tree walk.
                     let edits = if let Some(spec) = self.update_fast_path.filter(|_| {
-                        !returning_active
+                        self.eval_plan_qual.is_none()
+                            && !returning_active
                             && self.check_constraints.is_empty()
                             && self.foreign_key_checks.is_empty()
                             && self.exclusion_update_checks.is_empty()
@@ -134,9 +147,15 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         // Slow path: batch_to_rows + per-row eval +
                         // per-row codec.encode. Covers every UPDATE
                         // shape not matched by the fast-path detector.
+                        //
+                        // EvalPlanQual: lock every targeted row and rewrite
+                        // surviving rows to the latest committed version
+                        // BEFORE the SET expressions evaluate, so concurrent
+                        // writes serialize and no update is lost.
                         let child_schema = self.child.schema().clone();
                         let rows = batch_to_rows(&batch, &child_schema)
                             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                        let rows = self.apply_eval_plan_qual(rows)?;
                         let mut edits: Vec<(TupleId, UpdatePayload)> =
                             Vec::with_capacity(rows.len());
                         for row in &rows {
@@ -449,6 +468,20 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         // Single bulk UPDATE call after every input batch has been
         // accumulated. See the `all_update_edits` comment above.
         if !all_update_edits.is_empty() {
+            // `update_many` requires its edits in `(page, slot)` ascending
+            // order. The SeqScan child yields TIDs in that order, but the
+            // EvalPlanQual re-check can *retarget* a row to the latest
+            // committed version of its update chain — a TID in a later slot
+            // than the next scanned row's — which breaks the scan's implicit
+            // ordering. Re-sort here when EvalPlanQual is wired so a
+            // concurrent out-of-place UPDATE that moved a target row cannot
+            // hand `update_many` out-of-order edits. The index-change vectors
+            // are matched to outcomes by `old_tid` (a HashMap, not by
+            // position), so they need no reorder. Cheap no-op on already
+            // sorted input; only runs on the general EvalPlanQual path.
+            if self.eval_plan_qual.is_some() {
+                all_update_edits.sort_by_key(|(tid, _)| (tid.page, tid.slot));
+            }
             let n = all_update_edits.len();
             let wal = self.wal.clone();
             let wal_ref: Option<&dyn WalSink> = wal.as_deref();

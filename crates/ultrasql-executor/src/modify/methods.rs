@@ -6,6 +6,7 @@ use ultrasql_core::{DataType, TupleId, Value};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::UpdatePayload;
 
+use super::eval_plan_qual::EpqDecision;
 use super::helpers::{check_not_null_violations, extract_tid_and_row, updated_ctid_target};
 use super::{
     ComputedUpdate, ModifyTable, SequenceDefault, UpdateIndexChange, VectorUpdateIndexChange,
@@ -121,6 +122,68 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             vector_index_change,
             returning_row: capture_returning_row.then_some(new_row),
         })
+    }
+
+    /// Route every general UPDATE / DELETE child row through the per-row
+    /// Exclusive tuple lock + EvalPlanQual latest-version re-check, rewriting
+    /// the surviving rows so the downstream UPDATE / DELETE processing sees
+    /// the **latest** committed version.
+    ///
+    /// Each input `row` is `[tid_block, tid_slot, ...orig_cols]`. For each:
+    ///
+    /// 1. Acquire the Exclusive lock on the base TID and re-check the latest
+    ///    version (blocking on a conflict; aborts with 40001 under RR/SSI on
+    ///    a concurrent committed write).
+    /// 2. On [`EpqDecision::Skip`], drop the row (concurrent delete, or the
+    ///    latest version no longer matches the WHERE under READ COMMITTED).
+    /// 3. On [`EpqDecision::Apply`], rebuild the row as
+    ///    `[latest_tid_block, latest_tid_slot, ...latest_cols, ...extra]`,
+    ///    preserving any post-relation extra columns the child carried, so
+    ///    the SET / RETURNING expressions re-evaluate against the latest row
+    ///    and the new version is written to the latest TID.
+    ///
+    /// When no EvalPlanQual is wired (`None`), the rows pass through
+    /// unchanged — the legacy lock-free behavior.
+    pub(crate) fn apply_eval_plan_qual(
+        &self,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Vec<Vec<Value>>, ExecError> {
+        let Some(epq) = &self.eval_plan_qual else {
+            return Ok(rows);
+        };
+        let relation_cols = self.codec.schema().len();
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (tid, orig_row) = extract_tid_and_row(&row, self.relation)?;
+            match epq.lock_and_recheck(tid)? {
+                EpqDecision::Skip => {}
+                EpqDecision::Apply { tid, latest_row } => {
+                    if latest_row.len() != relation_cols {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "EvalPlanQual latest row has {} columns, expected {}",
+                            latest_row.len(),
+                            relation_cols,
+                        )));
+                    }
+                    // Preserve extra (post-relation) eval columns the child
+                    // appended — only the relation-width prefix is replaced
+                    // with the latest committed image.
+                    let extra = orig_row.get(relation_cols..).unwrap_or(&[]).to_vec();
+                    let block = i32::try_from(tid.page.block.raw()).map_err(|_| {
+                        ExecError::TypeMismatch("EvalPlanQual TID block exceeds i32".to_owned())
+                    })?;
+                    let slot = i32::from(tid.slot);
+                    let mut rebuilt: Vec<Value> =
+                        Vec::with_capacity(2 + relation_cols + extra.len());
+                    rebuilt.push(Value::Int32(block));
+                    rebuilt.push(Value::Int32(slot));
+                    rebuilt.extend(latest_row);
+                    rebuilt.extend(extra);
+                    out.push(rebuilt);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn compute_conflict_update_edit(

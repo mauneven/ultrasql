@@ -334,6 +334,31 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         let child_schema = self.child.schema().clone();
         let rows = crate::filter_op::batch_to_rows(batch, &child_schema)
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        self.extract_delete_tids_from_rows(rows, capture_deleted_rows)
+    }
+
+    /// EvalPlanQual DELETE extraction: lock + re-check every targeted row,
+    /// then build the heap-delete TIDs / index changes / deleted-row images
+    /// from the surviving (still-matching, not-concurrently-deleted) rows at
+    /// their latest base TID. See
+    /// [`ModifyTable::apply_eval_plan_qual`](super::ModifyTable::apply_eval_plan_qual).
+    pub(crate) fn extract_delete_tids_and_index_changes_epq(
+        &self,
+        batch: &Batch,
+        capture_deleted_rows: bool,
+    ) -> Result<DeleteExtraction, ExecError> {
+        let child_schema = self.child.schema().clone();
+        let rows = crate::filter_op::batch_to_rows(batch, &child_schema)
+            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        let rows = self.apply_eval_plan_qual(rows)?;
+        self.extract_delete_tids_from_rows(rows, capture_deleted_rows)
+    }
+
+    fn extract_delete_tids_from_rows(
+        &self,
+        rows: Vec<Vec<Value>>,
+        capture_deleted_rows: bool,
+    ) -> Result<DeleteExtraction, ExecError> {
         let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
         let mut changes: Vec<DeleteIndexChange> = Vec::with_capacity(rows.len());
         let mut vector_changes: Vec<VectorDeleteIndexChange> = Vec::with_capacity(rows.len());

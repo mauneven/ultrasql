@@ -129,10 +129,25 @@ impl<L: PageLoader> ModifyTable<L> {
             returning_evaluators: Vec::new(),
             uniqueness_snapshot: None,
             uniqueness_oracle: None,
+            eval_plan_qual: None,
             child,
             done: false,
             affected: 0,
         }
+    }
+
+    /// Attach the per-row Exclusive tuple lock + EvalPlanQual latest-version
+    /// re-check used by the general UPDATE / DELETE write path.
+    ///
+    /// Wire this for ordinary UPDATE / DELETE so every targeted base TID is
+    /// locked (blocking, deadlock-aware) and re-checked against the latest
+    /// committed version before its new version is written — preventing
+    /// lost updates under concurrency and honoring `SELECT ... FOR UPDATE`.
+    /// Omit it (the default `None`) to keep the legacy lock-free path.
+    #[must_use]
+    pub fn with_eval_plan_qual(mut self, epq: super::eval_plan_qual::EvalPlanQual) -> Self {
+        self.eval_plan_qual = Some(epq);
+        self
     }
 
     /// Attach the MVCC snapshot + status oracle used by the unique-index

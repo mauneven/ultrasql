@@ -555,6 +555,7 @@ impl IndexFixture {
             isolation: ultrasql_txn::IsolationLevel::ReadCommitted,
             oracle: StdArc::clone(&self.txn_manager),
             xid: self.loader_xid,
+            lock_xid: self.loader_xid,
             command_id: CommandId::FIRST,
             cte_buffers: HashMap::new(),
             jit: ultrasql_vec::jit::JitConfig::OFF,

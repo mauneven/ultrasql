@@ -698,6 +698,7 @@ where
                     isolation: txn.isolation,
                     oracle: Arc::clone(&self.state.txn_manager),
                     xid: txn.current_xid(),
+                    lock_xid: txn.xid,
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                     jit: self.jit_config(),
@@ -845,6 +846,7 @@ where
                     // subxact xid in xmin/xmax. ROLLBACK TO can then
                     // hide them by aborting that subxid in the CLOG.
                     xid: txn.current_xid(),
+                    lock_xid: txn.xid,
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                     jit: self.jit_config(),

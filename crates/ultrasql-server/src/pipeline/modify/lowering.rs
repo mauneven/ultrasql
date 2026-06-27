@@ -1,7 +1,10 @@
 //! Shared lowering helpers: the TID-emitting child scan for UPDATE /
 //! DELETE and the projection-elision logic for SELECT lists.
 
-use ultrasql_executor::{Filter, Operator, Project};
+use std::sync::Arc;
+
+use ultrasql_executor::modify::eval_plan_qual::{EvalPlanQual, EvalPlanQualConfig, make_epq_fetch};
+use ultrasql_executor::{Eval, Filter, Operator, Project, RowCodec};
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
 use ultrasql_catalog::TableEntry;
@@ -11,6 +14,7 @@ use crate::pipeline::LowerCtx;
 use crate::pipeline::agg_fuse::shift_column_indices;
 
 use super::indexes::build_tid_seq_scan;
+use super::update::acquire_eval_plan_qual_row_lock;
 
 /// Build the TID-emitting child operator for an UPDATE / DELETE.
 ///
@@ -50,6 +54,68 @@ pub(super) fn build_filtered_tid_scan(
             "UPDATE / DELETE input shape; expected Scan or Filter(Scan)",
         )),
     }
+}
+
+/// Build the per-row Exclusive tuple lock + EvalPlanQual latest-version
+/// re-check for a general UPDATE / DELETE on `entry`.
+///
+/// Reuses the **same** lock-manager path the fused fast path and
+/// `SELECT ... FOR UPDATE` use (`acquire_eval_plan_qual_row_lock`, the typed
+/// twin of the fused path's `acquire_indexed_update_row_lock`): the
+/// blocking, deadlock-aware Exclusive `LockTag::Tuple` acquisition under the
+/// session xid, so a concurrent FOR UPDATE / UPDATE / DELETE of the same row
+/// serializes. After the lock is granted the EvalPlanQual re-reads the latest
+/// committed version (READ COMMITTED) or aborts on a concurrent committed
+/// write (REPEATABLE READ / SERIALIZABLE → 40001), exactly as the fused path
+/// does via `refresh_after_lock` + the `WriteConflict` → 40001 relabel.
+///
+/// `input` is the binder's `Scan` / `Filter(Scan)` shape; its `Filter`
+/// predicate (un-shifted, addressing the relation schema directly) drives the
+/// READ COMMITTED predicate re-check against the latest row image.
+pub(super) fn build_eval_plan_qual(
+    entry: &TableEntry,
+    input: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> EvalPlanQual {
+    let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
+    // Lock under the TOP-LEVEL xid: the lock manager releases by xid only at
+    // txn end, so a lock taken inside a savepoint that is later rolled back
+    // must still be owned by the (stable) top-level xid — otherwise a re-lock
+    // of the same row in a later statement self-blocks behind the dead subxid.
+    let lock_xid = ctx.lock_xid;
+    let lock = Arc::new(move |tid| acquire_eval_plan_qual_row_lock(&lock_manager, lock_xid, tid));
+
+    let oracle_for_snapshot = Arc::clone(&ctx.oracle);
+    let snapshot_xid = ctx.xid;
+    let snapshot_command = ctx.command_id;
+    let fresh_snapshot =
+        Arc::new(move || oracle_for_snapshot.statement_snapshot(snapshot_xid, snapshot_command));
+
+    let fetch = make_epq_fetch(Arc::clone(&ctx.heap));
+
+    let oracle = Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>;
+
+    // The UPDATE/DELETE WHERE predicate lives in the child `Filter`. Its
+    // column indices address the relation schema directly (the +2 TID shift
+    // is applied only to the *scan* child), so it can be evaluated against a
+    // decoded relation row as-is for the READ COMMITTED predicate re-check.
+    let predicate = match input {
+        LogicalPlan::Filter { predicate, .. } => Some(Eval::new(predicate.clone())),
+        _ => None,
+    };
+
+    let codec = RowCodec::new(entry.schema.clone());
+
+    EvalPlanQual::new(EvalPlanQualConfig {
+        lock,
+        fresh_snapshot,
+        fetch,
+        oracle,
+        snapshot: ctx.snapshot.clone(),
+        isolation: ctx.isolation,
+        predicate,
+        codec,
+    })
 }
 
 pub(crate) fn lower_project_columns(

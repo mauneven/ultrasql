@@ -330,6 +330,14 @@ pub enum ExecError {
     #[error("could not serialize access due to concurrent update: {0}")]
     SerializationFailure(String),
 
+    /// The lock manager's deadlock detector chose this statement as the
+    /// victim of a lock-wait cycle while acquiring an Exclusive row lock
+    /// for an UPDATE / DELETE (the general write path's EvalPlanQual lock).
+    /// The server maps this to PostgreSQL SQLSTATE `40P01`
+    /// (`deadlock_detected`) — query-scoped and retryable.
+    #[error("deadlock detected: {0}")]
+    DeadlockDetected(String),
+
     /// A scalar subquery used as an expression returned more than one
     /// row. SQL requires exactly one row from such a subquery; the
     /// [`SingleRowAssert`] operator raises this the moment it observes a

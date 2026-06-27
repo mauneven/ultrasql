@@ -54,6 +54,7 @@ use crate::row_codec::{RowCodec, RowCodecError};
 use crate::{ExecError, Operator};
 
 mod builder;
+pub mod eval_plan_qual;
 pub(crate) mod helpers;
 mod index_maintainer;
 mod index_ops;
@@ -415,6 +416,16 @@ pub struct ModifyTable<L: PageLoader> {
     /// arm and for callers built before this wiring).
     pub(crate) uniqueness_snapshot: Option<ultrasql_mvcc::Snapshot>,
     pub(crate) uniqueness_oracle: Option<Arc<dyn ultrasql_mvcc::XidStatusOracle>>,
+    /// Per-row Exclusive tuple lock + EvalPlanQual latest-version re-check
+    /// for the **general** UPDATE / DELETE write path. When `Some`, every
+    /// targeted base TID is routed through
+    /// [`EvalPlanQual::lock_and_recheck`](eval_plan_qual::EvalPlanQual::lock_and_recheck)
+    /// before its new version is written, so a concurrent FOR UPDATE /
+    /// UPDATE / DELETE of the same row serializes and no update is lost.
+    /// `None` keeps the legacy lock-free behavior (used by callers with no
+    /// lock manager wired, such as in-process fixtures and the MERGE /
+    /// ON CONFLICT sub-paths that compute their own target set).
+    pub(crate) eval_plan_qual: Option<eval_plan_qual::EvalPlanQual>,
     pub(crate) child: Box<dyn Operator>,
     pub(crate) done: bool,
     pub(crate) affected: i64,

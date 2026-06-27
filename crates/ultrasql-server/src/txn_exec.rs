@@ -208,6 +208,12 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         // rather than the parent xid; ROLLBACK TO can then hide them
         // via the standard MVCC visibility rules.
         xid: txn.current_xid(),
+        // Row locks are owned by the TOP-LEVEL xid (released by
+        // `release_all` only at txn end, never at `ROLLBACK TO`), so a lock
+        // taken inside a savepoint that is later rolled back still releases
+        // at commit and a re-lock of the same row in a later statement is a
+        // no-op rather than a self-block.
+        lock_xid: txn.xid,
         command_id: txn.current_command,
         cte_buffers: std::collections::HashMap::new(),
         jit,

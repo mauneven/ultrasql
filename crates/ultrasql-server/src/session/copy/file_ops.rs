@@ -613,6 +613,7 @@ where
             isolation: read_isolation,
             oracle: Arc::clone(&self.state.txn_manager),
             xid: read_xid,
+            lock_xid: read_xid,
             command_id: read_command,
             cte_buffers: std::collections::HashMap::new(),
             jit: self.jit_config(),
