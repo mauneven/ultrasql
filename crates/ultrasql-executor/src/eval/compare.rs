@@ -216,9 +216,43 @@ pub(crate) fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Orderin
                 microseconds: rus,
             },
         ) => Ok((lm, ld, lus).cmp(&(rm, rd, rus))),
+        // Mixed integer/float comparison: PostgreSQL compares numerically by
+        // promoting the integer side to f64 (int -> float8 is the preferred
+        // implicit cast). Mirrors the float NaN handling above.
+        (
+            Value::Int16(_) | Value::Int32(_) | Value::Int64(_),
+            Value::Float32(_) | Value::Float64(_),
+        )
+        | (
+            Value::Float32(_) | Value::Float64(_),
+            Value::Int16(_) | Value::Int32(_) | Value::Int64(_),
+        ) => {
+            // SAFETY: both arms are guaranteed convertible by the match guard.
+            let (Some(left), Some(right)) = (as_f64_for_cmp(lv), as_f64_for_cmp(rv)) else {
+                return Err(EvalError::Type(format!(
+                    "comparison type mismatch: {lv:?} and {rv:?}"
+                )));
+            };
+            left.partial_cmp(&right)
+                .ok_or_else(|| EvalError::Type("comparison of NaN is undefined".to_owned()))
+        }
         (l, r) => Err(EvalError::Type(format!(
             "comparison type mismatch: {l:?} and {r:?}"
         ))),
+    }
+}
+
+/// Promote an integer or float [`Value`] to `f64` for cross-type numeric
+/// comparison. Returns `None` for non-int/float values.
+pub(crate) fn as_f64_for_cmp(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int16(v) => Some(f64::from(*v)),
+        Value::Int32(v) => Some(f64::from(*v)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Int64(v) => Some(*v as f64),
+        Value::Float32(v) => Some(f64::from(*v)),
+        Value::Float64(v) => Some(*v),
+        _ => None,
     }
 }
 

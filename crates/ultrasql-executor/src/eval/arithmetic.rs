@@ -102,6 +102,19 @@ pub(crate) fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, 
         return Ok(value);
     }
 
+    // PostgreSQL's `^` (power) operator is `float8 ^ float8`: it promotes both
+    // operands to double precision and returns double precision. We dispatch
+    // every numeric/integer/float (and decimal) operand pair through
+    // `float64_arith`, which both avoids the integer overflow of `int ^ int`
+    // (e.g. `10 ^ 19`) and matches the binder's Float64 result type. (PG
+    // returns `numeric` for numeric operands; we return the same value as
+    // float8, which is the accepted approximation here.)
+    if matches!(op, ArithOp::Pow) {
+        if let (Some(left), Some(right)) = (as_f64_for_arith(&lv), as_f64_for_arith(&rv)) {
+            return float64_arith(left, right, op);
+        }
+    }
+
     if let Some((left, right)) = decimal_float_operands(&lv, &rv) {
         return float64_arith(left, right, op);
     }
@@ -137,13 +150,45 @@ pub(crate) fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, 
         (Value::Float64(l), Value::Float64(r)) => float64_arith(l, r, op),
         (Value::Float64(l), Value::Float32(r)) => float64_arith(l, f64::from(r), op),
         (Value::Float32(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
+        // Mixed integer/float arithmetic: PostgreSQL promotes both operands to
+        // double precision (int -> float8 is the preferred implicit cast) and
+        // returns float8, for every (int width x float width) pair in both
+        // orders. Float32 (`real`) + integer therefore also yields float8.
         (Value::Float64(l), Value::Int16(r)) => float64_arith(l, f64::from(r), op),
         (Value::Int16(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
         (Value::Float64(l), Value::Int32(r)) => float64_arith(l, f64::from(r), op),
         (Value::Int32(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Float64(l), Value::Int64(r)) => float64_arith(l, r as f64, op),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Int64(l), Value::Float64(r)) => float64_arith(l as f64, r, op),
+        (Value::Float32(l), Value::Int16(r)) => float64_arith(f64::from(l), f64::from(r), op),
+        (Value::Int16(l), Value::Float32(r)) => float64_arith(f64::from(l), f64::from(r), op),
+        (Value::Float32(l), Value::Int32(r)) => float64_arith(f64::from(l), f64::from(r), op),
+        (Value::Int32(l), Value::Float32(r)) => float64_arith(f64::from(l), f64::from(r), op),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Float32(l), Value::Int64(r)) => float64_arith(f64::from(l), r as f64, op),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::Int64(l), Value::Float32(r)) => float64_arith(l as f64, f64::from(r), op),
         (l, r) => Err(EvalError::Type(format!(
             "arithmetic type mismatch: {l:?} and {r:?}"
         ))),
+    }
+}
+
+/// Promote an integer, float, or decimal [`Value`] to `f64` for the `^`
+/// power operator (PostgreSQL's `^` is `float8 ^ float8`). Returns `None`
+/// for non-numeric values.
+pub(crate) fn as_f64_for_arith(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int16(v) => Some(f64::from(*v)),
+        Value::Int32(v) => Some(f64::from(*v)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Int64(v) => Some(*v as f64),
+        Value::Float32(v) => Some(f64::from(*v)),
+        Value::Float64(v) => Some(*v),
+        Value::Decimal { value, scale } => decimal_value_to_f64(*value, *scale),
+        _ => None,
     }
 }
 

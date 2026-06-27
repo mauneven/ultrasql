@@ -14,7 +14,26 @@ pub(super) fn binary_result_type(
     rt: DataType,
 ) -> Result<DataType, PlanError> {
     match op {
-        BinaryOp::Add | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
+        // PostgreSQL's `^` (power) operator is `float8 ^ float8` and always
+        // returns double precision for integer/float operands (and for our
+        // implementation, numeric operands too). Splitting it out of the
+        // generic arithmetic arm avoids the integer `numeric_join` result
+        // that would otherwise overflow at execution time (e.g. `10 ^ 19`).
+        BinaryOp::Pow => {
+            if matches!(lt, DataType::Null) {
+                Ok(rt)
+            } else if matches!(rt, DataType::Null) {
+                Ok(lt)
+            } else if lt.is_numeric() && rt.is_numeric() {
+                Ok(DataType::Float64)
+            } else {
+                Err(PlanError::TypeMismatch(format!(
+                    "arithmetic operator {} on incompatible types {lt} and {rt}",
+                    display_binary(op)
+                )))
+            }
+        }
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
             if matches!(op, BinaryOp::Add) && network_integer_add_type(&lt, &rt).is_some() {
                 return Ok(DataType::Inet);
             }
@@ -255,7 +274,6 @@ fn decimal_arithmetic_type(op: BinaryOp, lt: &DataType, rt: &DataType) -> Option
             max_optional_scale(decimal_operand_scale(lt), decimal_operand_scale(rt)),
             Some(6),
         ),
-        BinaryOp::Pow => None,
         _ => None,
     };
     Some(DataType::Decimal {
@@ -402,10 +420,29 @@ mod tests {
                 .expect("decimal div"),
             decimal(Some(6))
         );
+        // `^` (power) is PostgreSQL's `float8 ^ float8`: always double
+        // precision for numeric operands, never the integer/decimal join.
         assert_eq!(
             binary_result_type(BinaryOp::Pow, decimal(Some(2)), DataType::Int32)
                 .expect("decimal pow"),
-            decimal(None)
+            DataType::Float64
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Pow, DataType::Int32, DataType::Int32).expect("int pow"),
+            DataType::Float64
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Pow, DataType::Int32, DataType::Float64)
+                .expect("int/float pow"),
+            DataType::Float64
+        );
+        assert!(
+            binary_result_type(
+                BinaryOp::Pow,
+                DataType::Text { max_len: None },
+                DataType::Int32
+            )
+            .is_err()
         );
         assert_eq!(
             binary_result_type(BinaryOp::Add, decimal(Some(2)), DataType::Float64)

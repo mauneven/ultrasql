@@ -530,13 +530,23 @@ impl DataType {
             });
         }
 
-        // Float absorbs integer.
+        // Float absorbs integer. PostgreSQL keeps `real` only when both
+        // operands are float and neither is double precision (`real + real`
+        // -> real). A mixed `real + integer` promotes to double precision,
+        // because `int -> float8` is the preferred implicit cast
+        // (`real + int4` -> double precision).
         if self.is_float() || other.is_float() {
-            return Ok(if self == &Self::Float64 || other == &Self::Float64 {
-                Self::Float64
-            } else {
-                Self::Float32
-            });
+            return Ok(
+                if self == &Self::Float64
+                    || other == &Self::Float64
+                    || self.is_integer()
+                    || other.is_integer()
+                {
+                    Self::Float64
+                } else {
+                    Self::Float32
+                },
+            );
         }
 
         // Both integer: widen.
@@ -731,13 +741,25 @@ mod tests {
 
     #[test]
     fn numeric_join_promotes_to_float() {
+        // PostgreSQL: a mixed integer/float join promotes the integer side via
+        // the preferred `int -> float8` cast, so `real + int4` is double
+        // precision, not real.
         assert_eq!(
             DataType::Int32.numeric_join(&DataType::Float32).unwrap(),
-            DataType::Float32
+            DataType::Float64
+        );
+        assert_eq!(
+            DataType::Float32.numeric_join(&DataType::Int16).unwrap(),
+            DataType::Float64
         );
         assert_eq!(
             DataType::Int32.numeric_join(&DataType::Float64).unwrap(),
             DataType::Float64
+        );
+        // `real + real` stays real (both operands already float, neither f8).
+        assert_eq!(
+            DataType::Float32.numeric_join(&DataType::Float32).unwrap(),
+            DataType::Float32
         );
         assert_eq!(
             DataType::Float32.numeric_join(&DataType::Float64).unwrap(),

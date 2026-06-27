@@ -232,5 +232,144 @@ fn record_eq_uses_three_valued_field_semantics() {
 }
 
 // -----------------------------------------------------------------------
+// Mixed integer/float comparison (PostgreSQL compares numerically)
+// -----------------------------------------------------------------------
+
+#[test]
+fn mixed_int_float_comparison_compares_numerically() {
+    // 3 < 2.5 -> false, 3 > 2.5 -> true, in both operand orders and widths.
+    assert_eq!(
+        apply_binary(BinaryOp::Lt, Value::Int32(3), Value::Float64(2.5)).unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Gt, Value::Float64(2.5), Value::Int32(3)).unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Gt, Value::Int32(3), Value::Float64(2.5)).unwrap(),
+        Value::Bool(true)
+    );
+    // Equality across int/float (real column case): 3 = 3.0 -> true.
+    assert_eq!(
+        apply_binary(BinaryOp::Eq, Value::Int32(3), Value::Float32(3.0)).unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Eq, Value::Float32(2.5), Value::Int32(3)).unwrap(),
+        Value::Bool(false)
+    );
+    // All integer widths against both float widths, both orders.
+    for cmp in [Value::Int16(3), Value::Int32(3), Value::Int64(3)] {
+        for flt in [Value::Float32(2.5), Value::Float64(2.5)] {
+            assert_eq!(
+                apply_binary(BinaryOp::Gt, cmp.clone(), flt.clone()).unwrap(),
+                Value::Bool(true),
+                "{cmp:?} > {flt:?}"
+            );
+            assert_eq!(
+                apply_binary(BinaryOp::Lt, flt.clone(), cmp.clone()).unwrap(),
+                Value::Bool(true),
+                "{flt:?} < {cmp:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mixed_int_float_comparison_rejects_nan() {
+    let err = apply_binary(BinaryOp::Lt, Value::Int32(1), Value::Float64(f64::NAN)).unwrap_err();
+    assert!(matches!(err, EvalError::Type(_)), "unexpected: {err}");
+}
+
+// -----------------------------------------------------------------------
+// Mixed integer/float arithmetic (PostgreSQL promotes to double precision)
+// -----------------------------------------------------------------------
+
+#[test]
+fn mixed_int_float_arithmetic_returns_float64() {
+    // bigint + float8, float8 * bigint
+    assert_eq!(
+        apply_binary(BinaryOp::Add, Value::Int64(5), Value::Float64(1.5)).unwrap(),
+        Value::Float64(6.5)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Mul, Value::Float64(1.5), Value::Int64(2)).unwrap(),
+        Value::Float64(3.0)
+    );
+    // real + int4 and int4 * real both promote to float8 (double precision).
+    assert_eq!(
+        apply_binary(BinaryOp::Add, Value::Float32(1.5), Value::Int32(2)).unwrap(),
+        Value::Float64(3.5)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Mul, Value::Int32(2), Value::Float32(1.5)).unwrap(),
+        Value::Float64(3.0)
+    );
+    // Every (int width x float width) pair in both orders yields Float64.
+    for i in [Value::Int16(4), Value::Int32(4), Value::Int64(4)] {
+        for f in [Value::Float32(2.0), Value::Float64(2.0)] {
+            assert!(
+                matches!(
+                    apply_binary(BinaryOp::Add, i.clone(), f.clone()).unwrap(),
+                    Value::Float64(_)
+                ),
+                "{i:?} + {f:?} should be Float64"
+            );
+            assert!(
+                matches!(
+                    apply_binary(BinaryOp::Sub, f.clone(), i.clone()).unwrap(),
+                    Value::Float64(_)
+                ),
+                "{f:?} - {i:?} should be Float64"
+            );
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// `^` power operator: PostgreSQL returns double precision, no overflow
+// -----------------------------------------------------------------------
+
+#[test]
+fn power_operator_returns_double_precision() {
+    // 2 ^ 3 = 8 (double precision)
+    assert_eq!(
+        apply_binary(BinaryOp::Pow, Value::Int32(2), Value::Int32(3)).unwrap(),
+        Value::Float64(8.0)
+    );
+    // 10 ^ 19 does not overflow (integer power would).
+    assert_eq!(
+        apply_binary(BinaryOp::Pow, Value::Int32(10), Value::Int32(19)).unwrap(),
+        Value::Float64(1e19)
+    );
+    // 2 ^ 0.5 = sqrt(2)
+    let Value::Float64(root) =
+        apply_binary(BinaryOp::Pow, Value::Int32(2), Value::Float64(0.5)).unwrap()
+    else {
+        panic!("expected Float64");
+    };
+    assert!((root - std::f64::consts::SQRT_2).abs() < 1e-12);
+    // bigint base no longer overflows.
+    assert_eq!(
+        apply_binary(BinaryOp::Pow, Value::Int64(10), Value::Int64(19)).unwrap(),
+        Value::Float64(1e19)
+    );
+    // numeric ^ int returns the value as double precision (6.25).
+    assert_eq!(
+        apply_binary(
+            BinaryOp::Pow,
+            Value::Decimal {
+                value: 25,
+                scale: 1
+            },
+            Value::Int32(2),
+        )
+        .unwrap(),
+        Value::Float64(6.25)
+    );
+}
+
+// -----------------------------------------------------------------------
 // Kleene AND/OR
 // -----------------------------------------------------------------------
