@@ -252,6 +252,54 @@ fn select_subquery_in_from_requires_alias() {
 }
 
 #[test]
+fn select_plain_derived_table_is_not_lateral() {
+    let stmt = parse("SELECT x FROM (SELECT 1 AS x) sub");
+    let Statement::Select(s) = stmt else { panic!() };
+    let TableRef::Subquery { lateral, alias, .. } = &s.from[0] else {
+        panic!()
+    };
+    assert!(!lateral, "a plain derived table is not LATERAL");
+    assert_eq!(alias.value, "sub");
+}
+
+#[test]
+fn select_lateral_derived_table_sets_flag() {
+    let stmt = parse("SELECT * FROM u a, LATERAL (SELECT a.id AS x) d");
+    let Statement::Select(s) = stmt else { panic!() };
+    // The comma list canonicalises to a left-deep CROSS JOIN; the LATERAL
+    // derived table is the right side.
+    let TableRef::Join { right, .. } = &s.from[0] else {
+        panic!("expected a Join for the comma list, got {:?}", s.from[0]);
+    };
+    let TableRef::Subquery { lateral, alias, .. } = right.as_ref() else {
+        panic!("expected a Subquery on the right, got {right:?}");
+    };
+    assert!(lateral, "LATERAL keyword must set the lateral flag");
+    assert_eq!(alias.value, "d");
+}
+
+#[test]
+fn select_join_lateral_derived_table_sets_flag() {
+    let stmt = parse("SELECT * FROM u a JOIN LATERAL (SELECT a.id AS x) d ON true");
+    let Statement::Select(s) = stmt else { panic!() };
+    let TableRef::Join { right, .. } = &s.from[0] else {
+        panic!("expected a Join, got {:?}", s.from[0]);
+    };
+    let TableRef::Subquery { lateral, .. } = right.as_ref() else {
+        panic!("expected a Subquery on the right, got {right:?}");
+    };
+    assert!(lateral, "JOIN LATERAL must set the lateral flag");
+}
+
+#[test]
+fn select_lateral_without_subquery_is_rejected() {
+    // `LATERAL` is only meaningful before a subquery; before a bare table name
+    // it is a parse error.
+    let err = parse_err("SELECT * FROM u a, LATERAL t");
+    assert!(matches!(err, crate::parser::ParseError::Expected { .. }));
+}
+
+#[test]
 fn select_csv_file_literal_in_from_lowers_to_read_csv_function() {
     let stmt = parse("SELECT count(*) FROM 'logs/*.csv'");
     let Statement::Select(s) = stmt else { panic!() };

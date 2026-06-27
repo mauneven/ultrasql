@@ -1382,7 +1382,13 @@ fn bind_order_by_around_projection_with_input_schema(
                 schema,
             })
         }
-        Err(PlanError::ColumnNotFound(_) | PlanError::Ambiguous(_)) => {
+        // A key the input schema can't resolve may still name an output column
+        // (the residual after alias-first resolution: e.g. a key that only
+        // exists post-projection). Lift the Sort above the projection and bind
+        // against the output schema. A genuine `Ambiguous` raised by alias-first
+        // resolution (two output columns share the name) is terminal — propagate
+        // it rather than silently picking the first via `Schema::find`.
+        Err(PlanError::ColumnNotFound(_)) => {
             let projected = LogicalPlan::Project {
                 input,
                 exprs,

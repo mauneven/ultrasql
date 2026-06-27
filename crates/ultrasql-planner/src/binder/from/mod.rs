@@ -23,8 +23,8 @@ const MAX_JOIN_DEPTH: usize = 64;
 use super::{
     AggregateFunc, Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPivotAggregate,
     LogicalPivotValue, LogicalPlan, LogicalUnpivotColumn, PlanError, ScalarExpr, ScopeEntry,
-    ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
-    lookup_table_reference, schema_for_qualified_binding,
+    ScopeFrame, ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
+    lookup_table_reference, plan_contains_outer_column, schema_for_qualified_binding,
 };
 
 use joins::{bind_explicit_join, concat_schemas_cross, merge_scopes};
@@ -65,7 +65,19 @@ pub(super) fn bind_from(
     let (mut plan, mut from_scope) = bind_table_ref(first, catalog, cte_catalog, outer_scope)?;
 
     for item in iter {
-        let (right_plan, right_scope) = bind_table_ref(item, catalog, cte_catalog, outer_scope)?;
+        // A `LATERAL` derived table may correlate to FROM items to its left at
+        // this query level: expose the accumulated left side as an extra outer
+        // scope frame while binding it. Plain (non-LATERAL) items see only the
+        // enclosing query's scope, so a sibling reference fails to resolve —
+        // matching PostgreSQL's "invalid reference to FROM-clause entry".
+        let (right_plan, right_scope) = bind_table_ref_maybe_lateral(
+            item,
+            plan.schema(),
+            &from_scope,
+            catalog,
+            cte_catalog,
+            outer_scope,
+        )?;
         let offset = from_scope.len();
         let join_schema = concat_schemas_cross(plan.schema(), right_plan.schema())?;
         let merged_scope = merge_scopes(from_scope, right_scope, offset);
@@ -80,6 +92,113 @@ pub(super) fn bind_from(
     }
 
     Ok((plan, from_scope))
+}
+
+/// Whether a FROM item is a `LATERAL` derived table — the only shape whose
+/// inner query may correlate to sibling FROM items at the same query level.
+pub(super) const fn table_ref_is_lateral(table_ref: &TableRef) -> bool {
+    matches!(table_ref, TableRef::Subquery { lateral: true, .. })
+}
+
+/// Bind a FROM item, honouring `LATERAL`.
+///
+/// A plain (non-`LATERAL`) derived table sees only the enclosing query's scope,
+/// never its siblings at this query level — so a sibling reference fails to
+/// resolve, matching PostgreSQL's "invalid reference to FROM-clause entry".
+///
+/// A `LATERAL` derived table *may* correlate to FROM items to its left
+/// (`left_plan_schema`/`left_scope`): pushing them as a `frame_depth = 1` scope
+/// binds such references to an [`ScalarExpr::OuterColumn`]. The query planner has
+/// no decorrelation rule for a lateral correlation that lives directly inside a
+/// join input (the executor rejects an outer-column reference that reaches it),
+/// so rather than emit a plan that fails at execution with an opaque internal
+/// error, reject a *correlated* `LATERAL` derived table up front. An
+/// uncorrelated `LATERAL` (no reference to the left) binds and runs normally.
+pub(super) fn bind_table_ref_maybe_lateral(
+    item: &TableRef,
+    left_plan_schema: &Schema,
+    left_scope: &[ScopeEntry],
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    if !table_ref_is_lateral(item) {
+        return bind_table_ref(item, catalog, cte_catalog, scope);
+    }
+    let frame_schema = schema_for_qualified_binding(left_plan_schema, left_scope)?;
+    scope.push(ScopeFrame {
+        schema: frame_schema,
+        qualifier: None,
+    });
+    let result = bind_table_ref(item, catalog, cte_catalog, scope);
+    scope.pop();
+    let (plan, from_scope) = result?;
+    if plan_correlates_to_left(&plan) {
+        return Err(PlanError::not_supported(
+            "correlated LATERAL derived table (references a column of a preceding FROM item)",
+        ));
+    }
+    Ok((plan, from_scope))
+}
+
+/// Whether `plan` (a freshly bound LATERAL derived table) contains an
+/// outer-column reference at `frame_depth == 1` — i.e. it correlates to the
+/// sibling FROM items the caller exposed, not to a farther-out enclosing query.
+/// Deeper references (`frame_depth > 1`) target the real outer query and are
+/// handled by the normal subquery decorrelation path, so they are not rejected
+/// here. Walks only the relational node shapes a derived-table `SELECT` can
+/// produce; the deny-list of statement plans cannot occur inside FROM.
+fn plan_correlates_to_left(plan: &LogicalPlan) -> bool {
+    use crate::expr::ScalarExpr;
+
+    let refs_left = |e: &ScalarExpr| e.contains_outer_column_depth1();
+
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            refs_left(predicate) || plan_correlates_to_left(input)
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            exprs.iter().any(|(e, _)| refs_left(e)) || plan_correlates_to_left(input)
+        }
+        LogicalPlan::Sort { input, keys } => {
+            keys.iter().any(|k| refs_left(&k.expr)) || plan_correlates_to_left(input)
+        }
+        LogicalPlan::DistinctOn { input, on_keys } => {
+            on_keys.iter().any(refs_left) || plan_correlates_to_left(input)
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        } => {
+            group_by.iter().any(refs_left)
+                || aggregates.iter().any(|a| {
+                    a.arg.as_ref().is_some_and(refs_left)
+                        || a.direct_arg.as_ref().is_some_and(refs_left)
+                        || a.order_by.as_ref().is_some_and(|k| refs_left(&k.expr))
+                })
+                || plan_correlates_to_left(input)
+        }
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            plan_correlates_to_left(left) || plan_correlates_to_left(right)
+        }
+        LogicalPlan::Values { rows, .. } => rows.iter().flat_map(|r| r.iter()).any(refs_left),
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
+        | LogicalPlan::Unpivot { input, .. } => plan_correlates_to_left(input),
+        LogicalPlan::Pivot {
+            input, aggregate, ..
+        } => aggregate.arg.as_ref().is_some_and(refs_left) || plan_correlates_to_left(input),
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => plan_correlates_to_left(definition) || plan_correlates_to_left(body),
+        // A correlation reaching the executor is rejected anyway; for any other
+        // (non-query) node shape, fall back to the conservative whole-plan check
+        // so we never let an undecorrelatable lateral reference slip through.
+        _ => plan_contains_outer_column(plan),
+    }
 }
 
 fn from_clause_join_depth(from_items: &[TableRef]) -> usize {

@@ -205,6 +205,10 @@ pub enum TableRef {
     /// PostgreSQL requires an alias on every derived table. Parsing
     /// without an alias is a [`crate::parser::ParseError`].
     Subquery {
+        /// `LATERAL` derived table: its inner query may reference columns of
+        /// FROM items that appear to its left at the same query level. A plain
+        /// (non-`LATERAL`) derived table may not.
+        lateral: bool,
         /// The inner SELECT.
         select: Box<SelectStmt>,
         /// Required alias for the derived table.

@@ -333,8 +333,12 @@ impl ServerError {
             // prefix of ORDER BY.
             Self::Plan(ultrasql_planner::PlanError::DistinctOnOrderByMismatch(_)) => "42P10",
             // ambiguous_column — a column reference matched more than one
-            // entry in scope (e.g. unqualified `id` across joined tables).
-            Self::Plan(ultrasql_planner::PlanError::Ambiguous(_)) => "42702",
+            // entry in scope (e.g. unqualified `id` across joined tables), or a
+            // USING/NATURAL common column duplicated on one side of the join.
+            Self::Plan(
+                ultrasql_planner::PlanError::Ambiguous(_)
+                | ultrasql_planner::PlanError::AmbiguousJoinColumn(_),
+            ) => "42702",
             // undefined_object — a referenced index does not exist in the
             // catalog (DROP INDEX / index hint on a missing name).
             Self::Plan(ultrasql_planner::PlanError::IndexNotFound(_)) => "42704",

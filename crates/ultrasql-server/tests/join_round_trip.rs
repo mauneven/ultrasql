@@ -445,3 +445,38 @@ async fn char_length_aliases_round_trip_as_length() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Bug #23: a `USING` common column that appears more than once on one side of
+/// the join (here both branches of a `CROSS JOIN` define `x`) is ambiguous.
+/// PostgreSQL reports SQLSTATE `42702` with "common column name … appears more
+/// than once"; previously UltraSQL silently paired the first `x` (or surfaced a
+/// generic schema error).
+#[tokio::test]
+async fn using_duplicate_common_column_reports_42702() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE ju1 (x INT NOT NULL, a INT NOT NULL)")
+        .await
+        .expect("create ju1");
+    client
+        .batch_execute("CREATE TABLE ju2 (x INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create ju2");
+    client
+        .batch_execute("CREATE TABLE ju3 (x INT NOT NULL, c INT NOT NULL)")
+        .await
+        .expect("create ju3");
+
+    let err = client
+        .simple_query("SELECT * FROM (ju1 CROSS JOIN ju2) JOIN ju3 USING (x)")
+        .await
+        .expect_err("USING (x) with x duplicated on the left must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42702"),
+        "duplicated USING common column must report ambiguous_column: {err:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}

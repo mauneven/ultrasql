@@ -6,7 +6,8 @@ use ultrasql_parser::ast::{JoinCondition, JoinOp};
 
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScopeEntry, ScopeStack,
-    bind_expr_with_ctes, bind_table_ref, schema_for_qualified_binding,
+    bind_expr_with_ctes, bind_table_ref, bind_table_ref_maybe_lateral,
+    schema_for_qualified_binding,
 };
 
 pub(super) fn bind_explicit_join(
@@ -19,7 +20,16 @@ pub(super) fn bind_explicit_join(
     scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     let (left_plan, left_scope) = bind_table_ref(left_ref, catalog, cte_catalog, scope)?;
-    let (right_plan, right_scope) = bind_table_ref(right_ref, catalog, cte_catalog, scope)?;
+    // `JOIN LATERAL (…)` lets the right side correlate to the left; a plain
+    // right side sees only the enclosing query's scope.
+    let (right_plan, right_scope) = bind_table_ref_maybe_lateral(
+        right_ref,
+        left_plan.schema(),
+        &left_scope,
+        catalog,
+        cte_catalog,
+        scope,
+    )?;
 
     let join_type = match op {
         JoinOp::Inner => LogicalJoinType::Inner,
@@ -70,7 +80,13 @@ pub(super) fn bind_explicit_join(
             ))
         }
         JoinCondition::Using(cols) => {
-            let pairs = resolve_using_pairs(cols, left_plan.schema(), right_plan.schema())?;
+            let pairs = resolve_using_pairs(
+                cols,
+                left_plan.schema(),
+                right_plan.schema(),
+                &left_scope,
+                &right_scope,
+            )?;
             bind_using_join(
                 left_plan,
                 right_plan,
@@ -81,7 +97,12 @@ pub(super) fn bind_explicit_join(
             )
         }
         JoinCondition::Natural => {
-            let pairs = resolve_natural_pairs(left_plan.schema(), right_plan.schema());
+            let pairs = resolve_natural_pairs(
+                left_plan.schema(),
+                right_plan.schema(),
+                &left_scope,
+                &right_scope,
+            )?;
             bind_using_join(
                 left_plan,
                 right_plan,
@@ -152,14 +173,48 @@ fn push_scope_entry(out: &mut Vec<ScopeEntry>, entry: &ScopeEntry) {
     });
 }
 
+/// Count how many of `scope`'s columns are named `col_name` (case-insensitive),
+/// using the scope's *true* column names. The plan schema deduplicates a
+/// repeated name (the 2nd `x` becomes `x_1`), so `Schema::find` would silently
+/// see only one — the scope is the only place a genuine duplicate survives.
+fn join_column_occurrences(scope: &[ScopeEntry], col_name: &str) -> usize {
+    scope
+        .iter()
+        .filter(|e| e.field.name.eq_ignore_ascii_case(col_name))
+        .count()
+}
+
+/// PostgreSQL rejects a `USING`/`NATURAL` common column that appears more than
+/// once on a side (`SELECT * FROM (t1 CROSS JOIN t2) JOIN t3 USING (x)` with a
+/// `t1.x` and a `t2.x`): SQLSTATE 42702. `side` is `"left"` or `"right"`.
+fn check_join_column_unique(
+    scope: &[ScopeEntry],
+    col_name: &str,
+    side: &str,
+) -> Result<(), PlanError> {
+    if join_column_occurrences(scope, col_name) > 1 {
+        return Err(PlanError::AmbiguousJoinColumn(format!(
+            "common column name \"{col_name}\" appears more than once in {side} table"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_using_pairs(
     cols: &[ultrasql_parser::ast::Identifier],
     left: &Schema,
     right: &Schema,
+    left_scope: &[ScopeEntry],
+    right_scope: &[ScopeEntry],
 ) -> Result<Vec<(usize, usize)>, PlanError> {
     let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(cols.len());
     for ident in cols {
         let col_name = &ident.value;
+        // A common column duplicated on either side is ambiguous (PG 42702):
+        // check before pairing, since the deduplicated schema would otherwise
+        // hide the duplicate and `Schema::find` would pair only the first.
+        check_join_column_unique(left_scope, col_name, "left")?;
+        check_join_column_unique(right_scope, col_name, "right")?;
         let left_idx = left
             .find(col_name)
             .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?
@@ -173,14 +228,23 @@ fn resolve_using_pairs(
     Ok(pairs)
 }
 
-fn resolve_natural_pairs(left: &Schema, right: &Schema) -> Vec<(usize, usize)> {
+fn resolve_natural_pairs(
+    left: &Schema,
+    right: &Schema,
+    left_scope: &[ScopeEntry],
+    right_scope: &[ScopeEntry],
+) -> Result<Vec<(usize, usize)>, PlanError> {
     let mut pairs = Vec::new();
     for (left_idx, left_field) in left.fields().iter().enumerate() {
         if let Some((right_idx, _)) = right.find(&left_field.name) {
+            // The pair is a common column; reject if it is duplicated on
+            // either side (PG 42702), using the scope's true names.
+            check_join_column_unique(left_scope, &left_field.name, "left")?;
+            check_join_column_unique(right_scope, &left_field.name, "right")?;
             pairs.push((left_idx, right_idx));
         }
     }
-    pairs
+    Ok(pairs)
 }
 
 fn build_using_schema(

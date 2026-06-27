@@ -106,18 +106,131 @@ fn order_by_can_reference_projection_alias() {
     let plan =
         parse_and_bind("SELECT id AS ident FROM users ORDER BY ident DESC", &cat).expect("bind ok");
 
-    let LogicalPlan::Sort { input, keys } = &plan else {
-        panic!("expected top Sort over projected alias, got {plan:?}");
+    // A bare ORDER BY name prefers the SELECT-list output alias (`ident`), which
+    // maps to the already-bound projection expression `id` (input index 0). The
+    // projection is order-preserving, so the Sort sits *below* it sorting the
+    // input by `id` DESC: `Project(Sort(Scan))`.
+    let LogicalPlan::Project { input, .. } = &plan else {
+        panic!("expected Project over Sort, got {plan:?}");
+    };
+    let LogicalPlan::Sort { keys, .. } = input.as_ref() else {
+        panic!("expected Sort below Project, got {input:?}");
     };
     assert_eq!(keys.len(), 1);
-    assert!(!keys[0].asc);
-    assert!(matches!(
-        &keys[0].expr,
-        ScalarExpr::Column { index: 0, name, .. } if name == "ident"
-    ));
+    assert!(!keys[0].asc, "ident DESC");
     assert!(
-        matches!(input.as_ref(), LogicalPlan::Project { .. }),
-        "alias ORDER BY should sort projected rows"
+        matches!(&keys[0].expr, ScalarExpr::Column { index: 0, .. }),
+        "alias `ident` resolves to projected column `id` (input index 0), got {:?}",
+        keys[0].expr
+    );
+}
+
+/// Catalog with one table `t(a INT, b INT)` for the bare-name ORDER BY tests.
+fn ab_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("a", DataType::Int32),
+        Field::required("b", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("t", TableMeta::new(schema));
+    cat
+}
+
+/// The single sort key of a `Project(Sort(..))` or bare `Sort(..)` plan.
+fn only_sort_key(plan: &LogicalPlan) -> &ScalarExpr {
+    let sort = match plan {
+        LogicalPlan::Sort { .. } => plan,
+        LogicalPlan::Project { input, .. } => input.as_ref(),
+        other => panic!("expected Sort or Project(Sort), got {other:?}"),
+    };
+    let LogicalPlan::Sort { keys, .. } = sort else {
+        panic!("expected Sort, got {sort:?}");
+    };
+    assert_eq!(keys.len(), 1, "exactly one sort key");
+    &keys[0].expr
+}
+
+#[test]
+fn order_by_bare_name_prefers_output_alias_over_input_column() {
+    // PG: `SELECT name AS id … ORDER BY id` sorts by the OUTPUT alias `id`
+    // (= the `name` column), NOT the input `users.id`. The projected expr for
+    // `name AS id` is the `name` column (input index 1).
+    let cat = users_catalog();
+    let plan = parse_and_bind("SELECT name AS id FROM users ORDER BY id", &cat).expect("bind ok");
+    assert!(
+        matches!(only_sort_key(&plan), ScalarExpr::Column { index: 1, .. }),
+        "ORDER BY id must sort by output alias `id` = name (input index 1), got {:?}",
+        only_sort_key(&plan)
+    );
+}
+
+#[test]
+fn order_by_bare_name_falls_back_to_input_when_not_an_output_alias() {
+    // PG: `SELECT a AS x … ORDER BY a` — `a` is not an output name, so it
+    // resolves to the input column `a` (index 0).
+    let cat = ab_catalog();
+    let plan = parse_and_bind("SELECT a AS x FROM t ORDER BY a", &cat).expect("bind ok");
+    assert!(
+        matches!(only_sort_key(&plan), ScalarExpr::Column { index: 0, .. }),
+        "ORDER BY a must fall back to input column a (index 0), got {:?}",
+        only_sort_key(&plan)
+    );
+}
+
+#[test]
+fn order_by_bare_name_matching_output_alias_uses_projection_expr() {
+    // PG: `SELECT a+0 AS a … ORDER BY a` sorts by the OUTPUT `a` (= a+0), not by
+    // a re-resolved input column. The sort key is the projection expression
+    // (a Binary Add), proving output-alias resolution rather than input binding.
+    let cat = ab_catalog();
+    let plan = parse_and_bind("SELECT a+0 AS a FROM t ORDER BY a", &cat).expect("bind ok");
+    assert!(
+        matches!(only_sort_key(&plan), ScalarExpr::Binary { .. }),
+        "ORDER BY a must reuse the projected `a+0` expression, got {:?}",
+        only_sort_key(&plan)
+    );
+}
+
+#[test]
+fn order_by_expression_resolves_against_input_not_output_alias() {
+    // PG: an ORDER BY *expression* (not a bare name) always uses input columns,
+    // even when it would name-match an output alias. `a+1` uses input `a`.
+    let cat = ab_catalog();
+    let plan = parse_and_bind("SELECT a+1 AS a FROM t ORDER BY a+1", &cat).expect("bind ok");
+    // The key is `a+1` over the input column a (index 0), independent of the
+    // output alias `a`.
+    let ScalarExpr::Binary { left, .. } = only_sort_key(&plan) else {
+        panic!("expected Binary sort key");
+    };
+    assert!(
+        matches!(left.as_ref(), ScalarExpr::Column { index: 0, .. }),
+        "ORDER BY a+1 must reference input column a (index 0), got {left:?}"
+    );
+}
+
+#[test]
+fn order_by_qualified_name_resolves_against_input() {
+    // A qualified name `t.a` is not a bare name, so it never prefers the output
+    // alias; it binds to the input column.
+    let cat = ab_catalog();
+    let plan = parse_and_bind("SELECT b AS a FROM t ORDER BY t.a", &cat).expect("bind ok");
+    assert!(
+        matches!(only_sort_key(&plan), ScalarExpr::Column { index: 0, .. }),
+        "ORDER BY t.a must resolve to input column a (index 0), got {:?}",
+        only_sort_key(&plan)
+    );
+}
+
+#[test]
+fn order_by_bare_name_ambiguous_across_two_output_aliases() {
+    // PG: two output columns named `a` → `ORDER BY "a" is ambiguous` (42702).
+    let cat = ab_catalog();
+    let err = parse_and_bind("SELECT a AS a, b AS a FROM t ORDER BY a", &cat)
+        .expect_err("two output columns named `a` make ORDER BY a ambiguous");
+    assert!(
+        matches!(err, PlanError::Ambiguous(_)),
+        "expected Ambiguous (42702), got {err:?}"
     );
 }
 
@@ -436,6 +549,78 @@ fn binds_natural_join_collapses_shared_columns_without_ambiguous_select() {
     assert_eq!(schema.field_at(0).name, "id");
     assert_eq!(schema.field_at(1).name, "left_name");
     assert_eq!(schema.field_at(2).name, "right_name");
+}
+
+/// Three tables `t1(x, a)`, `t2(x, b)`, `t3(x, c)` — distinct non-join columns
+/// so that only the join column `x` is shared (mirrors PostgreSQL's repro for
+/// the USING/NATURAL "appears more than once" error).
+fn three_x_catalog() -> InMemoryCatalog {
+    let mut cat = InMemoryCatalog::new();
+    for (name, other) in [("t1", "a"), ("t2", "b"), ("t3", "c")] {
+        let schema = Schema::new([
+            Field::required("x", DataType::Int32),
+            Field::required(other, DataType::Int32),
+        ])
+        .expect("schema ok");
+        cat.register(name, TableMeta::new(schema));
+    }
+    cat
+}
+
+#[test]
+fn using_join_column_duplicated_on_left_is_ambiguous() {
+    // `(t1 CROSS JOIN t2)` has two `x` columns; USING (x) against t3 is 42702.
+    let cat = three_x_catalog();
+    let err = parse_and_bind("SELECT * FROM (t1 CROSS JOIN t2) JOIN t3 USING (x)", &cat)
+        .expect_err("duplicated join column on the left must be rejected");
+    assert!(
+        matches!(err, PlanError::AmbiguousJoinColumn(_)),
+        "expected AmbiguousJoinColumn (SQLSTATE 42702), got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "common column name \"x\" appears more than once in left table"
+    );
+}
+
+#[test]
+fn using_join_column_duplicated_on_right_is_ambiguous() {
+    let cat = three_x_catalog();
+    let err = parse_and_bind("SELECT * FROM t3 JOIN (t1 CROSS JOIN t2) USING (x)", &cat)
+        .expect_err("duplicated join column on the right must be rejected");
+    assert!(
+        matches!(err, PlanError::AmbiguousJoinColumn(_)),
+        "expected AmbiguousJoinColumn, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "common column name \"x\" appears more than once in right table"
+    );
+}
+
+#[test]
+fn natural_join_column_duplicated_on_one_side_is_ambiguous() {
+    let cat = three_x_catalog();
+    let err = parse_and_bind("SELECT * FROM (t1 CROSS JOIN t2) NATURAL JOIN t3", &cat)
+        .expect_err("NATURAL join with a duplicated common column must be rejected");
+    assert!(
+        matches!(err, PlanError::AmbiguousJoinColumn(_)),
+        "expected AmbiguousJoinColumn, got {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "common column name \"x\" appears more than once in left table"
+    );
+}
+
+#[test]
+fn using_join_with_unique_columns_still_binds() {
+    // No duplicated common column — the normal path is unaffected.
+    let cat = three_x_catalog();
+    let plan =
+        parse_and_bind("SELECT * FROM t1 JOIN t3 USING (x)", &cat).expect("unique USING binds");
+    // Output: merged x, then t1.a, then t3.c = 3 columns.
+    assert_eq!(plan.schema().len(), 3);
 }
 
 #[test]

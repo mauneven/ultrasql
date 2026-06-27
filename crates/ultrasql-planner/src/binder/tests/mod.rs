@@ -14,6 +14,7 @@ mod between;
 mod create_table_basic;
 mod create_table_constraints;
 mod ddl_index_alter;
+mod derived_lateral;
 mod distinct_on;
 mod joins;
 mod merge_dml;

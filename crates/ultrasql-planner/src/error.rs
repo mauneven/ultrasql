@@ -26,6 +26,13 @@ pub enum PlanError {
     #[error("column reference is ambiguous: '{0}'")]
     Ambiguous(String),
 
+    /// A `USING` / `NATURAL` join common column appears more than once on one
+    /// side of the join (e.g. both branches of a `CROSS JOIN` define it). The
+    /// payload is the fully-rendered PostgreSQL message. Classified as
+    /// `ambiguous_column` (SQLSTATE 42702), like [`Self::Ambiguous`].
+    #[error("{0}")]
+    AmbiguousJoinColumn(String),
+
     /// The types of an expression's operands do not satisfy the
     /// operator's rule. The string names the failing combination so a
     /// SQL user can correct the query.

@@ -77,6 +77,30 @@ fn distinct_on_without_order_by_sorts_by_on_keys() {
 }
 
 #[test]
+fn distinct_on_key_prefers_output_alias() {
+    // PG: `SELECT DISTINCT ON (id) name AS id … ORDER BY id, score` resolves the
+    // ON key `id` to the OUTPUT alias `id` (= name, input index 1), not the
+    // input `users.id` (index 0). Both the ON key and the leading sort key bind
+    // to the projected `name` column.
+    let plan = parse_bind_ok("SELECT DISTINCT ON (id) name AS id FROM users ORDER BY id, score");
+    let (on_keys, below) = distinct_on_node(&plan);
+    assert_eq!(on_keys.len(), 1);
+    assert!(
+        matches!(&on_keys[0], ScalarExpr::Column { index: 1, .. }),
+        "ON key `id` should resolve to output alias `id` = name (input index 1), got {:?}",
+        on_keys[0]
+    );
+    let LogicalPlan::Sort { keys, .. } = below else {
+        panic!("expected Sort below DistinctOn, got {below:?}");
+    };
+    assert!(
+        matches!(&keys[0].expr, ScalarExpr::Column { index: 1, .. }),
+        "leading ORDER BY `id` should also resolve to the output alias, got {:?}",
+        keys[0].expr
+    );
+}
+
+#[test]
 fn distinct_on_non_prefix_order_by_is_rejected() {
     let cat = users_catalog();
     let err = parse_and_bind(

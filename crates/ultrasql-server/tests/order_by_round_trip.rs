@@ -640,3 +640,45 @@ async fn multi_column_index_nullable_leading_order_by_keeps_nulls() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Bug #20: a bare `ORDER BY` name resolves to the SELECT-list OUTPUT alias
+/// before an input column (PostgreSQL). `SELECT name AS id … ORDER BY id`
+/// must sort by the projected `name`, not the input `users.id`.
+#[tokio::test]
+async fn order_by_bare_name_sorts_by_output_alias() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE alias_users (id INT NOT NULL, name TEXT)")
+        .await
+        .expect("create table");
+    // Input id order is the inverse of name order, so the two resolutions are
+    // distinguishable: by name -> aaa,bbb,ccc; by id -> ccc,bbb,aaa.
+    for (id, name) in [(3_i32, "aaa"), (1, "ccc"), (2, "bbb")] {
+        client
+            .batch_execute(&format!("INSERT INTO alias_users VALUES ({id}, '{name}')"))
+            .await
+            .expect("insert");
+    }
+
+    let rows = client
+        .simple_query("SELECT name AS id FROM alias_users ORDER BY id")
+        .await
+        .expect("query succeeds");
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get(0).expect("col present").to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["aaa", "bbb", "ccc"],
+        "ORDER BY id must sort by the output alias `id` (= name), not input id"
+    );
+
+    shutdown(client, server_handle).await;
+}

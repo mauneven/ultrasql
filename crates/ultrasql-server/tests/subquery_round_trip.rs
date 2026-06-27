@@ -811,3 +811,63 @@ async fn cte_in_derived_table_with_reordered_body_filters_correct_column() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Bug #22: a plain (non-`LATERAL`) derived table may not reference a sibling
+/// FROM item (PostgreSQL: "invalid reference to FROM-clause entry"). An
+/// uncorrelated `LATERAL` derived table runs; a *correlated* one is rejected
+/// with a clear feature-not-supported error rather than crashing at execution.
+#[tokio::test]
+async fn lateral_derived_table_semantics() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE lat_u (id INT NOT NULL, k INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO lat_u VALUES (1, 10), (2, 20)")
+        .await
+        .expect("seed");
+
+    // Non-LATERAL sibling reference: rejected (undefined_column 42703).
+    let err = client
+        .simple_query("SELECT * FROM lat_u a, (SELECT a.id AS x) d")
+        .await
+        .expect_err("non-LATERAL sibling reference must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("42703"),
+        "non-LATERAL sibling reference is an undefined column: {err:?}"
+    );
+
+    // Correlated LATERAL: rejected as feature-not-supported (0A000), not a crash.
+    let err = client
+        .simple_query("SELECT * FROM lat_u a, LATERAL (SELECT a.id AS lid) d")
+        .await
+        .expect_err("correlated LATERAL is not supported");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("0A000"),
+        "correlated LATERAL must be feature_not_supported: {err:?}"
+    );
+
+    // Uncorrelated LATERAL: runs, producing the cross product.
+    let rows = client
+        .simple_query("SELECT id, k, z FROM lat_u a, LATERAL (SELECT 99 AS z) d ORDER BY id")
+        .await
+        .expect("uncorrelated LATERAL runs");
+    let zs: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(2)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        zs,
+        vec![99, 99],
+        "each outer row pairs with the lateral row"
+    );
+
+    shutdown(client, server_handle).await;
+}

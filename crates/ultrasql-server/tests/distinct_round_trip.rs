@@ -392,3 +392,50 @@ async fn distinct_on_with_limit() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Bug #21: a bare `DISTINCT ON` / `ORDER BY` key resolves to the SELECT-list
+/// OUTPUT alias before an input column (PostgreSQL). With `name AS id`, the ON
+/// key `id` is the projected `name`, so deduplication is by name. The leading
+/// ORDER BY `id` (= name) picks the first row per name group.
+#[tokio::test]
+async fn distinct_on_bare_key_uses_output_alias() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE don_alias (id INT NOT NULL, name TEXT NOT NULL, score INT NOT NULL)",
+        )
+        .await
+        .expect("create");
+    // Two rows share name 'aaa' (ids 1,4); DISTINCT ON the output alias `id`
+    // (= name) keeps one 'aaa' row plus 'bbb' and 'ccc'. If it wrongly grouped
+    // by input id, all four distinct ids would survive.
+    client
+        .batch_execute(
+            "INSERT INTO don_alias VALUES \
+             (1, 'aaa', 10), (4, 'aaa', 5), (2, 'bbb', 20), (3, 'ccc', 30)",
+        )
+        .await
+        .expect("seed");
+
+    let rows = client
+        .simple_query("SELECT DISTINCT ON (id) name AS id FROM don_alias ORDER BY id, score")
+        .await
+        .expect("distinct on by alias");
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get(0).expect("col present").to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["aaa", "bbb", "ccc"],
+        "DISTINCT ON (id) must dedup by the output alias `id` (= name)"
+    );
+
+    shutdown(client, server_handle).await;
+}

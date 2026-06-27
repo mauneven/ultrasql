@@ -193,6 +193,16 @@ impl Parser<'_> {
             return self.parse_table_transform_suffix(factor);
         }
 
+        // `LATERAL` marks the following derived table (or table function) so its
+        // inner query may correlate to FROM items to its left at the same query
+        // level. PostgreSQL only allows `LATERAL` before a subquery `(SELECT …)`
+        // or a function call; require one of those to follow.
+        let lateral_span = if self.peek()?.kind == TokenKind::KwLateral {
+            Some(self.advance()?.span)
+        } else {
+            None
+        };
+
         if self.peek()?.kind == TokenKind::LParen {
             let lp = self.advance()?;
 
@@ -218,14 +228,24 @@ impl Parser<'_> {
                     Vec::new()
                 };
 
+                let start = lateral_span.map_or(lp.span.start, |s| s.start);
                 let end = column_aliases.last().map_or(alias.span.end, |a| a.span.end);
                 let result = TableRef::Subquery {
+                    lateral: lateral_span.is_some(),
                     select: Box::new(select),
                     alias,
                     column_aliases,
-                    span: Span::new(lp.span.start, end),
+                    span: Span::new(start, end),
                 };
                 return self.parse_table_transform_suffix(result);
+            }
+
+            if lateral_span.is_some() {
+                return Err(ParseError::Expected {
+                    expected: "subquery (SELECT …) after LATERAL",
+                    found: self.peek().map_or(TokenKind::Eof, |t| t.kind),
+                    offset: lp.span.end_usize(),
+                });
             }
 
             // Parenthesised table reference / joined table.
@@ -257,6 +277,16 @@ impl Parser<'_> {
             }
 
             return self.parse_table_transform_suffix(result);
+        }
+
+        // `LATERAL` is only meaningful before a subquery; a bare named factor
+        // (or table function) after it is not yet supported.
+        if let Some(span) = lateral_span {
+            return Err(ParseError::Expected {
+                expected: "subquery (SELECT …) after LATERAL",
+                found: self.peek().map_or(TokenKind::Eof, |t| t.kind),
+                offset: span.start_usize(),
+            });
         }
 
         // Named table reference.

@@ -238,6 +238,32 @@ impl ScalarExpr {
         }
     }
 
+    /// Returns `true` if this expression references an [`Self::OuterColumn`] at
+    /// the immediately-enclosing scope (`frame_depth == 1`). Does not recurse
+    /// into nested subplans, mirroring [`Self::contains_outer_column`]. Used to
+    /// distinguish a `LATERAL` correlation to a sibling FROM item (the frame the
+    /// binder pushes is at depth 1) from a reference to a genuine outer query
+    /// (depth ≥ 2), which the normal subquery decorrelation path handles.
+    #[must_use]
+    pub fn contains_outer_column_depth1(&self) -> bool {
+        match self {
+            Self::OuterColumn { frame_depth, .. } => *frame_depth == 1,
+            Self::Column { .. }
+            | Self::Literal { .. }
+            | Self::Parameter { .. }
+            | Self::ScalarSubquery { .. }
+            | Self::Exists { .. }
+            | Self::InSubquery { .. } => false,
+            Self::Unary { expr, .. } | Self::IsNull { expr, .. } => {
+                expr.contains_outer_column_depth1()
+            }
+            Self::Binary { left, right, .. } => {
+                left.contains_outer_column_depth1() || right.contains_outer_column_depth1()
+            }
+            Self::FunctionCall { args, .. } => args.iter().any(Self::contains_outer_column_depth1),
+        }
+    }
+
     /// Returns `true` if this expression contains a scalar subquery, `EXISTS`,
     /// or `IN`-subquery anywhere in its scalar tree (it does not recurse into
     /// the nested subplans). The binder uses this to detect a non-order-

@@ -159,14 +159,59 @@ pub(super) fn derive_output_name(ast: &Expr, bound: &ScalarExpr) -> String {
     }
 }
 
+/// A bare, unqualified single-identifier `ORDER BY` / `DISTINCT ON` item — the
+/// only shape that prefers a SELECT-list *output* alias over an input column
+/// (PostgreSQL: `ORDER BY <name>` resolves to an output column first; qualified
+/// names `t.c` and any expression `a+1` resolve against input columns only).
+/// Returns the (case-folded comparison) identifier text when `expr` is such a
+/// reference.
+fn bare_output_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column { name } if name.parts.len() == 1 => Some(name.parts[0].value.as_str()),
+        _ => None,
+    }
+}
+
+/// Resolve a bare `ORDER BY` / `DISTINCT ON` name against the SELECT-list output
+/// columns (`proj_exprs`, the bound projection expressions paired with their
+/// output names), mirroring PostgreSQL's output-alias-first rule.
+///
+/// * Exactly one output column matches → that projection expression (already in
+///   the sort input's schema terms).
+/// * More than one output column shares the name → `ORDER BY "x" is ambiguous`
+///   (PostgreSQL raises this only for output/output collisions, never for an
+///   output column that merely shadows an input column of the same name).
+/// * No output column matches → `None`, and the caller falls back to binding the
+///   name against the input schema.
+fn resolve_output_alias(
+    name: &str,
+    proj_exprs: &[(ScalarExpr, String)],
+) -> Result<Option<ScalarExpr>, PlanError> {
+    let mut hit: Option<&ScalarExpr> = None;
+    for (expr, out_name) in proj_exprs {
+        if out_name.eq_ignore_ascii_case(name) {
+            if hit.is_some() {
+                return Err(PlanError::Ambiguous(format!(
+                    "ORDER BY \"{name}\" is ambiguous"
+                )));
+            }
+            hit = Some(expr);
+        }
+    }
+    Ok(hit.cloned())
+}
+
 /// Bind an `ORDER BY` list into sort keys.
 ///
 /// `proj_exprs`, when `Some`, are the bound projection output expressions in
 /// the sort input's schema (the `Sort` sits *below* the projection). It is the
 /// resolution target for positional ordinals (`ORDER BY 1`): see
-/// [`positional_ordinal`]. When `None`, the sort input *is* the output relation
+/// [`positional_ordinal`]. It is *also* the SELECT-list-alias resolution target:
+/// a bare unqualified name prefers a matching output column over an input column
+/// (PostgreSQL semantics). When `None`, the sort input *is* the output relation
 /// (a set-operation `ORDER BY`, or a `Sort` lifted above the projection), so an
-/// ordinal resolves to a column reference into `input`.
+/// ordinal resolves to a column reference into `input` and there are no aliases
+/// to prefer.
 pub(super) fn bind_order_by(
     items: &[OrderItem],
     input: &Schema,
@@ -179,7 +224,20 @@ pub(super) fn bind_order_by(
     for item in items {
         let expr = match positional_ordinal(&item.expr) {
             Some(n) => resolve_order_ordinal(n, input, proj_exprs)?,
-            None => bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?,
+            None => {
+                // A bare unqualified name prefers a SELECT-list output alias
+                // over an input column (PostgreSQL). Try output resolution
+                // first; fall back to the input schema when no alias matches.
+                match (bare_output_name(&item.expr), proj_exprs) {
+                    (Some(name), Some(exprs)) => match resolve_output_alias(name, exprs)? {
+                        Some(expr) => expr,
+                        None => {
+                            bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?
+                        }
+                    },
+                    _ => bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?,
+                }
+            }
         };
         let asc = matches!(item.direction, SortDirection::Asc);
         let nulls_first = match item.nulls {
