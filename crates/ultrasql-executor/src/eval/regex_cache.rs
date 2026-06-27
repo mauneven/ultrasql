@@ -27,7 +27,7 @@ use std::collections::HashMap;
 const MAX_ENTRIES: usize = 256;
 
 thread_local! {
-    static REGEX_CACHE: RefCell<HashMap<(String, bool), regex::Regex>> =
+    static REGEX_CACHE: RefCell<HashMap<(String, bool, bool), regex::Regex>> =
         RefCell::new(HashMap::new());
 }
 
@@ -42,18 +42,32 @@ pub(crate) fn cached_regex(
     pattern: &str,
     case_insensitive: bool,
 ) -> Result<regex::Regex, regex::Error> {
+    cached_regex_with(pattern, case_insensitive, false)
+}
+
+/// Like [`cached_regex`] but also threads the PostgreSQL `m` flag through to
+/// the engine's `multi_line` mode (`^`/`$` match at embedded line breaks).
+/// The cache key includes `multi_line` so a `regexp_replace(..., 'm')` and a
+/// plain `col ~ pat` never collide.
+pub(crate) fn cached_regex_with(
+    pattern: &str,
+    case_insensitive: bool,
+    multi_line: bool,
+) -> Result<regex::Regex, regex::Error> {
     REGEX_CACHE.with(|cache| {
-        if let Some(found) = cache.borrow().get(&(pattern.to_owned(), case_insensitive)) {
+        let key = (pattern.to_owned(), case_insensitive, multi_line);
+        if let Some(found) = cache.borrow().get(&key) {
             return Ok(found.clone());
         }
         let compiled = regex::RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
+            .multi_line(multi_line)
             .build()?;
         let mut map = cache.borrow_mut();
         if map.len() >= MAX_ENTRIES {
             map.clear();
         }
-        map.insert((pattern.to_owned(), case_insensitive), compiled.clone());
+        map.insert(key, compiled.clone());
         Ok(compiled)
     })
 }

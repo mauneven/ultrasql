@@ -301,10 +301,23 @@ pub(crate) fn extract_interval_part(
         "milliseconds" => Ok((microseconds % 60_000_000, 3)),
         "microseconds" => Ok((microseconds % 60_000_000, 0)),
         "epoch" => {
-            let total = i64::from(days)
-                .checked_mul(86_400_000_000)
-                .and_then(|base| base.checked_add(microseconds))
-                .ok_or_else(|| EvalError::Type("extract: interval epoch overflow".to_owned()))?;
+            // PostgreSQL's interval epoch treats a year as 365.25 days and a
+            // (sub-year) month as 30 days: months are split into whole years
+            // (365.25 days = 31_557_600 s) plus a remainder of 30-day months,
+            // then days at 86_400 s and the sub-day micros are added. Computed
+            // in micros via i128 to stay overflow-safe, returned at scale 6.
+            const MICROS_PER_SEC: i128 = 1_000_000;
+            const SECS_PER_YEAR: i128 = 31_557_600; // 365.25 * 86_400
+            const SECS_PER_MONTH: i128 = 2_592_000; // 30 * 86_400
+            const SECS_PER_DAY: i128 = 86_400;
+            let months = i128::from(months);
+            let total_micros = ((months / 12) * SECS_PER_YEAR
+                + (months % 12) * SECS_PER_MONTH
+                + i128::from(days) * SECS_PER_DAY)
+                * MICROS_PER_SEC
+                + i128::from(microseconds);
+            let total = i64::try_from(total_micros)
+                .map_err(|_| EvalError::Type("extract: interval epoch overflow".to_owned()))?;
             Ok((total, 6))
         }
         other => Err(EvalError::Type(format!(
@@ -349,14 +362,74 @@ pub(crate) fn eval_age(args: &[Value]) -> Result<Value, EvalError> {
     let Some(start) = timestamp_micros_arg("age", &args[args.len() - 1])? else {
         return Ok(Value::Null);
     };
-    let delta = end
-        .checked_sub(start)
-        .ok_or_else(|| EvalError::Type("age: interval overflow".to_owned()))?;
-    Ok(Value::Interval {
-        months: 0,
-        days: i32::try_from(delta.div_euclid(MICROS_PER_DAY)).unwrap_or(i32::MAX),
-        microseconds: delta.rem_euclid(MICROS_PER_DAY),
-    })
+    Ok(age_interval(end, start))
+}
+
+/// PostgreSQL `age(end, start)` semantics: a *calendar* field-wise
+/// subtraction, not a flat micro delta. Each endpoint is split into
+/// `(year, month, day, time-of-day micros)`; the fields are subtracted with
+/// borrowing — time borrows a day, day borrows a month (adding the day count
+/// of the *start* endpoint's month), and month borrows a year. The result
+/// stores total months (`years*12 + months`); PG only normalizes months into
+/// years for display.
+///
+/// The borrow-month rule was verified against PostgreSQL 14: a negative day
+/// field adds `days_in_month(start_year, start_month)`, not the month before
+/// the end. e.g. `age('2001-04-10','1957-06-13')` borrows June (30 days) and
+/// yields `43 years 9 mons 27 days`.
+///
+/// When `end < start` PostgreSQL computes the positive `age(start, end)` and
+/// negates every output field (so the result is `-2 mons -9 days`, not a
+/// borrowed `-3 mons 22 days`); we mirror that by reducing the larger
+/// endpoint against the smaller and applying the sign.
+pub(crate) fn age_interval(end: i64, start: i64) -> Value {
+    let sign: i64 = if end < start { -1 } else { 1 };
+    let (later, earlier) = if end < start {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let (ly, lm, ld, ltime) = split_engine_micros(later);
+    let (gy, gm, gd, gtime) = split_engine_micros(earlier);
+
+    let mut years = ly - gy;
+    let mut months = lm - gm;
+    let mut days = ld - gd;
+    let mut micros = ltime - gtime;
+
+    if micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    }
+    if days < 0 {
+        // Borrow the day count of the *earlier* endpoint's month, matching
+        // PostgreSQL's `timestamp_age` borrow behaviour.
+        days += i64::from(days_in_month(
+            i32::try_from(gy).unwrap_or(i32::MAX),
+            u32::try_from(gm).unwrap_or(1),
+        ));
+        months -= 1;
+    }
+    if months < 0 {
+        months += 12;
+        years -= 1;
+    }
+
+    Value::Interval {
+        months: i32::try_from(sign * (years * 12 + months)).unwrap_or(i32::MAX),
+        days: i32::try_from(sign * days).unwrap_or(i32::MAX),
+        microseconds: sign * micros,
+    }
+}
+
+/// Split engine-epoch micros into `(year, month, day, time-of-day micros)`
+/// using the civil-date helper in this module.
+fn split_engine_micros(micros: i64) -> (i64, i64, i64, i64) {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let time = micros.rem_euclid(MICROS_PER_DAY);
+    let days_i32 = i32::try_from(days).unwrap_or(i32::MAX);
+    let (year, month, day) = civil_from_days(days_i32);
+    (i64::from(year), i64::from(month), i64::from(day), time)
 }
 
 pub(crate) fn eval_timezone(args: &[Value]) -> Result<Value, EvalError> {

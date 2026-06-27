@@ -87,7 +87,12 @@ pub(crate) fn eval_regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
     } else {
         ""
     };
-    let regex = super::regex_cache::cached_regex(pattern, false)
+    // PostgreSQL flag semantics: `i` => case-insensitive, `g` => replace all
+    // (handled below — not a `regex` builder option), `m` => `^`/`$` match at
+    // line boundaries. `g` must NOT be forwarded into the regex engine.
+    let case_insensitive = flags.contains('i');
+    let multi_line = flags.contains('m');
+    let regex = super::regex_cache::cached_regex_with(pattern, case_insensitive, multi_line)
         .map_err(|err| EvalError::Type(format!("regexp_replace: invalid pattern: {err}")))?;
     let replaced = if flags.contains('g') {
         regex.replace_all(text, replacement)
@@ -100,6 +105,21 @@ pub(crate) fn eval_regexp_replace(args: &[Value]) -> Result<Value, EvalError> {
 pub(crate) fn format_value_text(value: &Value) -> String {
     match value {
         Value::Text(text) => text.clone(),
+        other => value_to_pg_output_text(other),
+    }
+}
+
+/// Render a value the way PostgreSQL's *type output function* does, which is
+/// what `concat`/`concat_ws`/`format`/`array_to_string` use for each element.
+///
+/// This differs from the explicit `::text` cast for `boolean`: `true::text`
+/// is `'true'`, but `boolout` (the output function) yields `'t'`/`'f'`, so
+/// `concat('x', true)` is `'xt'` and `format('%s', false)` is `'f'`. Every
+/// other type's output function matches its `Display`, so we only special-case
+/// `Value::Bool` and defer to `to_string()` otherwise.
+pub(crate) fn value_to_pg_output_text(value: &Value) -> String {
+    match value {
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_owned(),
         other => other.to_string(),
     }
 }

@@ -113,14 +113,45 @@ pub(in crate::binder) fn parse_decimal_literal(
     }
 }
 
+/// PostgreSQL `parse_bool_with_len` semantics — kept in lockstep with the
+/// executor's `parse_bool_pg` (crates/ultrasql-executor/src/eval/functions_cast.rs).
+/// Trims whitespace; rejects empty. Single chars `1`/`t`/`y` => true and
+/// `0`/`f`/`n` => false. Otherwise the lowercased input must be a non-empty
+/// case-insensitive prefix of exactly one of true/false/yes/no/on/off (a
+/// prefix matching two words, only `"o"`, is ambiguous and rejected).
 pub(in crate::binder) fn parse_bool_text(text: &str) -> Option<bool> {
-    match text.trim() {
-        "t" | "true" | "TRUE" | "T" | "1" | "y" | "Y" | "yes" | "YES" | "on" | "ON" => Some(true),
-        "f" | "false" | "FALSE" | "F" | "0" | "n" | "N" | "no" | "NO" | "off" | "OFF" => {
-            Some(false)
-        }
-        _ => None,
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.len() == 1 {
+        match lower.as_str() {
+            "1" | "t" | "y" => return Some(true),
+            "0" | "f" | "n" => return Some(false),
+            _ => {}
+        }
+    }
+
+    const WORDS: [(&str, bool); 6] = [
+        ("true", true),
+        ("false", false),
+        ("yes", true),
+        ("no", false),
+        ("on", true),
+        ("off", false),
+    ];
+    let mut found: Option<bool> = None;
+    for (word, value) in WORDS {
+        if word.starts_with(lower.as_str()) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
 }
 
 pub(in crate::binder) fn pow10_i128(exp: u32) -> Option<i128> {

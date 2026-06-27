@@ -141,13 +141,53 @@ pub(crate) fn eval_cast_bool(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 pub(crate) fn parse_bool_cast_text(text: &str) -> Option<bool> {
-    match text.trim() {
-        "t" | "true" | "TRUE" | "T" | "1" | "y" | "Y" | "yes" | "YES" | "on" | "ON" => Some(true),
-        "f" | "false" | "FALSE" | "F" | "0" | "n" | "N" | "no" | "NO" | "off" | "OFF" => {
-            Some(false)
-        }
-        _ => None,
+    parse_bool_pg(text)
+}
+
+/// PostgreSQL `parse_bool_with_len` semantics. Trims surrounding whitespace;
+/// an empty string is rejected. Single characters `1`/`t`/`y` => true and
+/// `0`/`f`/`n` => false (case-insensitive). Otherwise the lowercased, trimmed
+/// input must be a non-empty case-insensitive *prefix* of exactly one of
+/// `true`/`false`/`yes`/`no`/`on`/`off`. A prefix matching more than one word
+/// (only `"o"`, shared by `on`/`off`) is ambiguous and rejected, as is any
+/// string longer than the word it would match. Returns `None` on rejection.
+pub(crate) fn parse_bool_pg(text: &str) -> Option<bool> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.len() == 1 {
+        match lower.as_str() {
+            "1" | "t" | "y" => return Some(true),
+            "0" | "f" | "n" => return Some(false),
+            // "o" is intentionally not handled here: it is an ambiguous
+            // prefix of both "on" and "off", so it falls through to the
+            // prefix scan below and is rejected.
+            _ => {}
+        }
+    }
+
+    const WORDS: [(&str, bool); 6] = [
+        ("true", true),
+        ("false", false),
+        ("yes", true),
+        ("no", false),
+        ("on", true),
+        ("off", false),
+    ];
+    let mut found: Option<bool> = None;
+    for (word, value) in WORDS {
+        if word.starts_with(lower.as_str()) {
+            if found.is_some() {
+                // Ambiguous prefix (e.g. "o" matches both "on" and "off").
+                return None;
+            }
+            found = Some(value);
+        }
+    }
+    found
 }
 
 pub(crate) fn eval_cast_date(args: &[Value]) -> Result<Value, EvalError> {

@@ -764,7 +764,7 @@ pub(crate) fn eval_concat(args: &[Value]) -> Result<Value, EvalError> {
     let mut out = String::new();
     for arg in args {
         if !matches!(arg, Value::Null) {
-            out.push_str(&arg.to_string());
+            out.push_str(&value_to_pg_output_text(arg));
         }
     }
     Ok(Value::Text(out))
@@ -782,7 +782,7 @@ pub(crate) fn eval_concat_ws(args: &[Value]) -> Result<Value, EvalError> {
     let mut parts = Vec::new();
     for arg in &args[1..] {
         if !matches!(arg, Value::Null) {
-            parts.push(arg.to_string());
+            parts.push(value_to_pg_output_text(arg));
         }
     }
     Ok(Value::Text(parts.join(separator)))

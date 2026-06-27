@@ -339,9 +339,6 @@ pub(crate) fn eval_array_position(args: &[Value]) -> Result<Value, EvalError> {
             )))
         };
     };
-    if matches!(args[1], Value::Null) {
-        return Ok(Value::Null);
-    }
     let start_idx = match args.get(2) {
         Some(Value::Null) => return Ok(Value::Null),
         Some(value) => {
@@ -359,11 +356,11 @@ pub(crate) fn eval_array_position(args: &[Value]) -> Result<Value, EvalError> {
         }
         None => 0,
     };
+    // PostgreSQL compares with IS NOT DISTINCT FROM: a NULL search argument
+    // locates the first NULL element (rather than short-circuiting to NULL),
+    // matching `array_positions`/`array_replace`.
     for (idx, element) in elements.iter().enumerate().skip(start_idx) {
-        if matches!(element, Value::Null) {
-            continue;
-        }
-        if compare_values(element, &args[1])? == std::cmp::Ordering::Equal {
+        if array_element_matches(element, &args[1])? {
             let pos = i32::try_from(idx + 1)
                 .map_err(|_| EvalError::Type("array_position overflow".to_owned()))?;
             return Ok(Value::Int32(pos));
@@ -425,7 +422,9 @@ pub(crate) fn append_array_to_string_parts(
                     parts.push(text.to_owned());
                 }
             }
-            other => parts.push(other.to_string()),
+            // Use the PostgreSQL output-function text so `boolean` elements
+            // render as `t`/`f` (matching `array_to_string(ARRAY[true],',')`).
+            other => parts.push(value_to_pg_output_text(other)),
         }
     }
 }

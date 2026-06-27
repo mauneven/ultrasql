@@ -13,6 +13,7 @@ mod tests_coverage;
 mod tests_logic_concat;
 mod tests_money_json;
 mod tests_pattern_unary;
+mod tests_pg_builtin_bugfixes;
 mod tests_scalar_cov;
 mod tests_vector;
 
