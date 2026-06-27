@@ -20,7 +20,7 @@ use crate::error::ServerError;
 use crate::pipeline::{self};
 use crate::workload::{WorkloadQueryRecord, plan_hash_for_plan};
 use crate::{
-    CombinedCatalog, TxnState, record_serializable_predicate_locks,
+    CombinedCatalog, TxnState, acquire_simple_lock_rows, record_serializable_predicate_locks,
     record_serializable_write_conflicts,
 };
 
@@ -625,6 +625,48 @@ where
                 // it is disarmed once the normal commit/abort path has run.
                 let mut abort_guard =
                     AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid);
+                if let Some(plan) = portal_plan.as_ref() {
+                    record_serializable_predicate_locks(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    record_serializable_write_conflicts(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                }
+                // Acquire the real SELECT ... FOR UPDATE / SHARE row locks
+                // BEFORE building `ctx` (which immutably borrows `self`).
+                // A lock-acquisition error aborts this autocommit txn (the
+                // guard is still armed, so it releases any locks taken so
+                // far). SKIP LOCKED returns a rewritten plan; swap it into
+                // the portal for the duration of execution.
+                let mut restore_plan: Option<(String, Option<LogicalPlan>)> = None;
+                if let Some(plan) = portal_plan.as_ref() {
+                    match acquire_simple_lock_rows(
+                        plan,
+                        &catalog_snapshot,
+                        &self.state.table_constraints,
+                        self.state.heap.as_ref(),
+                        self.state.txn_manager.as_ref(),
+                        &txn,
+                    ) {
+                        Ok(rewritten) => {
+                            restore_plan = self.swap_portal_plan(portal, rewritten);
+                        }
+                        Err(e) => {
+                            return Err(self.rollback_transaction_after_error(
+                                txn,
+                                e,
+                                "Extended Execute autocommit rollback after FOR UPDATE lock error",
+                            ));
+                        }
+                    }
+                }
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
@@ -668,22 +710,12 @@ where
                     // mirroring the server-side COPY file gate.
                     allow_server_files: self.current_role_is_superuser(),
                 };
-                if let Some(plan) = portal_plan.as_ref() {
-                    record_serializable_predicate_locks(
-                        plan,
-                        &txn,
-                        &catalog_snapshot,
-                        self.state.txn_manager.as_ref(),
-                    );
-                    record_serializable_write_conflicts(
-                        plan,
-                        &txn,
-                        &catalog_snapshot,
-                        self.state.txn_manager.as_ref(),
-                    );
-                }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                drop(ctx);
+                if let Some((name, original)) = restore_plan {
+                    self.restore_portal_plan(&name, original);
+                }
                 // `execute_portal` (the panic-prone executor entry) has
                 // returned: from here on the XID is finalised by the normal
                 // commit/abort below, so disarm. A panic INSIDE `execute_portal`
@@ -739,6 +771,45 @@ where
                     self.txn_state = TxnState::Failed(txn);
                     return Err(e);
                 }
+                if let Some(plan) = portal_plan.as_ref() {
+                    record_serializable_predicate_locks(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    record_serializable_write_conflicts(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                }
+                // Acquire the real SELECT ... FOR UPDATE / SHARE row locks
+                // under the session transaction (held to commit/rollback),
+                // BEFORE building `ctx` (which immutably borrows `self`).
+                // A lock error aborts the explicit block (TxnState::Failed).
+                // SKIP LOCKED returns a rewritten plan swapped into the
+                // portal for the duration of execution.
+                let mut restore_plan: Option<(String, Option<LogicalPlan>)> = None;
+                if let Some(plan) = portal_plan.as_ref() {
+                    match acquire_simple_lock_rows(
+                        plan,
+                        &catalog_snapshot,
+                        &self.state.table_constraints,
+                        self.state.heap.as_ref(),
+                        self.state.txn_manager.as_ref(),
+                        &txn,
+                    ) {
+                        Ok(rewritten) => {
+                            restore_plan = self.swap_portal_plan(portal, rewritten);
+                        }
+                        Err(e) => {
+                            self.txn_state = TxnState::Failed(txn);
+                            return Err(e);
+                        }
+                    }
+                }
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
@@ -786,22 +857,12 @@ where
                     // mirroring the server-side COPY file gate.
                     allow_server_files: self.current_role_is_superuser(),
                 };
-                if let Some(plan) = portal_plan.as_ref() {
-                    record_serializable_predicate_locks(
-                        plan,
-                        &txn,
-                        &catalog_snapshot,
-                        self.state.txn_manager.as_ref(),
-                    );
-                    record_serializable_write_conflicts(
-                        plan,
-                        &txn,
-                        &catalog_snapshot,
-                        self.state.txn_manager.as_ref(),
-                    );
-                }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                drop(ctx);
+                if let Some((name, original)) = restore_plan {
+                    self.restore_portal_plan(&name, original);
+                }
                 if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
                     let rows = Self::parse_affected_rows_tag(&outcome.messages);
                     if let Err(err) = self.note_dml_effect(plan, rows) {
@@ -820,6 +881,32 @@ where
                 self.txn_state = TxnState::Failed(txn);
                 Err(ServerError::TransactionAborted)
             }
+        }
+    }
+
+    /// Swap a `SKIP LOCKED` rewritten plan into the named portal for the
+    /// duration of one `Execute`, returning the data needed to restore the
+    /// original plan afterwards.
+    ///
+    /// Returns `None` when there is nothing to swap (no rewrite, or the
+    /// portal vanished). The rewritten `Values` plan carries the same
+    /// output schema as the original `LockRows` plan, so the row
+    /// description computed at Bind/Describe time stays valid.
+    fn swap_portal_plan(
+        &mut self,
+        portal: &str,
+        rewritten: Option<LogicalPlan>,
+    ) -> Option<(String, Option<LogicalPlan>)> {
+        let rewritten = rewritten?;
+        let bound = self.extended.portals.get_mut(portal)?;
+        let original = bound.plan.replace(rewritten);
+        Some((portal.to_string(), original))
+    }
+
+    /// Restore a portal's original plan after a `SKIP LOCKED` swap.
+    fn restore_portal_plan(&mut self, portal: &str, original: Option<LogicalPlan>) {
+        if let Some(bound) = self.extended.portals.get_mut(portal) {
+            bound.plan = original;
         }
     }
 

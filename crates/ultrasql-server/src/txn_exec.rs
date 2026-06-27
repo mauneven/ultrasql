@@ -153,7 +153,11 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         result_encoder::TextEncodingOptions::from_session_settings(session_settings.as_ref());
     record_serializable_predicate_locks(plan, txn, &catalog_snapshot, oracle.as_ref());
     record_serializable_write_conflicts(plan, txn, &catalog_snapshot, oracle.as_ref());
-    acquire_simple_lock_rows(
+    // Acquire the real row locks demanded by a SELECT ... FOR UPDATE /
+    // SHARE clause. For SKIP LOCKED this returns a rewritten plan that
+    // yields only the rows this txn actually grabbed; otherwise the
+    // original plan is executed unchanged.
+    let rewritten_lock_plan = acquire_simple_lock_rows(
         plan,
         &catalog_snapshot,
         &table_constraints,
@@ -161,6 +165,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         oracle.as_ref(),
         txn,
     )?;
+    let plan: &LogicalPlan = rewritten_lock_plan.as_ref().unwrap_or(plan);
 
     // Mirror the COPY server-file gate: server-LOCAL external-file reads
     // (read_csv/read_parquet/…/sniff_csv) are permitted only for superusers.
@@ -300,6 +305,51 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
     }
 }
 
+/// One base relation that a `SELECT ... FOR UPDATE / SHARE` must lock,
+/// together with the single-relation predicate conjunct (if any) that
+/// restricts which of its rows are eligible.
+pub(crate) struct LockTarget<'a> {
+    /// Lower-cased relation name as written in the plan.
+    pub(crate) table: String,
+    /// The single-relation filter predicate, if one applies. `None`
+    /// means every visible row of the relation is locked.
+    pub(crate) predicate: Option<&'a ScalarExpr>,
+}
+
+/// Acquire the real row-level locks demanded by a `SELECT ... FOR UPDATE /
+/// FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE` clause.
+///
+/// This is the pre-execution lock pass: it runs after the SSI predicate
+/// bookkeeping and before the result pipeline is lowered, resolving the
+/// base-relation tuple ids each locked relation contributes and acquiring
+/// the mapped tuple lock under the session transaction's xid (held until
+/// commit/rollback, released by `release_all(xid)` at txn end).
+///
+/// # Plan-shape support
+///
+/// Fully supported (locks the exact base-relation rows that match):
+/// single-table `Scan` / `Filter(Scan)` / `Project` / `Sort` / `Limit`,
+/// and inner/cross `Join`s and comma multi-table selects whose leaves
+/// are those shapes. For a join, each base relation's rows matching that
+/// relation's own predicate conjuncts are locked (a safe superset of the
+/// emitted rows — never silent-no-lock).
+///
+/// Unsupported shapes (`Aggregate`, `SetOp`, sub-select/derived `Scan`
+/// with no catalog entry, CTE bodies, …) raise `feature_not_supported`
+/// rather than silently locking nothing.
+///
+/// # Wait policy
+///
+/// - `Wait`     — blocking `acquire()` (deadlock-aware); on a deadlock
+///   victim raises `40P01`.
+/// - `NoWait`   — `try_acquire`; first conflict raises `55P03`.
+/// - `SkipLocked` — `try_acquire`; conflicting rows are skipped (the
+///   non-conflicting rows are still locked).
+/// Returns `Some(rewritten_plan)` when the lock pass must replace the plan
+/// the caller executes — this happens only for `SKIP LOCKED`, whose result
+/// must exclude rows another transaction has locked (and so cannot be
+/// produced by the unmodified plan). For `Wait` / `NoWait` the original
+/// plan is executed unchanged and `None` is returned.
 pub(crate) fn acquire_simple_lock_rows(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
@@ -307,65 +357,385 @@ pub(crate) fn acquire_simple_lock_rows(
     heap: &HeapAccess<BlankPageLoader>,
     oracle: &TransactionManager,
     txn: &Transaction,
-) -> Result<(), ServerError> {
+) -> Result<Option<LogicalPlan>, ServerError> {
     let LogicalPlan::LockRows {
         input,
         strength,
         wait_policy,
-        ..
+        schema,
     } = plan
     else {
-        return Ok(());
+        return Ok(None);
     };
-    if *wait_policy != LockWaitPolicy::Wait {
-        return Ok(());
+    let mode = row_lock_mode(*strength);
+
+    // SKIP LOCKED needs the scan-then-skip-then-limit ordering and must
+    // filter locked rows out of the result, which the unmodified plan
+    // cannot do — handle it on its own single-table path that returns a
+    // rewritten Values plan of the grabbed rows.
+    if *wait_policy == LockWaitPolicy::SkipLocked {
+        return acquire_skip_locked(input, schema, catalog_snapshot, heap, oracle, txn, mode)
+            .map(Some);
     }
-    let Some((table, predicate)) = lock_rows_base_filter(input) else {
-        return Ok(());
-    };
-    let Some(entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
-        return Ok(());
+
+    // Collect every base relation the FOR UPDATE/SHARE clause must lock.
+    // An unrecognised shape errors here instead of silently locking
+    // nothing (silent-no-lock is the lost-update corruption).
+    let mut targets: Vec<LockTarget<'_>> = Vec::new();
+    collect_lock_targets(input, None, &mut targets)?;
+
+    for target in &targets {
+        let Some(entry) = catalog_snapshot.tables.get(&target.table) else {
+            // Named in the plan but absent from the catalog snapshot:
+            // refuse rather than skip. A FOR UPDATE that cannot resolve
+            // its base relation must not proceed lock-free.
+            return Err(ServerError::unsupported(format!(
+                "SELECT ... FOR UPDATE/SHARE: cannot resolve base relation '{}' to lock",
+                target.table
+            )));
+        };
+
+        let tids = resolve_lock_tids(
+            target.predicate,
+            entry,
+            catalog_snapshot,
+            table_constraints,
+            heap,
+            oracle,
+            txn,
+        )?;
+        acquire_row_locks(&tids, oracle, txn, mode, *wait_policy)?;
+    }
+
+    Ok(None)
+}
+
+/// `SKIP LOCKED` single-table path.
+///
+/// Scans the base relation in heap order, evaluates the optional `WHERE`
+/// predicate, `try_acquire`s the row lock on each match, skips rows whose
+/// lock is held by another transaction, and stops once `LIMIT` grabbed
+/// rows are collected (`SKIP` happens *before* `LIMIT`, matching
+/// PostgreSQL). Returns a `Values` plan of the grabbed rows projected
+/// through the original output list so the result excludes skipped rows.
+///
+/// Supported input shapes: `Scan`, `Filter(Scan)`, optional `Project`,
+/// optional `Limit`/`Offset`. `ORDER BY`, joins, aggregates and other
+/// shapes raise `feature_not_supported` (never silent-no-lock).
+fn acquire_skip_locked(
+    input: &LogicalPlan,
+    out_schema: &Schema,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    heap: &HeapAccess<BlankPageLoader>,
+    oracle: &TransactionManager,
+    txn: &Transaction,
+    mode: RowLockMode,
+) -> Result<LogicalPlan, ServerError> {
+    let shape = SkipLockedShape::collect(input)?;
+    let Some(entry) = catalog_snapshot.tables.get(&shape.table) else {
+        return Err(ServerError::unsupported(format!(
+            "SELECT ... FOR UPDATE SKIP LOCKED: cannot resolve base relation '{}' to lock",
+            shape.table
+        )));
     };
 
     let rel = RelationId(entry.oid);
-    let mode = row_lock_mode(*strength);
-    if let Some(tids) =
-        lock_rows_index_tids(predicate, entry, catalog_snapshot, table_constraints, heap)?
-    {
-        return lock_tuple_ids(&tids, oracle, txn, mode);
-    }
-
     let block_count = heap.block_count(rel).max(entry.n_blocks);
     let codec = RowCodec::new(entry.schema.clone());
-    let predicate_eval = predicate.cloned().map(Eval::new);
+    let predicate_eval = shape.predicate.cloned().map(Eval::new);
+    // Projection evaluators: `None` means SELECT * (emit the base row).
+    let projection: Option<Vec<Eval>> = shape
+        .projection
+        .as_ref()
+        .map(|exprs| exprs.iter().map(|(e, _)| Eval::new(e.clone())).collect());
+
+    let limit = shape.limit.unwrap_or(u64::MAX);
+    let offset = shape.offset;
+    let mut skipped = 0_u64;
+    let mut grabbed: Vec<Vec<ScalarExpr>> = Vec::new();
+    let xid = txn.current_xid();
 
     for tuple in heap.scan_visible(rel, block_count, &txn.snapshot, oracle) {
+        if grabbed.len() as u64 >= limit {
+            break;
+        }
         let tuple =
             tuple.map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
         let row = codec
             .decode(&tuple.data)
             .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
-        let matched = match &predicate_eval {
-            Some(eval) => match eval
+        if let Some(eval) = &predicate_eval {
+            match eval
                 .eval(&row)
                 .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?
             {
-                Value::Bool(true) => true,
-                Value::Bool(false) | Value::Null => false,
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => continue,
                 other => {
                     return Err(ServerError::Execute(ExecError::TypeMismatch(format!(
                         "FOR UPDATE predicate returned non-boolean value {other:?}",
                     ))));
                 }
-            },
+            }
+        }
+        // Try to grab the lock; a conflict means another txn holds it —
+        // skip the row entirely (no block, no error, not in the result).
+        let acquired = oracle
+            .lock_manager
+            .try_acquire(LockRequest {
+                xid,
+                tag: LockTag::Tuple(tuple.tid),
+                mode: mode.to_lock_mode(),
+            })
+            .map_err(|e| match e {
+                LockError::Deadlock { .. } => deadlock_error(),
+                other => ServerError::Execute(ExecError::SerializationFailure(other.to_string())),
+            })?;
+        if !acquired {
+            continue;
+        }
+        // OFFSET applies to grabbed (locked) rows, after SKIP.
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        grabbed.push(project_row(&row, projection.as_deref(), out_schema)?);
+    }
+
+    Ok(LogicalPlan::Values {
+        rows: grabbed,
+        schema: out_schema.clone(),
+    })
+}
+
+/// Project one decoded base row into the output literal list for a
+/// `Values` row, applying the SELECT list (or passing the row through for
+/// `SELECT *`) and tagging each value with the output schema's type.
+fn project_row(
+    row: &[Value],
+    projection: Option<&[Eval]>,
+    out_schema: &Schema,
+) -> Result<Vec<ScalarExpr>, ServerError> {
+    let values: Vec<Value> =
+        match projection {
+            Some(evals) => {
+                let mut out = Vec::with_capacity(evals.len());
+                for eval in evals {
+                    out.push(eval.eval(row).map_err(|e| {
+                        ServerError::Execute(ExecError::TypeMismatch(e.to_string()))
+                    })?);
+                }
+                out
+            }
+            None => row.to_vec(),
+        };
+    if values.len() != out_schema.fields().len() {
+        return Err(ServerError::unsupported(
+            "SELECT ... FOR UPDATE SKIP LOCKED: projection width does not match output schema",
+        ));
+    }
+    Ok(values
+        .into_iter()
+        .zip(out_schema.fields())
+        .map(|(value, field)| ScalarExpr::Literal {
+            value,
+            data_type: field.data_type.clone(),
+        })
+        .collect())
+}
+
+/// The decomposed single-table shape under a `SKIP LOCKED` `LockRows`.
+struct SkipLockedShape<'a> {
+    table: String,
+    predicate: Option<&'a ScalarExpr>,
+    projection: Option<&'a [(ScalarExpr, String)]>,
+    limit: Option<u64>,
+    offset: u64,
+}
+
+impl<'a> SkipLockedShape<'a> {
+    fn collect(plan: &'a LogicalPlan) -> Result<Self, ServerError> {
+        let mut shape = Self {
+            table: String::new(),
+            predicate: None,
+            projection: None,
+            limit: None,
+            offset: 0,
+        };
+        shape.walk(plan)?;
+        if shape.table.is_empty() {
+            return Err(ServerError::unsupported(
+                "SELECT ... FOR UPDATE SKIP LOCKED: could not identify a single base relation",
+            ));
+        }
+        Ok(shape)
+    }
+
+    fn walk(&mut self, plan: &'a LogicalPlan) -> Result<(), ServerError> {
+        match plan {
+            LogicalPlan::Limit { input, n, offset } => {
+                self.limit = Some(*n);
+                self.offset = *offset;
+                self.walk(input)
+            }
+            LogicalPlan::Project {
+                input,
+                exprs,
+                schema,
+            } => {
+                // Only a flat list of column/expression outputs is
+                // supported. The projection drives the Values rows.
+                let _ = schema;
+                self.projection = Some(exprs.as_slice());
+                self.walk(input)
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                if let LogicalPlan::Scan { table, .. } = input.as_ref() {
+                    self.predicate = Some(predicate);
+                    self.table = table.to_ascii_lowercase();
+                    Ok(())
+                } else {
+                    Err(skip_locked_unsupported())
+                }
+            }
+            LogicalPlan::Scan { table, .. } => {
+                self.table = table.to_ascii_lowercase();
+                Ok(())
+            }
+            _ => Err(skip_locked_unsupported()),
+        }
+    }
+}
+
+fn skip_locked_unsupported() -> ServerError {
+    ServerError::unsupported(
+        "SELECT ... FOR UPDATE SKIP LOCKED is supported only for a single base table with an \
+         optional WHERE / projection / LIMIT (ORDER BY, joins and aggregates are not supported)",
+    )
+}
+
+/// Resolve the visible base-relation tuple ids that a lock target's
+/// predicate selects, preferring an equality index probe and falling
+/// back to a predicate-filtered visible heap scan.
+fn resolve_lock_tids(
+    predicate: Option<&ScalarExpr>,
+    entry: &TableEntry,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    table_constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>,
+    heap: &HeapAccess<BlankPageLoader>,
+    oracle: &TransactionManager,
+    txn: &Transaction,
+) -> Result<Vec<ultrasql_core::TupleId>, ServerError> {
+    if let Some(tids) =
+        lock_rows_index_tids(predicate, entry, catalog_snapshot, table_constraints, heap)?
+    {
+        return Ok(tids);
+    }
+
+    let rel = RelationId(entry.oid);
+    let block_count = heap.block_count(rel).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let predicate_eval = predicate.cloned().map(Eval::new);
+    let mut tids = Vec::new();
+
+    for tuple in heap.scan_visible(rel, block_count, &txn.snapshot, oracle) {
+        let tuple =
+            tuple.map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+        let matched = match &predicate_eval {
+            Some(eval) => {
+                let row = codec
+                    .decode(&tuple.data)
+                    .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+                match eval
+                    .eval(&row)
+                    .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?
+                {
+                    Value::Bool(true) => true,
+                    Value::Bool(false) | Value::Null => false,
+                    other => {
+                        return Err(ServerError::Execute(ExecError::TypeMismatch(format!(
+                            "FOR UPDATE predicate returned non-boolean value {other:?}",
+                        ))));
+                    }
+                }
+            }
             None => true,
         };
         if matched {
-            lock_tuple_ids(&[tuple.tid], oracle, txn, mode)?;
+            tids.push(tuple.tid);
         }
     }
 
-    Ok(())
+    Ok(tids)
+}
+
+/// Recursively collect the base relations a `LockRows` child plan locks.
+///
+/// `inherited` is the predicate conjunct flowing down from an enclosing
+/// `Filter`; it is attached to a leaf `Scan` so single-table predicates
+/// restrict the locked set. Errors on any shape that cannot be reduced to
+/// concrete base relations (so the caller never silently locks nothing).
+pub(crate) fn collect_lock_targets<'a>(
+    plan: &'a LogicalPlan,
+    inherited: Option<&'a ScalarExpr>,
+    out: &mut Vec<LockTarget<'a>>,
+) -> Result<(), ServerError> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => {
+            out.push(LockTarget {
+                table: table.to_ascii_lowercase(),
+                predicate: inherited,
+            });
+            Ok(())
+        }
+        // Pass-through wrappers that neither change row identity nor the
+        // set of base relations contributing rows.
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => collect_lock_targets(input, inherited, out),
+        LogicalPlan::Filter { input, predicate } => {
+            // A nested filter combines with any inherited predicate. We
+            // keep the *innermost* predicate per relation; an equality on
+            // the indexed key (the common `WHERE id = ?` case) survives to
+            // drive the index probe. Carrying the filter down to a single
+            // Scan keeps single-table locking exact.
+            match input.as_ref() {
+                LogicalPlan::Scan { .. } => collect_lock_targets(input, Some(predicate), out),
+                _ => collect_lock_targets(input, inherited.or(Some(predicate)), out),
+            }
+        }
+        LogicalPlan::Join { left, right, .. } => {
+            // Lock both sides' base relations. The inherited single-relation
+            // predicate (if any) only soundly restricts one side, so we drop
+            // it across the join and lock each relation's full visible set —
+            // a safe superset of the emitted rows (never under-locks).
+            collect_lock_targets(left, None, out)?;
+            collect_lock_targets(right, None, out)?;
+            Ok(())
+        }
+        other => Err(ServerError::unsupported(format!(
+            "SELECT ... FOR UPDATE/SHARE over this plan shape is not supported \
+             (cannot identify base-relation rows to lock): {}",
+            lock_target_plan_label(other)
+        ))),
+    }
+}
+
+/// A short, stable node label for the unsupported-shape error message.
+fn lock_target_plan_label(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::SetOp { .. } => "SetOp",
+        LogicalPlan::Cte { .. } => "CTE",
+        LogicalPlan::Values { .. } => "Values",
+        LogicalPlan::FunctionScan { .. } => "FunctionScan",
+        LogicalPlan::Window { .. } => "Window",
+        LogicalPlan::DistinctOn { .. } => "DistinctOn",
+        LogicalPlan::Pivot { .. } => "Pivot",
+        LogicalPlan::Unpivot { .. } => "Unpivot",
+        LogicalPlan::Empty { .. } => "Empty",
+        _ => "unsupported",
+    }
 }
 
 pub(crate) fn lock_rows_index_tids(
@@ -410,32 +780,111 @@ pub(crate) fn lock_rows_index_tids(
     Ok(Some(tids))
 }
 
-pub(crate) fn lock_tuple_ids(
+/// Acquire row locks on `tids` under the requested wait policy.
+///
+/// The lock is taken under the session transaction's effective xid, so it
+/// is released by `lock_manager.release_all(xid)` at commit/rollback —
+/// i.e. it is held to the end of the transaction, matching PostgreSQL.
+///
+/// - `Wait`     — blocking, deadlock-aware `acquire()` (the same path the
+///   indexed UPDATE write uses). A conflicting holder makes this block
+///   until released; a deadlock victim returns `40P01`.
+/// - `NoWait`   — `try_acquire`; the first conflict returns `55P03`.
+/// - `SkipLocked` — `try_acquire`; conflicting rows are silently skipped
+///   (their non-conflict siblings are still locked).
+fn acquire_row_locks(
     tids: &[ultrasql_core::TupleId],
     oracle: &TransactionManager,
     txn: &Transaction,
     mode: RowLockMode,
+    wait_policy: LockWaitPolicy,
 ) -> Result<(), ServerError> {
+    let xid = txn.current_xid();
+    let lock_manager = &oracle.lock_manager;
     for tid in tids {
-        let acquired = oracle
-            .lock_manager
-            .try_acquire(LockRequest {
-                xid: txn.current_xid(),
-                tag: LockTag::Tuple(*tid),
-                mode: mode.to_lock_mode(),
-            })
-            .map_err(|e| ServerError::Execute(ExecError::SerializationFailure(e.to_string())))?;
-        if !acquired {
-            // serialization_failure (40001) — a concurrent transaction holds
-            // a conflicting row lock and this `FOR UPDATE`/`FOR SHARE` request
-            // cannot proceed. Mirrors PostgreSQL, which aborts the blocked
-            // statement with 40001 so retry-aware clients re-issue the txn.
-            return Err(ServerError::Execute(ExecError::SerializationFailure(
-                "could not serialize access due to concurrent update".to_string(),
-            )));
+        let req = LockRequest {
+            xid,
+            tag: LockTag::Tuple(*tid),
+            mode: mode.to_lock_mode(),
+        };
+        match wait_policy {
+            LockWaitPolicy::Wait => {
+                // Fast path: try once non-blocking. On a conflict fall back
+                // to the blocking, deadlock-detecting acquire — but never
+                // call it twice when this xid already holds the grant
+                // (re-locking the same row inside the same txn is a no-op).
+                match lock_manager.try_acquire(req) {
+                    Ok(true) => {}
+                    Ok(false) => block_on_lock(lock_manager, req)?,
+                    Err(LockError::Deadlock { .. }) => {
+                        return Err(deadlock_error());
+                    }
+                    Err(e) => {
+                        return Err(ServerError::Execute(ExecError::SerializationFailure(
+                            e.to_string(),
+                        )));
+                    }
+                }
+            }
+            LockWaitPolicy::NoWait => match lock_manager.try_acquire(req) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ServerError::LockNotAvailable(
+                        "could not obtain lock on row in relation".to_string(),
+                    ));
+                }
+                Err(LockError::Deadlock { .. }) => return Err(deadlock_error()),
+                Err(e) => {
+                    return Err(ServerError::Execute(ExecError::SerializationFailure(
+                        e.to_string(),
+                    )));
+                }
+            },
+            LockWaitPolicy::SkipLocked => match lock_manager.try_acquire(req) {
+                // A locked row is skipped: do not block, do not error.
+                Ok(_) => {}
+                Err(LockError::Deadlock { .. }) => return Err(deadlock_error()),
+                Err(e) => {
+                    return Err(ServerError::Execute(ExecError::SerializationFailure(
+                        e.to_string(),
+                    )));
+                }
+            },
         }
     }
     Ok(())
+}
+
+/// Block on a conflicting row lock via the lock manager's blocking,
+/// deadlock-aware `acquire()`. Mirrors the indexed-UPDATE write path:
+/// when running on a multi-thread tokio runtime the blocking call is
+/// wrapped in `block_in_place` so the worker thread is released to the
+/// scheduler while parked; otherwise it blocks the current thread
+/// directly (single-thread runtime / non-async caller).
+fn block_on_lock(lock_manager: &LockManager, req: LockRequest) -> Result<(), ServerError> {
+    let acquire = || lock_manager.acquire(req);
+    let result = if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(acquire)
+    } else {
+        acquire()
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(LockError::Deadlock { .. }) => Err(deadlock_error()),
+        Err(e) => Err(ServerError::Execute(ExecError::SerializationFailure(
+            e.to_string(),
+        ))),
+    }
+}
+
+/// Construct the `40P01 deadlock_detected` error for a row-lock victim.
+fn deadlock_error() -> ServerError {
+    ServerError::DeadlockDetected(
+        "deadlock detected while waiting for a row lock (FOR UPDATE/SHARE)".to_string(),
+    )
 }
 
 pub(crate) fn equality_i64_predicate(predicate: &ScalarExpr) -> Option<(usize, i64)> {
@@ -613,18 +1062,6 @@ pub(crate) fn unix_timestamp_micros() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-pub(crate) fn lock_rows_base_filter(plan: &LogicalPlan) -> Option<(&str, Option<&ScalarExpr>)> {
-    match plan {
-        LogicalPlan::Project { input, .. } => lock_rows_base_filter(input),
-        LogicalPlan::Filter { input, predicate } => match input.as_ref() {
-            LogicalPlan::Scan { table, .. } => Some((table.as_str(), Some(predicate))),
-            other => lock_rows_base_filter(other).map(|(table, _)| (table, Some(predicate))),
-        },
-        LogicalPlan::Scan { table, .. } => Some((table.as_str(), None)),
-        _ => None,
-    }
 }
 
 pub(crate) const fn row_lock_mode(strength: LockStrength) -> RowLockMode {

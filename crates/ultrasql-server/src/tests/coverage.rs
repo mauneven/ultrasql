@@ -1109,7 +1109,14 @@ fn server_config_backup_and_lock_helpers_cover_admin_edges() {
         schema: Schema::empty(),
         projection: None,
     };
-    assert_eq!(lock_rows_base_filter(&scan), Some(("t", None)));
+    // A bare Scan collects one target with no restricting predicate.
+    {
+        let mut targets = Vec::new();
+        collect_lock_targets(&scan, None, &mut targets).expect("scan collects");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].table, "t");
+        assert!(targets[0].predicate.is_none());
+    }
     let pred = ScalarExpr::Literal {
         value: Value::Bool(true),
         data_type: DataType::Bool,
@@ -1118,25 +1125,39 @@ fn server_config_backup_and_lock_helpers_cover_admin_edges() {
         input: Box::new(scan.clone()),
         predicate: pred.clone(),
     };
-    assert_eq!(
-        lock_rows_base_filter(&filter).map(|(table, has_pred)| (table, has_pred.is_some())),
-        Some(("t", true))
-    );
+    // Filter(Scan) attaches the predicate to the single base relation.
+    {
+        let mut targets = Vec::new();
+        collect_lock_targets(&filter, None, &mut targets).expect("filter collects");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].table, "t");
+        assert!(targets[0].predicate.is_some());
+    }
     let project = LogicalPlan::Project {
         input: Box::new(filter),
         exprs: Vec::new(),
         schema: Schema::empty(),
     };
-    assert_eq!(
-        lock_rows_base_filter(&project).map(|(table, has_pred)| (table, has_pred.is_some())),
-        Some(("t", true))
-    );
-    assert!(
-        lock_rows_base_filter(&LogicalPlan::Empty {
-            schema: Schema::empty()
-        })
-        .is_none()
-    );
+    {
+        let mut targets = Vec::new();
+        collect_lock_targets(&project, None, &mut targets).expect("project collects");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].table, "t");
+        assert!(targets[0].predicate.is_some());
+    }
+    // An unsupported shape errors rather than silently locking nothing.
+    {
+        let mut targets = Vec::new();
+        let err = collect_lock_targets(
+            &LogicalPlan::Empty {
+                schema: Schema::empty(),
+            },
+            None,
+            &mut targets,
+        )
+        .expect_err("unsupported shape must error, never silent-no-lock");
+        assert_eq!(err.sqlstate(), "0A000");
+    }
     assert_eq!(row_lock_mode(LockStrength::Update), RowLockMode::ForUpdate);
     assert_eq!(
         row_lock_mode(LockStrength::NoKeyUpdate),

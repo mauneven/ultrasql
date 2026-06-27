@@ -102,10 +102,10 @@ where
         // transaction and auto-released by `release_all(xid)` at
         // COMMIT/ROLLBACK. This is the authoritative serialization point for
         // two transactions racing to create the same relation: a non-blocking
-        // `try_acquire` (the engine's established lock discipline — blocking a
-        // tokio worker on a cross-transaction lock would stall the runtime;
-        // see `txn_exec::lock_tuple_ids`) so the loser fails immediately with
-        // a serialization error rather than parking a worker. Either way, two
+        // `try_acquire` so the loser fails immediately with a serialization
+        // error rather than parking a worker. (Row-level FOR UPDATE/SHARE locks
+        // instead block via `block_in_place` + `acquire`; see
+        // `txn_exec::acquire_row_locks`.) Either way, two
         // same-name `pg_class` rows can never both reach durable commit (which
         // would be a duplicate-name corruption on restart).
         // Both paths take this name lock so an autocommit and an in-transaction

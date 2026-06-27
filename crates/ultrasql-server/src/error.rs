@@ -153,6 +153,20 @@ pub enum ServerError {
     #[error("serialization failure: {0}")]
     SerializationFailure(String),
 
+    /// A `SELECT ... FOR UPDATE / SHARE ... NOWAIT` could not immediately
+    /// acquire a conflicting row lock. Maps to PostgreSQL SQLSTATE
+    /// `55P03` (`lock_not_available`). Query-scoped: the surrounding
+    /// transaction block is aborted, but the connection survives.
+    #[error("{0}")]
+    LockNotAvailable(String),
+
+    /// The lock manager's deadlock detector chose this transaction as the
+    /// victim of a lock-wait cycle. Maps to PostgreSQL SQLSTATE `40P01`
+    /// (`deadlock_detected`). Query-scoped and retryable: the client
+    /// should re-issue the transaction.
+    #[error("{0}")]
+    DeadlockDetected(String),
+
     /// `nextval` advanced a non-`CYCLE` sequence past its declared
     /// `MAXVALUE`/`MINVALUE`. Maps to PostgreSQL SQLSTATE `2200H`
     /// (`sequence_generator_limit_exceeded`). The string carries the
@@ -277,6 +291,8 @@ impl ServerError {
                 | Self::InvalidTableDefinition(_)
                 | Self::TransactionAborted
                 | Self::SerializationFailure(_)
+                | Self::LockNotAvailable(_)
+                | Self::DeadlockDetected(_)
                 | Self::SequenceLimitExceeded(_)
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
@@ -345,6 +361,12 @@ impl ServerError {
             Self::InvalidTableDefinition(_) => "42P16",  // invalid_table_definition
             Self::Catalog(_) => "42000",                 // generic catalog failure
             Self::SerializationFailure(_) => "40001",    // serialization_failure
+            // lock_not_available — SELECT ... FOR UPDATE/SHARE NOWAIT hit a
+            // conflicting row lock held by another transaction.
+            Self::LockNotAvailable(_) => "55P03",
+            // deadlock_detected — the lock manager's wait-for cycle detector
+            // picked this transaction as the victim.
+            Self::DeadlockDetected(_) => "40P01",
             // sequence_generator_limit_exceeded — nextval ran a non-CYCLE
             // sequence past its MAXVALUE/MINVALUE.
             Self::SequenceLimitExceeded(_) => "2200H",

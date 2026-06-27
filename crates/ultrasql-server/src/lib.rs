@@ -176,8 +176,8 @@ use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager}
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{
-    IsolationLevel, LockManager, LockMode, LockRequest, LockTag, RowLockMode, SsiManager,
-    Transaction, TransactionManager, TxnError,
+    IsolationLevel, LockError, LockManager, LockMode, LockRequest, LockTag, RowLockMode,
+    SsiManager, Transaction, TransactionManager, TxnError,
 };
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
