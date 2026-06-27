@@ -429,6 +429,15 @@ pub struct Int32PairUndoBatch {
     pub page: PageId,
     /// XID of the transaction that wrote the post-image.
     pub writer_xid: Xid,
+    /// Command within `writer_xid` that wrote the post-image. Together
+    /// with `writer_xid` this uniquely identifies the originating
+    /// in-place UPDATE command, distinguishing two distinct same-shape
+    /// commands of one transaction (same page/col/delta/slots, different
+    /// `command_id`) from a single record re-replayed during recovery.
+    /// It is a dedup discriminator only — it does NOT participate in the
+    /// pre-image delta sum (`undo_pre_image_from_log`), so two distinct
+    /// commands still both contribute their delta.
+    pub command_id: CommandId,
     /// Updated column: `0` for `id`, `1` for `val`.
     pub target_col: u8,
     /// Delta applied to the target column.

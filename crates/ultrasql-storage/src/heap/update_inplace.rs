@@ -167,6 +167,7 @@ impl PageUndoSlots {
         &mut self,
         page: PageId,
         writer_xid: Xid,
+        command_id: CommandId,
         target_col: u8,
         delta: i32,
     ) -> Option<Int32PairUndoBatch> {
@@ -181,6 +182,7 @@ impl PageUndoSlots {
         let batch = Int32PairUndoBatch {
             page,
             writer_xid,
+            command_id,
             target_col,
             delta,
             first_slot: self.first_slot,
@@ -793,7 +795,9 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
                 wal_scratch.clear();
             }
-            if let Some(batch) = page_undo_slots.take_batch(src_page_id, xid, target_col, delta) {
+            if let Some(batch) =
+                page_undo_slots.take_batch(src_page_id, xid, command_id, target_col, delta)
+            {
                 compact_undo_scratch.push(batch);
             }
             if page_updated && let Some(vm) = vm {
@@ -1112,7 +1116,9 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_page);
             drop(src_guard);
 
-            if let Some(batch) = page_undo_slots.take_batch(src_page_id, xid, target_col, delta) {
+            if let Some(batch) =
+                page_undo_slots.take_batch(src_page_id, xid, command_id, target_col, delta)
+            {
                 compact_undo_scratch.push(batch);
             }
             if page_updated && let Some(vm) = vm {

@@ -728,8 +728,21 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                             })?;
                     let payload_off = slot_off + TUPLE_HEADER_SIZE;
                     let target_off = payload_off + if payload.target_col == 0 { 1 } else { 5 };
+                    // The page redo is already reflected only when THIS
+                    // command's mutation is on the slot. Keying on
+                    // `xmax == writer_xid && UPDATED_IN_PLACE` alone cannot
+                    // tell two distinct commands of the same writer apart, so
+                    // a second same-writer command (`val += N` issued twice
+                    // in one txn over the same rows) would be wrongly treated
+                    // as already-applied and its delta never added to the
+                    // page on redo — diverging the recovered page from the
+                    // live one. `cmax` carries the writing command id, so a
+                    // newer command (`cmax < command_id`) still applies while
+                    // a re-replay of the same/older record (`cmax >=
+                    // command_id`) is correctly skipped.
                     let already_applied = hdr.xmax == payload.writer_xid
-                        && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE);
+                        && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
+                        && hdr.cmax >= payload.command_id;
                     if !already_applied {
                         let current = i32::from_le_bytes([
                             page_bytes[target_off],
@@ -764,12 +777,18 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             // WAL record. The read-time lookup
             // (`undo_pre_image_from_log`, compact path) recovers the
             // pre-image as `current − sum(invisible deltas)`, so we record
-            // the same `target_col + delta + slots` the producer
-            // (`update_int32_pair_inplace_undo`) appends — keeping recovery
-            // consistent with the live path. Because that lookup SUMS the
-            // deltas of every invisible batch, pushing the same batch twice
-            // would over-reverse; dedup by the full batch shape so a
-            // re-replay across restart cycles is idempotent.
+            // the same `command_id + target_col + delta + slots` the
+            // producer (`update_int32_pair_inplace_undo`) appends — keeping
+            // recovery consistent with the live path. Because that lookup
+            // SUMS the deltas of every invisible batch, two distinct
+            // commands of one transaction that touch the same rows with the
+            // same delta must BOTH be retained (the reader reverses
+            // `2·delta`), while a single record re-replayed during recovery
+            // must be deduped. `(writer_xid, command_id)` uniquely
+            // identifies the originating command and is the discriminator
+            // that tells these apart — keying on shape alone (page / col /
+            // delta / slots) would wrongly collapse two distinct same-shape
+            // commands into one batch and under-reverse the pre-image.
             let log_handle = self
                 .undo_log
                 .entry(rel)
@@ -778,6 +797,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             let already = log.int32_pair_batches.iter().rev().any(|existing| {
                 existing.page == page_id
                     && existing.writer_xid == payload.writer_xid
+                    && existing.command_id == payload.command_id
                     && existing.target_col == payload.target_col
                     && existing.delta == payload.delta
                     && batch_covers_exact_slots(existing, &payload.slots)
@@ -791,6 +811,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 log.int32_pair_batches.push(Int32PairUndoBatch {
                     page: page_id,
                     writer_xid: payload.writer_xid,
+                    command_id: payload.command_id,
                     target_col: payload.target_col,
                     delta: payload.delta,
                     first_slot: *payload.slots.first().unwrap_or(&0),

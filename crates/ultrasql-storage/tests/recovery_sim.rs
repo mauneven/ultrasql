@@ -1189,3 +1189,236 @@ fn crash_recovery_inplace_undo_rebuild_is_idempotent() {
         );
     }
 }
+
+/// DISTINCT-COMMAND DEDUP DISCRIMINATOR (compact form).
+///
+/// One transaction runs TWO in-place delta UPDATEs over the SAME rows with
+/// the SAME delta (`val += N` twice). These emit two distinct compact
+/// `HeapUpdateInt32PairDeltaBatch` records: identical
+/// page/writer_xid/target_col/delta/slots, but different `command_id` and
+/// different WAL LSN. After recovery the undo log must hold BOTH batches so a
+/// snapshot-predating reader reverses `2·N` (sees V0), not `N` (V0+N).
+///
+/// Regression: a dedup that keyed on batch SHAPE only (omitting command_id)
+/// collapsed the second batch into the first; because
+/// `undo_pre_image_from_log` SUMS invisible deltas, the reader then under-
+/// reversed by one delta. This fires on a PLAIN full replay (c1 then c2
+/// dispatched sequentially), not just the skip-redo path.
+///
+/// Both replay modes are checked: full replay (fresh pages) and skip-redo
+/// replay (pages durable past the record LSN, undo log cleared between).
+/// Genuine re-replay of the SAME record must still dedup — covered by
+/// running each mode and asserting exactly two batches, never four.
+#[test]
+fn crash_recovery_keeps_distinct_same_shape_compact_commands() {
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 120;
+    const WRITER: u64 = 2;
+    const N: i32 = 5;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(WRITER));
+
+    // Phase 1: insert, then run the SAME-shape compact UPDATE twice in one
+    // transaction (two distinct commands over the same rows).
+    let mut original_pairs: Vec<(i32, i32)> = Vec::with_capacity(ROWS);
+    let mut tids: Vec<TupleId> = Vec::with_capacity(ROWS);
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        for i in 0..ROWS {
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("value fits i32");
+            original_pairs.push((id, val));
+            let tid = heap
+                .insert(
+                    rel(),
+                    &pair_payload(id, val),
+                    insert_opts(Xid::new(1), sink.as_ref()),
+                )
+                .expect("insert");
+            tids.push(tid);
+        }
+        let n_blocks = heap.block_count(rel());
+        let sink_ref = sink.as_ref() as &dyn ultrasql_storage::wal_sink::WalSink;
+
+        // Command 0: val += N. current_command=1 so the committed xid=1
+        // inserts are visible; this command stamps cmax=0 on every row.
+        let snap_c0 = Snapshot::new(
+            Xid::new(WRITER),
+            Xid::new(WRITER + 1),
+            Xid::new(WRITER),
+            CommandId::new(1),
+            std::iter::empty(),
+        );
+        let u0 = heap
+            .update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel: rel(),
+                    block_count: n_blocks,
+                    snapshot: &snap_c0,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: N,
+                },
+                UpdateInt32PairStamp {
+                    xid: Xid::new(WRITER),
+                    command_id: CommandId::new(0),
+                },
+                Some(sink_ref),
+                None,
+            )
+            .expect("first in-place update");
+        assert_eq!(u0, ROWS);
+
+        // Command 1: val += N again over the same rows. current_command=2 so
+        // command 0's own writes (cmax=0 < 2) are Visible and re-update.
+        let snap_c1 = Snapshot::new(
+            Xid::new(WRITER),
+            Xid::new(WRITER + 1),
+            Xid::new(WRITER),
+            CommandId::new(2),
+            std::iter::empty(),
+        );
+        let u1 = heap
+            .update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel: rel(),
+                    block_count: n_blocks,
+                    snapshot: &snap_c1,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: N,
+                },
+                UpdateInt32PairStamp {
+                    xid: Xid::new(WRITER),
+                    command_id: CommandId::new(1),
+                },
+                Some(sink_ref),
+                None,
+            )
+            .expect("second in-place update");
+        assert_eq!(u1, ROWS, "the second command must re-update every row");
+        // Physical slot is now V0 + 2N on every row.
+        for (idx, &tid) in tids.iter().enumerate() {
+            let (_id, val) = pair_decode(&heap.fetch(tid).expect("fetch").data);
+            assert_eq!(
+                val,
+                original_pairs[idx].1.wrapping_add(2 * N),
+                "live post-image must be V0 + 2N after two commands"
+            );
+        }
+    }
+
+    // The stream must carry two distinct compact records (different LSN), with
+    // identical shape and delta.
+    let records = sink.records();
+    let compact: Vec<_> = records
+        .iter()
+        .filter(|(_, r)| {
+            matches!(
+                r.header.record_type,
+                ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaBatch
+                    | ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaRangeBatch
+            )
+        })
+        .collect();
+    assert!(
+        compact.len() >= 2,
+        "two distinct same-shape commands must emit at least two compact records (got {})",
+        compact.len()
+    );
+
+    let expected_pre: Vec<(i32, i32)> = original_pairs.clone();
+    let reader = predating_snapshot(WRITER);
+
+    // --- Mode A: plain FULL replay (fresh pages, both records applied). ---
+    {
+        let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+        for (lsn, rec) in &records {
+            dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("full replay");
+        }
+        // Two distinct commands ⇒ two retained batches (×ROWS slots each).
+        assert_eq!(
+            recovery_heap.int32_pair_undo_batch_len(rel()),
+            2,
+            "full replay must retain both distinct same-shape command batches"
+        );
+        assert_pre_image_is_v0(
+            &recovery_heap,
+            &tids,
+            &expected_pre,
+            &reader,
+            &oracle,
+            2 * N,
+        );
+    }
+
+    // --- Mode B: skip-redo replay (pages durable past LSN, undo cleared). ---
+    {
+        let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+        for (lsn, rec) in &records {
+            dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("first replay");
+        }
+        recovery_heap.undo_log.clear();
+        for (lsn, rec) in &records {
+            dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("skip replay");
+        }
+        assert_eq!(
+            recovery_heap.int32_pair_undo_batch_len(rel()),
+            2,
+            "skip-redo replay must rebuild both distinct command batches and dedup re-replay to exactly two"
+        );
+        assert_pre_image_is_v0(
+            &recovery_heap,
+            &tids,
+            &expected_pre,
+            &reader,
+            &oracle,
+            2 * N,
+        );
+    }
+}
+
+/// Assert every row's snapshot-predating pre-image equals V0, i.e. the post-
+/// image (`current`) minus `total_delta`. A correct two-batch undo log
+/// reverses `total_delta`; a wrongly-collapsed single batch reverses less.
+fn assert_pre_image_is_v0<O: ultrasql_mvcc::XidStatusOracle + ?Sized>(
+    heap: &HeapAccess<loader::MapLoader>,
+    tids: &[TupleId],
+    expected_pre: &[(i32, i32)],
+    reader: &ultrasql_mvcc::Snapshot,
+    oracle: &O,
+    total_delta: i32,
+) {
+    for (idx, &tid) in tids.iter().enumerate() {
+        let pre = heap
+            .fetch_visible_pre_image(tid, reader, oracle)
+            .expect("pre-image lookup")
+            .expect("undo entry present");
+        let (id, val) = pair_decode(&pre);
+        let (exp_id, exp_val) = expected_pre[idx];
+        assert_eq!(id, exp_id, "id must be stable");
+        assert_eq!(
+            val, exp_val,
+            "predating reader must see V0 = current - {total_delta}, not an under-reversed value"
+        );
+        // Cross-check: the live post-image is exactly V0 + total_delta.
+        let (_pid, post_val) = pair_decode(&heap.fetch(tid).expect("fetch").data);
+        assert_eq!(
+            post_val,
+            exp_val.wrapping_add(total_delta),
+            "post-image must be V0 + total_delta"
+        );
+    }
+}
