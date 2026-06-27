@@ -442,6 +442,34 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Int64(col)
             }
+            DataType::Interval => {
+                // Interval columns materialise as text so the full
+                // month/day/microsecond triple round-trips through the batch,
+                // mirroring the streaming row-codec column builder. The schema
+                // field carries the `DataType::Interval` tag so the wire OID
+                // (1186) is preserved and `batch_to_rows` re-parses the text
+                // back into a `Value::Interval`.
+                let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        Value::Interval { .. } => strings.push(Some(row[col_idx].to_string())),
+                        Value::Null => strings.push(None),
+                        other => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected Interval at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    }
+                }
+                match encode_strings_auto(
+                    strings.iter().map(|value| value.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                }
+            }
             other => {
                 return Err(ExecError::TypeMismatch(format!(
                     "SeqScan: unsupported column type {other} for batch building"

@@ -468,6 +468,36 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
+        DataType::Interval => {
+            // Interval columns materialise as text so the full
+            // month/day/microsecond triple round-trips through the batch,
+            // mirroring the streaming row-codec column builder which stores
+            // `Value::Interval{..}.to_string()` into a Utf8 column. The
+            // schema field still reports `DataType::Interval`, so the wire
+            // type OID (1186) is preserved by the result encoder.
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Interval { .. } => strings.push(Some(v.to_string())),
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected Interval at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
         DataType::Null => {
             // All-NULL output column. Carry an Int32 storage; the
             // schema field tag still reports `Null`.
@@ -741,6 +771,21 @@ mod tests {
         assert_text_values(
             build_column(&DataType::Bytea, vec![Value::Bytea(vec![0xde, 0xad])]).expect("bytea"),
             &[Some("\\xdead")],
+        );
+        assert_text_values(
+            build_column(
+                &DataType::Interval,
+                vec![
+                    Value::Interval {
+                        months: 2,
+                        days: 3,
+                        microseconds: 14_706_000_000,
+                    },
+                    Value::Null,
+                ],
+            )
+            .expect("interval"),
+            &[Some("2mon 3d 14706000000us"), None],
         );
         assert_i32_values(
             build_column(&DataType::Null, vec![Value::Null, Value::Null]).expect("null"),

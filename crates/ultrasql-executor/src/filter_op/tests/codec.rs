@@ -184,6 +184,7 @@ fn batch_to_rows_decodes_sql_storage_families_and_reports_bad_shapes() {
         Field::required("tstz", DataType::TimestampTz),
         Field::required("time", DataType::Time),
         Field::required("timetz", DataType::TimeTz),
+        Field::required("interval", DataType::Interval),
     ])
     .expect("schema");
     let timetz = pack_timetz(1_000, -3_600).expect("timetz");
@@ -232,6 +233,11 @@ fn batch_to_rows_decodes_sql_storage_families_and_reports_bad_shapes() {
         Column::Int64(NumericColumn::from_data(vec![222])),
         Column::Int64(NumericColumn::from_data(vec![333])),
         Column::Int64(NumericColumn::from_data(vec![timetz])),
+        // Interval columns materialise as their `Value::Interval` display text
+        // and must round-trip back into a real `Value::Interval`.
+        Column::Utf8(StringColumn::from_data(
+            ["2mon 3d 14706000000us".to_owned()],
+        )),
     ])
     .expect("batch");
 
@@ -254,6 +260,14 @@ fn batch_to_rows_decodes_sql_storage_families_and_reports_bad_shapes() {
             offset_seconds: -3_600
         }
     ));
+    assert_eq!(
+        rows[0][39],
+        Value::Interval {
+            months: 2,
+            days: 3,
+            microseconds: 14_706_000_000,
+        }
+    );
 
     let bad_cols =
         Batch::new([Column::Int64(NumericColumn::from_data(vec![1]))]).expect("bad batch");

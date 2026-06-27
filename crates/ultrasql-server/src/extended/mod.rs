@@ -115,6 +115,8 @@ const PG_OID_TIMESTAMP: u32 = 1114;
 const PG_OID_TIMETZ: u32 = 1266;
 /// PostgreSQL type OID for `timestamptz`.
 const PG_OID_TIMESTAMPTZ: u32 = 1184;
+/// PostgreSQL type OID for `interval`.
+const PG_OID_INTERVAL: u32 = 1186;
 /// PostgreSQL type OID for `oid`.
 const PG_OID_OID: u32 = 26;
 /// PostgreSQL type OID for `regclass`.

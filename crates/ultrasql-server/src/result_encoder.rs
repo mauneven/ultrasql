@@ -103,6 +103,8 @@ const PG_OID_TIMESTAMP: u32 = 1114;
 const PG_OID_TIMETZ: u32 = 1266;
 /// PostgreSQL type OID for `timestamptz`.
 const PG_OID_TIMESTAMPTZ: u32 = 1184;
+/// PostgreSQL type OID for `interval`.
+const PG_OID_INTERVAL: u32 = 1186;
 /// PostgreSQL type OID for `bool[]`.
 const PG_OID_BOOL_ARRAY: u32 = 1000;
 /// PostgreSQL type OID for `int2[]`.
@@ -1385,6 +1387,7 @@ fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Timestamp => PG_OID_TIMESTAMP,
         DataType::TimeTz => PG_OID_TIMETZ,
         DataType::TimestampTz => PG_OID_TIMESTAMPTZ,
+        DataType::Interval => PG_OID_INTERVAL,
         DataType::Bytea => PG_OID_BYTEA,
         DataType::Uuid => PG_OID_UUID,
         DataType::Json => PG_OID_JSON,
@@ -1551,6 +1554,9 @@ mod tests {
         assert_eq!(pg_type_oid(&DataType::RegClass), 2205);
         assert_eq!(pg_type_oid(&DataType::RegType), 2206);
         assert_eq!(pg_type_oid(&DataType::PgLsn), 3220);
+        // Interval advertises OID 1186 even though it materialises as a Utf8
+        // text column; the logical schema type drives the wire OID.
+        assert_eq!(pg_type_oid(&DataType::Interval), 1186);
         assert_eq!(
             pg_type_oid(&DataType::Array(Box::new(DataType::Array(Box::new(
                 DataType::Int32
