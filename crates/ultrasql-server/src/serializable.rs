@@ -63,6 +63,13 @@ fn collect_serializable_read_locks(
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::SingleRowAssert { input, .. }
+        // DISTINCT ON / PIVOT / UNPIVOT are non-leaf table factors: their
+        // `input` can be a `Scan`, so we must descend to take the read-lock.
+        // Skipping them would silently drop the predicate lock on the scanned
+        // relation and miss read-write conflicts (an SSI serialization hole).
+        | LogicalPlan::DistinctOn { input, .. }
+        | LogicalPlan::Pivot { input, .. }
+        | LogicalPlan::Unpivot { input, .. }
         | LogicalPlan::LockRows { input, .. } => {
             collect_serializable_read_locks(input, catalog_snapshot, out);
         }
@@ -76,12 +83,21 @@ fn collect_serializable_read_locks(
         LogicalPlan::Update { input, .. } | LogicalPlan::Delete { input, .. } => {
             collect_serializable_read_locks(input, catalog_snapshot, out);
         }
+        // MERGE reads its `source` relation; descend so its scans take read
+        // locks too (the target write conflicts are tracked separately).
+        LogicalPlan::Merge { source, .. } => {
+            collect_serializable_read_locks(source, catalog_snapshot, out);
+        }
         LogicalPlan::Cte {
             definition, body, ..
         } => {
             collect_serializable_read_locks(definition, catalog_snapshot, out);
             collect_serializable_read_locks(body, catalog_snapshot, out);
         }
+        // Remaining shapes carry no readable base-table subtree that isn't
+        // covered above: leaves with no scan (`Values`, `Empty`,
+        // `FunctionScan`), and control/DDL plans that never run as a
+        // serializable read. They legitimately need no predicate lock.
         _ => {}
     }
 }

@@ -1289,3 +1289,240 @@ async fn rls_restrictive_select_policies_narrow_permissive_visibility() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Regression / no-bypass: a row-level-security policy must apply when the
+/// protected table is read through a `DISTINCT ON` table factor. The binder
+/// lowers `SELECT DISTINCT ON (...)` to `Project(DistinctOn(Sort(Scan)))`.
+/// Before the fail-closed hardening, `apply_row_security` had no `DistinctOn`
+/// arm, so it hit the `_ => Ok(None)` catch-all, dropped the RLS-wrapped scan
+/// subtree, and the query saw EVERY tenant's rows (fail-open bypass).
+#[tokio::test]
+async fn rls_applies_through_distinct_on() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE distinct_secret (\
+                tenant_id TEXT NOT NULL, \
+                grp TEXT NOT NULL, \
+                doc_id TEXT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create table");
+    // Per group, the OTHER tenant's row sorts FIRST by doc_id (b-* < a-*), so
+    // `DISTINCT ON (grp) ... ORDER BY grp, doc_id` would emit the tenant-b row
+    // per group if RLS were bypassed. With RLS, tenant-b's rows never reach the
+    // dedup, so the tenant-a rows are the first (and only) per group.
+    client
+        .batch_execute(
+            "INSERT INTO distinct_secret VALUES \
+                ('tenant-a', 'g1', 'a-doc'), \
+                ('tenant-a', 'g2', 'a-doc'), \
+                ('tenant-b', 'g1', 'b-doc'), \
+                ('tenant-b', 'g2', 'b-doc')",
+        )
+        .await
+        .expect("insert seed rows");
+    client
+        .batch_execute(
+            "CREATE POLICY distinct_secret_isolation ON distinct_secret \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create tenant rls policy");
+    client
+        .batch_execute("ALTER TABLE distinct_secret ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable table rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    // DISTINCT ON (grp): if RLS were bypassed, b-doc (which sorts first) would
+    // be the chosen row per group. With RLS only tenant-a's rows are visible,
+    // so a-doc is emitted for each group.
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT DISTINCT ON (grp) grp, doc_id FROM distinct_secret ORDER BY grp, doc_id",
+            )
+            .await
+            .expect("distinct on respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["g1".to_owned(), "a-doc".to_owned()],
+            vec!["g2".to_owned(), "a-doc".to_owned()],
+        ],
+        "DISTINCT ON leaked other tenants' rows (RLS bypassed)"
+    );
+
+    // Decisive bypass detector: with the tenant GUC set to a value matching no
+    // row, RLS must filter EVERYTHING. A bypass would still surface rows here.
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'nonexistent-tenant'")
+        .await
+        .expect("set nonexistent tenant guc");
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT DISTINCT ON (grp) grp, doc_id FROM distinct_secret ORDER BY grp, doc_id",
+            )
+            .await
+            .expect("distinct on with no matching tenant"),
+    );
+    assert!(
+        rows.is_empty(),
+        "DISTINCT ON returned rows for a tenant that owns none (RLS bypassed): {rows:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// No-bypass sweep: RLS must be enforced through every common query shape over
+/// a protected table — bare scan, ORDER BY, LIMIT, DISTINCT, GROUP BY, window,
+/// UNION, CTE, and an IN-subquery. Each must return ONLY the current tenant's
+/// rows. This guards against a future plan-shape change re-opening a silent
+/// bypass: if any shape stopped applying the policy it would surface a
+/// tenant-b row here (or an inflated aggregate).
+#[tokio::test]
+async fn rls_no_bypass_through_common_shapes() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE sweep_secret (\
+                tenant_id TEXT NOT NULL, \
+                val INT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create table");
+    // tenant-a: two rows summing to 30; tenant-b: two rows summing to 70.
+    client
+        .batch_execute(
+            "INSERT INTO sweep_secret VALUES \
+                ('tenant-a', 10), \
+                ('tenant-a', 20), \
+                ('tenant-b', 30), \
+                ('tenant-b', 40)",
+        )
+        .await
+        .expect("insert seed rows");
+    client
+        .batch_execute(
+            "CREATE POLICY sweep_secret_isolation ON sweep_secret \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create tenant rls policy");
+    client
+        .batch_execute("ALTER TABLE sweep_secret ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable table rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    // Bare scan + ORDER BY + LIMIT: only tenant-a's two rows.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT val FROM sweep_secret ORDER BY val DESC LIMIT 5")
+            .await
+            .expect("order by / limit respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["20".to_owned()], vec!["10".to_owned()]]);
+
+    // DISTINCT.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT DISTINCT tenant_id FROM sweep_secret")
+            .await
+            .expect("distinct respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["tenant-a".to_owned()]]);
+
+    // GROUP BY / aggregate: tenant-a sums to 30, never 100.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT tenant_id, sum(val) FROM sweep_secret GROUP BY tenant_id")
+            .await
+            .expect("group by respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["tenant-a".to_owned(), "30".to_owned()]]);
+
+    // Window function over the protected scan.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT val, sum(val) OVER () AS running FROM sweep_secret ORDER BY val")
+            .await
+            .expect("window respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10".to_owned(), "30".to_owned()],
+            vec!["20".to_owned(), "30".to_owned()],
+        ],
+        "window saw other tenants' rows"
+    );
+
+    // UNION of two reads of the protected table: still only tenant-a.
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT val FROM sweep_secret UNION SELECT val FROM sweep_secret ORDER BY val",
+            )
+            .await
+            .expect("union respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["10".to_owned()], vec!["20".to_owned()]]);
+
+    // CTE wrapping the protected scan.
+    let rows = simple_rows(
+        &client
+            .simple_query("WITH t AS (SELECT val FROM sweep_secret) SELECT sum(val) FROM t")
+            .await
+            .expect("cte respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["30".to_owned()]]);
+
+    // IN-subquery against the protected table.
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT val FROM sweep_secret \
+                 WHERE val IN (SELECT val FROM sweep_secret) ORDER BY val",
+            )
+            .await
+            .expect("in-subquery respects RLS"),
+    );
+    assert_eq!(rows, vec![vec!["10".to_owned()], vec!["20".to_owned()]]);
+
+    // Decisive bypass detector: a tenant GUC matching no row must yield zero
+    // rows through every shape. If any shape silently skipped RLS, a row would
+    // leak here regardless of how an aggregate/dedup might mask it above.
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'nobody'")
+        .await
+        .expect("set nonexistent tenant guc");
+    for sql in [
+        "SELECT val FROM sweep_secret ORDER BY val",
+        "SELECT DISTINCT tenant_id FROM sweep_secret",
+        "SELECT val FROM sweep_secret UNION SELECT val FROM sweep_secret",
+        "WITH t AS (SELECT val FROM sweep_secret) SELECT val FROM t",
+        "SELECT val FROM sweep_secret WHERE val IN (SELECT val FROM sweep_secret)",
+    ] {
+        let rows = simple_rows(&client.simple_query(sql).await.expect(sql));
+        assert!(
+            rows.is_empty(),
+            "shape leaked rows for a tenant that owns none (RLS bypassed): {sql} -> {rows:?}"
+        );
+    }
+
+    shutdown(client, server_handle).await;
+}

@@ -294,7 +294,114 @@ where
                     input: Box::new(input),
                 })
                 .transpose_ok(),
-            _ => Ok(None),
+            // `SELECT DISTINCT ON (...)` dedup. Non-projecting unary node that
+            // wraps the (sorted) input subtree, which can be a `Scan` over an
+            // RLS table. Descend so the policy predicate reaches the scan;
+            // otherwise DISTINCT ON over a protected table would leak rows.
+            LogicalPlan::DistinctOn { input, on_keys } => self
+                .apply_row_security(input, catalog_snapshot, command)?
+                .map(|input| LogicalPlan::DistinctOn {
+                    input: Box::new(input),
+                    on_keys: on_keys.clone(),
+                })
+                .transpose_ok(),
+            // `PIVOT` table factor. Unary node over an input that can be a
+            // `Scan` of an RLS table; descend to inject the predicate.
+            LogicalPlan::Pivot {
+                input,
+                group_columns,
+                pivot_column,
+                aggregate,
+                pivot_values,
+                schema,
+            } => self
+                .apply_row_security(input, catalog_snapshot, command)?
+                .map(|input| LogicalPlan::Pivot {
+                    input: Box::new(input),
+                    group_columns: group_columns.clone(),
+                    pivot_column: *pivot_column,
+                    aggregate: aggregate.clone(),
+                    pivot_values: pivot_values.clone(),
+                    schema: schema.clone(),
+                })
+                .transpose_ok(),
+            // `UNPIVOT` table factor. Unary node over an RLS-bearing input;
+            // descend to inject the predicate.
+            LogicalPlan::Unpivot {
+                input,
+                passthrough_columns,
+                columns,
+                name_column,
+                value_column,
+                include_nulls,
+                schema,
+            } => self
+                .apply_row_security(input, catalog_snapshot, command)?
+                .map(|input| LogicalPlan::Unpivot {
+                    input: Box::new(input),
+                    passthrough_columns: passthrough_columns.clone(),
+                    columns: columns.clone(),
+                    name_column: name_column.clone(),
+                    value_column: value_column.clone(),
+                    include_nulls: *include_nulls,
+                    schema: schema.clone(),
+                })
+                .transpose_ok(),
+            // `MERGE INTO target USING source`. The `source` child is a read
+            // path that can be (or contain) a `Scan` over an RLS table, so it
+            // must have the SELECT-side policy applied. The target table's own
+            // RLS WITH CHECK enforcement is handled elsewhere (the executor's
+            // merge path); here we only rewrite the readable source subtree.
+            LogicalPlan::Merge {
+                target,
+                target_alias,
+                target_schema,
+                source,
+                on,
+                clauses,
+                schema,
+            } => self
+                .apply_row_security(source, catalog_snapshot, crate::RuntimeRlsCommand::Select)?
+                .map(|source| LogicalPlan::Merge {
+                    target: target.clone(),
+                    target_alias: target_alias.clone(),
+                    target_schema: target_schema.clone(),
+                    source: Box::new(source),
+                    on: on.clone(),
+                    clauses: clauses.clone(),
+                    schema: schema.clone(),
+                })
+                .transpose_ok(),
+            // Leaves with no base-table reference: a constant row set
+            // (`VALUES`), the empty/no-FROM source, and a set-returning
+            // function scan (its args are scalars, never a catalog relation).
+            // RLS does not apply — return `None` explicitly rather than via
+            // the (now fail-closed) catch-all.
+            LogicalPlan::Values { .. }
+            | LogicalPlan::Empty { .. }
+            | LogicalPlan::FunctionScan { .. } => Ok(None),
+            // `SUMMARIZE table` reads a base table directly. It has no child
+            // plan to inject a `Filter` into, and the SUMMARIZE pipeline
+            // refuses to run over an RLS-enabled table at its own scan site
+            // (`pipeline::scan` returns SQLSTATE 0A000 before reading any
+            // row). So there is nothing for this walker to rewrite; returning
+            // `None` here keeps the original plan, which the SUMMARIZE
+            // executor then rejects fail-closed. Enumerated explicitly (not
+            // via the catch-all) so this reasoning is auditable.
+            LogicalPlan::Summarize { .. } => Ok(None),
+            // Fail closed. Every data-plane plan shape that can reach this
+            // walker is enumerated above; control/DDL plans are dispatched
+            // before `apply_row_security` is ever called. An unenumerated
+            // shape here means a NEW node kind whose RLS handling has not
+            // been audited — it might carry a base-table reference below it,
+            // and silently returning `Ok(None)` would use the un-rewritten
+            // plan (RLS skipped). Refuse the query instead of risking a
+            // cross-tenant read. SQLSTATE 0A000 (feature_not_supported).
+            other => Err(ServerError::UnsupportedOwned(format!(
+                "row-level security cannot be verified for this plan shape ({:?}); refusing to \
+                 execute to avoid a possible policy bypass",
+                std::mem::discriminant(other),
+            ))),
         }
     }
 
@@ -539,5 +646,79 @@ where
                 "RLS WITH CHECK currently requires literal tenant values",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use std::sync::Arc;
+
+    use tokio::io::{DuplexStream, duplex};
+    use ultrasql_core::Schema;
+    use ultrasql_planner::LogicalPlan;
+
+    use crate::session::Session;
+    use crate::{RuntimeRlsCommand, Server};
+
+    fn test_session() -> Session<DuplexStream> {
+        let (io, _peer) = duplex(64);
+        Session::new(io, Arc::new(Server::with_sample_database()), None)
+    }
+
+    /// The `apply_row_security` walker must FAIL CLOSED on any plan shape it
+    /// does not explicitly enumerate: a silent `Ok(None)` would use the
+    /// un-rewritten plan and could skip RLS on a base-table scan buried in the
+    /// unknown shape. We use `Commit` only as a stand-in for "a node kind the
+    /// walker does not enumerate" (control plans never reach the walker in
+    /// production) — the point is that the catch-all errors rather than
+    /// returning `Ok(None)`.
+    #[test]
+    fn apply_row_security_fails_closed_on_unenumerated_shape() {
+        let session = test_session();
+        let snapshot = session.state.catalog_snapshot();
+        let plan = LogicalPlan::Commit {
+            schema: Schema::empty(),
+        };
+        let err = session
+            .apply_row_security(&plan, &snapshot, RuntimeRlsCommand::Select)
+            .expect_err("unenumerated plan shape must fail closed, not return Ok(None)");
+        let message = err.to_string();
+        assert!(
+            message.contains("row-level security cannot be verified"),
+            "fail-closed error should name the RLS verification limitation: {message}"
+        );
+        assert_eq!(err.sqlstate(), "0A000", "feature_not_supported expected");
+    }
+
+    /// Enumerated leaves that provably hold no base-table reference
+    /// (`VALUES`, the empty no-FROM source) must return `Ok(None)` — no RLS to
+    /// apply, and they must NOT trip the new fail-closed default.
+    #[test]
+    fn apply_row_security_passes_through_table_free_leaves() {
+        let session = test_session();
+        let snapshot = session.state.catalog_snapshot();
+
+        let empty = LogicalPlan::Empty {
+            schema: Schema::empty(),
+        };
+        assert!(
+            session
+                .apply_row_security(&empty, &snapshot, RuntimeRlsCommand::Select)
+                .expect("Empty is a table-free leaf")
+                .is_none(),
+            "Empty must need no RLS rewrite"
+        );
+
+        let values = LogicalPlan::Values {
+            rows: Vec::new(),
+            schema: Schema::empty(),
+        };
+        assert!(
+            session
+                .apply_row_security(&values, &snapshot, RuntimeRlsCommand::Select)
+                .expect("Values is a table-free leaf")
+                .is_none(),
+            "Values must need no RLS rewrite"
+        );
     }
 }
