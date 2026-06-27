@@ -40,7 +40,7 @@ pub mod scope;
 pub use binder::bind;
 pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
-pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
+pub use expr::{BinaryOp, INSERT_DEFAULT_SENTINEL, ScalarExpr, UnaryOp};
 pub use plan::{
     AggregateFunc, BoundFrameBound, BoundFrameExclusion, BoundFrameUnits, ConflictTarget,
     CopyDirection, CopyFormat, CopySource, ExplainFormat, LogicalAggregateExpr,

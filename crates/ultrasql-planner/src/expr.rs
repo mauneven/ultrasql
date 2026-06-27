@@ -34,6 +34,13 @@ use crate::plan::LogicalPlan;
 
 pub use ultrasql_parser::ast::{BinaryOp, UnaryOp};
 
+/// Reserved zero-argument function name used as the bound stand-in for a
+/// `DEFAULT` cell in an `INSERT ... VALUES` row. The server's INSERT
+/// lowering rewrites every occurrence into the target column's default
+/// expression (or NULL); it must never reach the executor unrewritten.
+/// The leading `__ultrasql_` prefix keeps it out of the user namespace.
+pub const INSERT_DEFAULT_SENTINEL: &str = "__ultrasql_insert_default";
+
 /// A typed, bound scalar expression.
 ///
 /// Each node carries a `DataType` that names the result type. The

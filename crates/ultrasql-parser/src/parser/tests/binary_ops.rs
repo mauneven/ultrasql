@@ -158,8 +158,10 @@ fn bitwise_precedence_tighter_than_comparison() {
 
 #[test]
 fn shift_lower_precedence_than_add() {
-    // Level 5 (<<) is *lower* than level 6 (+), so `a + b << 3`
-    // parses as `(a + b) << 3` — top-level operator is ShiftLeft.
+    // Per PostgreSQL Table 4.2, `<<` lives in the "all other operators"
+    // band which is *looser* than `+`/`-`. So `a + b << 3` parses as
+    // `(a + b) << 3` — the top-level operator is ShiftLeft. (Matches PG:
+    // `1 << 2 + 1` = `1 << (2 + 1)` = `1 << 3` = 8.)
     let expr = parse_expr("a + b << 3");
     assert!(matches!(
         expr,
@@ -168,6 +170,31 @@ fn shift_lower_precedence_than_add() {
             ..
         }
     ));
+}
+
+#[test]
+fn unary_minus_binds_tighter_than_power() {
+    // Per PostgreSQL Table 4.2, unary `+`/`-` bind *tighter* than `^`, so
+    // `-2 ^ 2` parses as `(-2) ^ 2` = 4, NOT `-(2 ^ 2)` = -4. The top-level
+    // operator is therefore Pow, with a Unary{Neg} left operand.
+    let expr = parse_expr("-2 ^ 2");
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::Pow,
+            left,
+            ..
+        } => assert!(
+            matches!(
+                *left,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    ..
+                }
+            ),
+            "expected (-2)^2 — left operand should be unary minus, got {left:?}"
+        ),
+        other => panic!("expected top-level Pow over a unary-minus left, got {other:?}"),
+    }
 }
 
 // ── JSON operators ───────────────────────────────────────────────────────
@@ -474,6 +501,135 @@ fn pow_is_left_associative() {
         *left,
         Expr::Binary {
             op: BinaryOp::Pow,
+            ..
+        }
+    ));
+}
+
+// ── Bug #1: postfix IS / IN / BETWEEN honour minimum precedence ──────────
+
+/// `a || b IS NULL` groups as `(a || b) IS NULL`: the IS-NULL test owns the
+/// whole concatenation, not just `b`.
+#[test]
+fn is_null_binds_looser_than_concat() {
+    let expr = parse_expr("a || b IS NULL");
+    let Expr::IsNull { expr: inner, .. } = expr else {
+        panic!("expected top-level IsNull, got {expr:?}");
+    };
+    assert!(matches!(
+        *inner,
+        Expr::Binary {
+            op: BinaryOp::Concat,
+            ..
+        }
+    ));
+}
+
+/// `1 + 2 IN (3)` groups as `(1 + 2) IN (3)`: IN owns the whole addition.
+#[test]
+fn in_list_binds_looser_than_add() {
+    let expr = parse_expr("1 + 2 IN (3)");
+    let Expr::InList { expr: inner, .. } = expr else {
+        panic!("expected top-level InList, got {expr:?}");
+    };
+    assert!(matches!(
+        *inner,
+        Expr::Binary {
+            op: BinaryOp::Add,
+            ..
+        }
+    ));
+}
+
+/// `2 * 3 BETWEEN 5 AND 7` groups as `(2 * 3) BETWEEN 5 AND 7`.
+#[test]
+fn between_binds_looser_than_mul() {
+    let expr = parse_expr("2 * 3 BETWEEN 5 AND 7");
+    let Expr::Between { expr: inner, .. } = expr else {
+        panic!("expected top-level Between, got {expr:?}");
+    };
+    assert!(matches!(
+        *inner,
+        Expr::Binary {
+            op: BinaryOp::Mul,
+            ..
+        }
+    ));
+}
+
+/// IS binds looser than comparison: `1 < 2 IS TRUE` = `(1 < 2) IS TRUE`.
+#[test]
+fn is_true_binds_looser_than_comparison() {
+    let expr = parse_expr("1 < 2 IS TRUE");
+    let Expr::IsBoolean { expr: inner, .. } = expr else {
+        panic!("expected top-level IsBoolean, got {expr:?}");
+    };
+    assert!(matches!(
+        *inner,
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            ..
+        }
+    ));
+}
+
+/// BETWEEN binds tighter than comparison: `2 BETWEEN 1 AND 3 = true` groups
+/// as `(2 BETWEEN 1 AND 3) = true`.
+#[test]
+fn between_binds_tighter_than_comparison() {
+    let expr = parse_expr("2 BETWEEN 1 AND 3 = true");
+    assert!(
+        matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ),
+        "expected top-level Eq with BETWEEN on its left"
+    );
+}
+
+// ── Bug #33: shift groups with the other non-arithmetic operators ────────
+
+/// `1 # 2 << 1` groups as `(1 # 2) << 1`: shift and bitwise-xor share one
+/// left-associative precedence level.
+#[test]
+fn shift_same_level_as_bitwise_xor() {
+    let expr = parse_expr("1 # 2 << 1");
+    let Expr::Binary {
+        op: BinaryOp::ShiftLeft,
+        left,
+        ..
+    } = expr
+    else {
+        panic!("expected top-level ShiftLeft, got {expr:?}");
+    };
+    assert!(matches!(
+        *left,
+        Expr::Binary {
+            op: BinaryOp::BitXor,
+            ..
+        }
+    ));
+}
+
+/// `+`/`-` bind tighter than shift: `1 << 2 + 1` = `1 << (2 + 1)`.
+#[test]
+fn add_binds_tighter_than_shift() {
+    let expr = parse_expr("1 << 2 + 1");
+    let Expr::Binary {
+        op: BinaryOp::ShiftLeft,
+        right,
+        ..
+    } = expr
+    else {
+        panic!("expected top-level ShiftLeft, got {expr:?}");
+    };
+    assert!(matches!(
+        *right,
+        Expr::Binary {
+            op: BinaryOp::Add,
             ..
         }
     ));

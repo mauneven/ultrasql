@@ -9,6 +9,7 @@ use ultrasql_parser::ast::{
 };
 
 use crate::catalog::TableMeta;
+use crate::expr::INSERT_DEFAULT_SENTINEL;
 
 use super::expr_bind::coerce_literal_to_type;
 use super::{
@@ -146,6 +147,20 @@ fn bind_values_rows(
         }
         let mut bound_cells = Vec::with_capacity(row.len());
         for e in row {
+            // `DEFAULT` in a VALUES cell is bound to an inert sentinel call.
+            // The server's INSERT lowering substitutes it with the target
+            // column's default expression (or NULL when none is declared).
+            // It never reaches the executor unrewritten; if it somehow did,
+            // the evaluator rejects the unknown function rather than
+            // producing a wrong value.
+            if matches!(e, Expr::Default { .. }) {
+                bound_cells.push(ScalarExpr::FunctionCall {
+                    name: INSERT_DEFAULT_SENTINEL.to_owned(),
+                    args: Vec::new(),
+                    data_type: DataType::Null,
+                });
+                continue;
+            }
             bound_cells.push(bind_expr(e, &empty, catalog, scope)?);
         }
         bound_rows.push(bound_cells);

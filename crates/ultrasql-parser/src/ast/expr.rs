@@ -337,6 +337,13 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `DEFAULT` placeholder, valid only as a cell of an `INSERT ... VALUES`
+    /// row. The binder substitutes the target column's default (or NULL);
+    /// it is rejected anywhere else, matching PostgreSQL.
+    Default {
+        /// Source span.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -375,7 +382,8 @@ impl Expr {
             | Self::AtTimeZone { span, .. }
             | Self::Collate { span, .. }
             | Self::Overlaps { span, .. }
-            | Self::Row { span, .. } => *span,
+            | Self::Row { span, .. }
+            | Self::Default { span, .. } => *span,
         }
     }
 }
@@ -571,29 +579,41 @@ pub enum BinaryOp {
 impl BinaryOp {
     /// Operator precedence level. Higher values bind more tightly.
     ///
-    /// The table mirrors PostgreSQL's operator precedence from lowest to highest:
+    /// The table mirrors PostgreSQL's operator precedence (Table 4.2) from
+    /// loosest to tightest. The numeric levels here are shared with the
+    /// non-operator postfix decorators handled in the Pratt loop (`IN`,
+    /// `BETWEEN`, `IS`); see the `IN_BETWEEN_PREC` and `IS_PREC` constants.
     ///
     /// ```text
     /// Level 1 — OR
     /// Level 2 — AND
-    /// Level 3 — comparison band: < > = <= >= <>, LIKE, ILIKE, regex ops (~, ~*, !~, !~*)
-    /// Level 4 — JSON ops (-> ->> #> #>> @> <@ ? ?| ?&), concat ||, bitwise & | #,
+    /// (NOT is a prefix operator, handled in parse_prefix)
+    /// Level 3 — IS / ISNULL / NOTNULL band              (Self::IS_PREC)
+    /// Level 4 — comparison band: < > = <= >= <>, LIKE, ILIKE,
+    ///           regex ops (~, ~*, !~, !~*), network containment
+    /// Level 5 — IN / BETWEEN band                       (Self::IN_BETWEEN_PREC)
+    /// Level 6 — all other binary operators (one PostgreSQL level):
+    ///           JSON ops (-> ->> #> #>> @> <@ ? ?| ?&), concat ||,
+    ///           bitwise & | #, bitwise shift << >>,
     ///           vector distance ops (<-> <#> <=> <+>)
-    /// Level 5 — bitwise shift << >>
-    /// Level 6 — addition/subtraction + -
-    /// Level 7 — multiplication/division/modulo * / %
-    /// Level 8 — exponentiation ^ (left-associative, as in PostgreSQL)
+    /// Level 7 — addition/subtraction + -
+    /// Level 8 — multiplication/division/modulo * / %
+    /// Level 9 — exponentiation ^ (left-associative, as in PostgreSQL)
     /// ```
     ///
-    /// JSON operators and bitwise operators sit between the comparison band
-    /// and arithmetic to match the most common PostgreSQL use patterns and
-    /// avoid mandatory parentheses in practical queries.
+    /// Per PostgreSQL Table 4.2 every non-arithmetic infix operator
+    /// (concat, bitwise, shift, JSON, vector distance, …) shares a single
+    /// "all other operators" precedence level that sits just *below*
+    /// addition/subtraction. Shift therefore groups with bitwise/concat,
+    /// not above add/sub. The comparison band keeps LIKE/ILIKE/regex
+    /// alongside `=`/`<`/… so their long-standing grouping is unchanged.
     #[must_use]
     pub const fn precedence(self) -> u8 {
         match self {
             Self::Or => 1,
             Self::And => 2,
-            // Comparison and regex band
+            // (Self::IS_PREC == 3 — postfix IS band, no binary op lives here.)
+            // Comparison and regex band.
             Self::Eq
             | Self::NotEq
             | Self::Lt
@@ -609,8 +629,10 @@ impl BinaryOp {
             | Self::RegexNotMatch
             | Self::RegexNotIMatch
             | Self::NetworkContainedEq
-            | Self::NetworkContainsEq => 3,
-            // JSON operators, concat, and bitwise and/or/xor
+            | Self::NetworkContainsEq => 4,
+            // (Self::IN_BETWEEN_PREC == 5 — postfix IN/BETWEEN band.)
+            // "All other operators": JSON, concat, bitwise and/or/xor,
+            // bitwise shift, and vector distance — one PostgreSQL level.
             Self::JsonGet
             | Self::JsonGetText
             | Self::JsonGetPath
@@ -626,17 +648,28 @@ impl BinaryOp {
             | Self::BitAnd
             | Self::BitOr
             | Self::BitXor
+            | Self::ShiftLeft
+            | Self::ShiftRight
             | Self::VectorL2Distance
             | Self::VectorNegativeInnerProduct
             | Self::VectorCosineDistance
-            | Self::VectorL1Distance => 4,
-            // Bitwise shift (tighter than add/sub)
-            Self::ShiftLeft | Self::ShiftRight => 5,
-            Self::Add | Self::Sub => 6,
-            Self::Mul | Self::Div | Self::Mod => 7,
-            Self::Pow => 8,
+            | Self::VectorL1Distance => 6,
+            Self::Add | Self::Sub => 7,
+            Self::Mul | Self::Div | Self::Mod => 8,
+            Self::Pow => 9,
         }
     }
+
+    /// Precedence level of the postfix `IS` band (`IS NULL`, `IS TRUE`,
+    /// `IS DISTINCT FROM`, …). Per PostgreSQL Table 4.2 this binds *looser*
+    /// than the comparison band, so it sits just above `AND`.
+    pub(crate) const IS_PREC: u8 = 3;
+
+    /// Precedence level of the postfix `IN` / `BETWEEN` band. Per
+    /// PostgreSQL Table 4.2 this binds *tighter* than comparison but
+    /// *looser* than the "all other operators" level (concat, bitwise,
+    /// shift, …).
+    pub(crate) const IN_BETWEEN_PREC: u8 = 5;
 
     /// `true` iff this operator is right-associative.
     ///

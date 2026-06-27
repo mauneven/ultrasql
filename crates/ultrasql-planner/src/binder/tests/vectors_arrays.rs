@@ -1,11 +1,11 @@
 //! Binder tests for array and vector column types, vector distance/metric
 //! functions, array functions and JSON_TABLE.
 
-use ultrasql_core::{DataType, Schema};
+use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::BinaryOp;
 
 use super::*;
-use crate::catalog::InMemoryCatalog;
+use crate::catalog::{InMemoryCatalog, TableMeta};
 
 #[test]
 fn binds_create_table_array_column_types() {
@@ -441,4 +441,80 @@ fn vector_family_distance_rejects_dimension_mismatch() {
         let err = parse_and_bind(sql, &cat).unwrap_err();
         assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
     }
+}
+
+#[test]
+fn binds_array_type_casts_for_common_element_types() {
+    let cat = InMemoryCatalog::new();
+    for (sql, expected) in [
+        // Text-literal source: parsed element-wise via `Value::parse_array`.
+        (
+            "SELECT '{1,2,3}'::int[]",
+            DataType::Array(Box::new(DataType::Int32)),
+        ),
+        (
+            "SELECT CAST('{a,b}' AS text[])",
+            DataType::Array(Box::new(DataType::Text { max_len: None })),
+        ),
+        (
+            // Declared size is ignored, matching PostgreSQL.
+            "SELECT '{1,2,3}'::int[3]",
+            DataType::Array(Box::new(DataType::Int32)),
+        ),
+        (
+            "SELECT '{1.5,2.5}'::float8[]",
+            DataType::Array(Box::new(DataType::Float64)),
+        ),
+        (
+            "SELECT '{1,2}'::bigint[]",
+            DataType::Array(Box::new(DataType::Int64)),
+        ),
+        // ARRAY[...] source cast to the same element type needs no
+        // element coercion, so it binds.
+        (
+            "SELECT ARRAY[1,2]::int[]",
+            DataType::Array(Box::new(DataType::Int32)),
+        ),
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect("bind ok");
+        let LogicalPlan::Project { schema, .. } = &plan else {
+            panic!("expected Project for {sql}, got {plan:?}");
+        };
+        assert_eq!(
+            schema.field_at(0).data_type,
+            expected,
+            "schema type for {sql}"
+        );
+    }
+}
+
+#[test]
+fn array_cast_requiring_element_coercion_is_a_clean_feature_error() {
+    // `ARRAY[1,2]::text[]` would need per-element int→text coercion, which
+    // the literal-array coercion path does not perform. It must fail cleanly
+    // (not a parse error, not a silent subscript misparse).
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("SELECT ARRAY[1,2]::text[]", &cat)
+        .expect_err("element coercion is unsupported");
+    assert!(
+        matches!(err, PlanError::NotSupported(_)),
+        "expected NotSupported, got {err:?}"
+    );
+}
+
+#[test]
+fn non_literal_array_cast_is_a_clean_feature_error() {
+    // Casting a non-literal column expression to an array type is not yet
+    // supported in the runtime cast path; it must be a clean error, never a
+    // parse error or a silent subscript misparse.
+    let mut cat = InMemoryCatalog::new();
+    cat.register(
+        "t",
+        TableMeta::new(Schema::new([Field::nullable("id", DataType::Int32)]).expect("schema")),
+    );
+    let err = parse_and_bind("SELECT id::text[] FROM t", &cat).expect_err("should not bind");
+    assert!(
+        matches!(err, PlanError::NotSupported(_)),
+        "expected NotSupported, got {err:?}"
+    );
 }

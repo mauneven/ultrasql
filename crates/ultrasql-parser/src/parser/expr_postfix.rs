@@ -7,7 +7,7 @@
 //! the Pratt loop continues operating on.
 
 use super::{ParseError, Parser};
-use crate::ast::{Expr, Identifier, ObjectName};
+use crate::ast::{BinaryOp, Expr, Identifier, ObjectName};
 use crate::span::Span;
 use crate::token::TokenKind;
 
@@ -74,10 +74,17 @@ impl<'src> Parser<'src> {
         let start = expr.span().start;
         self.advance()?; // BETWEEN
         let symmetric = self.match_kw(TokenKind::KwSymmetric);
-        // Precedence 4 stops before AND (prec 2) but allows arithmetic.
-        let low = self.parse_expr_with_precedence(4)?;
+        // PostgreSQL parses each BETWEEN bound as a `b_expr`: it includes
+        // arithmetic and the "all other operators" band (concat, bitwise,
+        // shift, JSON), but stops before comparison (`=`/`<`/…), `IN`, a
+        // nested `BETWEEN`, and `AND`/`OR`. The "all other operators" level
+        // (here represented by `Concat`) is the loosest precedence a bound
+        // may include, so parsing the bound at that level excludes every
+        // looser operator (comparison, IN/BETWEEN) while keeping arithmetic.
+        let bound_min_prec = BinaryOp::Concat.precedence();
+        let low = self.parse_expr_with_precedence(bound_min_prec)?;
         self.expect(TokenKind::KwAnd, "AND")?;
-        let high = self.parse_expr_with_precedence(4)?;
+        let high = self.parse_expr_with_precedence(bound_min_prec)?;
         let span = Span::new(start, high.span().end);
         Ok(Expr::Between {
             expr: Box::new(expr),
@@ -142,7 +149,11 @@ impl<'src> Parser<'src> {
             TokenKind::KwDistinct => {
                 self.advance()?; // DISTINCT
                 self.expect(TokenKind::KwFrom, "FROM")?;
-                let right = self.parse_expr_with_precedence(4)?;
+                // The right operand of `IS DISTINCT FROM` includes arithmetic
+                // and the "all other operators" band but stops before
+                // comparison, so `a IS DISTINCT FROM b = c` groups as
+                // `(a IS DISTINCT FROM b) = c` (matches PostgreSQL).
+                let right = self.parse_expr_with_precedence(BinaryOp::Concat.precedence())?;
                 let span = Span::new(start, right.span().end);
                 Ok(Expr::IsDistinctFrom {
                     left: Box::new(expr),
@@ -218,8 +229,12 @@ impl<'src> Parser<'src> {
         self.advance()?; // AT
         self.expect(TokenKind::KwTime, "TIME")?;
         self.expect(TokenKind::KwZone, "ZONE")?;
-        // Zone is a high-precedence expression (e.g. string literal or ident).
-        let zone = self.parse_expr_with_precedence(8)?;
+        // The zone is a high-precedence operand (typically a string literal
+        // or identifier). It binds tighter than every binary operator, so a
+        // trailing operator such as `|| 'TC'` applies to the whole
+        // `AT TIME ZONE` result rather than being folded into the zone —
+        // matching PostgreSQL.
+        let zone = self.parse_expr_with_precedence(BinaryOp::Pow.precedence())?;
         let span = Span::new(start, zone.span().end);
         Ok(Expr::AtTimeZone {
             expr: Box::new(expr),

@@ -11,7 +11,9 @@ use ultrasql_executor::{
     Eval, InsertConflictAction, ModifyKind, ModifyTable, ModifyTableStamps, Operator,
     SequenceDefault, ValuesScan,
 };
-use ultrasql_planner::{BinaryOp, LogicalOnConflict, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{
+    BinaryOp, INSERT_DEFAULT_SENTINEL, LogicalOnConflict, LogicalPlan, ScalarExpr,
+};
 
 use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
@@ -79,7 +81,10 @@ pub(crate) fn lower_real_insert(
         }
         let child: Box<dyn Operator> = match source {
             LogicalPlan::Values { rows, schema } => {
-                Box::new(ValuesScan::new(rows.clone(), schema.clone()))
+                // Partitioned tables reject constraints/defaults above, so a
+                // `DEFAULT` cell here can only resolve to NULL.
+                let rows = rewrite_insert_default_cells(rows, &insert_columns, None)?;
+                Box::new(ValuesScan::new(rows, schema.clone()))
             }
             other => lower_query(other, ctx)?,
         };
@@ -109,7 +114,11 @@ pub(crate) fn lower_real_insert(
     }
     let child: Box<dyn Operator> = match source {
         LogicalPlan::Values { rows, schema } => {
-            Box::new(ValuesScan::new(rows.clone(), schema.clone()))
+            // Substitute any `DEFAULT` cells with the target column's
+            // default expression (or NULL when the column has none).
+            let constraints = ctx.table_constraints.get(&entry.oid).map(|c| c.clone());
+            let rows = rewrite_insert_default_cells(rows, &insert_columns, constraints.as_deref())?;
+            Box::new(ValuesScan::new(rows, schema.clone()))
         }
         // `INSERT INTO t SELECT ...` — drive the destination through the
         // same `ModifyTable` shape we use for `VALUES`, but with a
@@ -472,6 +481,72 @@ fn insert_column_map_needed(columns: &[usize], target_width: usize) -> bool {
             .copied()
             .enumerate()
             .any(|(idx, target_idx)| idx != target_idx)
+}
+
+/// Replace every `DEFAULT` sentinel cell in a `VALUES` source with the
+/// target column's declared default expression, or `NULL` when the column
+/// has no plain default.
+///
+/// `insert_columns[i]` is the table-column index that source position `i`
+/// feeds. A `DEFAULT` against a column whose default is provided by a
+/// sequence (`SERIAL`) or `GENERATED ... AS IDENTITY` is not yet rewritten
+/// here and is reported as unsupported rather than silently producing a
+/// wrong value.
+fn rewrite_insert_default_cells(
+    rows: &[Vec<ScalarExpr>],
+    insert_columns: &[usize],
+    constraints: Option<&crate::TableRuntimeConstraints>,
+) -> Result<Vec<Vec<ScalarExpr>>, ServerError> {
+    // Fast path: no `DEFAULT` cell anywhere — clone through unchanged.
+    let has_default = rows
+        .iter()
+        .flatten()
+        .any(|cell| matches!(cell, ScalarExpr::FunctionCall { name, .. } if name == INSERT_DEFAULT_SENTINEL));
+    if !has_default {
+        return Ok(rows.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut new_row = Vec::with_capacity(row.len());
+        for (pos, cell) in row.iter().enumerate() {
+            let is_default = matches!(
+                cell,
+                ScalarExpr::FunctionCall { name, .. } if name == INSERT_DEFAULT_SENTINEL
+            );
+            if !is_default {
+                new_row.push(cell.clone());
+                continue;
+            }
+            let table_col = insert_columns.get(pos).copied().unwrap_or(pos);
+            // A column whose default is a sequence (`SERIAL`) or an identity
+            // column needs nextval/identity machinery we do not reproduce at
+            // this rewrite point; refuse rather than insert a wrong value.
+            if let Some(constraints) = constraints {
+                if constraints
+                    .sequence_defaults
+                    .get(table_col)
+                    .is_some_and(Option::is_some)
+                    || constraints.identity_always.get(table_col).copied() == Some(true)
+                {
+                    return Err(ServerError::Unsupported(
+                        "DEFAULT in VALUES for a SERIAL/identity column is not yet supported",
+                    ));
+                }
+            }
+            let replacement = constraints
+                .and_then(|c| c.defaults.get(table_col))
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or(ScalarExpr::Literal {
+                    value: Value::Null,
+                    data_type: DataType::Null,
+                });
+            new_row.push(replacement);
+        }
+        out.push(new_row);
+    }
+    Ok(out)
 }
 
 pub(super) fn build_sequence_defaults(

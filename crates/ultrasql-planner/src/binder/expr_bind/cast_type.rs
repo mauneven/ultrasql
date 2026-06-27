@@ -5,6 +5,15 @@ use super::*;
 
 pub(in crate::binder) fn resolve_cast_type(type_name: &str) -> Option<DataType> {
     let type_name = type_name.to_ascii_lowercase();
+    // Array-type casts: `int[]`, `text[]`, … The parser folds every
+    // `[]`/`[n]` suffix into a single trailing `[]`. We resolve the element
+    // type recursively and wrap it in `DataType::Array`. PostgreSQL only
+    // tracks the element type (the declared dimension count/size is not part
+    // of the value's type), so a single `Array` layer is sufficient.
+    if let Some(element_name) = type_name.strip_suffix("[]") {
+        let element = resolve_cast_type(element_name.trim_end())?;
+        return Some(DataType::Array(Box::new(element)));
+    }
     if let Some(data_type) = parse_vector_family_type_name(&type_name) {
         return Some(data_type);
     }

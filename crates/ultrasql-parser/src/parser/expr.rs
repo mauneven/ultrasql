@@ -67,44 +67,54 @@ impl<'src> Parser<'src> {
                 continue 'outer;
             }
 
+            // ----------------------------------------------------------------
+            // Postfix `IN` / `BETWEEN` / `IS` are *operators* in PostgreSQL's
+            // precedence table (Table 4.2): IN/BETWEEN at band 9
+            // (`IN_BETWEEN_PREC`), IS at band 11 (`IS_PREC`). They must obey
+            // the same `prec < min_prec` gate as the binary operators below,
+            // otherwise they would wrongly attach to the RHS of a tighter
+            // operator. For example, as the RHS of `||` (min_prec is the
+            // "other operators" level + 1) the recursion for `b` in
+            // `a || b IS NULL` must return just `b` and let the *outer*
+            // frame re-check `IS NULL` against the whole `a || b`.
+            // ----------------------------------------------------------------
+
             // `expr [NOT] BETWEEN [SYMMETRIC] low AND high`
-            if self.peek()?.kind == TokenKind::KwBetween {
-                left = self.parse_between_body(left, false)?;
-                continue 'outer;
-            }
-            if self.peek()?.kind == TokenKind::KwNot {
-                // Peek: NOT BETWEEN
-                if self.lookahead_at(1)?.kind == TokenKind::KwBetween {
+            if BinaryOp::IN_BETWEEN_PREC >= min_prec {
+                if self.peek()?.kind == TokenKind::KwBetween {
+                    left = self.parse_between_body(left, false)?;
+                    continue 'outer;
+                }
+                if self.peek()?.kind == TokenKind::KwNot
+                    && self.lookahead_at(1)?.kind == TokenKind::KwBetween
+                {
                     self.advance()?; // NOT
                     left = self.parse_between_body(left, true)?;
+                    continue 'outer;
+                }
+
+                // `expr [NOT] IN (…)` — consumed here rather than the binary
+                // loop. The IN/NOT-IN result is fed back through the loop so
+                // the standard Pratt walk keeps composing any remaining
+                // boolean chain (e.g. a trailing `AND foo > bar`).
+                if self.peek()?.kind == TokenKind::KwIn {
+                    self.advance()?; // IN
+                    left = self.parse_in_expr(left, false)?;
+                    continue 'outer;
+                }
+                if self.peek()?.kind == TokenKind::KwNot
+                    && self.lookahead_at(1)?.kind == TokenKind::KwIn
+                {
+                    self.advance()?; // NOT
+                    self.advance()?; // IN
+                    left = self.parse_in_expr(left, true)?;
                     continue 'outer;
                 }
             }
 
             // `expr IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM`
-            if self.peek()?.kind == TokenKind::KwIs {
+            if BinaryOp::IS_PREC >= min_prec && self.peek()?.kind == TokenKind::KwIs {
                 left = self.parse_is_postfix(left)?;
-                continue 'outer;
-            }
-
-            // `expr [NOT] IN (…)` — consumed here rather than the binary loop.
-            // The earlier implementation `return`ed straight out of the
-            // Pratt loop, which dropped every binary operator chained
-            // after the IN clause (e.g. the trailing `AND foo > bar`
-            // inside a WHERE block). We feed the IN/NOT-IN result back
-            // through the loop so the standard Pratt walk keeps
-            // composing the remaining boolean chain.
-            if self.peek()?.kind == TokenKind::KwIn {
-                self.advance()?; // IN
-                left = self.parse_in_expr(left, false)?;
-                continue 'outer;
-            }
-            if self.peek()?.kind == TokenKind::KwNot
-                && self.lookahead_at(1)?.kind == TokenKind::KwIn
-            {
-                self.advance()?; // NOT
-                self.advance()?; // IN
-                left = self.parse_in_expr(left, true)?;
                 continue 'outer;
             }
 
@@ -174,8 +184,10 @@ impl<'src> Parser<'src> {
                     BinaryOp::Eq.precedence()
                 } else {
                     // Arithmetic / bitwise unary (+ - ~) bind tighter than any
-                    // binary operator, as in PostgreSQL.
-                    9
+                    // binary operator (including `^`), as in PostgreSQL: `-2^2`
+                    // parses as `(-2)^2` = 4, not `-(2^2)` = -4. Track Pow (the
+                    // tightest binary op) so this survives precedence renumbering.
+                    BinaryOp::Pow.precedence() + 1
                 };
                 let rhs = self.parse_expr_with_precedence(rhs_min_prec)?;
                 let span = Span::new(op_tok.span.start, rhs.span().end);
@@ -1370,6 +1382,26 @@ impl<'src> Parser<'src> {
             let rp = self.expect(TokenKind::RParen, ")")?;
             target.value = format!("{base}({len})");
             target.span = Span::new(target.span.start, rp.span.end);
+        }
+
+        // Optional trailing array suffixes: `int[]`, `text[][]`, `int[3]`.
+        // PostgreSQL treats every `[]`/`[n]` as one more array dimension and
+        // ignores the declared size, so we fold them all into a single `[]`
+        // marker on the type-name string. Without this, `'{1,2}'::int[]`
+        // would mis-parse the `[` as a subscript on `('{1,2}'::int)`.
+        let mut saw_array = false;
+        while self.peek()?.kind == TokenKind::LBracket {
+            self.advance()?; // [
+            // PostgreSQL accepts (and ignores) an optional dimension size.
+            if self.peek()?.kind == TokenKind::Integer {
+                self.advance()?;
+            }
+            let rb = self.expect(TokenKind::RBracket, "]")?;
+            saw_array = true;
+            target.span = Span::new(target.span.start, rb.span.end);
+        }
+        if saw_array {
+            target.value = format!("{}[]", target.value);
         }
         Ok(target)
     }

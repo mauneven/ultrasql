@@ -134,7 +134,15 @@ impl Parser<'_> {
         self.expect(TokenKind::LParen, "(")?;
         let mut exprs = Vec::new();
         loop {
-            exprs.push(self.parse_expr()?);
+            // `DEFAULT` is only legal as a whole VALUES cell (PostgreSQL),
+            // so we accept it here rather than in the general expression
+            // grammar — keeping it an error in arbitrary expressions.
+            if self.peek()?.kind == TokenKind::KwDefault {
+                let tok = self.advance()?;
+                exprs.push(crate::ast::Expr::Default { span: tok.span });
+            } else {
+                exprs.push(self.parse_expr()?);
+            }
             match self.peek()?.kind {
                 TokenKind::Comma => {
                     self.advance()?;
@@ -358,6 +366,30 @@ mod tests {
         for row in rows {
             assert_eq!(row.len(), 2);
         }
+    }
+
+    #[test]
+    fn insert_values_default_cell() {
+        let stmt = parse_insert("INSERT INTO t (a, b) VALUES (1, DEFAULT), (2, 5)");
+        let InsertSource::Values(rows) = &stmt.source else {
+            panic!("expected Values source")
+        };
+        assert_eq!(rows.len(), 2);
+        // First row's second cell is the DEFAULT sentinel.
+        assert!(matches!(rows[0][1], Expr::Default { .. }));
+        // Second row's second cell is a plain literal.
+        assert!(matches!(rows[1][1], Expr::Literal(Literal::Integer { .. })));
+    }
+
+    #[test]
+    fn default_keyword_rejected_outside_values() {
+        // `DEFAULT` is not a general expression; the WHERE parser must
+        // refuse it.
+        let err = Parser::new("SELECT * FROM t WHERE a = DEFAULT").parse_statement();
+        assert!(
+            err.is_err(),
+            "DEFAULT in an expression must be a parse error"
+        );
     }
 
     #[test]

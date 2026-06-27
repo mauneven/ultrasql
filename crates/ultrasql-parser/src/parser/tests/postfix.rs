@@ -174,6 +174,56 @@ fn postfix_cast_integer() {
 }
 
 #[test]
+fn postfix_cast_array_type() {
+    // `::int[]` must be the cast target, not a subscript on `(x::int)`.
+    let expr = parse_expr("x::int[]");
+    let Expr::PostfixCast { target, expr, .. } = expr else {
+        panic!("expected postfix array cast, got {expr:?}");
+    };
+    assert_eq!(target.value, "int[]");
+    assert!(
+        matches!(*expr, Expr::Column { .. }),
+        "operand should be the column, not a subscript"
+    );
+}
+
+#[test]
+fn postfix_cast_array_literal_text() {
+    // `'{1,2,3}'::int[]` previously mis-parsed the `[` as a subscript.
+    let expr = parse_expr("'{1,2,3}'::int[]");
+    let Expr::PostfixCast { target, .. } = expr else {
+        panic!("expected postfix array cast, got {expr:?}");
+    };
+    assert_eq!(target.value, "int[]");
+}
+
+#[test]
+fn postfix_cast_array_type_collapses_dimensions_and_size() {
+    // Multiple `[]` and a declared size all collapse to a single `[]`.
+    for (sql, expected) in [
+        ("x::text[][]", "text[]"),
+        ("x::int[3]", "int[]"),
+        ("x::numeric[]", "numeric[]"),
+    ] {
+        let expr = parse_expr(sql);
+        let Expr::PostfixCast { target, .. } = expr else {
+            panic!("expected postfix array cast for {sql}")
+        };
+        assert_eq!(target.value, expected);
+    }
+}
+
+#[test]
+fn cast_expr_array_type() {
+    // `CAST(x AS text[])` prefix form.
+    let expr = parse_expr("CAST(x AS text[])");
+    let Expr::Cast { target, .. } = expr else {
+        panic!("expected CAST array, got {expr:?}");
+    };
+    assert_eq!(target.value, "text[]");
+}
+
+#[test]
 fn postfix_cast_vector_with_modifier() {
     let expr = parse_expr("'[1,2,3]'::VECTOR(3)");
     let Expr::PostfixCast { target, .. } = expr else {
