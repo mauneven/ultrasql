@@ -15,25 +15,31 @@ fn date_json_xml_bit_and_network_helpers_cover_scalar_edges() {
             "extract",
             vec![Value::Text("year".to_owned()), date.clone()]
         ),
-        Value::Int64(2024)
+        Value::Decimal {
+            value: 2024,
+            scale: 0
+        }
     );
     assert_eq!(
         eval_fn(
             "extract",
             vec![Value::Text("month".to_owned()), date.clone()]
         ),
-        Value::Int64(2)
+        Value::Decimal { value: 2, scale: 0 }
     );
     assert_eq!(
         eval_fn("extract", vec![Value::Text("day".to_owned()), date]),
-        Value::Int64(29)
+        Value::Decimal {
+            value: 29,
+            scale: 0
+        }
     );
     assert_eq!(
         eval_fn(
             "extract",
             vec![Value::Text("hour".to_owned()), Value::Time(3_661_000_000)]
         ),
-        Value::Int64(1)
+        Value::Decimal { value: 1, scale: 0 }
     );
     assert_eq!(
         eval_fn(
@@ -47,7 +53,7 @@ fn date_json_xml_bit_and_network_helpers_cover_scalar_edges() {
                 },
             ]
         ),
-        Value::Int64(0)
+        Value::Decimal { value: 0, scale: 0 }
     );
     assert_eq!(
         eval_fn(

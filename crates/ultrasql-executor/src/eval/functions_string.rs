@@ -288,6 +288,29 @@ pub(crate) fn eval_numeric_binary(
     Ok(Value::Float64(op(left, right)))
 }
 
+/// `log(x)` returns base-10 logarithm; `log(b, x)` returns the logarithm
+/// of `x` to base `b` (computed as `ln(x) / ln(b)`). This mirrors
+/// PostgreSQL, where `log` is overloaded on arity. Both forms return
+/// `double precision` here (numeric-typing of `log` is out of scope), so
+/// the produced `Float64` agrees with the planner's declared `Float64`.
+pub(crate) fn eval_log(args: &[Value]) -> Result<Value, EvalError> {
+    match args.len() {
+        1 => eval_numeric_unary(args, "log", f64::log10),
+        2 => {
+            let Some(base) = numeric_arg("log", args, 0)? else {
+                return Ok(Value::Null);
+            };
+            let Some(x) = numeric_arg("log", args, 1)? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(x.ln() / base.ln()))
+        }
+        n => Err(EvalError::Type(format!(
+            "log: expected 1 or 2 args, got {n}"
+        ))),
+    }
+}
+
 /// `mod(a, b)` with an integer fast path.
 ///
 /// When both arguments are integers, the remainder is computed exactly
@@ -401,11 +424,23 @@ pub(crate) fn eval_bit_length(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let Some(bits) = bit_string_arg("bit_length", args, 0)? else {
-        return Ok(Value::Null);
+    // PostgreSQL: `bit_length(text)` is the byte length times 8;
+    // `bit_length(bit)` is the exact bit count of the bit string.
+    let len = match &args[0] {
+        Value::Text(s) => s.len().checked_mul(8),
+        Value::Char(s) => bpchar_semantic_text(s).len().checked_mul(8),
+        Value::BitString(bits) => usize::try_from(bits.len()).ok(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "bit_length: argument 1 must be text or bit string, got {:?}",
+                other.data_type()
+            )));
+        }
     };
-    let len = i32::try_from(bits.len())
-        .map_err(|_| EvalError::Type("bit_length: result overflow".to_owned()))?;
+    let len = len
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or_else(|| EvalError::Type("bit_length: result overflow".to_owned()))?;
     Ok(Value::Int32(len))
 }
 
@@ -416,10 +451,22 @@ pub(crate) fn eval_octet_length(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let Some(bits) = bit_string_arg("octet_length", args, 0)? else {
-        return Ok(Value::Null);
+    // PostgreSQL: `octet_length(text)` is the number of bytes in the UTF-8
+    // encoding (so multibyte characters count more than once);
+    // `octet_length(bit)` is the byte length of the bit string.
+    let len = match &args[0] {
+        Value::Text(s) => s.len(),
+        Value::Char(s) => bpchar_semantic_text(s).len(),
+        Value::BitString(bits) => bits.octet_len() as usize,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "octet_length: argument 1 must be text or bit string, got {:?}",
+                other.data_type()
+            )));
+        }
     };
-    let len = i32::try_from(bits.octet_len())
+    let len = i32::try_from(len)
         .map_err(|_| EvalError::Type("octet_length: result overflow".to_owned()))?;
     Ok(Value::Int32(len))
 }

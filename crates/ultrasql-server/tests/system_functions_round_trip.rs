@@ -277,6 +277,22 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
     assert_eq!(row.get::<_, String>(20), "X123abc");
     assert_eq!(row.get::<_, String>(21), "X123X");
 
+    // FIX 7 — octet_length/bit_length accept text. ASCII counts one byte
+    // per character; a multibyte UTF-8 string counts its encoded bytes.
+    let byte_lengths = client
+        .query_one(
+            "SELECT \
+             octet_length('abc'), \
+             octet_length('héllo'), \
+             bit_length('jose')",
+            &[],
+        )
+        .await
+        .expect("octet/bit length on text");
+    assert_eq!(byte_lengths.get::<_, i32>(0), 3);
+    assert_eq!(byte_lengths.get::<_, i32>(1), 6);
+    assert_eq!(byte_lengths.get::<_, i32>(2), 32);
+
     shutdown(running).await;
 }
 
@@ -380,6 +396,16 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
         .await
         .expect("numeric round");
     assert_eq!(numeric_round.get::<_, String>(0), "3");
+
+    // FIX 8 — log(b, x) is the logarithm of x to base b; log(x) stays
+    // base-10. Both forms return double precision.
+    let log_base = client
+        .query_one("SELECT log(2, 64), log(10, 1000), log(100)", &[])
+        .await
+        .expect("log base form");
+    assert!((log_base.get::<_, f64>(0) - 6.0).abs() < 1e-9);
+    assert!((log_base.get::<_, f64>(1) - 3.0).abs() < 1e-9);
+    assert!((log_base.get::<_, f64>(2) - 2.0).abs() < 1e-9);
 
     let row = client
         .query_one(
@@ -495,34 +521,85 @@ async fn scalar_datetime_functions_return_postgres_shaped_values() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;
 
+    // FIX 6 — extract()/date_part() return `numeric` (not integer), so the
+    // values are read via a `::text` cast. Whole-number units render with
+    // scale 0; `second`/`epoch` keep the fractional micros (scale 6).
     let row = client
         .query_one(
             "SELECT \
-             extract(year FROM DATE '2024-05-22'), \
-             extract(hour FROM TIMESTAMP '2024-05-22 13:14:15'), \
-             extract(epoch FROM TIMESTAMP '2000-01-02 00:00:00'), \
+             extract(year FROM DATE '2024-05-22')::text, \
+             pg_typeof(extract(year FROM DATE '2024-05-22'))::text, \
+             extract(hour FROM TIMESTAMP '2024-05-22 13:14:15')::text, \
+             extract(epoch FROM TIMESTAMP '2000-01-02 00:00:00')::text, \
              extract(year FROM current_date) >= 2026, \
-             extract(epoch FROM to_timestamp(86400)), \
-             extract(day FROM make_date(2024, 2, 29)), \
-             extract(day FROM date_trunc('month', TIMESTAMP '2024-05-22 13:14:15')), \
-             extract(hour FROM date_trunc('day', TIMESTAMP '2024-05-22 13:14:15')), \
-             extract(day FROM age(TIMESTAMP '2024-05-22 13:14:15', TIMESTAMP '2024-05-20 12:14:15')), \
-             extract(day FROM date_bin(INTERVAL '1' DAY, TIMESTAMP '2000-01-03 15:00:00', TIMESTAMP '2000-01-01 00:00:00'))",
+             extract(epoch FROM to_timestamp(86400))::text, \
+             extract(day FROM make_date(2024, 2, 29))::text, \
+             extract(day FROM date_trunc('month', TIMESTAMP '2024-05-22 13:14:15'))::text, \
+             extract(hour FROM date_trunc('day', TIMESTAMP '2024-05-22 13:14:15'))::text, \
+             extract(day FROM age(TIMESTAMP '2024-05-22 13:14:15', TIMESTAMP '2024-05-20 12:14:15'))::text, \
+             extract(day FROM date_bin(INTERVAL '1' DAY, TIMESTAMP '2000-01-03 15:00:00', TIMESTAMP '2000-01-01 00:00:00'))::text",
             &[],
         )
         .await
         .expect("datetime functions");
 
-    assert_eq!(row.get::<_, i64>(0), 2024);
-    assert_eq!(row.get::<_, i64>(1), 13);
-    assert_eq!(row.get::<_, i64>(2), 946_771_200);
-    assert!(row.get::<_, bool>(3));
-    assert_eq!(row.get::<_, i64>(4), 86_400);
-    assert_eq!(row.get::<_, i64>(5), 29);
-    assert_eq!(row.get::<_, i64>(6), 1);
-    assert_eq!(row.get::<_, i64>(7), 0);
-    assert_eq!(row.get::<_, i64>(8), 2);
-    assert_eq!(row.get::<_, i64>(9), 3);
+    assert_eq!(row.get::<_, String>(0), "2024");
+    assert_eq!(row.get::<_, String>(1), "numeric");
+    assert_eq!(row.get::<_, String>(2), "13");
+    assert_eq!(row.get::<_, String>(3), "946771200.000000");
+    assert!(row.get::<_, bool>(4));
+    assert_eq!(row.get::<_, String>(5), "86400.000000");
+    assert_eq!(row.get::<_, String>(6), "29");
+    assert_eq!(row.get::<_, String>(7), "1");
+    assert_eq!(row.get::<_, String>(8), "0");
+    assert_eq!(row.get::<_, String>(9), "2");
+    assert_eq!(row.get::<_, String>(10), "3");
+
+    // Sub-second precision survives: `second`/`milliseconds`/`microseconds`
+    // report the fractional part, and `extract` still drives GROUP BY/WHERE.
+    let sub_second = client
+        .query_one(
+            "SELECT \
+             extract(second FROM TIME '00:00:01.5')::text, \
+             pg_typeof(extract(second FROM TIME '00:00:01.5'))::text, \
+             extract(milliseconds FROM TIME '00:00:01.5')::text, \
+             extract(microseconds FROM TIME '00:00:01.5')::text",
+            &[],
+        )
+        .await
+        .expect("sub-second extract");
+    assert_eq!(sub_second.get::<_, String>(0), "1.500000");
+    assert_eq!(sub_second.get::<_, String>(1), "numeric");
+    assert_eq!(sub_second.get::<_, String>(2), "1500.000");
+    assert_eq!(sub_second.get::<_, String>(3), "1500000");
+
+    // extract() in WHERE and GROUP BY still works end-to-end.
+    client
+        .batch_execute(
+            "CREATE TABLE extract_dates (d DATE NOT NULL); \
+             INSERT INTO extract_dates VALUES (DATE '2020-03-15'), (DATE '2021-06-20')",
+        )
+        .await
+        .expect("create extract table");
+    let filtered = client
+        .query(
+            "SELECT d FROM extract_dates WHERE extract(year FROM d) = 2020",
+            &[],
+        )
+        .await
+        .expect("extract in where");
+    assert_eq!(filtered.len(), 1);
+    let grouped = client
+        .query(
+            "SELECT count(*) \
+             FROM extract_dates GROUP BY extract(year FROM d) ORDER BY count(*)",
+            &[],
+        )
+        .await
+        .expect("extract in group by");
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0].get::<_, i64>(0), 1);
+    assert_eq!(grouped[1].get::<_, i64>(0), 1);
 
     shutdown(running).await;
 }

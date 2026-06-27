@@ -22,7 +22,10 @@ pub(in crate::binder) fn builtin_return_type(
             Ok(args[0].data_type())
         }
         "least" | "greatest" | "min" | "max" => common_scalar_return_type(func_name, args),
-        "extract" => Ok(DataType::Int64),
+        "extract" => Ok(DataType::Decimal {
+            precision: None,
+            scale: None,
+        }),
         "current_date" | "make_date" => Ok(DataType::Date),
         "now" | "current_timestamp" | "date_trunc" | "to_timestamp" | "date_bin" => {
             Ok(DataType::TimestampTz)

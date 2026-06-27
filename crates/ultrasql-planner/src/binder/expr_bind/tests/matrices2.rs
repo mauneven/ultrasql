@@ -28,7 +28,14 @@ fn builtin_validation_and_type_matrix_covers_catalog_introspection_surface() {
             vec![null_arg(DataType::Float64)],
             DataType::Float64,
         ),
-        ("extract", Vec::new(), DataType::Int64),
+        (
+            "extract",
+            Vec::new(),
+            DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+        ),
         ("current_date", Vec::new(), DataType::Date),
         ("now", Vec::new(), DataType::TimestampTz),
         ("age", Vec::new(), DataType::Interval),

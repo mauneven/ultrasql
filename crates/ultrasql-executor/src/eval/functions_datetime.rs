@@ -188,23 +188,37 @@ pub(crate) fn eval_extract(args: &[Value]) -> Result<Value, EvalError> {
         return Ok(Value::Null);
     }
     let unit_norm = unit.to_ascii_lowercase();
-    let out_i64 = extract_datetime_part(&unit_norm, &args[1])?;
-    Ok(Value::Int64(out_i64))
+    // PostgreSQL's `extract`/`date_part` return `numeric`, preserving
+    // sub-second precision (e.g. `extract(second from ...)` keeps the
+    // fractional micros). Each unit reports its own scale: SECOND/EPOCH
+    // are scale 6, MILLISECONDS scale 3, MICROSECONDS scale 0, and the
+    // whole-number units (year/month/day/...) are scale 0. The binder
+    // declares the result as `Decimal { scale: None }`, whose projection
+    // path stringifies each value with its own scale — so the per-unit
+    // scale survives to the wire.
+    let (value, scale) = extract_datetime_part(&unit_norm, &args[1])?;
+    Ok(Value::Decimal { value, scale })
 }
 
-pub(crate) fn extract_datetime_part(unit: &str, source: &Value) -> Result<i64, EvalError> {
+pub(crate) fn extract_datetime_part(unit: &str, source: &Value) -> Result<(i64, i32), EvalError> {
     match source {
         Value::Date(days) => {
             let (year, month, day) = civil_from_days(*days);
             match unit {
-                "year" => Ok(i64::from(year)),
-                "month" => Ok(i64::from(month)),
-                "day" => Ok(i64::from(day)),
-                "quarter" => Ok(i64::from((month - 1) / 3 + 1)),
-                "epoch" => Ok(date_as_timestamp(*days)?
-                    .checked_add(UNIX_TO_ENGINE_EPOCH_MICROS)
-                    .ok_or_else(|| EvalError::Type("extract: epoch overflow".to_owned()))?
-                    / 1_000_000),
+                "year" => Ok((i64::from(year), 0)),
+                "month" => Ok((i64::from(month), 0)),
+                "day" => Ok((i64::from(day), 0)),
+                "quarter" => Ok((i64::from((month - 1) / 3 + 1), 0)),
+                "hour" | "minute" => Ok((0, 0)),
+                "second" => Ok((0, 6)),
+                "milliseconds" => Ok((0, 3)),
+                "microseconds" => Ok((0, 0)),
+                "epoch" => {
+                    let micros = date_as_timestamp(*days)?
+                        .checked_add(UNIX_TO_ENGINE_EPOCH_MICROS)
+                        .ok_or_else(|| EvalError::Type("extract: epoch overflow".to_owned()))?;
+                    Ok((micros, 6))
+                }
                 other => Err(EvalError::Type(format!(
                     "extract: unit `{other}` not implemented"
                 ))),
@@ -226,35 +240,42 @@ pub(crate) fn extract_datetime_part(unit: &str, source: &Value) -> Result<i64, E
     }
 }
 
-pub(crate) fn extract_timestamp_part(unit: &str, micros: i64) -> Result<i64, EvalError> {
+pub(crate) fn extract_timestamp_part(unit: &str, micros: i64) -> Result<(i64, i32), EvalError> {
     let days = micros.div_euclid(MICROS_PER_DAY);
     let time = micros.rem_euclid(MICROS_PER_DAY);
     let days_i32 = i32::try_from(days).unwrap_or(i32::MAX);
     let (year, month, day) = civil_from_days(days_i32);
     match unit {
-        "year" => Ok(i64::from(year)),
-        "month" => Ok(i64::from(month)),
-        "day" => Ok(i64::from(day)),
-        "quarter" => Ok(i64::from((month - 1) / 3 + 1)),
-        "hour" => Ok(time / 3_600_000_000),
-        "minute" => Ok(time % 3_600_000_000 / 60_000_000),
-        "second" => Ok(time % 60_000_000 / 1_000_000),
-        "epoch" => Ok(micros
-            .checked_add(UNIX_TO_ENGINE_EPOCH_MICROS)
-            .ok_or_else(|| EvalError::Type("extract: epoch overflow".to_owned()))?
-            / 1_000_000),
+        "year" => Ok((i64::from(year), 0)),
+        "month" => Ok((i64::from(month), 0)),
+        "day" => Ok((i64::from(day), 0)),
+        "quarter" => Ok((i64::from((month - 1) / 3 + 1), 0)),
+        "hour" => Ok((time / 3_600_000_000, 0)),
+        "minute" => Ok((time % 3_600_000_000 / 60_000_000, 0)),
+        "second" => Ok((time % 60_000_000, 6)),
+        "milliseconds" => Ok((time % 60_000_000, 3)),
+        "microseconds" => Ok((time % 60_000_000, 0)),
+        "epoch" => {
+            let total = micros
+                .checked_add(UNIX_TO_ENGINE_EPOCH_MICROS)
+                .ok_or_else(|| EvalError::Type("extract: epoch overflow".to_owned()))?;
+            Ok((total, 6))
+        }
         other => Err(EvalError::Type(format!(
             "extract: unit `{other}` not implemented"
         ))),
     }
 }
 
-pub(crate) fn extract_time_part(unit: &str, micros: i64) -> Result<i64, EvalError> {
+pub(crate) fn extract_time_part(unit: &str, micros: i64) -> Result<(i64, i32), EvalError> {
     let time = micros.rem_euclid(MICROS_PER_DAY);
     match unit {
-        "hour" => Ok(time / 3_600_000_000),
-        "minute" => Ok(time % 3_600_000_000 / 60_000_000),
-        "second" => Ok(time % 60_000_000 / 1_000_000),
+        "hour" => Ok((time / 3_600_000_000, 0)),
+        "minute" => Ok((time % 3_600_000_000 / 60_000_000, 0)),
+        "second" => Ok((time % 60_000_000, 6)),
+        "milliseconds" => Ok((time % 60_000_000, 3)),
+        "microseconds" => Ok((time % 60_000_000, 0)),
+        "epoch" => Ok((time, 6)),
         other => Err(EvalError::Type(format!(
             "extract: unit `{other}` not implemented"
         ))),
@@ -266,18 +287,23 @@ pub(crate) fn extract_interval_part(
     months: i32,
     days: i32,
     microseconds: i64,
-) -> Result<i64, EvalError> {
+) -> Result<(i64, i32), EvalError> {
     match unit {
-        "year" => Ok(i64::from(months / 12)),
-        "month" => Ok(i64::from(months % 12)),
-        "day" => Ok(i64::from(days)),
-        "hour" => Ok(microseconds / 3_600_000_000),
-        "minute" => Ok(microseconds % 3_600_000_000 / 60_000_000),
-        "second" => Ok(microseconds % 60_000_000 / 1_000_000),
-        "epoch" => Ok(i64::from(days)
-            .checked_mul(86_400)
-            .and_then(|base| base.checked_add(microseconds / 1_000_000))
-            .ok_or_else(|| EvalError::Type("extract: interval epoch overflow".to_owned()))?),
+        "year" => Ok((i64::from(months / 12), 0)),
+        "month" => Ok((i64::from(months % 12), 0)),
+        "day" => Ok((i64::from(days), 0)),
+        "hour" => Ok((microseconds / 3_600_000_000, 0)),
+        "minute" => Ok((microseconds % 3_600_000_000 / 60_000_000, 0)),
+        "second" => Ok((microseconds % 60_000_000, 6)),
+        "milliseconds" => Ok((microseconds % 60_000_000, 3)),
+        "microseconds" => Ok((microseconds % 60_000_000, 0)),
+        "epoch" => {
+            let total = i64::from(days)
+                .checked_mul(86_400_000_000)
+                .and_then(|base| base.checked_add(microseconds))
+                .ok_or_else(|| EvalError::Type("extract: interval epoch overflow".to_owned()))?;
+            Ok((total, 6))
+        }
         other => Err(EvalError::Type(format!(
             "extract: unit `{other}` not implemented"
         ))),

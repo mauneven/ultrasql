@@ -268,7 +268,7 @@ pub(crate) fn eval_expr(
 ///
 /// Today's support set is the slice needed for TPC-H lift-off:
 /// - `abs(int)` — absolute value. Returns `i64`.
-/// - `extract(unit, date)` — date-part extraction. Returns `i64`.
+/// - `extract(unit, date)` — date-part extraction. Returns `numeric`.
 /// - `lower(text)` / `upper(text)` — case folding for expression indexes
 ///   and simple scalar projections.
 /// - `pg_get_userbyid(oid)` — catalog helper for psql meta SQL.
@@ -301,7 +301,7 @@ fn eval_function_call(
         "sqrt" => eval_numeric_unary(args, "sqrt", f64::sqrt),
         "exp" => eval_numeric_unary(args, "exp", f64::exp),
         "ln" => eval_numeric_unary(args, "ln", f64::ln),
-        "log" => eval_numeric_unary(args, "log", f64::log10),
+        "log" => eval_log(args),
         "random" => eval_random(args),
         "sin" => eval_numeric_unary(args, "sin", f64::sin),
         "cos" => eval_numeric_unary(args, "cos", f64::cos),

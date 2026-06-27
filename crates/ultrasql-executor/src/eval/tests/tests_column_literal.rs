@@ -207,6 +207,38 @@ fn text_math_regex_and_format_helpers_cover_common_scalar_paths() {
         ),
         Value::Int32(1)
     );
+    // FIX 7 — octet_length/bit_length accept text. ASCII counts one byte
+    // per char; multibyte UTF-8 counts the encoded bytes; bit_length is
+    // octet_length * 8 for text; NULL stays NULL.
+    assert_eq!(
+        eval_fn("octet_length", vec![Value::Text("abc".to_owned())]),
+        Value::Int32(3)
+    );
+    assert_eq!(
+        eval_fn("octet_length", vec![Value::Text("héllo".to_owned())]),
+        Value::Int32(6)
+    );
+    assert_eq!(
+        eval_fn("octet_length", vec![Value::Char("ab ".to_owned())]),
+        Value::Int32(2)
+    );
+    assert_eq!(
+        eval_fn("bit_length", vec![Value::Text("jose".to_owned())]),
+        Value::Int32(32)
+    );
+    assert_eq!(eval_fn("octet_length", vec![Value::Null]), Value::Null);
+    assert_eq!(eval_fn("bit_length", vec![Value::Null]), Value::Null);
+    // FIX 8 — log(b, x) is log base b of x; log(x) is base-10.
+    assert!(
+        matches!(eval_fn("log", vec![Value::Int32(2), Value::Int32(64)]),
+            Value::Float64(v) if (v - 6.0).abs() < 1e-9)
+    );
+    assert!(
+        matches!(eval_fn("log", vec![Value::Int32(10), Value::Int32(1000)]),
+            Value::Float64(v) if (v - 3.0).abs() < 1e-9)
+    );
+    assert!(matches!(eval_fn("log", vec![Value::Int32(100)]),
+            Value::Float64(v) if (v - 2.0).abs() < 1e-9));
     assert_eq!(
         eval_fn("trim", vec![Value::Text("  hi  ".to_owned())]),
         Value::Text("hi".to_owned())
