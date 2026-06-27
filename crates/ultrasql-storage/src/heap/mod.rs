@@ -467,6 +467,139 @@ impl Int32PairUndoBatch {
     }
 }
 
+/// Reconstruct the pre-image an in-place-updated slot must show to
+/// `snapshot`, by reversing every undo record whose `writer_xid` the
+/// snapshot cannot see. Shared by the closure scan (`scan.rs`) and the
+/// free walker (`walker.rs`) so both paths use identical logic.
+///
+/// Two record kinds coexist for one slot:
+///
+/// - **Full-payload [`UndoEntry`]**: each writer stored the payload as
+///   it stood *before that writer* applied. The state the snapshot
+///   must observe is the value last committed before it took its
+///   snapshot — i.e. the `old_payload` of the **oldest** (smallest
+///   `writer_xid`) invisible writer. Picking the newest would surface
+///   an intermediate version (snapshot-isolation violation).
+/// - **Compact [`Int32PairUndoBatch`]**: each writer stored a signed
+///   `delta` on one `target_col`. Reversing one writer is not enough
+///   when several stacked; we subtract the **sum of all invisible
+///   deltas** for each affected column from the current payload.
+///
+/// A writer the snapshot *can* see is already reflected in the current
+/// payload and is left untouched, so a mix of visible + invisible
+/// writers correctly yields the state after the last visible writer.
+pub(crate) fn undo_pre_image_from_log<O>(
+    log: &UndoRelationLog,
+    tid: TupleId,
+    current_payload: &[u8],
+    snapshot: &ultrasql_mvcc::Snapshot,
+    oracle: &O,
+) -> Option<Vec<u8>>
+where
+    O: ultrasql_mvcc::XidStatusOracle + ?Sized,
+{
+    // Full-payload path: select the oldest invisible writer's
+    // pre-image. Entries are appended in `(tid, writer_xid)` order;
+    // walking forward visits writers oldest-first, so the first
+    // invisible writer we meet is the oldest. For the bench's
+    // autocommit workload `entries` is short; binary search by tid
+    // would be a follow-up.
+    let mut oldest_invisible_full: Option<(Xid, &[u8; 9])> = None;
+    for entry in &log.entries {
+        if entry.tid != tid {
+            continue;
+        }
+        let writer = entry.writer_xid;
+        // Skip writers the snapshot already sees — their change is
+        // baked into `current_payload` and must NOT be reversed.
+        if undo_writer_visible_to_snapshot(writer, snapshot, oracle) {
+            continue;
+        }
+        if oldest_invisible_full.is_none_or(|(best, _)| writer < best) {
+            oldest_invisible_full = Some((writer, &entry.old_payload));
+        }
+    }
+
+    // Compact int32-pair path: accumulate the signed sum of every
+    // invisible writer's delta, per affected column, then apply
+    // `current − sum` once. A visible writer's delta is left in place.
+    let mut sum_delta_col0: i64 = 0;
+    let mut sum_delta_col1: i64 = 0;
+    let mut saw_compact_invisible = false;
+    for batch in &log.int32_pair_batches {
+        if batch.page != tid.page || !batch.contains_slot(tid.slot) {
+            continue;
+        }
+        if undo_writer_visible_to_snapshot(batch.writer_xid, snapshot, oracle) {
+            continue;
+        }
+        saw_compact_invisible = true;
+        let delta = i64::from(batch.delta);
+        if batch.target_col == 0 {
+            sum_delta_col0 += delta;
+        } else {
+            sum_delta_col1 += delta;
+        }
+    }
+
+    // Precedence: if both kinds touched this slot, the full-payload
+    // oldest invisible pre-image already captures the complete
+    // pre-snapshot state, so prefer it.
+    if let Some((_, payload)) = oldest_invisible_full {
+        return Some(payload.to_vec());
+    }
+    if saw_compact_invisible {
+        return compact_int32_pair_reverse_deltas(current_payload, sum_delta_col0, sum_delta_col1);
+    }
+    None
+}
+
+#[inline]
+fn undo_writer_visible_to_snapshot<O>(
+    writer: Xid,
+    snapshot: &ultrasql_mvcc::Snapshot,
+    oracle: &O,
+) -> bool
+where
+    O: ultrasql_mvcc::XidStatusOracle + ?Sized,
+{
+    if snapshot.is_current_xid(writer) {
+        true
+    } else if snapshot.xid_in_progress(writer) {
+        false
+    } else {
+        matches!(
+            oracle.status(writer),
+            ultrasql_mvcc::status::XidStatus::Committed | ultrasql_mvcc::status::XidStatus::Frozen,
+        )
+    }
+}
+
+/// Reverse the accumulated invisible deltas for a 9-byte
+/// `(null, id, val)` int32-pair payload: `out[col] = current − sum`.
+/// Returns `None` on a short payload or if any column would overflow
+/// `i32`.
+fn compact_int32_pair_reverse_deltas(
+    current_payload: &[u8],
+    sum_delta_col0: i64,
+    sum_delta_col1: i64,
+) -> Option<Vec<u8>> {
+    if current_payload.len() < 9 {
+        return None;
+    }
+    let mut out = current_payload[..9].to_vec();
+    for (offset, sum) in [(1_usize, sum_delta_col0), (5_usize, sum_delta_col1)] {
+        if sum == 0 {
+            continue;
+        }
+        let current = i32::from_le_bytes(out[offset..offset + 4].try_into().ok()?);
+        let restored = i64::from(current).checked_sub(sum)?;
+        let restored = i32::try_from(restored).ok()?;
+        out[offset..offset + 4].copy_from_slice(&restored.to_le_bytes());
+    }
+    Some(out)
+}
+
 #[inline]
 fn checked_heap_count_add(
     current: usize,

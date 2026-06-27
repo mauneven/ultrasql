@@ -16,7 +16,7 @@ use crate::page::PageError;
 use crate::vm::VisibilityMap;
 
 use super::walker::VisibleHeapWalker;
-use super::{HeapAccess, HeapError, HeapTuple, UndoRelationLog};
+use super::{HeapAccess, HeapError, HeapTuple, UndoRelationLog, undo_pre_image_from_log};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Read a tuple by id. Visibility is not enforced — callers running
@@ -221,13 +221,13 @@ impl<L: PageLoader> HeapAccess<L> {
                         // in-place UPDATE the reader's snapshot does
                         // not yet see committed. Substitute the
                         // pre-image from the per-relation undo log.
-                        // Lookup is by `(tid, writer_xid == header.xmax)`;
-                        // multiple in-place updates on the same slot
-                        // produce a chain we walk newest-to-oldest,
-                        // picking the youngest entry whose writer is
-                        // still invisible to this snapshot. A missing
-                        // entry means VACUUM trimmed it after we lost
-                        // the right to see the pre-image — treat as
+                        // Multiple in-place updates on the same slot
+                        // form a chain; we reverse every writer the
+                        // snapshot cannot see (full-payload: take the
+                        // oldest invisible writer's pre-image; compact:
+                        // subtract the sum of all invisible deltas). A
+                        // missing entry means VACUUM trimmed it after we
+                        // lost the right to see the pre-image — treat as
                         // invisible (the safe direction).
                         if let Some(pre) = Self::lookup_undo_pre_image(
                             &self.undo_log,
@@ -250,10 +250,19 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
-    /// Walk the per-relation undo log newest-to-oldest looking for
-    /// the youngest pre-image whose `writer_xid` is still invisible
-    /// to `snapshot`. Returns owned bytes so the scan callback can
-    /// keep its borrow across iterations.
+    /// Reconstruct the pre-image this `snapshot` must observe for an
+    /// in-place-updated slot, by reversing every undo record whose
+    /// `writer_xid` is invisible to the snapshot.
+    ///
+    /// Full-payload entries store the payload *before* their writer
+    /// applied, so the correct pre-image is the **oldest** invisible
+    /// writer's `old_payload` (the last state committed before the
+    /// snapshot). Compact int32-pair batches store a signed delta per
+    /// writer, so the pre-image is `current − sum(invisible deltas)`
+    /// per affected column. Writers the snapshot *can* see are already
+    /// reflected in the current payload and must NOT be reversed.
+    /// Returns owned bytes so the scan callback can keep its borrow
+    /// across iterations.
     ///
     /// Lock order: caller has already dropped (or never acquired)
     /// the page-write guard; this only takes the per-relation
@@ -269,42 +278,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ) -> Option<Vec<u8>> {
         let log = undo_log.get(&rel)?;
         let log = log.read();
-        let mut best_writer: Option<Xid> = None;
-        let mut best_payload: Option<Vec<u8>> = None;
-        // Entries are appended in `(tid, writer_xid)` order; we walk
-        // backwards for newest-first. For the bench's autocommit
-        // workload `entries` is short; binary search by tid would be
-        // a follow-up.
-        for entry in log.entries.iter().rev() {
-            if entry.tid != tid {
-                continue;
-            }
-            // Pick the first (youngest) entry whose writer's commit
-            // is *not* visible to this snapshot. That is the pre-
-            // image the reader logically observes.
-            let writer = entry.writer_xid;
-            if !writer_visible_to_snapshot(writer, snapshot, oracle)
-                && best_writer.is_none_or(|best| writer > best)
-            {
-                best_writer = Some(writer);
-                best_payload = Some(entry.old_payload.to_vec());
-            }
-        }
-        for batch in log.int32_pair_batches.iter().rev() {
-            if batch.page != tid.page || !batch.contains_slot(tid.slot) {
-                continue;
-            }
-            let writer = batch.writer_xid;
-            if !writer_visible_to_snapshot(writer, snapshot, oracle)
-                && best_writer.is_none_or(|best| writer > best)
-                && let Some(pre_image) =
-                    compact_int32_pair_pre_image(current_payload, batch.target_col, batch.delta)
-            {
-                best_writer = Some(writer);
-                best_payload = Some(pre_image);
-            }
-        }
-        best_payload
+        undo_pre_image_from_log(&log, tid, current_payload, snapshot, oracle)
     }
 
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
@@ -410,39 +384,6 @@ impl<L: PageLoader> HeapAccess<L> {
             pre_image_scratch: Vec::new(),
         }
     }
-}
-
-#[inline]
-fn writer_visible_to_snapshot<O: XidStatusOracle + ?Sized>(
-    writer: Xid,
-    snapshot: &Snapshot,
-    oracle: &O,
-) -> bool {
-    if snapshot.is_current_xid(writer) {
-        true
-    } else if snapshot.xid_in_progress(writer) {
-        false
-    } else {
-        matches!(
-            oracle.status(writer),
-            ultrasql_mvcc::status::XidStatus::Committed | ultrasql_mvcc::status::XidStatus::Frozen,
-        )
-    }
-}
-
-fn compact_int32_pair_pre_image(
-    current_payload: &[u8],
-    target_col: u8,
-    delta: i32,
-) -> Option<Vec<u8>> {
-    if current_payload.len() < 9 {
-        return None;
-    }
-    let mut out = current_payload[..9].to_vec();
-    let offset = if target_col == 0 { 1 } else { 5 };
-    let current = i32::from_le_bytes(out[offset..offset + 4].try_into().ok()?);
-    out[offset..offset + 4].copy_from_slice(&current.wrapping_sub(delta).to_le_bytes());
-    Some(out)
 }
 
 /// Iterator yielded by [`HeapAccess::scan`].

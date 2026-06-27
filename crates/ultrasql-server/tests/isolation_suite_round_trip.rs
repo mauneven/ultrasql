@@ -180,6 +180,83 @@ async fn hermitage_pmp_repeatable_read_prevents_phantom_wire() {
     shutdown(running).await;
 }
 
+/// REPEATABLE READ snapshot stability across *multiple* committed
+/// in-place updates: the reader opens its snapshot with a first SELECT,
+/// a peer then commits several `value = value + 1` updates back-to-back
+/// (each an in-place update stacking an undo record), and the reader's
+/// re-SELECT must still observe its original snapshot value — not an
+/// intermediate. This is the end-to-end form of the multi-writer
+/// pre-image fix: a wrong pre-image lookup would surface an intermediate
+/// version here.
+#[tokio::test]
+async fn repeatable_read_stable_across_multiple_inplace_updates_wire() {
+    let running = start_sample_server("rr_multi_inplace").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "rr_multi_inplace_peer").await;
+
+    setup_hermitage_table(&running.client).await;
+
+    // Reader opens its snapshot. The first SELECT fixes the snapshot for
+    // the whole REPEATABLE READ transaction.
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin reader");
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT value FROM isolation_hermitage WHERE id = 1",
+        )
+        .await,
+        10,
+        "reader's snapshot value before any update"
+    );
+
+    // Peer commits several in-place updates after the reader's snapshot.
+    for _ in 0..3 {
+        peer.batch_execute("UPDATE isolation_hermitage SET value = value + 1 WHERE id = 1")
+            .await
+            .expect("peer in-place update");
+    }
+    // Sanity: a fresh (auto-commit) read sees the latest value, 13.
+    assert_eq!(
+        scalar_i32(&peer, "SELECT value FROM isolation_hermitage WHERE id = 1",).await,
+        13,
+        "post-update committed value"
+    );
+
+    // Reader re-SELECTs under the same snapshot: must STILL see 10, not
+    // 11/12/13.
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT value FROM isolation_hermitage WHERE id = 1",
+        )
+        .await,
+        10,
+        "REPEATABLE READ must keep the original snapshot value across multiple in-place updates"
+    );
+
+    running
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("reader commit");
+    // After commit, the reader sees the latest committed value.
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT value FROM isolation_hermitage WHERE id = 1",
+        )
+        .await,
+        13,
+        "after commit the reader observes the latest value"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn hermitage_g2_serializable_write_skew_aborts_one_wire() {
     let running = start_sample_server("hermitage_g2").await;

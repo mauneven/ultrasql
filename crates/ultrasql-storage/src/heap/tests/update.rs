@@ -429,6 +429,279 @@ fn parallel_no_wal_inplace_int32_update_records_undo_and_rolls_back() {
     }
 }
 
+// -----------------------------------------------------------------------
+// Multi-writer in-place-update pre-image (snapshot isolation).
+//
+// A row updated IN PLACE by several committed writers AFTER a reader's
+// snapshot must reconstruct the value as of *before the first writer
+// the reader cannot see*, not an intermediate version. Writers use xids
+// in [xmin, xmax) of `committed_snap` so each writer sees its
+// predecessor committed; readers use a snapshot whose `xmax` lands below
+// the writer xids so they fall in the implicit in-progress region.
+// -----------------------------------------------------------------------
+
+/// FULL-PAYLOAD path (`update_int32_pair_tid_inplace_undo`, one
+/// [`UndoEntry`] per write): three committed writers stack V0→V1→V2→V3.
+/// A reader whose snapshot predates all three must observe V0, not an
+/// intermediate V1/V2.
+#[test]
+fn full_payload_multi_writer_reader_sees_oldest_pre_image() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 100), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+    oracle.set_committed(Xid::new(300));
+
+    // V0 (val=100) -> V1 (105) -> V2 (108) -> V3 (114), each a committed
+    // writer that sees its predecessor committed.
+    for (writer, delta) in [(100_u64, 5_i32), (200, 3), (300, 6)] {
+        let snap = committed_snap(writer);
+        let updated = heap
+            .update_int32_pair_tid_inplace_undo(
+                UpdateInt32PairTid {
+                    tid,
+                    snapshot: &snap,
+                    oracle: &oracle,
+                    predicate: |id, _val| id == 1,
+                },
+                update_int32_edit(1, delta),
+                update_int32_stamp(writer),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+    // Physical slot is the post-image V3.
+    assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 114));
+
+    // Reader whose snapshot predates all three writers (xmax = 50, so
+    // 100/200/300 are implicitly in progress) must see V0 = 100, NOT an
+    // intermediate.
+    let reader = Snapshot::new(
+        Xid::new(20),
+        Xid::new(50),
+        Xid::new(30),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 100),
+        "reader predating all writers must see V0, not an intermediate"
+    );
+
+    // Single-writer case is still correct: a reader predating only the
+    // first writer sees V0 too (sanity that the oldest-pick is also
+    // right with one entry).
+    let single = Snapshot::new(
+        Xid::new(20),
+        Xid::new(50),
+        Xid::new(30),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let walked: Vec<(i32, i32)> = collect_walker_pairs(&heap, &single, &oracle);
+    assert_eq!(walked, vec![(1, 100)]);
+}
+
+/// FULL-PAYLOAD path with a MIX of visible and invisible writers: T100
+/// is visible to the reader, T200/T300 are not. The reader must see V1
+/// (the state after the last visible writer), reversing only the two
+/// invisible writers.
+#[test]
+fn full_payload_mixed_visibility_reader_sees_after_last_visible() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 100), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+    oracle.set_committed(Xid::new(300));
+
+    for (writer, delta) in [(100_u64, 5_i32), (200, 3), (300, 6)] {
+        let snap = committed_snap(writer);
+        heap.update_int32_pair_tid_inplace_undo(
+            UpdateInt32PairTid {
+                tid,
+                snapshot: &snap,
+                oracle: &oracle,
+                predicate: |id, _val| id == 1,
+            },
+            update_int32_edit(1, delta),
+            update_int32_stamp(writer),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    // Reader with xmax = 150: T100 < 150 and committed -> visible;
+    // T200/T300 >= 150 -> implicitly in progress -> invisible. Correct
+    // view is V1 = 105 (after the last visible writer T100).
+    let reader = Snapshot::new(
+        Xid::new(50),
+        Xid::new(150),
+        Xid::new(60),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 105),
+        "reader must see state after last visible writer (V1), not V0 or V2"
+    );
+}
+
+/// COMPACT DELTA path (`update_int32_pair_inplace_undo`, one
+/// [`Int32PairUndoBatch`] per write): `val += 5` then `val += 3` by two
+/// committed writers. A reader predating both must see `current − 8`
+/// (the base), not `current − 3` (reversing only the newest delta).
+#[test]
+fn compact_delta_multi_writer_reverses_all_invisible_deltas() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 100), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+
+    for (writer, delta) in [(100_u64, 5_i32), (200, 3)] {
+        let snap = committed_snap(writer);
+        let updated = heap
+            .update_int32_pair_inplace_undo(
+                update_int32_scan(
+                    rel(),
+                    heap.block_count(rel()),
+                    &snap,
+                    &oracle,
+                    |id, _val| id == 1,
+                ),
+                update_int32_edit(1, delta),
+                update_int32_stamp(writer),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+    // Current slot is base + 8 = 108.
+    assert_eq!(
+        int32_pair_from_payload(&heap.fetch(tid).unwrap().data),
+        (1, 108)
+    );
+
+    let reader = Snapshot::new(
+        Xid::new(20),
+        Xid::new(50),
+        Xid::new(30),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 100),
+        "reader must reverse both invisible deltas (current - 8), not just the newest"
+    );
+}
+
+/// COMPACT DELTA path, per-column correctness: two writers touch
+/// different target columns (`id += 7`, then `val += 4`). A reader
+/// predating both must reverse each column's delta independently.
+#[test]
+fn compact_delta_per_column_reverses_correctly() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 100), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+
+    // T100: id += 7  -> (8, 100). Re-target by id == 1 first.
+    let snap_100 = committed_snap(100);
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &snap_100,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(0, 7),
+        update_int32_stamp(100),
+        None,
+        None,
+    )
+    .unwrap();
+    // T200: val += 4 -> (8, 104).
+    let snap_200 = committed_snap(200);
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &snap_200,
+            &oracle,
+            |id, _val| id == 8,
+        ),
+        update_int32_edit(1, 4),
+        update_int32_stamp(200),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        int32_pair_from_payload(&heap.fetch(tid).unwrap().data),
+        (8, 104)
+    );
+
+    let reader = Snapshot::new(
+        Xid::new(20),
+        Xid::new(50),
+        Xid::new(30),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &reader, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 100),
+        "per-column reversal must restore id and val independently"
+    );
+}
+
 #[test]
 fn point_inplace_int32_update_rechecks_tid_predicate() {
     let heap = make_heap(8);

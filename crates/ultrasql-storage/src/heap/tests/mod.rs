@@ -201,6 +201,22 @@ fn int32_pair_from_payload(payload: &[u8]) -> (i32, i32) {
     (id, val)
 }
 
+/// Drive the free `VisibleHeapWalker` path (mirrors the closure scan in
+/// `scan.rs`) and collect each visible row's `(id, val)`. Exercises
+/// `walker.rs`'s pre-image reconstruction alongside the closure scan.
+fn collect_walker_pairs<O: XidStatusOracle + ?Sized>(
+    heap: &HeapAccess<MapLoader>,
+    snapshot: &Snapshot,
+    oracle: &O,
+) -> Vec<(i32, i32)> {
+    let mut walker = heap.scan_visible_walker(rel(), heap.block_count(rel()), snapshot, oracle);
+    let mut out = Vec::new();
+    while let Some((_, _, payload)) = walker.try_next().unwrap() {
+        out.push(int32_pair_from_payload(payload));
+    }
+    out
+}
+
 fn committed_snap(current_xid: u64) -> Snapshot {
     // Snapshot where all xids < 50 are outside the active set.
     Snapshot::new(
