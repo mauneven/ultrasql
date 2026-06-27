@@ -1,7 +1,8 @@
 //! Modify + index-scan pipeline tests.
 
 use super::select::{
-    between_id_literal, build_filter_scan_plan, build_index_fixture, drain_id_val, eq_id_literal,
+    between_id_literal, build_filter_scan_plan, build_index_fixture,
+    build_index_fixture_with_id_nullability, drain_id_val, eq_id_literal,
 };
 use super::{collect_pairs, column, int_row, schema_int_col, synthetic_ctx};
 use crate::pipeline::index_scan::{
@@ -258,6 +259,97 @@ fn lower_query_order_by_desc_indexed_column_picks_backward_index_scan() {
     );
     let pairs = drain_id_val(op.as_mut()).expect("drain");
     let expected: Vec<(i32, i32)> = (1..=8).rev().map(|i| (i, i * 10)).collect();
+    assert_eq!(pairs, expected);
+}
+
+/// Regression: `ORDER BY id` over a NULLABLE indexed column must NOT lower
+/// to a bare ordered index scan — the i64 B-tree never stores NULL keys, so
+/// the scan would silently drop the rows where `id IS NULL`. The lowerer
+/// must decline the fast path and emit a heap `Sort` instead, which
+/// enumerates every row. The keyed `id` column here is `Field::nullable`.
+#[test]
+fn lower_query_order_by_nullable_indexed_column_falls_back_to_sort() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) =
+        build_index_fixture_with_id_nullability("t_order_nullable", &rows, true, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([
+        Field::nullable("id", DataType::Int32),
+        Field::required("val", DataType::Int32),
+    ])
+    .expect("schema");
+    let plan = LogicalPlan::Sort {
+        input: Box::new(LogicalPlan::Scan {
+            table: "t_order_nullable".into(),
+            schema: schema.clone(),
+            projection: None,
+        }),
+        keys: vec![SortKey {
+            expr: ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        }],
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("Sort"),
+        "ORDER BY a nullable indexed column must fall back to Sort, got: {debug}"
+    );
+    assert!(
+        !debug.contains("IndexScan"),
+        "nullable ORDER BY must not serve via an ordered IndexScan, got: {debug}"
+    );
+    // All rows still flow through (the Sort enumerates the full heap).
+    let pairs = drain_id_val(op.as_mut()).expect("drain");
+    let expected: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    assert_eq!(pairs, expected);
+}
+
+/// Counterpart to the fallback test: a NOT NULL indexed column keeps the
+/// fast ordered index scan for `ORDER BY id` (ASC). Pins that the
+/// nullability guard does not regress the optimization for NOT NULL keys.
+#[test]
+fn lower_query_order_by_not_null_indexed_column_keeps_index_scan() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) =
+        build_index_fixture_with_id_nullability("t_order_not_null", &rows, true, false);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::required("val", DataType::Int32),
+    ])
+    .expect("schema");
+    let plan = LogicalPlan::Sort {
+        input: Box::new(LogicalPlan::Scan {
+            table: "t_order_not_null".into(),
+            schema: schema.clone(),
+            projection: None,
+        }),
+        keys: vec![SortKey {
+            expr: ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        }],
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("IndexScan"),
+        "ORDER BY a NOT NULL indexed column must keep the fast IndexScan, got: {debug}"
+    );
+    let pairs = drain_id_val(op.as_mut()).expect("drain");
+    let expected: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
     assert_eq!(pairs, expected);
 }
 

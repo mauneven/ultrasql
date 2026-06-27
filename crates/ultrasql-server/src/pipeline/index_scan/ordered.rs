@@ -102,6 +102,23 @@ fn try_ordered_index_scan_with_cap(
     let Some(col_idx) = column_idx_for_int_key(&key.expr) else {
         return Ok(None);
     };
+    // Correctness guard (silent row loss): the i64 B-tree never stores
+    // NULL keys, so a bare ordered index scan over a NULLABLE column
+    // enumerates only the non-NULL rows and silently drops every row
+    // where the ordering column IS NULL. It also has no way to honor
+    // NULLS FIRST/LAST. Decline the fast path and let the caller lower a
+    // heap `Sort`, which enumerates ALL rows (NULLs included) and places
+    // them per the requested NULLS clause. A NOT NULL column has no NULLs
+    // to lose, so the directed scan stays correct: the only ordering
+    // distinction it must reproduce is ASC/DESC (via `key.asc`), and the
+    // NULLS clause is vacuous when no NULLs exist.
+    if table_entry
+        .schema
+        .field(col_idx)
+        .is_none_or(|field| field.nullable)
+    {
+        return Ok(None);
+    }
     let Some(index_entry) =
         find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
     else {

@@ -419,6 +419,21 @@ pub(super) fn build_index_fixture(
     rows: &[(i32, i32)],
     with_index: bool,
 ) -> (IndexFixture, ultrasql_catalog::TableEntry, Vec<TupleId>) {
+    // The default fixture marks the keyed `id` column NOT NULL, which keeps
+    // the ordered-index-scan fast path eligible for `ORDER BY id`.
+    build_index_fixture_with_id_nullability(table_name, rows, with_index, false)
+}
+
+/// Like [`build_index_fixture`] but lets the caller choose whether the keyed
+/// `id` column is nullable. The ordered-index-scan lowerer declines the fast
+/// path for a nullable ordering column (the i64 B-tree cannot enumerate NULL
+/// keys), so this knob exercises the fall-back-to-`Sort` decision.
+pub(super) fn build_index_fixture_with_id_nullability(
+    table_name: &str,
+    rows: &[(i32, i32)],
+    with_index: bool,
+    id_nullable: bool,
+) -> (IndexFixture, ultrasql_catalog::TableEntry, Vec<TupleId>) {
     let catalog = StdArc::new(PersistentCatalog::new());
     let pool = StdArc::new(BufferPool::new(64, BlankPageLoader::new()));
     let heap = StdArc::new(HeapAccess::new(StdArc::clone(&pool)));
@@ -426,11 +441,13 @@ pub(super) fn build_index_fixture(
     let txn_manager = StdArc::new(TransactionManager::new());
 
     // Create the table in the catalog under a fresh OID.
-    let schema = Schema::new([
-        Field::required("id", DataType::Int32),
-        Field::required("val", DataType::Int32),
-    ])
-    .expect("schema ok");
+    let id_field = if id_nullable {
+        Field::nullable("id", DataType::Int32)
+    } else {
+        Field::required("id", DataType::Int32)
+    };
+    let schema =
+        Schema::new([id_field, Field::required("val", DataType::Int32)]).expect("schema ok");
     let oid = catalog.next_oid();
     let entry = ultrasql_catalog::TableEntry::new(oid, table_name, "public", schema.clone());
     catalog.create_table(entry.clone()).expect("create table");

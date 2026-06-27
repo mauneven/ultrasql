@@ -7,7 +7,7 @@
 
 use ultrasql_core::Schema;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
-use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
+use ultrasql_vec::{Batch, Bitmap, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::{ExecError, Operator};
 
@@ -141,33 +141,62 @@ fn slice_batch_range(input: &Batch, start: usize, end: usize) -> Result<Batch, E
     debug_assert!(end <= input.rows());
     let mut out = Vec::with_capacity(input.width());
     for col in input.columns() {
-        out.push(slice_column_range(col, start, end));
+        out.push(slice_column_range(col, start, end)?);
     }
     Batch::new(out).map_err(Into::into)
 }
 
-fn slice_column_range(col: &Column, start: usize, end: usize) -> Column {
-    match col {
-        Column::Int32(c) => Column::Int32(slice_numeric_range(c, start, end)),
-        Column::Int64(c) => Column::Int64(slice_numeric_range(c, start, end)),
-        Column::Float32(c) => Column::Float32(slice_numeric_range(c, start, end)),
-        Column::Float64(c) => Column::Float64(slice_numeric_range(c, start, end)),
-        Column::Bool(c) => Column::Bool(slice_bool_range(c, start, end)),
+fn slice_column_range(col: &Column, start: usize, end: usize) -> Result<Column, ExecError> {
+    Ok(match col {
+        Column::Int32(c) => Column::Int32(slice_numeric_range(c, start, end)?),
+        Column::Int64(c) => Column::Int64(slice_numeric_range(c, start, end)?),
+        Column::Float32(c) => Column::Float32(slice_numeric_range(c, start, end)?),
+        Column::Float64(c) => Column::Float64(slice_numeric_range(c, start, end)?),
+        Column::Bool(c) => Column::Bool(slice_bool_range(c, start, end)?),
         Column::Utf8(_) | Column::DictionaryUtf8(_) => slice_text_column_range(col, start, end),
-    }
+    })
 }
 
 fn slice_numeric_range<T: Copy>(
     col: &NumericColumn<T>,
     start: usize,
     end: usize,
-) -> NumericColumn<T> {
-    NumericColumn::from_data(col.data()[start..end].to_vec())
+) -> Result<NumericColumn<T>, ExecError> {
+    let data = col.data()[start..end].to_vec();
+    // Preserve the validity bitmap. Dropping it would silently turn every
+    // NULL in the sliced range into the type's zero value (e.g.
+    // `ORDER BY c LIMIT k` over a nullable column showed `0` for NULL rows).
+    match slice_validity(col.nulls(), start, end, data.len()) {
+        Some(nulls) => NumericColumn::with_nulls(data, nulls)
+            .map_err(|e| ExecError::TypeMismatch(e.to_string())),
+        None => Ok(NumericColumn::from_data(data)),
+    }
 }
 
-fn slice_bool_range(col: &BoolColumn, start: usize, end: usize) -> BoolColumn {
+fn slice_bool_range(col: &BoolColumn, start: usize, end: usize) -> Result<BoolColumn, ExecError> {
     let rows: Vec<bool> = (start..end).map(|i| col.value(i)).collect();
-    BoolColumn::from_data(rows)
+    match slice_validity(col.nulls(), start, end, rows.len()) {
+        Some(nulls) => {
+            BoolColumn::with_nulls(rows, nulls).map_err(|e| ExecError::TypeMismatch(e.to_string()))
+        }
+        None => Ok(BoolColumn::from_data(rows)),
+    }
+}
+
+/// Slice a validity bitmap to `[start, end)`, preserving the `1 = valid,
+/// 0 = null` convention. Returns `None` when the source column has no
+/// nulls (the common case), so the caller can keep the cheaper
+/// bitmap-free representation.
+fn slice_validity(nulls: Option<&Bitmap>, start: usize, end: usize, len: usize) -> Option<Bitmap> {
+    let src = nulls?;
+    let mut out = Bitmap::new(len, true);
+    for (out_row, src_row) in (start..end).enumerate() {
+        // A bit beyond the source length is treated as null, matching the
+        // column accessors' tolerance for short bitmaps.
+        let valid = src_row < src.len() && src.get(src_row);
+        out.set(out_row, valid);
+    }
+    Some(out)
 }
 
 fn slice_text_column_range(col: &Column, start: usize, end: usize) -> Column {
@@ -265,6 +294,52 @@ mod tests {
             Column::Utf8(s) => {
                 assert_eq!(s.value(0), "a");
                 assert_eq!(s.value(1), "bb");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_preserves_numeric_and_bool_nulls() {
+        use ultrasql_vec::Bitmap;
+        use ultrasql_vec::column::BoolColumn;
+
+        // Int32 column: rows [10, NULL, 30, NULL]; bitmap 1=valid.
+        let mut int_nulls = Bitmap::new(4, true);
+        int_nulls.set(1, false);
+        int_nulls.set(3, false);
+        let ints = NumericColumn::with_nulls(vec![10_i32, 0, 30, 0], int_nulls).unwrap();
+        // Bool column: rows [true, NULL, false, NULL].
+        let mut bool_nulls = Bitmap::new(4, true);
+        bool_nulls.set(1, false);
+        bool_nulls.set(3, false);
+        let bools = BoolColumn::with_nulls(vec![true, false, false, false], bool_nulls).unwrap();
+
+        let batch = Batch::new([Column::Int32(ints), Column::Bool(bools)]).unwrap();
+        // Window [1, 4) → rows NULL, 30, NULL (and NULL, false, NULL).
+        let sliced = slice_batch_range(&batch, 1, 4).unwrap();
+        assert_eq!(sliced.rows(), 3);
+
+        match &sliced.columns()[0] {
+            Column::Int32(c) => {
+                assert!(
+                    c.nulls().is_some(),
+                    "validity bitmap must survive the slice"
+                );
+                let nulls = c.nulls().unwrap();
+                assert!(!nulls.get(0), "row 0 (orig row 1) is NULL");
+                assert!(nulls.get(1), "row 1 (orig row 2 = 30) is valid");
+                assert!(!nulls.get(2), "row 2 (orig row 3) is NULL");
+                assert_eq!(c.data()[1], 30);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        match &sliced.columns()[1] {
+            Column::Bool(c) => {
+                let nulls = c.nulls().expect("bool validity survives slice");
+                assert!(!nulls.get(0));
+                assert!(nulls.get(1));
+                assert!(!nulls.get(2));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

@@ -14,16 +14,17 @@
 //!   above `HashAggregate`)
 //!
 //! NULL-placement semantics (PostgreSQL `ASC` → `NULLS LAST`, `DESC` →
-//! `NULLS FIRST`) live in the executor unit tests
-//! (`crates/ultrasql-executor/src/sort.rs::sort_null_ordering_semantics`,
-//! which directly exercises `compare_values_nullable`). An end-to-end
-//! NULL test against `tokio-postgres` would require `INSERT INTO t
-//! VALUES (..., NULL)` to land a `Value::Null` into the heap, which
-//! the wire INSERT path does not yet support — `SeqScan::build_batch`
-//! rejects `DataType::Null` columns and surfaces "unsupported column
-//! type null for batch building." That gap is unrelated to the Sort
-//! wiring; the unit-level coverage above ensures Sort itself handles
-//! NULLs correctly once the INSERT gap closes.
+//! `NULLS FIRST`) are exercised end-to-end below by the
+//! `indexed_nullable_order_by_*` battery, which inserts real
+//! `Value::Null` rows over the wire and asserts that an `ORDER BY` over
+//! an *indexed* nullable column returns the exact same row-set and order
+//! as the same query with no index. That equality is the regression
+//! guard for the silent-row-loss bug where a bare ordered index scan
+//! over a nullable column dropped every `NULL` row (the i64 B-tree never
+//! stores NULL keys); the fix declines the index-ordered fast path for
+//! nullable ordering columns and falls back to the heap `Sort`.
+//! Operator-level NULL placement is additionally pinned in the executor
+//! unit tests (`crates/ultrasql-executor/src/sort.rs`).
 //!
 //! Each test creates a fresh table per-server so the assertions don't
 //! depend on cross-test ordering.
@@ -307,6 +308,334 @@ async fn order_by_builtin_collate_uses_bytewise_order() {
     assert!(
         message.contains("unsupported collation"),
         "unexpected error: {err}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+// ===========================================================================
+// Regression battery: ORDER BY over an indexed *nullable* column must not
+// silently drop the rows where the ordering column IS NULL.
+//
+// Before the fix, the planner lowered `ORDER BY <indexed_col>` to a bare
+// ordered B-tree IndexScan. The i64 B-tree never stores NULL keys, so the
+// NULL rows were never enumerated and silently vanished from the result —
+// and the path also ignored NULLS FIRST/LAST. The fix declines the
+// index-ordered fast path when the ordering column is nullable and falls
+// back to the heap `Sort`, which enumerates ALL rows (NULLs included) and
+// places them per the requested (or PG-default) NULLS clause. A NOT NULL
+// ordering column keeps the fast directed index scan (no NULLs to lose).
+//
+// The seed `{1, NULL, 3, 2, NULL}` is the canonical repro.
+// ===========================================================================
+
+/// Read column 0 of a `simple_query` result as `Option<i32>`, where a SQL
+/// NULL surfaces as `None`. Preserves result order.
+fn col0_nullable_i32(rows: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Option<i32>> {
+    rows.iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get(0).map(|s| s.parse::<i32>().expect("int parses")))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Seed `t(c INT)` with `{1, NULL, 3, 2, NULL}`. The column is nullable.
+async fn seed_nullable_c(client: &tokio_postgres::Client, table: &str) {
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (c INT)"))
+        .await
+        .expect("create table");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {table} (c) VALUES (1), (NULL), (3), (2), (NULL)"
+        ))
+        .await
+        .expect("seed rows");
+}
+
+/// 1. `ORDER BY c` over an indexed nullable column returns ALL five rows,
+///    NULLS LAST by PG default: 1, 2, 3, NULL, NULL.
+#[tokio::test]
+async fn indexed_nullable_order_by_asc_keeps_null_rows() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_asc").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_asc_c ON idx_null_asc(c)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .simple_query("SELECT c FROM idx_null_asc ORDER BY c")
+        .await
+        .expect("query");
+    assert_eq!(
+        col0_nullable_i32(&rows),
+        vec![Some(1), Some(2), Some(3), None, None],
+        "ORDER BY c (indexed, nullable) must keep the two NULL rows, NULLS LAST"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 2. `ORDER BY c DESC` over an indexed nullable column: NULLS FIRST by PG
+///    default: NULL, NULL, 3, 2, 1.
+#[tokio::test]
+async fn indexed_nullable_order_by_desc_keeps_null_rows() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_desc").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_desc_c ON idx_null_desc(c)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .simple_query("SELECT c FROM idx_null_desc ORDER BY c DESC")
+        .await
+        .expect("query");
+    assert_eq!(
+        col0_nullable_i32(&rows),
+        vec![None, None, Some(3), Some(2), Some(1)],
+        "ORDER BY c DESC (indexed) must put NULLs first per PG default"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 3. `ORDER BY c ASC NULLS FIRST` (indexed) -> NULL, NULL, 1, 2, 3.
+#[tokio::test]
+async fn indexed_nullable_order_by_asc_nulls_first() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_asc_nf").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_asc_nf_c ON idx_null_asc_nf(c)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .simple_query("SELECT c FROM idx_null_asc_nf ORDER BY c ASC NULLS FIRST")
+        .await
+        .expect("query");
+    assert_eq!(
+        col0_nullable_i32(&rows),
+        vec![None, None, Some(1), Some(2), Some(3)],
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 4. `ORDER BY c DESC NULLS LAST` (indexed) -> 3, 2, 1, NULL, NULL.
+#[tokio::test]
+async fn indexed_nullable_order_by_desc_nulls_last() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_desc_nl").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_desc_nl_c ON idx_null_desc_nl(c)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .simple_query("SELECT c FROM idx_null_desc_nl ORDER BY c DESC NULLS LAST")
+        .await
+        .expect("query");
+    assert_eq!(
+        col0_nullable_i32(&rows),
+        vec![Some(3), Some(2), Some(1), None, None],
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 5. THE KEY ASSERTION: for an indexed nullable column the result row-set
+///    AND order equal the result with NO index — for ASC, DESC, and both
+///    explicit NULLS clauses. Drives the same seed twice: once indexed,
+///    once after dropping the index, and compares.
+#[tokio::test]
+async fn indexed_nullable_order_by_equals_non_indexed_for_every_clause() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_eq").await;
+
+    let queries = [
+        "SELECT c FROM idx_null_eq ORDER BY c",
+        "SELECT c FROM idx_null_eq ORDER BY c DESC",
+        "SELECT c FROM idx_null_eq ORDER BY c ASC NULLS FIRST",
+        "SELECT c FROM idx_null_eq ORDER BY c DESC NULLS LAST",
+        "SELECT c FROM idx_null_eq ORDER BY c ASC NULLS LAST",
+        "SELECT c FROM idx_null_eq ORDER BY c DESC NULLS FIRST",
+    ];
+
+    // Baseline: no index (heap Sort).
+    let mut baseline = Vec::new();
+    for q in queries {
+        let rows = client.simple_query(q).await.expect("baseline query");
+        baseline.push(col0_nullable_i32(&rows));
+    }
+
+    // Now build the index and re-run the identical queries.
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_eq_c ON idx_null_eq(c)")
+        .await
+        .expect("create index");
+    for (q, expected) in queries.into_iter().zip(baseline) {
+        let rows = client.simple_query(q).await.expect("indexed query");
+        assert_eq!(
+            col0_nullable_i32(&rows),
+            expected,
+            "indexed result for `{q}` must equal the non-indexed result exactly"
+        );
+        // The indexed result must also contain all five rows (no silent loss).
+        assert_eq!(col0_nullable_i32(&rows).len(), 5, "indexed `{q}` lost rows");
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+/// 6. A NOT NULL indexed column (PRIMARY KEY) keeps the fast ordered index
+///    scan and returns correct order. Operator-level proof that the fast
+///    path is preserved lives in the lowerer unit tests
+///    (`pipeline::tests::modify_index`); here we assert the behavioural
+///    result is correct.
+#[tokio::test]
+async fn not_null_pk_indexed_order_by_is_correct() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE pk_order (id INT PRIMARY KEY)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO pk_order (id) VALUES (3), (1), (4), (2)")
+        .await
+        .expect("seed");
+
+    let asc = client
+        .simple_query("SELECT id FROM pk_order ORDER BY id")
+        .await
+        .expect("asc query");
+    assert_eq!(
+        col0_nullable_i32(&asc),
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+
+    let desc = client
+        .simple_query("SELECT id FROM pk_order ORDER BY id DESC")
+        .await
+        .expect("desc query");
+    assert_eq!(
+        col0_nullable_i32(&desc),
+        vec![Some(4), Some(3), Some(2), Some(1)]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 7. ORDER BY indexed nullable + LIMIT: a NULL must be able to appear in
+///    the LIMIT window. `ORDER BY c LIMIT 4` -> 1, 2, 3, NULL (4th is NULL);
+///    `ORDER BY c DESC LIMIT 2` -> NULL, NULL.
+#[tokio::test]
+async fn indexed_nullable_order_by_with_limit_includes_nulls() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_limit").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_limit_c ON idx_null_limit(c)")
+        .await
+        .expect("create index");
+
+    let asc4 = client
+        .simple_query("SELECT c FROM idx_null_limit ORDER BY c LIMIT 4")
+        .await
+        .expect("asc limit query");
+    assert_eq!(
+        col0_nullable_i32(&asc4),
+        vec![Some(1), Some(2), Some(3), None],
+        "ORDER BY c LIMIT 4 must include the first NULL as the 4th row"
+    );
+
+    let desc2 = client
+        .simple_query("SELECT c FROM idx_null_limit ORDER BY c DESC LIMIT 2")
+        .await
+        .expect("desc limit query");
+    assert_eq!(
+        col0_nullable_i32(&desc2),
+        vec![None, None],
+        "ORDER BY c DESC LIMIT 2 must return the two NULL rows (NULLS FIRST)"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 8. Control: a predicate index scan is unaffected by the fix. `WHERE c > 1`
+///    over the indexed nullable column returns 2, 3 — NULLs are correctly
+///    excluded by the predicate (three-valued logic), not by the bug.
+#[tokio::test]
+async fn predicate_index_scan_excludes_nulls_by_predicate() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    seed_nullable_c(&client, "idx_null_pred").await;
+    client
+        .batch_execute("CREATE INDEX ix_idx_null_pred_c ON idx_null_pred(c)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .simple_query("SELECT c FROM idx_null_pred WHERE c > 1 ORDER BY c")
+        .await
+        .expect("query");
+    assert_eq!(
+        col0_nullable_i32(&rows),
+        vec![Some(2), Some(3)],
+        "WHERE c > 1 excludes NULLs by predicate, not by row loss"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// 9. A multi-column index whose first column is nullable, with `ORDER BY`
+///    on that first column, must still return every row. This path is not
+///    served by the single-column ordered index scan (the lowerer only
+///    matches single-column int B-trees), so it falls back to `Sort` and
+///    enumerates the NULLs regardless. Asserted indexed == non-indexed.
+#[tokio::test]
+async fn multi_column_index_nullable_leading_order_by_keeps_nulls() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE multi_idx_null (a INT, b INT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO multi_idx_null (a, b) VALUES (1, 10), (NULL, 20), (3, 30), (2, 40), (NULL, 50)",
+        )
+        .await
+        .expect("seed");
+
+    // Baseline (no index).
+    let baseline = col0_nullable_i32(
+        &client
+            .simple_query("SELECT a FROM multi_idx_null ORDER BY a")
+            .await
+            .expect("baseline"),
+    );
+    assert_eq!(
+        baseline,
+        vec![Some(1), Some(2), Some(3), None, None],
+        "baseline must already place NULLs last and keep all rows"
+    );
+
+    client
+        .batch_execute("CREATE INDEX ix_multi_idx_null_ab ON multi_idx_null(a, b)")
+        .await
+        .expect("create multi-column index");
+
+    let indexed = col0_nullable_i32(
+        &client
+            .simple_query("SELECT a FROM multi_idx_null ORDER BY a")
+            .await
+            .expect("indexed"),
+    );
+    assert_eq!(
+        indexed, baseline,
+        "multi-column-index ORDER BY on a nullable leading column must keep all rows"
     );
 
     shutdown(client, server_handle).await;
