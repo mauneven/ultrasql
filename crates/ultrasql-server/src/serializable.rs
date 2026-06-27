@@ -62,6 +62,7 @@ fn collect_serializable_read_locks(
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::LockRows { input, .. } => {
             collect_serializable_read_locks(input, catalog_snapshot, out);
         }

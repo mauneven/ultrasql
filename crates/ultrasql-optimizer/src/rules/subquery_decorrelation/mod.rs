@@ -140,6 +140,14 @@ fn decorrelate(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError>
             }))
         }
 
+        // Recurse through the single-row guard so a scalar subquery whose
+        // own body contains another subquery (nested decorrelation) still
+        // gets rewritten on a later fixpoint iteration.
+        LogicalPlan::SingleRowAssert { input } => {
+            let new_input = decorrelate(input)?;
+            Ok(new_input.map(|i| LogicalPlan::SingleRowAssert { input: Box::new(i) }))
+        }
+
         LogicalPlan::Aggregate {
             input,
             group_by,

@@ -251,6 +251,14 @@ impl<'s> CostModel<'s> {
                 self.estimate(input)
             }
 
+            LogicalPlan::SingleRowAssert { input } => {
+                // The guard scans its child once and emits exactly one row
+                // (the scalar value, or a NULL-padded row on empty input).
+                let mut est = self.estimate(input);
+                est.rows = 1.0;
+                est
+            }
+
             LogicalPlan::Join {
                 left,
                 right,

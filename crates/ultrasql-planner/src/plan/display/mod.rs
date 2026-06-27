@@ -44,6 +44,9 @@ impl LogicalPlan {
             Self::DistinctOn { input, on_keys } => {
                 scans::fmt_distinct_on(input, on_keys, indent, out);
             }
+            Self::SingleRowAssert { input } => {
+                scans::fmt_single_row_assert(input, indent, out);
+            }
             Self::Window {
                 input,
                 partition_by,

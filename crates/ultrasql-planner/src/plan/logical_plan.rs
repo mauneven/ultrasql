@@ -97,6 +97,23 @@ pub enum LogicalPlan {
         on_keys: Vec<ScalarExpr>,
     },
 
+    /// Single-row guard for a scalar subquery used as an expression.
+    ///
+    /// Wraps the (uncorrelated) subquery plan and constrains it to emit
+    /// **exactly one** row: a 1-row child passes through, a 0-row child is
+    /// replaced by a single all-NULL row, and a child with more than one
+    /// row raises SQLSTATE `21000` (`cardinality_violation`) at execution.
+    /// This lets the decorrelation rule lower a scalar subquery to a
+    /// `CROSS JOIN` against its guaranteed single-row right side — every
+    /// outer row is kept and paired with the scalar (NULL when the
+    /// subquery was empty), matching PostgreSQL. The node is
+    /// non-projecting: its output schema is the input's, only the row
+    /// count is constrained.
+    SingleRowAssert {
+        /// The scalar-subquery plan whose cardinality is being asserted.
+        input: Box<Self>,
+    },
+
     /// Window-function application. Wraps a child plan and appends one
     /// column carrying the per-row window result. The executor's
     /// `WindowAgg` operator consumes this shape directly.

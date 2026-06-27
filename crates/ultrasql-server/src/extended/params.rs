@@ -135,6 +135,7 @@ fn infer_into(
         }
         LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::DistinctOn { input, .. } => {
             infer_into(input, catalog, out);
             if let LogicalPlan::Sort { keys, .. } = plan {
@@ -565,6 +566,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         }
         LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::DistinctOn { input, .. } => {
             walk_plan_exprs(input, f);
             if let LogicalPlan::Sort { keys, .. } = plan {

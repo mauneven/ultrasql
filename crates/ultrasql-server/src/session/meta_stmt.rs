@@ -323,9 +323,9 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
                 walk_expr_for_max_param(e, max_idx);
             }
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
-            walk_plan_for_max_param(input, max_idx)
-        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. } => walk_plan_for_max_param(input, max_idx),
         LogicalPlan::Sort { input, keys } => {
             walk_plan_for_max_param(input, max_idx);
             for k in keys {

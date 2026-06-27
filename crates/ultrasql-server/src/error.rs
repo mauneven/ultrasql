@@ -372,6 +372,10 @@ impl ServerError {
             // touched. Mirrors the SSI `Self::SerializationFailure` 40001
             // path above so retry-aware clients classify both alike.
             Self::Execute(ultrasql_executor::ExecError::SerializationFailure(_)) => "40001",
+            // cardinality_violation — a scalar subquery used as an
+            // expression returned more than one row. Raised by the
+            // `SingleRowAssert` guard the decorrelation rule inserts.
+            Self::Execute(ultrasql_executor::ExecError::CardinalityViolation) => "21000",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.

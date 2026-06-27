@@ -1080,6 +1080,151 @@ async fn rls_update_checks_new_rows_and_preserves_old_row_on_failure() {
     shutdown(client, server_handle).await;
 }
 
+/// Regression: a row-level-security policy must apply to a table read through
+/// an uncorrelated scalar subquery, even after the optimizer decorrelates it
+/// and wraps the subquery's right side in a `SingleRowAssert` cardinality
+/// guard. Before the fix, `apply_row_security` treated `SingleRowAssert` as a
+/// leaf (its `_ => Ok(None)` catch-all), dropping the inner scan subtree, so
+/// the policy predicate was never injected and the scalar saw EVERY tenant's
+/// rows (`SELECT (SELECT sum(val) FROM secret)` returned 60, not 10).
+#[tokio::test]
+async fn rls_applies_through_scalar_subquery_single_row_assert() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE secret (\
+                tenant_id TEXT NOT NULL, \
+                val INT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create secret table");
+    // tenant-a sums to 10; tenant-b sums to 50. Across all tenants: 60.
+    client
+        .batch_execute(
+            "INSERT INTO secret VALUES \
+                ('tenant-a', 10), \
+                ('tenant-b', 20), \
+                ('tenant-b', 30)",
+        )
+        .await
+        .expect("insert seed rows");
+    // A second table so the scalar subquery is uncorrelated (decorrelation
+    // hoists it as the right side of a CROSS join wrapped in SingleRowAssert).
+    client
+        .batch_execute("CREATE TABLE outer_t (k INT NOT NULL)")
+        .await
+        .expect("create outer table");
+    client
+        .batch_execute("INSERT INTO outer_t VALUES (1)")
+        .await
+        .expect("insert outer row");
+    client
+        .batch_execute(
+            "CREATE POLICY secret_tenant_isolation ON secret \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create tenant rls policy");
+    client
+        .batch_execute("ALTER TABLE secret ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable table rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    // Control: a direct aggregate sees only tenant-a (10), never 60.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT sum(val) FROM secret")
+            .await
+            .expect("direct aggregate respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["10".to_owned()]],
+        "direct aggregate must reflect only the current tenant"
+    );
+
+    // (1) SELECT-list scalar subquery: the bypass site. Must be 10, not 60.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT (SELECT sum(val) FROM secret) FROM outer_t")
+            .await
+            .expect("scalar subquery in SELECT list respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["10".to_owned()]],
+        "scalar subquery leaked other tenants' rows (RLS bypassed)"
+    );
+
+    // (2) WHERE-position scalar subquery: the tenant-filtered value is 10, so
+    // the predicate holds and the outer row survives. If RLS were bypassed the
+    // subquery would be 60 and the row would be filtered out.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT k FROM outer_t WHERE (SELECT sum(val) FROM secret) = 10")
+            .await
+            .expect("scalar subquery in WHERE respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_owned()]],
+        "WHERE-clause scalar subquery did not reflect the tenant-filtered value"
+    );
+
+    // (3) RLS filters BEFORE the single-row assert: with only tenant-a visible,
+    // a row-returning scalar subquery yields exactly one row (no 21000), and it
+    // is the current tenant's value (10).
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT (SELECT val FROM secret) FROM outer_t")
+            .await
+            .expect("row-returning scalar subquery respects RLS and is single-row"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["10".to_owned()]],
+        "row-returning scalar subquery leaked other tenants' rows"
+    );
+
+    // (3b) Multiple visible tenant rows still raise cardinality 21000 AFTER RLS
+    // has filtered: switch to tenant-b, which has two surviving rows.
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-b'")
+        .await
+        .expect("switch tenant guc");
+    let err = client
+        .simple_query("SELECT (SELECT val FROM secret) FROM outer_t")
+        .await
+        .expect_err("multi-row scalar subquery must raise 21000 after RLS filtering");
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(
+        db.code(),
+        &SqlState::CARDINALITY_VIOLATION,
+        "expected 21000 cardinality violation, got: {}",
+        db.message()
+    );
+    // And tenant-b's aggregate is 50 (20 + 30), never 60.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT (SELECT sum(val) FROM secret) FROM outer_t")
+            .await
+            .expect("tenant-b scalar aggregate respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["50".to_owned()]],
+        "tenant-b scalar subquery must sum only tenant-b rows"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
 #[tokio::test]
 async fn rls_restrictive_select_policies_narrow_permissive_visibility() {
     let (client, _conn, server_handle) = start_server_and_connect().await;

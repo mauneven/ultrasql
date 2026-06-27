@@ -91,6 +91,7 @@ impl LogicalPlan {
             | Self::LockRows { .. } => true,
             Self::Filter { input, .. }
             | Self::Project { input, .. }
+            | Self::SingleRowAssert { input, .. }
             | Self::Limit { input, .. } => input.has_batch_pipeline(),
             Self::Cte {
                 definition, body, ..
@@ -231,6 +232,7 @@ impl LogicalPlan {
             Self::Filter { input, .. }
             | Self::Limit { input, .. }
             | Self::Sort { input, .. }
+            | Self::SingleRowAssert { input, .. }
             | Self::DistinctOn { input, .. } => input.schema(),
         }
     }

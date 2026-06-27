@@ -111,6 +111,7 @@ mod row_codec;
 mod row_spill;
 mod seq_scan;
 pub mod set_op;
+mod single_row_assert;
 pub mod sinks;
 mod sort;
 pub mod sort_aggregate;
@@ -166,6 +167,7 @@ pub use result_op::ResultOp;
 pub use row_codec::{RowCodec, RowCodecError};
 pub use seq_scan::{SeqScan, SeqScanRangeWithVmConfig, build_batch};
 pub use set_op::SetOp;
+pub use single_row_assert::SingleRowAssert;
 pub use sort::Sort;
 pub use sort_aggregate::SortAggregate;
 pub use top_k::TopK;
@@ -327,6 +329,14 @@ pub enum ExecError {
     /// relabels the aborted statement; it does not add wait/retry.
     #[error("could not serialize access due to concurrent update: {0}")]
     SerializationFailure(String),
+
+    /// A scalar subquery used as an expression returned more than one
+    /// row. SQL requires exactly one row from such a subquery; the
+    /// [`SingleRowAssert`] operator raises this the moment it observes a
+    /// second row. The server maps this to PostgreSQL SQLSTATE `21000`
+    /// (`cardinality_violation`).
+    #[error("more than one row returned by a subquery used as an expression")]
+    CardinalityViolation,
 }
 
 /// Convert scalar-expression interpreter errors into stable executor errors.

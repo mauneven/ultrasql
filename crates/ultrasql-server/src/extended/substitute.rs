@@ -341,6 +341,9 @@ where
             input: Box::new(map_plan_exprs(input, f)),
             on_keys: on_keys.iter().map(f).collect(),
         },
+        LogicalPlan::SingleRowAssert { input } => LogicalPlan::SingleRowAssert {
+            input: Box::new(map_plan_exprs(input, f)),
+        },
         LogicalPlan::Values { rows, schema } => {
             // After substitution, parameter cells become concrete-typed
             // literals; the binder built `schema` assuming `Null` for

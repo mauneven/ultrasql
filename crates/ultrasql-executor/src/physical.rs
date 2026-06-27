@@ -164,6 +164,11 @@ pub fn build_operator(
             Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
         }
 
+        LogicalPlan::SingleRowAssert { input } => {
+            let child = build_operator(input, data_source)?;
+            Ok(Box::new(crate::SingleRowAssert::new(child)))
+        }
+
         LogicalPlan::Empty { schema } => {
             Ok(Box::new(MemTableScan::new(schema.clone(), Vec::new())))
         }

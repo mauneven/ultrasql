@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
-    DistinctOn, Filter, HashAggregate, Limit, Operator, Pivot, ProfiledOperator, ResultOp, Sort,
-    TopK, Unique, Unpivot, ValuesScan,
+    DistinctOn, Filter, HashAggregate, Limit, Operator, Pivot, ProfiledOperator, ResultOp,
+    SingleRowAssert, Sort, TopK, Unique, Unpivot, ValuesScan,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
@@ -294,6 +294,13 @@ fn lower_query_inner(
             // the first row of each ON-key group.
             let child = lower_query(input, ctx)?;
             Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
+        }
+        LogicalPlan::SingleRowAssert { input } => {
+            // Scalar-subquery single-row guard produced by decorrelation:
+            // emit exactly one row (the scalar value, a NULL-padded row on
+            // empty input, or a 21000 cardinality_violation on >1 rows).
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(SingleRowAssert::new(child)))
         }
         LogicalPlan::Update {
             table,
@@ -742,6 +749,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::DistinctOn { .. } => "Unique",
+        LogicalPlan::SingleRowAssert { .. } => "SingleRowAssert",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
         LogicalPlan::Pivot { .. } => "Pivot",

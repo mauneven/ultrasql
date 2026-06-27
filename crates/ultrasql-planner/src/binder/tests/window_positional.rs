@@ -18,6 +18,7 @@ fn collect_window_funcs<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a LogicalWind
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::DistinctOn { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Pivot { input, .. }
         | LogicalPlan::Unpivot { input, .. }

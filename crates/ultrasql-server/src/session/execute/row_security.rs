@@ -283,6 +283,17 @@ where
                     })
                     .transpose_ok()
             }
+            // Unary cardinality guard the scalar-subquery decorrelation rule
+            // inserts around the subquery's right side before the CROSS join.
+            // It is non-projecting, so descend into `input` to reach the inner
+            // scan and inject its RLS predicate; otherwise the subquery's rows
+            // bypass row-level security entirely.
+            LogicalPlan::SingleRowAssert { input } => self
+                .apply_row_security(input, catalog_snapshot, command)?
+                .map(|input| LogicalPlan::SingleRowAssert {
+                    input: Box::new(input),
+                })
+                .transpose_ok(),
             _ => Ok(None),
         }
     }

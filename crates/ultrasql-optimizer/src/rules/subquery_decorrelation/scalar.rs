@@ -39,6 +39,22 @@ pub(crate) struct CorrelatedScalarRight {
     empty_set_is_zero: bool,
 }
 
+/// Wrap an uncorrelated scalar-subquery right side in a
+/// [`LogicalPlan::SingleRowAssert`] so that its CROSS JOIN against the
+/// outer plan has the SQL-correct cardinality: exactly one inner row.
+///
+/// The guard normalises the inner cardinality to one row — the scalar
+/// value when the subquery returns a single row, a NULL-padded row when
+/// it returns none (so `CROSS JOIN` keeps every outer row, PG semantics),
+/// and a runtime `21000` `cardinality_violation` when it returns more
+/// than one. This is what lets the rewrite use a plain `Cross` join
+/// instead of a `LEFT JOIN ON true`.
+fn single_row_assert(input: LogicalPlan) -> LogicalPlan {
+    LogicalPlan::SingleRowAssert {
+        input: Box::new(input),
+    }
+}
+
 pub(crate) fn rewrite_scalar_subquery_filter(
     outer: &LogicalPlan,
     predicate: &ScalarExpr,
@@ -82,7 +98,11 @@ pub(crate) fn rewrite_scalar_subquery_filter(
         outer_width,
         "__scalar_subquery".to_owned(),
     )?;
-    let right = alias_first_column(*subplan, "__scalar_subquery")?;
+    // Guard the scalar subquery to exactly one row before the CROSS JOIN:
+    // an empty subquery becomes a single NULL row (so `a = NULL` is UNKNOWN
+    // and the row is dropped by the filter — PG semantics), and a >1-row
+    // subquery raises 21000 instead of silently fanning out the outer rows.
+    let right = single_row_assert(alias_first_column(*subplan, "__scalar_subquery")?);
     let join_schema = concat_schemas(outer.schema(), right.schema())?;
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
@@ -190,8 +210,16 @@ pub(crate) fn rewrite_project_with_scalar_subquery(
             outer_width,
             "__scalar_subquery".to_owned(),
         ) {
-            let right = alias_first_column(*subplan, "__scalar_subquery")?;
+            let right = single_row_assert(alias_first_column(*subplan, "__scalar_subquery")?);
             let join_schema = concat_schemas(input.schema(), right.schema())?;
+            // `SingleRowAssert` guarantees the right side yields EXACTLY one
+            // row (the scalar value, or a NULL-padded row when the subquery
+            // was empty), so a CROSS JOIN pairs every outer row with that
+            // single row — keeping all outer rows (PG never drops a row for
+            // an empty scalar subquery) and raising 21000 when the subquery
+            // returns more than one row. A LEFT JOIN is unnecessary: with a
+            // guaranteed-1-row right side the CROSS product is already the
+            // correct cardinality.
             let join = LogicalPlan::Join {
                 left: Box::new(input.clone()),
                 right: Box::new(right),

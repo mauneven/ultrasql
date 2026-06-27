@@ -271,6 +271,10 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             }))
         }
 
+        LogicalPlan::SingleRowAssert { input } => {
+            Ok(fold_plan(input)?.map(|i| LogicalPlan::SingleRowAssert { input: Box::new(i) }))
+        }
+
         LogicalPlan::Window {
             input,
             partition_by,

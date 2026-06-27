@@ -58,6 +58,13 @@ pub(super) fn fmt_limit(input: &LogicalPlan, n: u64, offset: u64, indent: usize,
     input.display_into(indent + 2, out);
 }
 
+pub(super) fn fmt_single_row_assert(input: &LogicalPlan, indent: usize, out: &mut String) {
+    let pad = " ".repeat(indent);
+    out.push_str(&pad);
+    out.push_str("SingleRowAssert\n");
+    input.display_into(indent + 2, out);
+}
+
 pub(super) fn fmt_sort(input: &LogicalPlan, keys: &[SortKey], indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
     out.push_str(&pad);

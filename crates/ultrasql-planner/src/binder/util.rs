@@ -351,9 +351,9 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         LogicalPlan::DistinctOn { input, on_keys } => {
             on_keys.iter().any(expr_contains_outer) || plan_contains_outer_column(input)
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
-            plan_contains_outer_column(input)
-        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. } => plan_contains_outer_column(input),
         LogicalPlan::Pivot {
             input, aggregate, ..
         } => {

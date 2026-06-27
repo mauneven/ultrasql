@@ -24,6 +24,7 @@ pub(super) fn plan_sources(plan: &LogicalPlan) -> Vec<Option<ColumnSource>> {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::DistinctOn { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::LockRows { input, .. } => plan_sources(input),
         LogicalPlan::Project { input, exprs, .. } => {
             let input_sources = plan_sources(input);

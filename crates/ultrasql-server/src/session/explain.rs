@@ -760,6 +760,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Limit { .. } => "Limit",
         LogicalPlan::Sort { .. } => "Sort",
         LogicalPlan::DistinctOn { .. } => "Unique",
+        LogicalPlan::SingleRowAssert { .. } => "SingleRowAssert",
         LogicalPlan::Join { .. } => "Hash Join",
         LogicalPlan::Aggregate { .. } => "Aggregate",
         LogicalPlan::Pivot { .. } => "Pivot",

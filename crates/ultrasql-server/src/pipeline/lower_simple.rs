@@ -3,8 +3,8 @@
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{
-    DistinctOn, Filter, Limit, MemTableScan, Operator, Pivot, Project, ResultOp, SetOp, Sort,
-    Unpivot,
+    DistinctOn, Filter, Limit, MemTableScan, Operator, Pivot, Project, ResultOp, SetOp,
+    SingleRowAssert, Sort, Unpivot,
 };
 use ultrasql_planner::{InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -52,6 +52,10 @@ pub fn lower_plan(
         LogicalPlan::DistinctOn { input, on_keys } => {
             let child = lower_plan(input, tables)?;
             Ok(Box::new(DistinctOn::new(child, on_keys.clone())))
+        }
+        LogicalPlan::SingleRowAssert { input } => {
+            let child = lower_plan(input, tables)?;
+            Ok(Box::new(SingleRowAssert::new(child)))
         }
         LogicalPlan::Join {
             left,

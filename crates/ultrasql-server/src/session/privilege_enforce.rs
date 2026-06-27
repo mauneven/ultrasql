@@ -225,7 +225,9 @@ where
                 }
                 self.collect_plan(input, false);
             }
-            LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
+            LogicalPlan::Limit { input, .. }
+            | LogicalPlan::LockRows { input, .. }
+            | LogicalPlan::SingleRowAssert { input, .. } => {
                 self.collect_plan(input, output_observed);
             }
             LogicalPlan::Sort { input, keys } => {

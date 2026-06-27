@@ -535,9 +535,239 @@ async fn correlated_count_scalar_subquery_returns_zero_for_unmatched_rows() {
     shutdown(client, server_handle).await;
 }
 
-// NOTE: a non-aggregated correlated scalar subquery whose inner side matches
+// NOTE: a non-aggregated *correlated* scalar subquery whose inner side matches
 // more than one row per outer key is a documented pre-existing limitation —
 // decorrelation rewrites it to a LEFT OUTER JOIN that duplicates the outer row
-// rather than raising a cardinality error, because the executor has no runtime
-// single-row-assert operator. Fixing it correctly requires that operator and is
-// tracked separately; the common single-row case (covered above) works.
+// rather than raising a cardinality error. The `SingleRowAssert` operator added
+// for *uncorrelated* scalar subqueries is a single global 1-row guard and does
+// not fit the per-outer-key semantics the correlated LEFT-JOIN shape needs, so
+// the correlated multi-row case stays a separate roadmap item; the common
+// single-row case (covered above) works. The uncorrelated empty / multi-row /
+// single-row cases ARE fully fixed — see
+// `uncorrelated_scalar_subquery_single_row_assert_battery` below.
+
+/// Adversarial battery for the uncorrelated scalar-subquery single-row guard.
+///
+/// Each uncorrelated scalar subquery is decorrelated to a CROSS JOIN against a
+/// `SingleRowAssert`-wrapped right side, which constrains the subquery to
+/// exactly one row: empty → NULL-padded (all outer rows kept), single → value,
+/// >1 → SQLSTATE 21000 (`cardinality_violation`). This mirrors PostgreSQL.
+#[tokio::test]
+async fn uncorrelated_scalar_subquery_single_row_assert_battery() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    // `t` (3 rows), `e` (empty), `m` (2 rows), `s` (1 row, value 9).
+    client
+        .batch_execute("CREATE TABLE sra_t (a INT NOT NULL)")
+        .await
+        .expect("create t");
+    client
+        .batch_execute("CREATE TABLE sra_e (id INT)")
+        .await
+        .expect("create e");
+    client
+        .batch_execute("CREATE TABLE sra_m (id INT NOT NULL)")
+        .await
+        .expect("create m");
+    client
+        .batch_execute("CREATE TABLE sra_s (id INT NOT NULL)")
+        .await
+        .expect("create s");
+    client
+        .batch_execute("INSERT INTO sra_t VALUES (10), (20), (30)")
+        .await
+        .expect("insert t");
+    client
+        .batch_execute("INSERT INTO sra_m VALUES (1), (2)")
+        .await
+        .expect("insert m");
+    client
+        .batch_execute("INSERT INTO sra_s VALUES (9)")
+        .await
+        .expect("insert s");
+
+    // ---- (1) EMPTY uncorrelated scalar in SELECT: 3 rows, scalar all NULL ----
+    let rows = client
+        .simple_query("SELECT a, (SELECT id FROM sra_e) AS sc FROM sra_t ORDER BY a")
+        .await
+        .expect("empty scalar in SELECT succeeds");
+    let pairs: Vec<(i32, Option<String>)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1).map(str::to_owned)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![(10, None), (20, None), (30, None)],
+        "empty scalar subquery must keep all 3 outer rows and NULL-pad the scalar"
+    );
+
+    // ---- (3) SINGLE-ROW uncorrelated scalar in SELECT: each row gets 9 ----
+    let rows = client
+        .simple_query("SELECT a, (SELECT id FROM sra_s) AS sc FROM sra_t ORDER BY a")
+        .await
+        .expect("single-row scalar in SELECT succeeds");
+    let pairs: Vec<(i32, i32)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1)?.parse().ok()?))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pairs, vec![(10, 9), (20, 9), (30, 9)]);
+
+    // ---- (2) MULTI-ROW uncorrelated scalar in SELECT: ERROR 21000 ----
+    let err = client
+        .simple_query("SELECT a, (SELECT id FROM sra_m) FROM sra_t")
+        .await
+        .expect_err("multi-row scalar subquery in SELECT must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("21000"),
+        "multi-row scalar subquery must raise cardinality_violation, not fan out"
+    );
+
+    // ---- (4) WHERE position: empty → 0 matches; single → matching row; multi → 21000 ----
+    let rows = client
+        .simple_query("SELECT a FROM sra_t WHERE a = (SELECT id FROM sra_e) ORDER BY a")
+        .await
+        .expect("empty scalar in WHERE succeeds");
+    let matched: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matched.is_empty(),
+        "a = NULL is UNKNOWN, so an empty scalar subquery yields no matches"
+    );
+
+    let rows = client
+        .simple_query("SELECT a FROM sra_t WHERE a = (SELECT id FROM sra_s) * 1 ORDER BY a")
+        .await
+        .expect("single-row scalar in WHERE succeeds");
+    let matched: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    // No outer row equals 9, so this is empty; the point is it does not error
+    // and does not drop or duplicate rows incorrectly.
+    assert!(matched.is_empty());
+
+    let err = client
+        .simple_query("SELECT a FROM sra_t WHERE a = (SELECT id FROM sra_m)")
+        .await
+        .expect_err("multi-row scalar subquery in WHERE must error");
+    assert_eq!(
+        err.code().map(tokio_postgres::error::SqlState::code),
+        Some("21000")
+    );
+
+    // ---- (5) Aggregated scalar (no GROUP BY): max(empty)=NULL, count(empty)=0 ----
+    let rows = client
+        .simple_query("SELECT a, (SELECT max(id) FROM sra_e) AS mx FROM sra_t ORDER BY a")
+        .await
+        .expect("max over empty succeeds");
+    let pairs: Vec<(i32, Option<String>)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1).map(str::to_owned)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![(10, None), (20, None), (30, None)],
+        "max() of empty is NULL (one row), still kept for every outer row"
+    );
+
+    let rows = client
+        .simple_query("SELECT a, (SELECT count(*) FROM sra_e) AS n FROM sra_t ORDER BY a")
+        .await
+        .expect("count over empty succeeds");
+    let pairs: Vec<(i32, i64)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1)?.parse().ok()?))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![(10, 0), (20, 0), (30, 0)],
+        "count(*) of empty is 0 (NOT NULL, NOT dropped) for every outer row"
+    );
+
+    // ---- (6) Scalar subquery used in an expression: a + scalar ----
+    let rows = client
+        .simple_query("SELECT a + (SELECT id FROM sra_s) AS v FROM sra_t ORDER BY a")
+        .await
+        .expect("scalar in expression succeeds");
+    let vals: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(vals, vec![19, 29, 39], "a + 9 per row");
+
+    // a + NULL = NULL for the empty subquery (every outer row kept, value NULL).
+    let rows = client
+        .simple_query("SELECT a, a + (SELECT id FROM sra_e) AS v FROM sra_t ORDER BY a")
+        .await
+        .expect("a + empty scalar succeeds");
+    let pairs: Vec<(i32, Option<String>)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1).map(str::to_owned)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pairs, vec![(10, None), (20, None), (30, None)]);
+
+    // ---- (8) Nested: a scalar subquery whose body has a scalar subquery ----
+    // The outer subquery has FROM sra_s (1 row) and projects a nested scalar
+    // subquery `(SELECT id FROM sra_s)`; both decorrelate through SingleRowAssert.
+    let rows = client
+        .simple_query(
+            "SELECT a,
+                    (SELECT (SELECT id FROM sra_s) + 1 FROM sra_s) AS sc
+             FROM sra_t
+             ORDER BY a",
+        )
+        .await
+        .expect("nested scalar subquery succeeds");
+    let pairs: Vec<(i32, i32)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1)?.parse().ok()?))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![(10, 10), (20, 10), (30, 10)],
+        "inner 9 + 1 = 10"
+    );
+
+    shutdown(client, server_handle).await;
+}

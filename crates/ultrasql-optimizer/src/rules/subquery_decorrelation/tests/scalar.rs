@@ -33,21 +33,25 @@ fn real_uncorrelated_scalar_subquery_rewrites_to_cross_join_filter() {
         panic!("expected Project, got {result:?}");
     };
     assert_eq!(schema.len(), 2);
+    let LogicalPlan::Filter { input: join, .. } = input.as_ref() else {
+        panic!("expected Filter under the Project, got {input:?}");
+    };
+    let LogicalPlan::Join {
+        join_type: LogicalJoinType::Cross,
+        right,
+        ..
+    } = join.as_ref()
+    else {
+        panic!("scalar subquery should become Cross Join + Filter, got {join:?}");
+    };
+    // The single-row guard MUST wrap the right side so the Cross join has
+    // the SQL-correct cardinality (exactly one inner row → all outer rows
+    // kept, NULL on empty, 21000 on >1). Without it the Cross join would
+    // annihilate outer rows on an empty subquery and fan them out on a
+    // multi-row subquery.
     assert!(
-        matches!(
-            input.as_ref(),
-            LogicalPlan::Filter {
-                input,
-                ..
-            } if matches!(
-                input.as_ref(),
-                LogicalPlan::Join {
-                    join_type: LogicalJoinType::Cross,
-                    ..
-                }
-            )
-        ),
-        "scalar subquery should become Cross Join + Filter, got {input:?}"
+        matches!(right.as_ref(), LogicalPlan::SingleRowAssert { .. }),
+        "Cross join right side must be wrapped in SingleRowAssert, got {right:?}"
     );
 }
 

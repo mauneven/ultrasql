@@ -333,6 +333,7 @@ fn cte_use_count(plan: &LogicalPlan, name: &str) -> usize {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Project { input, .. }
+        | LogicalPlan::SingleRowAssert { input, .. }
         | LogicalPlan::Aggregate { input, .. } => cte_use_count(input, name),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             cte_use_count(left, name) + cte_use_count(right, name)
