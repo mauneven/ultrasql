@@ -519,8 +519,12 @@ fn cast_type_and_numeric_helpers_cover_edge_paths() {
     assert_eq!(pow10_i64(3), Some(1000));
     assert_eq!(scaled_decimal_text_to_i64("-12.30"), Some(-1230));
     assert_eq!(scaled_decimal_text_to_i64("bad"), None);
-    assert_eq!(parse_decimal_literal("12.30"), Some((1230, 2)));
-    assert_eq!(parse_decimal_literal("1e2"), None);
+    assert_eq!(parse_decimal_literal("12.30"), Ok(Some((1230, 2))));
+    assert_eq!(parse_decimal_literal("1e2"), Ok(None));
+    assert!(matches!(
+        parse_decimal_literal("9999999999999999999.99"),
+        Err(PlanError::NumericValueOutOfRange(_))
+    ));
     assert_eq!(
         decimal_from_numeric_value(&Value::Int32(12), Some(2)),
         Some((1200, 2))

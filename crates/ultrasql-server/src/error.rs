@@ -306,6 +306,10 @@ impl ServerError {
             // undefined_function — a call named a function that is not a
             // supported builtin.
             Self::Plan(ultrasql_planner::PlanError::UndefinedFunction(_)) => "42883",
+            // numeric_value_out_of_range — a numeric/integer literal could
+            // not be represented (magnitude exceeds i64). The binder errors
+            // here rather than silently saturating to i64::MAX.
+            Self::Plan(ultrasql_planner::PlanError::NumericValueOutOfRange(_)) => "22003",
             // undefined_table — coarse planner fallback plus the catalog
             // NotFound that surfaces when DROP / ALTER fails to resolve a name
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
@@ -427,6 +431,20 @@ mod tests {
         let err = ServerError::UnsupportedProtocol { major: 2, minor: 0 };
         assert!(!err.is_query_scoped());
         assert_eq!(err.sqlstate(), "08P01");
+    }
+
+    #[test]
+    fn out_of_range_numeric_literal_maps_to_22003() {
+        // FIX A: an out-of-i64 numeric/integer literal raises
+        // numeric_value_out_of_range at bind time. The server must surface
+        // SQLSTATE 22003 over the wire (not the 42P01 planner catch-all),
+        // and the error must be query-scoped so the connection survives.
+        let err: ServerError = ultrasql_planner::PlanError::NumericValueOutOfRange(
+            "integer literal 99999999999999999999 is out of range".to_owned(),
+        )
+        .into();
+        assert_eq!(err.sqlstate(), "22003");
+        assert!(err.is_query_scoped());
     }
 
     #[test]

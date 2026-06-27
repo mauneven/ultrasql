@@ -21,6 +21,46 @@ pub(super) fn plan(sql: &str, catalog: &InMemoryCatalog) -> LogicalPlan {
 }
 
 #[test]
+fn out_of_i64_integer_literal_binds_to_22003_over_the_wire() {
+    // FIX A end-to-end: a 20-digit integer literal must not silently
+    // saturate to i64::MAX. The binder raises numeric_value_out_of_range,
+    // which the server surfaces as SQLSTATE 22003.
+    let (catalog, _) = fixture();
+    let stmt = Parser::new("SELECT 99999999999999999999")
+        .parse_statement()
+        .expect("parses");
+    let err = bind(&stmt, &catalog).expect_err("out-of-i64 literal must error");
+    assert!(matches!(
+        err,
+        ultrasql_planner::PlanError::NumericValueOutOfRange(_)
+    ));
+    let server_err: crate::ServerError = err.into();
+    assert_eq!(server_err.sqlstate(), "22003");
+}
+
+#[test]
+fn out_of_i64_numeric_literal_binds_to_22003_over_the_wire() {
+    let (catalog, _) = fixture();
+    let stmt = Parser::new("SELECT 9999999999999999999.99")
+        .parse_statement()
+        .expect("parses");
+    let err = bind(&stmt, &catalog).expect_err("out-of-range numeric literal must error");
+    let server_err: crate::ServerError = err.into();
+    assert_eq!(server_err.sqlstate(), "22003");
+}
+
+#[test]
+fn i64_max_literal_still_binds_successfully() {
+    // The boundary value i64::MAX (9223372036854775807) is representable
+    // and must continue to plan without error.
+    let (catalog, _) = fixture();
+    let stmt = Parser::new("SELECT 9223372036854775807")
+        .parse_statement()
+        .expect("parses");
+    bind(&stmt, &catalog).expect("i64::MAX literal binds");
+}
+
+#[test]
 fn lowers_simple_scan_and_project() {
     let (catalog, tables) = fixture();
     let p = plan("SELECT id FROM users", &catalog);

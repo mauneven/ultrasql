@@ -27,7 +27,7 @@ pub(in crate::binder) fn bind_expr_with_ctes(
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
     match expr {
-        Expr::Literal(lit) => Ok(bind_literal(lit)),
+        Expr::Literal(lit) => bind_literal(lit),
         Expr::Column { name } => bind_column(name, input, scope),
         Expr::Parameter { index, .. } => Ok(ScalarExpr::Parameter {
             index: *index,

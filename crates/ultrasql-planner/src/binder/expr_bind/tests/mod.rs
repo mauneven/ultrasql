@@ -45,6 +45,7 @@ fn typed(type_name: &str, value: &str, unit: Option<&str>) -> ScalarExpr {
         unit: unit.map(str::to_owned),
         span: Span::default(),
     })
+    .expect("typed literal binds")
 }
 
 fn null_arg(data_type: DataType) -> ScalarExpr {

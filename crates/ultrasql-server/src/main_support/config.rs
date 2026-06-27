@@ -319,17 +319,49 @@ pub(crate) fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String
 }
 
 pub(crate) fn listen_security_from_cli(cli: &Cli) -> Result<(), String> {
-    if cli.listen.ip().is_loopback() || cli.allow_insecure_listen || cli_has_password_auth(cli) {
+    require_auth_or_refuse(
+        &cli.listen,
+        cli_has_explicit_auth(cli),
+        cli.allow_insecure_listen,
+    )
+}
+
+/// Refuse to start an accept-all "trust" listener on a public interface
+/// unless the operator explicitly opted in.
+///
+/// Decision matrix:
+/// - loopback bind (127.0.0.0/8, `::1`)            → always OK (local dev).
+/// - explicit auth configured                      → always OK (any bind).
+/// - non-loopback + no auth + `insecure_no_auth`   → OK (explicit opt-in).
+/// - non-loopback + no auth + no opt-in            → hard error.
+///
+/// Pulled out as a pure function (no `Cli`, no I/O) so the security
+/// decision is unit-testable in isolation. `bind_addr.ip().is_loopback()`
+/// covers the entire IPv4 `127.0.0.0/8` range and IPv6 `::1`; `0.0.0.0`
+/// and any routable address report `false` and so are treated as public.
+pub(crate) fn require_auth_or_refuse(
+    bind_addr: &std::net::SocketAddr,
+    auth_configured: bool,
+    insecure_no_auth: bool,
+) -> Result<(), String> {
+    if bind_addr.ip().is_loopback() || auth_configured || insecure_no_auth {
         return Ok(());
     }
     Err(format!(
-        "PostgreSQL listener {} uses trust authentication on a non-loopback address; bind to 127.0.0.1/::1 or pass --allow-insecure-listen for isolated test networks",
-        cli.listen
+        "refusing to listen on a non-loopback address ({bind_addr}) with no authentication: \
+         the server would silently accept all clients with trust authentication. \
+         Configure auth (--auth-user/--auth-password-file with SCRAM, or --hba-file), \
+         bind to a loopback address (127.0.0.1/::1), or pass --insecure-no-auth to \
+         explicitly allow trust on this bind"
     ))
 }
 
-fn cli_has_password_auth(cli: &Cli) -> bool {
-    cli.auth_user.is_some() && cli.auth_password_file.is_some()
+/// `true` when the operator explicitly configured an authentication
+/// mechanism: either password auth (`--auth-user` + `--auth-password-file`)
+/// or a `pg_hba.conf`-style rules file. A configured mechanism is treated
+/// as an explicit, deliberate choice regardless of bind address.
+fn cli_has_explicit_auth(cli: &Cli) -> bool {
+    cli.hba_file.is_some() || (cli.auth_user.is_some() && cli.auth_password_file.is_some())
 }
 
 pub(crate) fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {

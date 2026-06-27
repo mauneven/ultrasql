@@ -40,7 +40,16 @@ pub(crate) struct Cli {
     pub(crate) listen: SocketAddr,
 
     /// Permit trust-auth PostgreSQL-wire listener on non-loopback addresses.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// `--insecure-no-auth` is the preferred spelling; `--allow-insecure-listen`
+    /// is kept as a backward-compatible alias. Either flag explicitly opts the
+    /// operator into accept-all "trust" authentication on a public bind (for
+    /// deployments behind a separately trusted network boundary).
+    #[arg(
+        long = "insecure-no-auth",
+        alias = "allow-insecure-listen",
+        default_value_t = false
+    )]
     pub(crate) allow_insecure_listen: bool,
 
     /// Optional data directory. When set, server boots WAL-backed storage.
@@ -234,7 +243,8 @@ Supported query shapes in v0.5:
 
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
-  - --allow-insecure-listen  permit trust-auth listener outside loopback
+  - --insecure-no-auth  explicitly permit trust-auth listener outside loopback
+                        (alias: --allow-insecure-listen)
   - --auth-user USER    require password auth for this PostgreSQL user
   - --auth-password-file PATH  read the auth password from a private local secret file
   - --auth-method METHOD  scram (SCRAM-SHA-256, default) or md5 (legacy)

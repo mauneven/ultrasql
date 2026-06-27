@@ -34,54 +34,69 @@ pub(in crate::binder) fn days_since_epoch(year: i32, month: u32, day: u32) -> Op
 }
 
 /// Pick the narrowest signed integer type that fits a decimal literal.
-pub(in crate::binder) fn parse_integer_literal(text: &str) -> (Value, DataType) {
+///
+/// An integer literal whose magnitude exceeds `i64` cannot be
+/// represented yet (the i64-backed `NUMERIC`/`Decimal` value model
+/// cannot hold it, and the i128 widening is a separate later task).
+/// Rather than silently saturating to `i64::MAX` — undetectable,
+/// irreversible data corruption on the most common write path — we
+/// raise `numeric_value_out_of_range` (SQLSTATE 22003), mirroring the
+/// `::numeric` cast overflow path.
+pub(in crate::binder) fn parse_integer_literal(text: &str) -> Result<(Value, DataType), PlanError> {
     if let Ok(v) = text.parse::<i32>() {
-        return (Value::Int32(v), DataType::Int32);
+        return Ok((Value::Int32(v), DataType::Int32));
     }
     if let Ok(v) = text.parse::<i64>() {
-        return (Value::Int64(v), DataType::Int64);
+        return Ok((Value::Int64(v), DataType::Int64));
     }
-    // Out of i64 range — fall back to a Decimal placeholder; this
-    // matches what `numeric_join` already promotes integer literals to
-    // when paired with a Decimal column. We do not yet have a Decimal
-    // Value variant, so park it as `Int64::MAX`. A future pass with
-    // a Decimal datum will replace this branch.
-    (
-        Value::Int64(i64::MAX),
-        DataType::Decimal {
-            precision: None,
-            scale: None,
-        },
-    )
+    Err(PlanError::NumericValueOutOfRange(format!(
+        "integer literal {text} is out of range for the supported numeric types"
+    )))
 }
 
-pub(in crate::binder) fn bind_numeric_literal(text: &str) -> ScalarExpr {
-    if let Some((value, scale)) = parse_decimal_literal(text) {
-        return ScalarExpr::Literal {
+pub(in crate::binder) fn bind_numeric_literal(text: &str) -> Result<ScalarExpr, PlanError> {
+    if let Some((value, scale)) = parse_decimal_literal(text)? {
+        return Ok(ScalarExpr::Literal {
             value: Value::Decimal { value, scale },
             data_type: DataType::Decimal {
                 precision: None,
                 scale: Some(scale),
             },
-        };
+        });
     }
 
     // Exponent notation is approximate in the current literal model.
     let parsed = text.parse::<f64>().unwrap_or(f64::NAN);
-    ScalarExpr::Literal {
+    Ok(ScalarExpr::Literal {
         value: Value::Float64(parsed),
         data_type: DataType::Float64,
-    }
+    })
 }
 
-pub(in crate::binder) fn parse_decimal_literal(text: &str) -> Option<(i64, i32)> {
+/// Parse a fixed-point decimal literal into its scaled-`i64` form.
+///
+/// Returns `Ok(None)` when the text is not a fixed-point decimal we
+/// represent exactly (exponent notation), so the caller can fall back
+/// to `Float64`. Returns `Err` with `numeric_value_out_of_range`
+/// (SQLSTATE 22003) when the literal *is* a fixed-point decimal but its
+/// unscaled mantissa overflows the i64-backed `NUMERIC` representation
+/// — erroring instead of silently dropping to a lossy `Float64`.
+pub(in crate::binder) fn parse_decimal_literal(
+    text: &str,
+) -> Result<Option<(i64, i32)>, PlanError> {
     if text.contains('e') || text.contains('E') {
-        return None;
+        return Ok(None);
     }
-    let Value::Decimal { value, scale } = parse_decimal_text(text, None).ok()? else {
-        return None;
-    };
-    Some((value, scale))
+    match parse_decimal_text(text, None) {
+        Ok(Value::Decimal { value, scale }) => Ok(Some((value, scale))),
+        // A non-Decimal value is unexpected for fixed-point input; treat
+        // it as "not an exact decimal" and let the caller fall back.
+        Ok(_) => Ok(None),
+        Err(err) => Err(PlanError::NumericValueOutOfRange(format!(
+            "numeric literal {text} is out of range: {}",
+            err.message
+        ))),
+    }
 }
 
 pub(in crate::binder) fn parse_bool_text(text: &str) -> Option<bool> {

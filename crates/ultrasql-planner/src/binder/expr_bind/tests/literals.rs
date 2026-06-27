@@ -124,7 +124,8 @@ fn dotted_numeric_literal_binds_as_exact_decimal() {
     let expr = bind_literal(&Literal::Float {
         text: "0.0001".to_owned(),
         span: Span::default(),
-    });
+    })
+    .expect("decimal literal binds");
     let ScalarExpr::Literal { value, data_type } = expr else {
         panic!("expected literal");
     };
@@ -164,7 +165,8 @@ fn decimal_literal_coerces_to_float64_target() {
     let mut expr = bind_literal(&Literal::Float {
         text: "1.5".to_owned(),
         span: Span::default(),
-    });
+    })
+    .expect("float literal binds");
     coerce_literal_to_type(&mut expr, &DataType::Float64);
     let ScalarExpr::Literal { value, data_type } = expr else {
         panic!("expected literal");
@@ -183,7 +185,8 @@ fn typed_vector_literal_binds_to_vector_value() {
         value: "[1,2,3]".to_owned(),
         unit: None,
         span: Span::default(),
-    });
+    })
+    .expect("vector literal binds");
     let ScalarExpr::Literal { value, data_type } = expr else {
         panic!("expected literal");
     };
@@ -198,7 +201,8 @@ fn typed_vector_literal_with_modifier_validates_dimension() {
         value: "[1,2,3]".to_owned(),
         unit: None,
         span: Span::default(),
-    });
+    })
+    .expect("vector(3) literal binds");
     let ScalarExpr::Literal { value, data_type } = expr else {
         panic!("expected literal");
     };
@@ -213,7 +217,8 @@ fn typed_vector_literal_rejects_dimension_mismatch() {
         value: "[1,2]".to_owned(),
         unit: None,
         span: Span::default(),
-    });
+    })
+    .expect("vector(3) dimension-mismatch literal binds to NULL");
     let ScalarExpr::Literal { value, data_type } = expr else {
         panic!("expected literal");
     };
@@ -228,7 +233,8 @@ fn bind_time_and_timetz_literals_from_ast() {
         value: "04:05:06-08".into(),
         unit: None,
         span: Span::new(0, 0),
-    });
+    })
+    .expect("time literal binds");
     let ScalarExpr::Literal { value, data_type } = time_expr else {
         panic!("expected time literal");
     };
@@ -240,7 +246,8 @@ fn bind_time_and_timetz_literals_from_ast() {
         value: "04:05:06-08".into(),
         unit: None,
         span: Span::new(0, 0),
-    });
+    })
+    .expect("timetz literal binds");
     let ScalarExpr::Literal { value, data_type } = timetz_expr else {
         panic!("expected timetz literal");
     };
@@ -304,4 +311,117 @@ fn folds_float_literal_subtraction() {
     };
     assert_eq!(data_type, DataType::Float64);
     assert!((value - 0.05).abs() < 1.0e-12, "expected 0.05, got {value}");
+}
+
+fn integer_literal(text: &str) -> ScalarExpr {
+    bind_literal(&Literal::Integer {
+        text: text.to_owned(),
+        span: Span::default(),
+    })
+    .expect("integer literal binds")
+}
+
+#[test]
+fn i64_max_integer_literal_binds_exactly() {
+    // 9223372036854775807 is i64::MAX exactly and must round-trip.
+    let ScalarExpr::Literal { value, data_type } = integer_literal("9223372036854775807") else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Int64(i64::MAX));
+    assert_eq!(data_type, DataType::Int64);
+}
+
+#[test]
+fn narrow_integer_literals_keep_their_natural_width() {
+    let ScalarExpr::Literal { value, data_type } = integer_literal("42") else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Int32(42));
+    assert_eq!(data_type, DataType::Int32);
+
+    let ScalarExpr::Literal { value, data_type } = integer_literal("3000000000") else {
+        panic!("expected literal");
+    };
+    assert_eq!(value, Value::Int64(3_000_000_000));
+    assert_eq!(data_type, DataType::Int64);
+}
+
+#[test]
+fn out_of_i64_integer_literal_errors_instead_of_saturating() {
+    // 20-digit literal: previously parked at i64::MAX (silent corruption);
+    // now raises numeric_value_out_of_range (22003).
+    let err = bind_literal(&Literal::Integer {
+        text: "99999999999999999999".to_owned(),
+        span: Span::default(),
+    })
+    .expect_err("20-digit literal must error, not saturate");
+    assert!(matches!(err, PlanError::NumericValueOutOfRange(_)));
+}
+
+#[test]
+fn integer_literal_at_i64_boundary_plus_one_errors() {
+    // i64::MAX + 1 = 9223372036854775808 (unsigned) is the first value
+    // that no longer fits an i64; it must error rather than truncate.
+    let err = bind_literal(&Literal::Integer {
+        text: "9223372036854775808".to_owned(),
+        span: Span::default(),
+    })
+    .expect_err("i64::MAX + 1 must error");
+    assert!(matches!(err, PlanError::NumericValueOutOfRange(_)));
+}
+
+#[test]
+fn out_of_range_decimal_literal_errors_instead_of_lossy_float() {
+    // 9999999999999999999.99 has an unscaled mantissa that overflows the
+    // i64-backed NUMERIC; previously it silently fell back to a lossy
+    // Float64. Now it raises numeric_value_out_of_range (22003).
+    let err = bind_literal(&Literal::Float {
+        text: "9999999999999999999.99".to_owned(),
+        span: Span::default(),
+    })
+    .expect_err("out-of-range decimal must error");
+    assert!(matches!(err, PlanError::NumericValueOutOfRange(_)));
+}
+
+#[test]
+fn in_range_decimal_literal_binds_exactly() {
+    let ScalarExpr::Literal { value, data_type } = bind_literal(&Literal::Float {
+        text: "123.45".to_owned(),
+        span: Span::default(),
+    })
+    .expect("in-range decimal binds") else {
+        panic!("expected literal");
+    };
+    assert_eq!(
+        value,
+        Value::Decimal {
+            value: 12_345,
+            scale: 2
+        }
+    );
+    assert_eq!(
+        data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: Some(2),
+        }
+    );
+}
+
+#[test]
+fn exponent_literal_still_falls_back_to_float64() {
+    // Exponent notation is not an exact fixed-point decimal; it must
+    // continue to bind as Float64, not error.
+    let ScalarExpr::Literal { value, data_type } = bind_literal(&Literal::Float {
+        text: "1.5e3".to_owned(),
+        span: Span::default(),
+    })
+    .expect("exponent literal binds") else {
+        panic!("expected literal");
+    };
+    assert_eq!(data_type, DataType::Float64);
+    let Value::Float64(v) = value else {
+        panic!("expected float64");
+    };
+    assert!((v - 1500.0).abs() < f64::EPSILON);
 }

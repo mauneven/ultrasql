@@ -70,6 +70,17 @@ pub enum PlanError {
     /// (`undefined_function`). The string names the missing function.
     #[error("function {0} does not exist")]
     UndefinedFunction(String),
+
+    /// A numeric or integer literal could not be represented by the
+    /// engine's value model (e.g. an integer literal whose magnitude
+    /// exceeds `i64`, or a decimal literal whose unscaled mantissa
+    /// overflows the i64-backed `NUMERIC` representation). PostgreSQL
+    /// raises `numeric_value_out_of_range`; the server maps this to
+    /// SQLSTATE `22003`. Erroring here is deliberate: the alternative
+    /// (silently saturating to `i64::MAX`) is undetectable data
+    /// corruption on the write path.
+    #[error("{0}")]
+    NumericValueOutOfRange(String),
 }
 
 impl PlanError {

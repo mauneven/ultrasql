@@ -4,19 +4,20 @@
 
 use super::*;
 
-pub(in crate::binder) fn bind_literal(lit: &Literal) -> ScalarExpr {
-    match lit {
+pub(in crate::binder) fn bind_literal(lit: &Literal) -> Result<ScalarExpr, PlanError> {
+    let expr = match lit {
         Literal::Bool { value, .. } => ScalarExpr::Literal {
             value: Value::Bool(*value),
             data_type: DataType::Bool,
         },
         Literal::Integer { text, .. } => {
             // Pick the narrowest integer width that fits, matching the
-            // PostgreSQL convention.
-            let (value, data_type) = parse_integer_literal(text);
+            // PostgreSQL convention. Out-of-i64 magnitudes raise
+            // `numeric_value_out_of_range` (22003) rather than saturate.
+            let (value, data_type) = parse_integer_literal(text)?;
             ScalarExpr::Literal { value, data_type }
         }
-        Literal::Float { text, .. } => bind_numeric_literal(text),
+        Literal::Float { text, .. } => bind_numeric_literal(text)?,
         Literal::String { value, .. } => ScalarExpr::Literal {
             value: Value::Text(value.clone()),
             data_type: DataType::Text { max_len: None },
@@ -33,7 +34,8 @@ pub(in crate::binder) fn bind_literal(lit: &Literal) -> ScalarExpr {
             value: Value::Null,
             data_type: DataType::Null,
         },
-    }
+    };
+    Ok(expr)
 }
 
 pub(in crate::binder) fn bind_array_literal(

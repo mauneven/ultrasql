@@ -8,7 +8,7 @@ use crate::cli::{Cli, CliLogStatementMode, LogFormat};
 use crate::config::{
     apply_auth_config, apply_startup_signal_files, auth_config_from_cli,
     autovacuum_config_from_cli, listen_security_from_cli, logging_config_from_cli,
-    ops_token_from_cli,
+    ops_token_from_cli, require_auth_or_refuse,
 };
 
 #[test]
@@ -219,6 +219,80 @@ fn listen_security_from_cli_rejects_wildcard_without_override() {
     cli.listen = "0.0.0.0:5433".parse().expect("wildcard listen");
     cli.allow_insecure_listen = true;
     assert!(listen_security_from_cli(&cli).is_ok());
+}
+
+#[test]
+fn require_auth_or_refuse_rejects_public_bind_without_auth_or_flag() {
+    let public: std::net::SocketAddr = "0.0.0.0:5433".parse().expect("addr");
+    let err = require_auth_or_refuse(&public, false, false)
+        .expect_err("public + no auth + no flag must refuse to start");
+    assert!(
+        err.contains("non-loopback") && err.contains("--insecure-no-auth"),
+        "error must name the cause and the opt-in flag, got {err}"
+    );
+}
+
+#[test]
+fn require_auth_or_refuse_allows_public_bind_with_insecure_flag() {
+    let public: std::net::SocketAddr = "0.0.0.0:5433".parse().expect("addr");
+    assert!(
+        require_auth_or_refuse(&public, false, true).is_ok(),
+        "explicit --insecure-no-auth must permit trust on a public bind"
+    );
+}
+
+#[test]
+fn require_auth_or_refuse_allows_public_bind_with_explicit_auth() {
+    let public: std::net::SocketAddr = "0.0.0.0:5433".parse().expect("addr");
+    assert!(
+        require_auth_or_refuse(&public, true, false).is_ok(),
+        "explicit auth must permit a public bind without the insecure flag"
+    );
+}
+
+#[test]
+fn require_auth_or_refuse_allows_loopback_without_auth() {
+    for addr in ["127.0.0.1:5433", "127.5.6.7:5433", "[::1]:5433"] {
+        let bind: std::net::SocketAddr = addr.parse().expect("addr");
+        assert!(
+            require_auth_or_refuse(&bind, false, false).is_ok(),
+            "loopback bind {addr} (no auth, no flag) must be allowed"
+        );
+    }
+}
+
+#[test]
+fn require_auth_or_refuse_treats_wildcard_as_public() {
+    // 0.0.0.0 / [::] are not loopback: they must require auth or the flag.
+    for addr in ["0.0.0.0:5433", "[::]:5433"] {
+        let bind: std::net::SocketAddr = addr.parse().expect("addr");
+        assert!(
+            require_auth_or_refuse(&bind, false, false).is_err(),
+            "wildcard bind {addr} must be treated as public"
+        );
+    }
+}
+
+#[test]
+fn require_auth_or_refuse_treats_routable_address_as_public() {
+    let bind: std::net::SocketAddr = "203.0.113.5:5433".parse().expect("addr");
+    assert!(
+        require_auth_or_refuse(&bind, false, false).is_err(),
+        "a routable public IP must require auth or the insecure flag"
+    );
+}
+
+#[test]
+fn listen_security_from_cli_allows_public_bind_with_hba_file() {
+    // A configured pg_hba.conf-style rules file is explicit auth
+    // configuration: the public-bind guard must accept it without the
+    // insecure flag.
+    let mut cli = wildcard_trust_cli();
+    cli.hba_file = Some(PathBuf::from("/etc/ultrasql/pg_hba.conf"));
+    assert!(
+        listen_security_from_cli(&cli).is_ok(),
+        "explicit --hba-file auth must satisfy the public-bind guard"
+    );
 }
 
 #[test]
@@ -448,6 +522,16 @@ fn write_private_password_file(path: &Path, contents: &str) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod private password file");
     }
+}
+
+/// A non-loopback, no-auth, no-flag `Cli` — the insecure-by-default
+/// shape the public-bind guard must reject unless something is opted in.
+fn wildcard_trust_cli() -> Cli {
+    let mut cli = cli_with_auth_password_file(PathBuf::from("/unused"));
+    cli.listen = "0.0.0.0:5433".parse().expect("wildcard listen");
+    cli.auth_user = None;
+    cli.auth_password_file = None;
+    cli
 }
 
 fn cli_with_auth_password_file(password_file: PathBuf) -> Cli {
