@@ -123,6 +123,18 @@ pub(in crate::binder) fn builtin_return_type(
         "hybrid_search" => Ok(DataType::Float64),
         "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
+        // Sequence-manipulation functions are real, supported functions that
+        // the *server session layer* evaluates (see
+        // `crates/ultrasql-server/src/session/sequence.rs`), not the binder's
+        // scalar dispatcher. They are not allowed inside a bound `ScalarExpr`,
+        // so they fall through here — but reporting them as `42883`
+        // (undefined_function) is wrong: they exist. Restore the pre-existing
+        // `feature_not_supported` (0A000) classification so callers such as the
+        // in-transaction `CREATE TABLE ... DEFAULT nextval(...)` guard reach
+        // their own reject path instead of an "undefined function" error.
+        "nextval" | "currval" | "lastval" | "setval" => {
+            Err(PlanError::NotSupported("non-aggregate function calls"))
+        }
         // undefined_function (42883) — the call named a function that is not
         // a supported builtin. PostgreSQL reports this distinct class rather
         // than feature_not_supported.
