@@ -3683,6 +3683,7 @@ dependencies = [
  "md5",
  "tokio",
  "tokio-postgres",
+ "ultrasql-core",
  "ultrasql-server",
 ]
 

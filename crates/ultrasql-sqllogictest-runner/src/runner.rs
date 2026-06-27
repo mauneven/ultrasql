@@ -1,10 +1,12 @@
 //! Case execution, expectation comparison, and result-row formatting.
 
 use std::collections::BTreeSet;
+use std::error::Error as StdError;
 
 use anyhow::{Result, bail};
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, Row};
+use ultrasql_core::{Value, decode_pg_numeric_binary};
 
 use crate::model::{
     QueryExpectation, SkipFilters, SortMode, StatementExpectation, TestCase, TestKind,
@@ -215,7 +217,7 @@ pub(crate) async fn execute_query(
                 row.columns().len()
             );
         }
-        formatted_rows.push(format_row(&row)?);
+        formatted_rows.push(format_row(&row, type_string)?);
     }
     if matches!(sort_mode, SortMode::RowSort) {
         formatted_rows.sort();
@@ -223,15 +225,19 @@ pub(crate) async fn execute_query(
     Ok(formatted_rows.into_iter().flatten().collect())
 }
 
-fn format_row(row: &Row) -> Result<Vec<String>> {
+fn format_row(row: &Row, type_string: &str) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(row.columns().len());
     for (idx, column) in row.columns().iter().enumerate() {
-        out.push(format_cell(row, idx, column.type_())?);
+        // The declared sqllogictest type letter for this column (`I`, `R`,
+        // `T`, `B`); drives NUMERIC formatting, which is type-directed in
+        // canonical sqllogictest rather than value-directed.
+        let declared = type_string.chars().nth(idx);
+        out.push(format_cell(row, idx, column.type_(), declared)?);
     }
     Ok(out)
 }
 
-fn format_cell(row: &Row, idx: usize, ty: &Type) -> Result<String> {
+fn format_cell(row: &Row, idx: usize, ty: &Type, declared: Option<char>) -> Result<String> {
     if *ty == Type::INT2 {
         let value: Option<i16> = row.try_get(idx)?;
         return Ok(format_nullable(value));
@@ -260,11 +266,86 @@ fn format_cell(row: &Row, idx: usize, ty: &Type) -> Result<String> {
         let value: Option<String> = row.try_get(idx)?;
         return Ok(value.unwrap_or_else(|| "NULL".to_owned()));
     }
+    if *ty == Type::NUMERIC {
+        let value: Option<PgNumeric> = row.try_get(idx)?;
+        return Ok(value.map_or_else(|| "NULL".to_owned(), |n| n.format_for(declared)));
+    }
     bail!(
         "unsupported result type `{}` at column {}",
         ty.name(),
         idx.saturating_add(1)
     )
+}
+
+/// A decoded PostgreSQL `numeric` result value (the exact scaled integer and
+/// its display scale), formatted per the declared sqllogictest type letter.
+///
+/// The server advertises decimal columns as `numeric` (OID 1700) and
+/// `tokio_postgres` requests them in binary, so the wire payload is PG binary
+/// numeric (base-10000 digit groups). The decoder is robust to either form:
+/// PG binary numeric or — as a fallback for text-format servers — ASCII text.
+struct PgNumeric {
+    value: i128,
+    scale: i32,
+}
+
+impl PgNumeric {
+    /// Render this numeric per the declared sqllogictest column type:
+    /// - `I` (integer): the truncated integer part, matching the PG-derived
+    ///   baselines (e.g. `AVG`-of-int `15`).
+    /// - `R` (real): three decimal places, the canonical sqllogictest `R` form.
+    /// - `T` / anything else: the canonical PG fixed-point numeric text.
+    fn format_for(&self, declared: Option<char>) -> String {
+        let decimal = Value::Decimal {
+            value: self.value,
+            scale: self.scale,
+        };
+        match declared {
+            Some('I') => self.integer_part().to_string(),
+            Some('R') => format!("{:.3}", self.as_f64()),
+            _ => decimal.to_string(),
+        }
+    }
+
+    /// Integer part via truncation toward zero (PG `numeric -> int` text under
+    /// sqllogictest `query I` matches truncation for these baselines).
+    fn integer_part(&self) -> i128 {
+        if self.scale <= 0 {
+            // Already an integer (possibly with implied trailing zeros).
+            let mut v = self.value;
+            for _ in 0..(-self.scale) {
+                v = v.saturating_mul(10);
+            }
+            v
+        } else {
+            let divisor = 10_i128.pow(u32::try_from(self.scale).unwrap_or(u32::MAX));
+            self.value / divisor
+        }
+    }
+
+    fn as_f64(&self) -> f64 {
+        (self.value as f64) / 10_f64.powi(self.scale)
+    }
+}
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+        // Binary PG numeric is the common case (tokio_postgres requests binary
+        // results). Fall back to ASCII text for text-format servers.
+        let decoded = decode_pg_numeric_binary(raw).or_else(|_| {
+            let text = std::str::from_utf8(raw)?;
+            ultrasql_core::parse_decimal_text(text, None)
+                .map_err(|err| Box::<dyn StdError + Sync + Send>::from(err.to_string()))
+        })?;
+        let Value::Decimal { value, scale } = decoded else {
+            return Err("decoded numeric was not a decimal value".into());
+        };
+        Ok(Self { value, scale })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
 }
 
 fn format_nullable<T: ToString>(value: Option<T>) -> String {
@@ -276,4 +357,73 @@ pub(crate) fn format_pg_error(err: &tokio_postgres::Error) -> String {
         return format!("{}: {}", db_error.code().code(), db_error.message());
     }
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::encode_pg_numeric_binary;
+
+    #[test]
+    fn numeric_query_i_renders_truncated_integer_part() {
+        // AVG(int) materialises as numeric `15` (scale 0); `query I` -> "15".
+        let n = PgNumeric {
+            value: 15,
+            scale: 0,
+        };
+        assert_eq!(n.format_for(Some('I')), "15");
+
+        // A fractional numeric under `query I` truncates toward zero.
+        let frac = PgNumeric {
+            value: 1599,
+            scale: 2,
+        };
+        assert_eq!(frac.format_for(Some('I')), "15");
+    }
+
+    #[test]
+    fn numeric_query_r_renders_three_decimals() {
+        let n = PgNumeric {
+            value: 15,
+            scale: 1,
+        };
+        assert_eq!(n.format_for(Some('R')), "1.500");
+    }
+
+    #[test]
+    fn numeric_query_t_renders_canonical_text() {
+        let n = PgNumeric {
+            value: 1230,
+            scale: 2,
+        };
+        assert_eq!(n.format_for(Some('T')), "12.30");
+    }
+
+    #[test]
+    fn numeric_negative_scale_query_i_appends_trailing_zeros() {
+        // Scale -1 means the stored value carries an implied trailing zero.
+        let n = PgNumeric {
+            value: 15,
+            scale: -1,
+        };
+        assert_eq!(n.format_for(Some('I')), "150");
+    }
+
+    #[test]
+    fn from_sql_decodes_pg_binary_numeric() {
+        let payload = encode_pg_numeric_binary(150, 1).expect("encode 15.0");
+        let decoded = PgNumeric::from_sql(&Type::NUMERIC, &payload).expect("decode binary numeric");
+        assert_eq!(decoded.value, 150);
+        assert_eq!(decoded.scale, 1);
+        assert_eq!(decoded.format_for(Some('I')), "15");
+        assert_eq!(decoded.format_for(Some('T')), "15.0");
+    }
+
+    #[test]
+    fn from_sql_falls_back_to_ascii_text() {
+        let decoded = PgNumeric::from_sql(&Type::NUMERIC, b"12.30")
+            .expect("decode ascii-text numeric fallback");
+        assert_eq!(decoded.format_for(Some('T')), "12.30");
+        assert_eq!(decoded.format_for(Some('I')), "12");
+    }
 }
