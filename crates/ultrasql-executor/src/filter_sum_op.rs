@@ -33,10 +33,9 @@
 
 use std::sync::Arc;
 
-use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_storage::column_cache::CachedColumns;
-use ultrasql_vec::column::{Column, NumericColumn};
+use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use ultrasql_vec::jit::{JitConfig, filter_sum_i32_widening_gt_jit};
 use ultrasql_vec::kernels::{
     CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, sum_i32_widening,
@@ -58,12 +57,13 @@ fn null_i64_column() -> Result<Column, ExecError> {
         .map_err(|_| ExecError::Internal("single-row Int64 NULL length mismatch"))
 }
 
-fn null_f64_column() -> Result<Column, ExecError> {
+fn null_decimal_column() -> Result<Column, ExecError> {
+    // Decimal columns materialise as text; an empty-group AVG is SQL NULL.
     let mut nulls = Bitmap::new(1, false);
     nulls.set(0, false);
-    NumericColumn::with_nulls(vec![0.0_f64], nulls)
-        .map(Column::Float64)
-        .map_err(|_| ExecError::Internal("single-row Float64 NULL length mismatch"))
+    StringColumn::with_nulls(vec![String::new()], nulls)
+        .map(Column::Utf8)
+        .map_err(|_| ExecError::Internal("single-row Decimal NULL length mismatch"))
 }
 
 fn checked_sum_i64(acc: i64, delta: i64, context: &str) -> Result<i64, ExecError> {
@@ -542,7 +542,16 @@ impl std::fmt::Debug for CachedAvgI32Scan {
 impl CachedAvgI32Scan {
     #[must_use]
     pub fn new(columns: Arc<CachedColumns>, sum_col: usize, output_name: String) -> Self {
-        let output_schema = single_output_schema(output_name, DataType::Float64);
+        // AVG over an integer column returns `numeric` (PG semantics), so the
+        // fused fast path emits a Decimal column, matching the normal
+        // HashAggregate AVG lowering.
+        let output_schema = single_output_schema(
+            output_name,
+            DataType::Decimal {
+                precision: None,
+                scale: Some(AVG_DECIMAL_SCALE),
+            },
+        );
         Self {
             columns,
             sum_col,
@@ -580,11 +589,19 @@ impl Operator for CachedAvgI32Scan {
             c
         });
         let result_col = if non_null == 0 {
-            null_f64_column()?
+            null_decimal_column()?
         } else {
             let total = sum_i32_widening(col);
-            let avg = i64_to_f64_saturating(total) / usize_to_f64_saturating(non_null);
-            Column::Float64(NumericColumn::from_data(vec![avg]))
+            // Exact i128 decimal division `total / non_null` rounded half-up
+            // to the AVG result scale, then materialised as decimal text (the
+            // standard Decimal column representation).
+            let count = i64::try_from(non_null).map_err(|_| {
+                ExecError::NumericFieldOverflow("CachedAvgI32Scan: count exceeds i64".to_owned())
+            })?;
+            let text = avg_decimal_text(i128::from(total), count).ok_or_else(|| {
+                ExecError::NumericFieldOverflow("CachedAvgI32Scan: avg overflow".to_owned())
+            })?;
+            Column::Utf8(StringColumn::from_data(vec![text]))
         };
         let batch = Batch::new([result_col]).map_err(ExecError::from)?;
         Ok(Some(batch))
@@ -734,18 +751,19 @@ impl Operator for FilterSumI64Scan {
     }
 }
 
-fn i64_to_f64_saturating(value: i64) -> f64 {
-    value.to_f64().unwrap_or_else(|| {
-        if value.is_negative() {
-            f64::MIN
-        } else {
-            f64::MAX
-        }
-    })
-}
+/// Nominal declared display scale for the `AVG`-over-integer output column.
+/// This is advisory metadata only — the actual rendered scale is computed
+/// per value by PostgreSQL's `select_div_scale` rule (see
+/// [`crate::hash_aggregate::arith::avg_decimal_division`]). The codec
+/// re-derives scale from the decimal text, so this value does not affect the
+/// wire payload.
+const AVG_DECIMAL_SCALE: i32 = 16;
 
-fn usize_to_f64_saturating(value: usize) -> f64 {
-    value.to_f64().unwrap_or(f64::MAX)
+/// Exact `total / count` rendered as decimal text using the same
+/// PostgreSQL-compatible `AVG` scale as the canonical aggregate path.
+/// `count` is non-zero by construction. Returns `None` on i128 overflow.
+fn avg_decimal_text(total: i128, count: i64) -> Option<String> {
+    crate::hash_aggregate::arith::avg_decimal_division(total, 0, count).map(|v| v.to_string())
 }
 
 #[cfg(test)]
@@ -763,17 +781,19 @@ mod tests {
         col.data()[0]
     }
 
-    fn output_f64(batch: &Batch) -> f64 {
-        let Column::Float64(col) = &batch.columns()[0] else {
-            panic!("expected float64 output")
+    /// AVG output is a Decimal column materialised as text.
+    fn output_decimal_text(batch: &Batch) -> String {
+        let Column::Utf8(col) = &batch.columns()[0] else {
+            panic!("expected decimal-text (Utf8) output")
         };
-        col.data()[0]
+        col.value(0).to_owned()
     }
 
     fn output_is_null(batch: &Batch) -> bool {
         match &batch.columns()[0] {
             Column::Int64(col) => col.nulls().is_some_and(|nulls| !nulls.get(0)),
             Column::Float64(col) => col.nulls().is_some_and(|nulls| !nulls.get(0)),
+            Column::Utf8(col) => col.nulls().is_some_and(|nulls| !nulls.get(0)),
             other => panic!("unexpected output column {other:?}"),
         }
     }
@@ -996,10 +1016,11 @@ mod tests {
         assert_eq!(output_i64(&sum.next_batch().expect("ok").expect("row")), 60);
         assert_eq!(sum.estimated_row_count(), Some(1));
 
+        // AVG over Int32 returns numeric: avg(10,20,30) = 20 exact, scale 16.
         let mut avg = CachedAvgI32Scan::new(Arc::clone(&columns), 1, "avg".to_owned());
         assert_eq!(
-            output_f64(&avg.next_batch().expect("ok").expect("row")),
-            20.0
+            output_decimal_text(&avg.next_batch().expect("ok").expect("row")),
+            "20.0000000000000000"
         );
 
         let empty = cached_i32(vec![
@@ -1023,10 +1044,11 @@ mod tests {
                 NumericColumn::with_nulls(vec![10, 20, 30], valid).expect("matching lengths"),
             ),
         ]);
+        // avg(10, NULL, 30) skips the null: (10+30)/2 = 20 exact.
         let mut nullable_avg = CachedAvgI32Scan::new(nullable, 1, "avg".to_owned());
         assert_eq!(
-            output_f64(&nullable_avg.next_batch().expect("ok").expect("row")),
-            20.0
+            output_decimal_text(&nullable_avg.next_batch().expect("ok").expect("row")),
+            "20.0000000000000000"
         );
     }
 }

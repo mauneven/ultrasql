@@ -63,6 +63,26 @@ pub enum SavepointError {
     },
 }
 
+/// Outcome of a [`SubtxnManager::rollback_to`] operation.
+///
+/// PostgreSQL keeps the target savepoint active after `ROLLBACK TO`, so the
+/// manager must abort the work done *since* the savepoint (the old target
+/// subxid plus every inner savepoint) yet leave the target name on the stack
+/// under a **fresh** subxid that subsequent work — and a subsequent
+/// `ROLLBACK TO` to the same name — can use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RollbackOutcome {
+    /// Subxids that must be marked `Aborted` in the CLOG: the inner
+    /// savepoints removed from the stack plus the target's *old* subxid.
+    pub aborted: Vec<Xid>,
+    /// The fresh subxid allocated for the surviving target savepoint. The
+    /// caller must register it in the CLOG (`InProgress`) and the
+    /// subxid→parent map, exactly as [`SubtxnManager::savepoint`]'s
+    /// allocator does, so subsequent writes under the kept savepoint are
+    /// stamped with a live subxid.
+    pub new_target_xid: Xid,
+}
+
 /// Subtransaction / savepoint manager for one top-level transaction.
 ///
 /// Maintains a stack of [`Subtxn`] entries.  The stack grows on
@@ -168,14 +188,32 @@ impl SubtxnManager {
 
     /// Roll back to the savepoint named `name`.
     ///
-    /// Finds the most recent savepoint with the given name, removes it and
-    /// all savepoints set after it, and returns the XIDs of all removed
-    /// subtransactions (in stack order, most-recent-first).  The caller is
-    /// responsible for marking those XIDs as aborted in the CLOG.
+    /// Finds the most recent savepoint with the given name and undoes the
+    /// work done *since* it, matching PostgreSQL's `ROLLBACK TO SAVEPOINT`:
+    /// the target savepoint **stays active** afterwards (so a second
+    /// `ROLLBACK TO` to the same name succeeds), while every savepoint set
+    /// after it is discarded.
+    ///
+    /// Concretely this:
+    /// - removes every *inner* savepoint (those set after the target);
+    /// - aborts the target's *old* subxid (the writes made since the
+    ///   savepoint are reverted);
+    /// - allocates — via `alloc_xid` — a *fresh* subxid for the surviving
+    ///   target entry, so subsequent writes are stamped with a live subxid
+    ///   that can itself be rolled back again later.
+    ///
+    /// The returned [`RollbackOutcome::aborted`] lists every subxid the
+    /// caller must mark `Aborted` in the CLOG (inner savepoints + old
+    /// target). [`RollbackOutcome::new_target_xid`] is the fresh subxid the
+    /// caller must register as `InProgress` (mirroring [`Self::savepoint`]).
     ///
     /// Returns [`SavepointError::NotFound`] if no savepoint with that name
     /// exists.
-    pub fn rollback_to(&self, name: &str) -> Result<Vec<Xid>, SavepointError> {
+    pub fn rollback_to(
+        &self,
+        name: &str,
+        alloc_xid: impl FnOnce() -> Xid,
+    ) -> Result<RollbackOutcome, SavepointError> {
         let mut stack = self.stack.lock();
         // Find the most recent entry with the matching name (scan from the top).
         let pos =
@@ -186,17 +224,25 @@ impl SubtxnManager {
                     name: name.to_owned(),
                 })?;
 
-        // Cutoff = the target savepoint's own subxid. Subxids are handed
-        // out strictly increasing, so every subtransaction established at
-        // or after the target (whether still on the stack or already
-        // RELEASEd into `merged_up`) carries `xid >= cutoff` and must be
-        // discarded by this rollback.
+        // Cutoff = the target savepoint's own (old) subxid. Subxids are
+        // handed out strictly increasing, so every subtransaction
+        // established at or after the target (whether still on the stack or
+        // already RELEASEd into `merged_up`) carries `xid >= cutoff` and
+        // must be discarded by this rollback.
         let cutoff = stack[pos].xid;
 
-        // Drain from `pos` to the end.  The entry at `pos` itself is also
-        // removed — after rollback the savepoint no longer exists and must be
-        // re-established via another `SAVEPOINT name` if needed.
-        let removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
+        // Drain only the *inner* savepoints (strictly after `pos`); the
+        // target entry at `pos` survives. Its old subxid is aborted along
+        // with the inner ones, and the entry is re-stamped with a fresh
+        // subxid so work after this rollback is under a live subxid (PG
+        // keeps the savepoint, so a later ROLLBACK TO the same name must
+        // still find it).
+        let mut aborted: Vec<Xid> = stack.drain(pos + 1..).map(|s| s.xid).collect();
+        // The old target subxid is reverted too: roll back everything since
+        // the savepoint, but keep the savepoint itself.
+        aborted.push(cutoff);
+        let new_target_xid = alloc_xid();
+        stack[pos].xid = new_target_xid;
         drop(stack);
 
         // Prune `merged_up`: any subxid RELEASEd earlier but at or above
@@ -216,15 +262,20 @@ impl SubtxnManager {
                     true
                 }
             });
-            // The drained stack subxids themselves are recorded rolled-back
-            // by the manager via `record_rolled_back`, but record them here
-            // too so the local "self vs reverted" view is coherent the
-            // instant the stack drains.
-            for &xid in &removed {
+            // The drained stack subxids and the old target subxid are
+            // recorded rolled-back by the manager via `record_rolled_back`,
+            // but record them here too so the local "self vs reverted" view
+            // is coherent the instant the stack drains. The freshly
+            // allocated `new_target_xid` is strictly greater than `cutoff`
+            // and is intentionally NOT inserted here — it is a live subxid.
+            for &xid in &aborted {
                 rolled.insert(xid);
             }
         }
-        Ok(removed)
+        Ok(RollbackOutcome {
+            aborted,
+            new_target_xid,
+        })
     }
 
     /// Release the savepoint named `name`.
@@ -409,17 +460,44 @@ mod tests {
         mgr.savepoint("b", &mut alloc, cid(1)); // xid 21
         mgr.savepoint("c", &mut alloc, cid(2)); // xid 22
 
-        // Rollback to "b" should remove "b" and "c".
-        let aborted = mgr.rollback_to("b").unwrap();
-        // Returns XIDs in drain order: index 1 ("b") first, then index 2 ("c").
-        assert_eq!(aborted.len(), 2);
-        assert!(aborted.contains(&xid(21)));
-        assert!(aborted.contains(&xid(22)));
-
-        // Only "a" remains.
-        assert_eq!(mgr.depth(), 1);
+        // Rollback to "b" aborts inner "c" (xid 22) and the old "b" subxid
+        // (xid 21), then re-stamps the surviving "b" with a fresh subxid.
+        let outcome = mgr.rollback_to("b", &mut alloc).unwrap();
+        assert_eq!(outcome.aborted.len(), 2);
+        assert!(outcome.aborted.contains(&xid(21))); // old "b"
+        assert!(outcome.aborted.contains(&xid(22))); // inner "c"
+        // PG keeps the savepoint: "a" and a re-stamped "b" both remain.
+        assert_eq!(mgr.depth(), 2);
         let snap = mgr.stack_snapshot();
         assert_eq!(snap[0].name, "a");
+        assert_eq!(snap[1].name, "b");
+        // The surviving "b" carries the fresh subxid (xid 23, next from the
+        // shared allocator), not the aborted old one.
+        assert_eq!(snap[1].xid, outcome.new_target_xid);
+        assert_eq!(snap[1].xid, xid(23));
+        assert!(!outcome.aborted.contains(&snap[1].xid));
+    }
+
+    // ── rollback_to keeps the savepoint (PG semantics) ──────────────────────
+
+    #[test]
+    fn rollback_to_keeps_target_for_repeat_rollback() {
+        // PG: ROLLBACK TO s1 keeps s1, so a second ROLLBACK TO s1 succeeds.
+        let mgr = SubtxnManager::new(xid(1));
+        let mut alloc = make_alloc(100);
+
+        mgr.savepoint("s1", &mut alloc, cid(0)); // xid 100
+        let first = mgr.rollback_to("s1", &mut alloc).unwrap();
+        assert_eq!(first.aborted, vec![xid(100)]); // old s1 reverted
+        assert_eq!(first.new_target_xid, xid(101)); // fresh s1
+        assert_eq!(mgr.depth(), 1, "s1 must survive the first rollback");
+
+        // Second ROLLBACK TO s1 must succeed (it errored before the fix).
+        let second = mgr.rollback_to("s1", &mut alloc).unwrap();
+        assert_eq!(second.aborted, vec![xid(101)]); // the fresh s1 reverted
+        assert_eq!(second.new_target_xid, xid(102)); // another fresh s1
+        assert_eq!(mgr.depth(), 1, "s1 must still survive the second rollback");
+        assert_eq!(mgr.stack_snapshot()[0].name, "s1");
     }
 
     // ── rollback_to unknown name returns error ───────────────────────────────
@@ -430,14 +508,14 @@ mod tests {
         let mut alloc = make_alloc(30);
         mgr.savepoint("sp1", &mut alloc, cid(0));
 
-        let err = mgr.rollback_to("nonexistent").unwrap_err();
+        let err = mgr.rollback_to("nonexistent", &mut alloc).unwrap_err();
         assert_eq!(
             err,
             SavepointError::NotFound {
                 name: "nonexistent".to_owned(),
             }
         );
-        // Stack remains intact.
+        // Stack remains intact (the allocator is never invoked on error).
         assert_eq!(mgr.depth(), 1);
     }
 
@@ -526,14 +604,37 @@ mod tests {
         mgr.savepoint("x", &mut alloc, cid(1)); // xid 71 — most recent
         mgr.savepoint("y", &mut alloc, cid(2)); // xid 72
 
-        // Rollback to most-recent "x" should remove "x" (xid 71) and "y" (xid 72).
-        let aborted = mgr.rollback_to("x").unwrap();
-        assert_eq!(aborted.len(), 2);
-        assert!(aborted.contains(&xid(71)));
-        assert!(aborted.contains(&xid(72)));
+        // Rollback to most-recent "x" aborts inner "y" (xid 72) and the old
+        // most-recent "x" subxid (xid 71); both "x" entries survive.
+        let outcome = mgr.rollback_to("x", &mut alloc).unwrap();
+        assert_eq!(outcome.aborted.len(), 2);
+        assert!(outcome.aborted.contains(&xid(71))); // old most-recent "x"
+        assert!(outcome.aborted.contains(&xid(72))); // inner "y"
 
-        // First "x" (xid 70) remains.
-        assert_eq!(mgr.depth(), 1);
-        assert_eq!(mgr.stack_snapshot()[0].xid, xid(70));
+        // Both "x" entries remain: first "x" (xid 70) plus the re-stamped
+        // most-recent "x" (fresh xid 73).
+        assert_eq!(mgr.depth(), 2);
+        let snap = mgr.stack_snapshot();
+        assert_eq!(snap[0].xid, xid(70));
+        assert_eq!(snap[1].name, "x");
+        assert_eq!(snap[1].xid, outcome.new_target_xid);
+        assert_eq!(snap[1].xid, xid(73));
+    }
+
+    // ── rolled-back set excludes the re-stamped surviving subxid ────────────
+
+    #[test]
+    fn rollback_to_does_not_flag_fresh_target_subxid_rolled_back() {
+        let mgr = SubtxnManager::new(xid(1));
+        let mut alloc = make_alloc(200);
+
+        mgr.savepoint("s", &mut alloc, cid(0)); // xid 200
+        let outcome = mgr.rollback_to("s", &mut alloc).unwrap();
+
+        // Old subxid is rolled back; fresh one is a live "self" subxid.
+        assert!(mgr.is_rolled_back(xid(200)));
+        assert!(!mgr.is_rolled_back(outcome.new_target_xid));
+        assert!(mgr.self_subxids().contains(&outcome.new_target_xid));
+        assert!(!mgr.self_subxids().contains(&xid(200)));
     }
 }

@@ -14,7 +14,7 @@
 //! [`ultrasql_vec::kernels`] for dense batches:
 //!
 //! * `SUM(int)`   → `sum_i32_widening` / `sum_i64`            → `Int64` output
-//! * `AVG(int)`   → `sum_*` + `count_i64` (column length)     → `Float64` output
+//! * `AVG(int)`   → `sum_*` + `count_i64` (column length)     → `numeric` output
 //! * `COUNT(*)`   → column length per batch                     → `Int64` output
 //!
 //! The operator emits exactly one row in a single batch, then EOF.
@@ -26,7 +26,7 @@
 //! * the hash-table allocation and key-equality machinery for a plan
 //!   that contains zero group keys,
 //! * the per-batch projection allocation, since the result schema is
-//!   fixed (`Int64` or `Float64`, single column).
+//!   fixed (`Int64`, `numeric`, single column).
 //!
 //! NULL handling: dense batches stay on the SIMD kernel path. Nullable
 //! batches use a compact per-row validity fold that skips invalid rows
@@ -40,10 +40,9 @@
 //! * `AVG(BIGINT) → DOUBLE PRECISION`
 //! * `COUNT(*) → BIGINT`
 
-use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn};
+use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use ultrasql_vec::kernels::sum_i32_widening;
 
 use crate::{ExecError, Operator};
@@ -58,7 +57,8 @@ pub enum DirectScalarAggKind {
     /// columns (PostgreSQL widens `SUM(INT)` to `BIGINT` to avoid
     /// 32-bit overflow on large groups).
     Sum,
-    /// `AVG(col)`. Output type is `Float64`.
+    /// `AVG(col)`. Output type is `numeric` (PostgreSQL semantics — exact
+    /// decimal division materialised as decimal text).
     Avg,
     /// `COUNT(*)`. Output type is `Int64`. Reads no column.
     CountStar,
@@ -128,28 +128,28 @@ impl DirectScalarAggScan {
         )
     }
 
-    /// Build an `AVG(INT)` aggregator over `col_idx` of `child`. The
-    /// output is `Float64`.
+    /// Build an `AVG(INT)` aggregator over `col_idx` of `child`. The output
+    /// is `numeric` (PostgreSQL semantics — exact decimal division).
     #[must_use]
     pub fn avg_int32(child: Box<dyn Operator>, col_idx: usize, output_name: String) -> Self {
         Self::new_int_input(
             child,
             DirectScalarAggKind::Avg,
             InputKind::Int32 { col_idx },
-            DataType::Float64,
+            avg_decimal_type(),
             output_name,
         )
     }
 
     /// Build an `AVG(BIGINT)` aggregator over `col_idx` of `child`. The
-    /// output is `Float64`.
+    /// output is `numeric` (PostgreSQL semantics — exact decimal division).
     #[must_use]
     pub fn avg_int64(child: Box<dyn Operator>, col_idx: usize, output_name: String) -> Self {
         Self::new_int_input(
             child,
             DirectScalarAggKind::Avg,
             InputKind::Int64 { col_idx },
-            DataType::Float64,
+            avg_decimal_type(),
             output_name,
         )
     }
@@ -259,8 +259,8 @@ impl Operator for DirectScalarAggScan {
         }
 
         // Emit exactly one row. `Sum` and `CountStar` emit `Int64`;
-        // `Avg` emits `Float64`. Empty input produces a single SQL
-        // NULL row to match PostgreSQL semantics.
+        // `Avg` emits `numeric` (decimal text). Empty input produces a
+        // single SQL NULL row to match PostgreSQL semantics.
         let result_col = match self.kind {
             DirectScalarAggKind::Sum => {
                 if count_rows == 0 {
@@ -274,23 +274,23 @@ impl Operator for DirectScalarAggScan {
             }
             DirectScalarAggKind::Avg => {
                 if count_rows == 0 {
-                    null_float64_row()?
+                    null_decimal_row()?
                 } else {
-                    // Widen through f64 once. Matches PostgreSQL's
-                    // `AVG(INT) → DOUBLE PRECISION` widening rule
-                    // and the binder's declared aggregate result type.
-                    let sum = total_sum.to_f64().ok_or_else(|| {
+                    // PostgreSQL `AVG(int)` returns `numeric`: divide the i64
+                    // sum exactly in i128 decimal space at the
+                    // PostgreSQL-compatible result scale, then materialise as
+                    // decimal text (the standard Decimal column form).
+                    let avg = crate::hash_aggregate::arith::avg_decimal_division(
+                        i128::from(total_sum),
+                        0,
+                        count_rows,
+                    )
+                    .ok_or_else(|| {
                         ExecError::NumericFieldOverflow(
-                            "DirectScalarAggScan AVG sum conversion overflow".to_owned(),
+                            "DirectScalarAggScan AVG division overflow".to_owned(),
                         )
                     })?;
-                    let count = count_rows.to_f64().ok_or_else(|| {
-                        ExecError::NumericFieldOverflow(
-                            "DirectScalarAggScan AVG count conversion overflow".to_owned(),
-                        )
-                    })?;
-                    let avg = sum / count;
-                    Column::Float64(NumericColumn::from_data(vec![avg]))
+                    Column::Utf8(StringColumn::from_data(vec![avg.to_string()]))
                 }
             }
         };
@@ -319,12 +319,32 @@ fn null_int64_row() -> Result<Column, ExecError> {
         .map_err(|err| ExecError::TypeMismatch(format!("direct scalar SUM NULL row: {err}")))
 }
 
-/// Build a single-row `Float64` column carrying SQL `NULL`.
-fn null_float64_row() -> Result<Column, ExecError> {
+/// Logical type of an `AVG`-over-integer result column: `numeric`
+/// (PostgreSQL semantics). Precision/scale are unconstrained — the rendered
+/// scale is value-dependent (PostgreSQL `select_div_scale`).
+pub fn avg_decimal_type() -> DataType {
+    DataType::Decimal {
+        precision: None,
+        scale: None,
+    }
+}
+
+/// Render `AVG(sum, count)` over integer input as PostgreSQL-compatible
+/// `numeric` decimal text (exact i128 division at PG's `select_div_scale`).
+/// `count` must be non-zero. Returns `None` on i128 overflow. Shared with
+/// the server's cached scalar-aggregate fast path so every AVG path agrees.
+#[must_use]
+pub fn avg_int_decimal_text(sum: i128, count: i64) -> Option<String> {
+    crate::hash_aggregate::arith::avg_decimal_division(sum, 0, count).map(|v| v.to_string())
+}
+
+/// Build a single-row Decimal column carrying SQL `NULL`. Decimal columns
+/// materialise as text, so an empty-group AVG is a NULL text cell.
+fn null_decimal_row() -> Result<Column, ExecError> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    NumericColumn::with_nulls(vec![0.0_f64], nulls)
-        .map(Column::Float64)
+    StringColumn::with_nulls(vec![String::new()], nulls)
+        .map(Column::Utf8)
         .map_err(|err| ExecError::TypeMismatch(format!("direct scalar AVG NULL row: {err}")))
 }
 
@@ -486,13 +506,15 @@ mod tests {
     }
 
     #[test]
-    fn avg_int32_divides_and_widens_to_float64() {
+    fn avg_int32_divides_exactly_to_numeric() {
+        // AVG over INT returns numeric (PG): avg(2,4,6,8) = 5, rendered at the
+        // AVG result scale (16) as decimal text.
         let scan = make_int32_scan("x", vec![2, 4, 6, 8]);
         let mut agg = DirectScalarAggScan::avg_int32(Box::new(scan), 0, "avg".into());
         let batch = agg.next_batch().expect("ok").expect("row");
         match &batch.columns()[0] {
-            Column::Float64(c) => assert_eq!(c.data(), &[5.0_f64]),
-            other => panic!("expected Float64, got {other:?}"),
+            Column::Utf8(c) => assert_eq!(c.value(0), "5.0000000000000000"),
+            other => panic!("expected decimal-text (Utf8), got {other:?}"),
         }
     }
 
@@ -533,11 +555,12 @@ mod tests {
         let mut agg = DirectScalarAggScan::avg_int32(Box::new(scan), 0, "avg".into());
         let batch = agg.next_batch().expect("ok").expect("row");
         match &batch.columns()[0] {
-            Column::Float64(c) => {
+            // Empty-group AVG is numeric NULL, materialised as a NULL text cell.
+            Column::Utf8(c) => {
                 let nulls = c.nulls().expect("null bitmap present on empty AVG");
                 assert!(!nulls.get(0));
             }
-            other => panic!("expected Float64 column, got {other:?}"),
+            other => panic!("expected decimal-text (Utf8) column, got {other:?}"),
         }
     }
 
@@ -563,9 +586,10 @@ mod tests {
 
         let batch = agg.next_batch().expect("ok").expect("row");
 
+        // AVG over BIGINT returns numeric: avg(10,20,30) = 20 (scale 16).
         match &batch.columns()[0] {
-            Column::Float64(c) => assert_eq!(c.data(), &[20.0_f64]),
-            other => panic!("expected Float64, got {other:?}"),
+            Column::Utf8(c) => assert_eq!(c.value(0), "20.0000000000000000"),
+            other => panic!("expected decimal-text (Utf8), got {other:?}"),
         }
     }
 
@@ -607,9 +631,10 @@ mod tests {
 
         let batch = agg.next_batch().expect("ok").expect("row");
 
+        // Skips the two NULLs: avg(10, 30) = 20 as numeric (scale 16).
         match &batch.columns()[0] {
-            Column::Float64(c) => assert_eq!(c.data(), &[20.0]),
-            other => panic!("expected Float64, got {other:?}"),
+            Column::Utf8(c) => assert_eq!(c.value(0), "20.0000000000000000"),
+            other => panic!("expected decimal-text (Utf8), got {other:?}"),
         }
     }
 

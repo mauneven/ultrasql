@@ -33,8 +33,8 @@ use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::Batch;
 
 use crate::aggregate_math::{
-    add_dense_vector_values, divide_dense_vector_values, percentile_cont_indexes,
-    percentile_disc_index, usize_to_f64, widen_sum_seed,
+    add_dense_vector_values, percentile_cont_indexes, percentile_disc_index, usize_to_f64,
+    widen_sum_seed,
 };
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
@@ -619,16 +619,14 @@ fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
     }
 }
 
+/// Divide a running `AVG` sum by the count.
+///
+/// Delegates to the canonical [`crate::hash_aggregate::arith::divide_value`]
+/// so the sort-based aggregate path produces the same PostgreSQL types as
+/// the hash-aggregate path: `numeric` (exact `i128` division) for
+/// integer/numeric sums, `double precision` for float sums.
 fn divide_value(sum: Value, count: i64) -> Value {
-    let count_f64 = i64_to_f64_saturating(count);
-    match sum {
-        Value::Int64(s) => Value::Float64(i64_to_f64_saturating(s) / count_f64),
-        Value::Float64(s) => Value::Float64(s / count_f64),
-        Value::Decimal { value, scale } => Value::Float64(decimal_to_f64(value, scale) / count_f64),
-        Value::Vector(values) => Value::Vector(divide_dense_vector_values(values, count)),
-        Value::HalfVec(values) => Value::HalfVec(divide_dense_vector_values(values, count)),
-        other => other,
-    }
+    crate::hash_aggregate::arith::divide_value(sum, count)
 }
 
 fn add_decimal_values(
@@ -1359,7 +1357,14 @@ mod tests {
         let out_schema = Schema::new([
             Field::required("group", DataType::Int32),
             Field::required("sum", DataType::Int64),
-            Field::required("avg", DataType::Float64),
+            // AVG over an Int64 column returns `numeric` (PG semantics).
+            Field::required(
+                "avg",
+                DataType::Decimal {
+                    precision: None,
+                    scale: Some(16),
+                },
+            ),
             Field::required("min", DataType::Text { max_len: None }),
             Field::required("max", DataType::Int64),
             Field::required("all", DataType::Bool),
@@ -1380,7 +1385,10 @@ mod tests {
                 AggregateFunc::Avg,
                 Some(col("val", 1, DataType::Int64)),
                 "avg",
-                DataType::Float64,
+                DataType::Decimal {
+                    precision: None,
+                    scale: Some(16),
+                },
             ),
             agg(
                 AggregateFunc::Min,
@@ -1430,7 +1438,14 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Value::Int64(30));
-        assert_eq!(rows[0][2], Value::Float64(15.0));
+        // avg(10, 20) = 15 exactly, as numeric at the AVG result scale (16).
+        assert_eq!(
+            rows[0][2],
+            Value::Decimal {
+                value: 15 * 10_i128.pow(16),
+                scale: 16,
+            }
+        );
         assert_eq!(rows[0][3], Value::Text("a".to_owned()));
         assert_eq!(rows[0][4], Value::Int64(20));
         assert_eq!(rows[0][5], Value::Bool(false));

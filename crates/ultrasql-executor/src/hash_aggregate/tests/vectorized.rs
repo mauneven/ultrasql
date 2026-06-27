@@ -209,7 +209,12 @@ fn vectorized_avg_i32_matches_scalar() {
     let values: Vec<i32> = (0_i32..4096).map(|i| i - 2048).collect();
 
     let (schema, batch) = make_i32_batch(values, None);
-    let out_schema = Schema::new([Field::nullable("avg_v", DataType::Float64)]).expect("schema ok");
+    // AVG over an integer column returns `numeric` (PG semantics).
+    let avg_type = DataType::Decimal {
+        precision: None,
+        scale: None,
+    };
+    let out_schema = Schema::new([Field::nullable("avg_v", avg_type.clone())]).expect("schema ok");
 
     let avg_v = LogicalAggregateExpr {
         func: AggregateFunc::Avg,
@@ -218,7 +223,7 @@ fn vectorized_avg_i32_matches_scalar() {
         order_by: None,
         distinct: false,
         output_name: "avg_v".into(),
-        data_type: DataType::Float64,
+        data_type: avg_type,
     };
 
     // Vectorised path.
@@ -240,17 +245,23 @@ fn vectorized_avg_i32_matches_scalar() {
     assert_eq!(rows_vec.len(), 1);
     assert_eq!(rows_sca.len(), 1);
 
-    // The result is Float64; compare via bit pattern for exact equality.
-    match (&rows_vec[0][0], &rows_sca[0][0]) {
-        (Value::Float64(a), Value::Float64(b)) => {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "vectorised AVG bits must equal scalar AVG bits"
-            );
-        }
-        other => panic!("expected Float64 results, got {other:?}"),
-    }
+    // The result is numeric (Decimal): the vectorised and scalar paths must
+    // produce identical exact decimals. avg(-2048..=2047) = -0.5. PostgreSQL's
+    // select_div_scale yields scale 20 here (quotient |0.5| < 1), so -0.5 is
+    // rendered as -50_000_000_000_000_000_000 at scale 20 (matches
+    // `psql: -0.50000000000000000000`).
+    assert_eq!(
+        rows_vec[0][0],
+        Value::Decimal {
+            value: -50_000_000_000_000_000_000,
+            scale: 20,
+        },
+        "vectorised AVG must be exact numeric -0.5"
+    );
+    assert_eq!(
+        rows_vec[0][0], rows_sca[0][0],
+        "vectorised AVG must equal scalar AVG exactly"
+    );
 }
 
 #[test]

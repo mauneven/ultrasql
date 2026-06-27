@@ -114,11 +114,20 @@ async fn direct_scalar_aggregate_skips_nullable_inputs() {
         .expect("sum over nullable facts");
     assert_eq!(sum.get::<_, i64>(0), 40);
 
-    let avg = client
-        .query_one("SELECT AVG(v) FROM nullable_facts", &[])
+    // AVG over INT returns NUMERIC (PG semantics), so read it as text via the
+    // simple-query protocol. avg(10, 30) = 20, rendered at the AVG scale (16).
+    let avg_rows = client
+        .simple_query("SELECT AVG(v) FROM nullable_facts")
         .await
         .expect("avg over nullable facts");
-    assert_eq!(avg.get::<_, f64>(0), 20.0);
+    let avg_text = avg_rows
+        .iter()
+        .find_map(|msg| match msg {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row.get(0).unwrap().to_owned()),
+            _ => None,
+        })
+        .expect("avg row");
+    assert_eq!(avg_text, "20.0000000000000000");
 
     shutdown(client, server_handle).await;
 }

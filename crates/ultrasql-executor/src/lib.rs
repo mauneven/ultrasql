@@ -130,7 +130,9 @@ use ultrasql_vec::Batch;
 
 pub use bitmap_heap_scan::IndexOnlyScan;
 pub use cte_scan::CteScan;
-pub use direct_scalar_agg::{DirectScalarAggKind, DirectScalarAggScan};
+pub use direct_scalar_agg::{
+    DirectScalarAggKind, DirectScalarAggScan, avg_decimal_type, avg_int_decimal_text,
+};
 pub use distinct_on::DistinctOn;
 pub use eval::eval_clock::{EvalClock, EvalClockGuard, live_engine_timestamp_micros};
 pub use eval::{Eval, EvalError};

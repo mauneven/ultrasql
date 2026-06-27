@@ -278,10 +278,16 @@ fn binds_aggregate_window_functions_with_result_types() {
     let LogicalPlan::Project { schema, .. } = &plan else {
         panic!("expected Project");
     };
-    // sum(int) -> Int64, avg -> Float64, count/count(*) -> Int64,
-    // min/max(float) -> Float64.
+    // sum(int) -> Int64, avg(int) -> numeric (PG semantics),
+    // count/count(*) -> Int64, min/max(float) -> Float64.
     assert_eq!(schema.field_at(0).data_type, DataType::Int64);
-    assert_eq!(schema.field_at(1).data_type, DataType::Float64);
+    assert_eq!(
+        schema.field_at(1).data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: None,
+        }
+    );
     assert_eq!(schema.field_at(2).data_type, DataType::Int64);
     assert_eq!(schema.field_at(3).data_type, DataType::Int64);
     assert_eq!(schema.field_at(4).data_type, DataType::Float64);

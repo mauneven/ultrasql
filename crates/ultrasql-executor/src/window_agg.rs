@@ -3075,6 +3075,9 @@ mod tests {
             vec![Value::Int32(10), Value::Int32(30), Value::Int32(30)]
         );
 
+        // AVG over an Int32 column returns `numeric` (PG semantics): exact
+        // decimal division at the AVG result scale (16), not double precision.
+        let avg_scale = 16;
         let mut avg_op = WindowAgg::new(
             Box::new(MemTableScan::new(schema_id_val(), rows)),
             vec![],
@@ -3083,18 +3086,21 @@ mod tests {
                 kind: WindowAggKind::Avg,
                 expr: col_val(),
             },
-            schema_with_value_window(DataType::Float64),
+            schema_with_value_window(DataType::Decimal {
+                precision: None,
+                scale: Some(avg_scale),
+            }),
         )
         .with_order_directions(vec![(true, false)])
         .with_frame(default_running_frame());
-        // running avg: 10, 20, 20
+        // running avg: 10, 20, 20 — exact, rendered at scale 16.
+        let dec = |whole: i128| Value::Decimal {
+            value: whole * 10_i128.pow(16),
+            scale: avg_scale,
+        };
         assert_eq!(
             drain_window_values(&mut avg_op),
-            vec![
-                Value::Float64(10.0),
-                Value::Float64(20.0),
-                Value::Float64(20.0)
-            ]
+            vec![dec(10), dec(20), dec(20)]
         );
     }
 

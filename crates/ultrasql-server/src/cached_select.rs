@@ -1,6 +1,8 @@
 //! Fast-path cached scalar-aggregate and int32-pair SELECT execution.
 //!
 //! Moved verbatim from the crate root; behavior unchanged.
+use ultrasql_vec::column::StringColumn;
+
 use super::*;
 
 pub(crate) fn try_run_cached_int32_pair_select(
@@ -343,6 +345,8 @@ pub(crate) fn build_cached_avg_column(
     data_type: &ultrasql_core::DataType,
     columns: &[Column],
 ) -> Option<Column> {
+    // AVG over integer input returns `numeric` (PG semantics): exact i128
+    // division materialised as decimal text. Empty group is SQL NULL.
     match data_type {
         ultrasql_core::DataType::Int32 => {
             let Column::Int32(col) = columns.get(sum_col)? else {
@@ -352,11 +356,14 @@ pub(crate) fn build_cached_avg_column(
                 return None;
             }
             if col.is_empty() {
-                null_float64_column()
+                null_decimal_column()
             } else {
-                let avg = i64_to_f64_saturating(sum_i32_widening(col))
-                    / usize_to_f64_saturating(col.len());
-                Some(Column::Float64(NumericColumn::from_data(vec![avg])))
+                let count = i64::try_from(col.len()).ok()?;
+                let text = ultrasql_executor::avg_int_decimal_text(
+                    i128::from(sum_i32_widening(col)),
+                    count,
+                )?;
+                Some(Column::Utf8(StringColumn::from_data(vec![text])))
             }
         }
         ultrasql_core::DataType::Int64 => {
@@ -367,28 +374,16 @@ pub(crate) fn build_cached_avg_column(
                 return None;
             }
             if col.is_empty() {
-                null_float64_column()
+                null_decimal_column()
             } else {
-                let avg = i64_to_f64_saturating(sum_i64(col)) / usize_to_f64_saturating(col.len());
-                Some(Column::Float64(NumericColumn::from_data(vec![avg])))
+                let count = i64::try_from(col.len()).ok()?;
+                let text =
+                    ultrasql_executor::avg_int_decimal_text(i128::from(sum_i64(col)), count)?;
+                Some(Column::Utf8(StringColumn::from_data(vec![text])))
             }
         }
         _ => None,
     }
-}
-
-pub(crate) fn i64_to_f64_saturating(value: i64) -> f64 {
-    value.to_f64().unwrap_or_else(|| {
-        if value.is_negative() {
-            f64::MIN
-        } else {
-            f64::MAX
-        }
-    })
-}
-
-pub(crate) fn usize_to_f64_saturating(value: usize) -> f64 {
-    value.to_f64().unwrap_or(f64::MAX)
 }
 
 pub(crate) fn build_cached_filter_sum_column(
@@ -544,12 +539,14 @@ pub(crate) fn null_int64_column() -> Option<Column> {
         .map(Column::Int64)
 }
 
-pub(crate) fn null_float64_column() -> Option<Column> {
+/// Single-row Decimal column carrying SQL `NULL` (Decimal materialises as
+/// text). Used for an empty-group `AVG`, which returns `numeric` NULL.
+pub(crate) fn null_decimal_column() -> Option<Column> {
     let mut nulls = ultrasql_vec::Bitmap::new(1, false);
     nulls.set(0, false);
-    NumericColumn::with_nulls(vec![0.0_f64], nulls)
+    StringColumn::with_nulls(vec![String::new()], nulls)
         .ok()
-        .map(Column::Float64)
+        .map(Column::Utf8)
 }
 
 pub(crate) fn decode_key_column(

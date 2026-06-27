@@ -433,6 +433,14 @@ pub(super) fn encode_binary_value_typed(
         (DataType::Jsonb, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
             col.text_value(row).map(encode_pg_binary_jsonb)
         }
+        // A UUID column is physically stored as canonical 36-char text. In
+        // binary result format PostgreSQL sends the raw 16 bytes, so parse
+        // the text and emit those bytes (mirroring the COPY binary path);
+        // the text-format branch still returns the 36-char ASCII below.
+        (DataType::Uuid, Column::Utf8(_) | Column::DictionaryUtf8(_)) => col
+            .text_value(row)
+            .and_then(Value::parse_uuid)
+            .map(|uuid| uuid.to_vec()),
         _ => encode_binary_value(col, row),
     }
 }
@@ -647,6 +655,7 @@ const fn pg_type_size(ty: &DataType) -> i16 {
         | DataType::TimestampTz
         | DataType::PgLsn => 8,
         DataType::TimeTz => 12,
+        DataType::Uuid => 16,
         _ => -1,
     }
 }

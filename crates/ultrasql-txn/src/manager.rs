@@ -1044,7 +1044,21 @@ impl TransactionManager {
         txn: &mut Transaction,
         name: &str,
     ) -> Result<Vec<Xid>, SavepointError> {
-        let aborted_xids = txn.subtxn_stack.rollback_to(name)?;
+        let parent = txn.xid;
+        // PG keeps the savepoint after ROLLBACK TO, re-stamping it with a
+        // fresh subxid. Allocate it the same way `begin_savepoint` does so
+        // subsequent writes carry a live, registered subxid.
+        let outcome = txn.subtxn_stack.rollback_to(name, || {
+            let raw = self.next_xid.fetch_add(1, Ordering::AcqRel);
+            let sub_xid = Xid::new(raw);
+            self.clog.insert(sub_xid, XidStatus::InProgress);
+            self.in_progress.lock().insert(sub_xid);
+            sub_xid
+        })?;
+        // Register the surviving savepoint's fresh subxid → top-parent link
+        // (pg_subtrans analog), mirroring `begin_savepoint`.
+        self.subxid_parent.insert(outcome.new_target_xid, parent);
+        let aborted_xids = outcome.aborted;
         for &sub_xid in &aborted_xids {
             // Transition InProgress → Aborted.  If the entry is missing
             // (programming error) the transition is a no-op.

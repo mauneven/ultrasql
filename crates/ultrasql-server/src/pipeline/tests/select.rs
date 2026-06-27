@@ -84,9 +84,20 @@ fn direct_scalar_avg_miss_populates_column_cache_and_next_lowering_uses_cached_a
             order_by: None,
             distinct: false,
             output_name: "avg".into(),
-            data_type: DataType::Float64,
+            // AVG over Int32 returns numeric (PG semantics).
+            data_type: DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
         }],
-        schema: Schema::new([Field::required("avg", DataType::Float64)]).expect("schema ok"),
+        schema: Schema::new([Field::required(
+            "avg",
+            DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+        )])
+        .expect("schema ok"),
     };
 
     let mut first = lower_query(&plan, &ctx).expect("first lowering");

@@ -863,12 +863,14 @@ fn scalar_cache_index_and_ann_helpers_cover_hot_edges() {
         panic!("sum i32 column type");
     };
     assert_eq!(sum_i32.data(), &[100]);
-    let Column::Float64(avg_i32) =
+    // AVG over INT returns numeric (PG): avg(1,2,3,4) = 2.5, rendered as
+    // decimal text at the AVG result scale (16).
+    let Column::Utf8(avg_i32) =
         build_cached_avg_column(0, &DataType::Int32, &i32_columns).expect("avg i32")
     else {
         panic!("avg i32 column type");
     };
-    assert_eq!(avg_i32.data(), &[2.5]);
+    assert_eq!(avg_i32.value(0), "2.5000000000000000");
     let Column::Int64(sum_i64) =
         build_cached_sum_column(0, &DataType::Int64, &i64_columns).expect("sum i64")
     else {

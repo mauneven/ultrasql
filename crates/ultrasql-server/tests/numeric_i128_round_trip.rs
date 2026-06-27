@@ -87,6 +87,9 @@ async fn sum_avg_over_large_bigints_are_correct() {
         one_value(client, "SELECT SUM(v) FROM big").await,
         "22500000000000000000"
     );
+    // AVG over NUMERIC returns NUMERIC (exact). PostgreSQL's select_div_scale
+    // yields scale 0 at this magnitude, so the exact average renders with no
+    // fractional digits (matches `psql: avg -> 7500000000000000000`).
     assert_eq!(
         one_value(client, "SELECT AVG(v) FROM big").await,
         "7500000000000000000"

@@ -140,15 +140,22 @@ pub(crate) fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> 
             other if other.is_numeric() => other,
             _ => DataType::Null,
         },
-        AggregateFunc::Avg => {
-            if arg_type.is_numeric() {
-                DataType::Float64
-            } else if matches!(arg_type, DataType::Vector { .. } | DataType::HalfVec { .. }) {
-                arg_type
-            } else {
-                DataType::Null
-            }
-        }
+        AggregateFunc::Avg => match arg_type {
+            // PostgreSQL: AVG over an integer or numeric argument returns
+            // `numeric` (exact division), while AVG over a float argument
+            // returns `double precision`.
+            DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            DataType::Decimal { .. } => DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            DataType::Float32 | DataType::Float64 => DataType::Float64,
+            DataType::Vector { .. } | DataType::HalfVec { .. } => arg_type,
+            _ => DataType::Null,
+        },
         AggregateFunc::Min | AggregateFunc::Max => arg_type,
         AggregateFunc::BoolAnd | AggregateFunc::BoolOr => DataType::Bool,
         AggregateFunc::StringAgg => DataType::Text { max_len: None },
