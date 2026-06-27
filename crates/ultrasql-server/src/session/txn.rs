@@ -12,6 +12,7 @@ use ultrasql_txn::IsolationLevel;
 use super::Session;
 use crate::error::ServerError;
 use crate::result_encoder::SelectResult;
+use crate::server_lifecycle::CommitDurability;
 use crate::{TxnState, notice_warning};
 
 impl<RW> Session<RW>
@@ -173,6 +174,31 @@ where
                     self.clear_pending_dml_effects();
                     return Err(err);
                 }
+                // Force ALL of this txn's DATA WAL records durable BEFORE the
+                // prepared-state file is written and the PREPARE is acked. The
+                // state file (fsynced by the coordinator) records the txn as
+                // prepared; if the data WAL tail were not yet durable, a crash
+                // after the ack would leave the txn in-doubt with its row
+                // changes discarded, and a later COMMIT PREPARED would mark it
+                // committed but replay nothing — silent loss of an acknowledged
+                // transaction. Order: data WAL durable -> state file durable
+                // (inside prepare_transaction) -> ack PREPARE (returning Ok).
+                let xid = txn.xid;
+                if let Err(e) = self.state.wait_for_txn_data_wal_durable(xid) {
+                    // The txn's data WAL is not durable: do NOT prepare/ack.
+                    // Roll the txn back (releasing its locks) and surface the
+                    // durability error so the coordinator never sees it as
+                    // prepared. Mirror the deferred-FK rollback path's cleanup.
+                    let err = self.rollback_transaction_after_error_with_abort_marker(
+                        txn,
+                        e,
+                        "PREPARE TRANSACTION rollback after data WAL durability failure",
+                        true,
+                    );
+                    self.discard_pending_catalog_ddl();
+                    self.clear_pending_dml_effects();
+                    return Err(err);
+                }
                 if let Err(e) = self.state.txn_manager.prepare_transaction(
                     gid,
                     txn,
@@ -267,11 +293,30 @@ where
             // pure-WAL restart after COMMIT PREPARED marks the whole family
             // Committed and rows written under a savepoint do not vanish.
             let committed_subxids = prepared.committed_subxids.clone();
+            // Append the Commit record. An append failure (or no WAL sink) keeps
+            // the record OUT of the durable pipeline, so unwinding to
+            // abort_resolution (leaving the txn prepared/in-doubt) is safe.
             if let Some(commit_lsn) = self
                 .state
                 .append_commit_record(xid, committed_subxids.clone())?
             {
-                self.state.wait_for_wal_durable(commit_lsn)?;
+                // POST-APPEND: the Commit record is now in the durable pipeline
+                // and the background writer may fsync it at any moment. A
+                // durability failure here is the SAME phantom-commit hazard as
+                // single-phase COMMIT: we must NOT report failure + leave the
+                // txn in-doubt while the record could still flush (recovery
+                // would then find the durable Commit record and commit a txn the
+                // client was told failed). Escalate to a FATAL process abort so
+                // recovery decides the true outcome from the durable WAL. This
+                // bypasses the per-statement catch_unwind (std::process::abort,
+                // not panic!), and crucially does NOT abort_resolution.
+                if let CommitDurability::Fatal(reason) = self
+                    .state
+                    .resolve_commit_durability_after_append(commit_lsn)
+                {
+                    self.state
+                        .fatal_commit_durability_failure(xid, "COMMIT PREPARED", &reason);
+                }
             }
             self.state
                 .txn_manager

@@ -498,13 +498,23 @@ impl TransactionManager {
         self.build_snapshot(current_xid, current_command, own)
     }
 
-    /// Commit `txn`. Marks the XID `Committed` in the CLOG.
+    /// Commit `txn` in a single shot. Marks the XID `Committed` in the CLOG.
+    ///
+    /// This is the non-durable convenience path: it runs the serializable check
+    /// and immediately makes the txn visible, with no WAL fsync in between.
+    /// **Durable** commit paths (every txn that changed persistent heap/index
+    /// state) must instead use the two-phase decomposition so the commit is made
+    /// durable BEFORE it is visible:
+    ///
+    /// 1. [`Self::commit_check_serializable`] — run the SSI check, get the family
+    /// 2. append the Commit WAL record for the family and fsync it
+    /// 3. [`Self::commit_finalize_visible`] — flip the CLOG + release locks
     ///
     /// For [`IsolationLevel::Serializable`] transactions with an installed
-    /// [`SsiManager`], the SSI manager's dangerous-structure check is run
-    /// after the CLOG entry is flipped. If a serialization anomaly is
-    /// detected, the commit fails with [`TxnError::SerializationFailure`]
-    /// and the caller must call [`Self::abort`] to roll back.
+    /// [`SsiManager`], the dangerous-structure check runs first; if a
+    /// serialization anomaly is detected the commit fails with
+    /// [`TxnError::SerializationFailure`] (the CLOG is left untouched) and the
+    /// caller must call [`Self::abort`] to roll back.
     ///
     /// Returns the **committed subtransaction family** — every subxid flipped
     /// to `Committed` alongside the parent (released + implicitly-released
@@ -526,48 +536,118 @@ impl TransactionManager {
         reason = "by-value enforces the at-most-once lifecycle invariant"
     )]
     pub fn commit(&self, txn: Transaction) -> Result<Vec<Xid>, TxnError> {
-        let xid = txn.xid;
-        let isolation = txn.isolation;
-        // Atomic family fold: the parent and every still-`InProgress`
-        // merged-up subxid flip to Committed together, under the
-        // `in_progress` lock, so a concurrent `build_snapshot` sees the
-        // whole family committed or none of it (test H).
-        let folded = self.merged_up_family(&txn);
-        self.terminate_with_subxids(xid, &folded, XidStatus::Committed, false)?;
+        // Single-shot commit: run the serialization check (computing the
+        // committed-subxid family), then immediately make the txn visible.
+        // The durable-commit path splits these two phases — running the WAL
+        // fsync between them so the commit is durable BEFORE it is visible —
+        // via [`Self::commit_check_serializable`] and
+        // [`Self::commit_finalize_visible`].
+        match self.commit_check_serializable(&txn) {
+            Ok(folded) => {
+                // A double-commit surfaces here as `AlreadyTerminated`; propagate
+                // it unchanged (the txn is already terminated, so there is
+                // nothing to roll back). The normal path makes the txn visible.
+                self.commit_finalize_visible(&txn, &folded)?;
+                Ok(folded)
+            }
+            Err(e) => {
+                // Backward-compatible single-shot contract: a serialization
+                // failure leaves the txn fully rolled back (CLOG `Aborted`,
+                // locks released), so direct `commit` callers that consume the
+                // handle do not leak locks. The durable server path uses the
+                // decomposed methods and aborts explicitly instead.
+                let _ = self.abort(txn);
+                Err(e)
+            }
+        }
+    }
 
-        // Release all row-level and relation-level locks.
-        self.lock_manager.release_all(xid);
-        self.forget_subxid_parents(&folded);
+    /// Phase 1 of a durable commit: run the serializable-isolation check and
+    /// return the committed-subtransaction family, **without** flipping the CLOG
+    /// or releasing locks.
+    ///
+    /// The returned family — every released (merged-up) and implicitly-released
+    /// open-savepoint subxid, excluding `ROLLBACK TO`-aborted ones — is the set
+    /// that must ride inside the durable Commit WAL record so recovery marks the
+    /// whole family `Committed` together. Callers append+fsync that record, then
+    /// call [`Self::commit_finalize_visible`] with this family to make the txn
+    /// visible *only after* it is durable.
+    ///
+    /// For a [`IsolationLevel::Serializable`] txn with an installed
+    /// [`SsiManager`] this runs the dangerous-structure check. On a serialization
+    /// anomaly the SSI entry is removed and [`TxnError::SerializationFailure`] is
+    /// returned; the caller must then abort the txn (no Commit record is written,
+    /// so the txn is never made visible and never durably committed). The CLOG is
+    /// untouched, so the SSI optimistic "mark committed" no longer needs the
+    /// later `force_abort` retraction the single-shot path used.
+    pub fn commit_check_serializable(&self, txn: &Transaction) -> Result<Vec<Xid>, TxnError> {
+        let folded = self.merged_up_family(txn);
 
-        // SSI check: only for serializable transactions with an installed manager.
-        if isolation == IsolationLevel::Serializable {
+        // SSI check: only for serializable transactions with an installed
+        // manager. This runs BEFORE the CLOG flip, so a failure leaves the txn
+        // still `InProgress` (MVCC-invisible) and the caller aborts it cleanly.
+        if txn.isolation == IsolationLevel::Serializable {
             if let Some(ssi) = &self.ssi {
-                // Capture the current XID high-water mark as this commit's
-                // GC horizon: every transaction able to be concurrent with us
-                // has, by definition, already begun and so carries a smaller
-                // XID. `terminate` above already removed `xid` from the active
-                // set, so a later `oldest_in_progress()` reaching this value
-                // proves no concurrent transaction survives.
+                // Capture the current XID high-water mark as this commit's GC
+                // horizon: every transaction able to be concurrent with us has,
+                // by definition, already begun and so carries a smaller XID. The
+                // txn is still in the active set here (the CLOG flip happens in
+                // phase 2), but the horizon is `next_xid()` — strictly greater
+                // than `txn.xid` — so a later `oldest_in_progress()` reaching it
+                // still proves no concurrent transaction survives.
                 if let Err(SsiError::Serialization { victim, detail }) =
-                    ssi.commit(xid, self.next_xid())
+                    ssi.commit(txn.xid, self.next_xid())
                 {
-                    // The SSI manager marked us committed before detecting the
-                    // cycle; we must immediately abort to restore consistency.
-                    // Flip the parent CLOG entry back to Aborted **and force-
-                    // abort the folded subxids** so a serialization failure
-                    // retracts the whole family, not just the parent.
-                    self.force_abort(xid);
-                    for &sub in &folded {
-                        self.force_abort(sub);
-                    }
-                    self.forget_subxid_parents(&folded);
-                    ssi.abort(xid);
+                    // The SSI manager optimistically marked us committed before
+                    // detecting the cycle. The CLOG was never flipped, so there
+                    // is nothing to retract there; just drop the SSI entry and
+                    // report the failure. The caller aborts the txn.
+                    ssi.abort(txn.xid);
                     return Err(TxnError::SerializationFailure { victim, detail });
                 }
             }
         }
 
         Ok(folded)
+    }
+
+    /// Phase 2 of a durable commit: make the txn visible.
+    ///
+    /// Flips the parent CLOG entry and the whole `folded` subxid family to
+    /// `Committed` in one atomic active-set transition (so a concurrent
+    /// `build_snapshot` sees the whole family committed or none of it), then
+    /// releases all of the txn's row- and relation-level locks and forgets the
+    /// folded subxid→parent links.
+    ///
+    /// This is the step that makes the commit observable to every other backend.
+    /// The durable-commit caller invokes it **only after** the Commit WAL record
+    /// is fsynced, so no other snapshot can observe a commit that a subsequent
+    /// crash would roll back.
+    ///
+    /// `folded` must be the family returned by the matching
+    /// [`Self::commit_check_serializable`] call for `txn`.
+    ///
+    /// Returns [`TxnError::AlreadyTerminated`] / [`TxnError::Unknown`] if the
+    /// parent CLOG entry is no longer `InProgress` (a mis-driven double-commit);
+    /// the CLOG and locks are left untouched in that case.
+    pub fn commit_finalize_visible(
+        &self,
+        txn: &Transaction,
+        folded: &[Xid],
+    ) -> Result<(), TxnError> {
+        let xid = txn.xid;
+        // Atomic family fold: the parent and every still-`InProgress` merged-up
+        // subxid flip to Committed together, under the `in_progress` lock, so a
+        // concurrent `build_snapshot` sees the whole family committed or none of
+        // it (test H). The parent must still be `InProgress` here in the normal
+        // linearly-driven lifecycle; a double-commit surfaces as
+        // `AlreadyTerminated` and leaves visibility/locks untouched.
+        self.terminate_with_subxids(xid, folded, XidStatus::Committed, false)?;
+
+        // Release all row-level and relation-level locks.
+        self.lock_manager.release_all(xid);
+        self.forget_subxid_parents(folded);
+        Ok(())
     }
 
     /// Abort `txn`. Marks the XID `Aborted` in the CLOG.
@@ -1072,22 +1152,6 @@ impl TransactionManager {
         coordinator.prepare(gid, txn.xid, &committed_subxids)
         // `txn` is dropped here; the CLOG entry remains `InProgress` until
         // the coordinator resolves via `commit_prepared` / `rollback_prepared`.
-    }
-
-    /// Force-set the CLOG entry for `xid` to `Aborted`, regardless of the
-    /// current status.
-    ///
-    /// Used exclusively by the SSI commit path to roll back a transaction
-    /// that was optimistically flipped to `Committed` but subsequently
-    /// found to be the pivot of a dangerous structure.  Callers must hold
-    /// the SSI manager's entry for `xid` while invoking this to prevent
-    /// concurrent observers from seeing a partially-committed state.
-    fn force_abort(&self, xid: Xid) {
-        if let Some(mut entry) = self.clog.get_mut(&xid) {
-            *entry.value_mut() = XidStatus::Aborted;
-            drop(entry);
-            self.in_progress.lock().remove(&xid);
-        }
     }
 
     /// Finalise a previously-prepared transaction by stamping its
@@ -1804,6 +1868,111 @@ mod tests {
             mgr.lock_manager.inspect(tag).is_none(),
             "lock must be released on commit"
         );
+    }
+
+    #[test]
+    fn commit_check_serializable_does_not_make_txn_visible_or_release_locks() {
+        use crate::lock::{LockMode, LockRequest, LockTag};
+        use ultrasql_core::RelationId;
+
+        // FIX #5: the durable-commit phase 1 must NOT flip the CLOG visible nor
+        // release locks — those happen only in phase 2, after the WAL fsync.
+        let mgr = TransactionManager::new();
+        let t = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid = t.xid;
+
+        let tag = LockTag::Relation(RelationId::new(7));
+        mgr.lock_manager
+            .acquire(LockRequest {
+                xid,
+                tag,
+                mode: LockMode::Exclusive,
+            })
+            .unwrap();
+
+        // Phase 1: serialization check + family computation. Visibility/locks
+        // must be untouched.
+        let folded = mgr.commit_check_serializable(&t).expect("phase 1 ok");
+        assert!(folded.is_empty(), "no savepoints → empty family");
+        assert_eq!(
+            mgr.status(xid),
+            XidStatus::InProgress,
+            "txn must stay InProgress (invisible) until phase 2"
+        );
+        assert!(
+            mgr.lock_manager
+                .inspect(tag)
+                .is_some_and(|s| s.grants.iter().any(|(x, _)| *x == xid)),
+            "lock must still be held after phase 1"
+        );
+
+        // Phase 2: make visible + release locks.
+        mgr.commit_finalize_visible(&t, &folded)
+            .expect("phase 2 ok");
+        assert_eq!(mgr.status(xid), XidStatus::Committed);
+        assert!(
+            mgr.lock_manager.inspect(tag).is_none(),
+            "lock must be released only in phase 2"
+        );
+    }
+
+    #[test]
+    fn commit_check_serializable_failure_leaves_txn_in_progress_for_caller_abort() {
+        // FIX #5: an SSI pivot must fail in phase 1 WITHOUT flipping the CLOG, so
+        // the caller can abort cleanly (and never writes a Commit WAL record).
+        let ssi = Arc::new(crate::ssi::SsiManager::new());
+        let mgr = TransactionManager::new_with_ssi(Arc::clone(&ssi));
+
+        let t1 = mgr.begin(IsolationLevel::Serializable);
+        let t2 = mgr.begin(IsolationLevel::Serializable);
+        let t3 = mgr.begin(IsolationLevel::Serializable);
+        let t2_xid = t2.xid;
+
+        mgr.record_rw_conflict(t1.xid, t2.xid);
+        mgr.record_rw_conflict(t2.xid, t3.xid);
+
+        mgr.commit(t1).unwrap();
+        mgr.commit(t3).unwrap();
+
+        // Phase-1 check for the pivot must report SerializationFailure and leave
+        // the CLOG InProgress (NOT Committed, NOT yet Aborted — the caller aborts).
+        let err = mgr
+            .commit_check_serializable(&t2)
+            .expect_err("pivot must fail phase 1");
+        assert!(matches!(err, TxnError::SerializationFailure { .. }));
+        assert_eq!(
+            mgr.status(t2_xid),
+            XidStatus::InProgress,
+            "phase-1 failure must not flip the CLOG; the caller aborts"
+        );
+
+        // The caller's abort path then marks it Aborted.
+        mgr.abort(t2).unwrap();
+        assert_eq!(mgr.status(t2_xid), XidStatus::Aborted);
+    }
+
+    #[test]
+    fn single_shot_commit_still_serializable_aborts_pivot() {
+        // Regression: the single-shot `commit` (rebuilt on the new decomposition)
+        // must still abort an SSI pivot and report SerializationFailure.
+        let ssi = Arc::new(crate::ssi::SsiManager::new());
+        let mgr = TransactionManager::new_with_ssi(Arc::clone(&ssi));
+
+        let t1 = mgr.begin(IsolationLevel::Serializable);
+        let t2 = mgr.begin(IsolationLevel::Serializable);
+        let t3 = mgr.begin(IsolationLevel::Serializable);
+        let t2_xid = t2.xid;
+
+        mgr.record_rw_conflict(t1.xid, t2.xid);
+        mgr.record_rw_conflict(t2.xid, t3.xid);
+
+        mgr.commit(t1).unwrap();
+        let err = mgr.commit(t2).expect_err("pivot must fail");
+        assert!(matches!(err, TxnError::SerializationFailure { .. }));
+        // Single-shot `commit` preserves its original contract: a failed commit
+        // leaves the txn fully aborted (CLOG Aborted, locks released).
+        assert_eq!(mgr.status(t2_xid), XidStatus::Aborted);
+        mgr.commit(t3).unwrap();
     }
 
     #[test]

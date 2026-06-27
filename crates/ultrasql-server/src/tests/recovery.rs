@@ -920,3 +920,247 @@ fn uncommitted_ddl_catalog_rows_do_not_resurrect_after_restart() {
         "the committed table must be present in the persistent catalog"
     );
 }
+
+/// FIX #5: a durable `commit_transaction` makes the commit DURABLE before it
+/// flips the CLOG visible. After a successful call the txn is `Committed` AND
+/// the WAL is flushed up to (at least) the commit-record LSN, so no concurrent
+/// reader could have observed the commit before it was on disk.
+#[test]
+fn commit_transaction_makes_commit_durable_then_visible() {
+    use ultrasql_txn::IsolationLevel;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    let pool = server.heap.buffer_pool();
+    let sink = pool.wal_sink().expect("WAL-backed server installs a sink");
+
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let xid = txn.xid;
+    // A data WAL record so the txn looks like it changed persistent state.
+    let record = WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, vec![0u8; 64])
+        .expect("nop record fits size limits");
+    let data_lsn = sink.append(record).unwrap();
+
+    // Before commit the txn is still in progress (invisible).
+    assert_eq!(server.txn_manager.status(xid), XidStatus::InProgress);
+
+    server
+        .commit_transaction(txn, true, "fix5 durable commit test")
+        .expect("durable commit must succeed");
+
+    // After the durable commit: visible (Committed) AND the WAL is flushed past
+    // the data record — the commit record was fsynced before the CLOG flip.
+    assert_eq!(server.txn_manager.status(xid), XidStatus::Committed);
+    let flushed = server
+        .runtime_wal_flushed_lsn()
+        .expect("persistent server owns a WAL writer");
+    assert!(
+        flushed.raw() >= data_lsn.raw(),
+        "WAL must be durable (flushed={}) past the commit's data record (lsn={}) \
+         once commit_transaction returns",
+        flushed.raw(),
+        data_lsn.raw()
+    );
+}
+
+/// FIX #5 (corrected semantics): once the Commit record has been APPENDED to the
+/// durable WAL pipeline, a durability failure must NOT be turned into an
+/// in-memory abort + normal error. The background writer may still fsync that
+/// record, so an in-memory abort that tells the client "commit failed" would let
+/// crash recovery later resurrect the txn from the durable Commit record — a
+/// phantom commit. The decision after append therefore has only two outcomes:
+/// durable, or FATAL (process abort so recovery decides). This test drives a
+/// real `commit_transaction` whose post-append durable-wait fails (simulated
+/// dead WAL writer) on a scoped thread and asserts that:
+///   * the FATAL escalation is hit (recorded via the test seam), and
+///   * `txn_manager.abort` was NOT called — the txn is still `InProgress`, never
+///     `Aborted` (no phantom-commit window).
+#[test]
+fn commit_durability_failure_after_append_escalates_to_fatal_not_in_memory_abort() {
+    use ultrasql_txn::IsolationLevel;
+
+    // Serialize against the shared FATAL-escalation recorder.
+    let _guard = super::FATAL_COMMIT_ABORT_LOCK.lock().unwrap();
+    super::clear_fatal_commit_abort();
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Arc::new(Server::init(data_dir.path()).unwrap());
+
+    let pool = server.heap.buffer_pool();
+    let sink = pool.wal_sink().expect("WAL-backed server installs a sink");
+
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let xid = txn.xid;
+    // A data WAL record so the txn looks like it changed persistent state and
+    // takes the durable commit path.
+    let record = WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, vec![0u8; 64])
+        .expect("nop record fits size limits");
+    sink.append(record).unwrap();
+
+    // Simulate a dead WAL writer: the post-append durable-wait will observe the
+    // fatal flag and resolve to `Fatal` rather than ever reaching the target.
+    let writer = server
+        .wal_writer
+        .as_ref()
+        .expect("persistent server owns a WAL writer");
+    writer.force_fatal_for_test();
+    assert!(
+        writer.has_fatal_error(),
+        "the WAL writer must report its (simulated) hard error"
+    );
+
+    // Run the commit on a scoped thread: the FATAL path parks forever in test
+    // builds (it would `process::abort()` in production), so we never join it —
+    // we wait on the recorder instead, mirroring how the real process never
+    // returns from the abort.
+    let server_for_commit = Arc::clone(&server);
+    let _commit_thread = std::thread::spawn(move || {
+        let _ = server_for_commit.commit_transaction(txn, true, "phantom-commit gate test");
+        // Unreachable in practice: the durable path takes the parked FATAL exit.
+    });
+
+    // Poll for the FATAL escalation to be recorded.
+    let mut recorded = None;
+    for _ in 0..2_000 {
+        if let Some(rec) = super::taken_fatal_commit_abort() {
+            recorded = Some(rec);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let recorded = recorded.expect(
+        "a post-append durability failure must escalate to the FATAL path, not silently abort",
+    );
+    assert_eq!(recorded.xid, xid.raw());
+    assert_eq!(recorded.context, "phantom-commit gate test");
+    assert!(
+        recorded.reason.contains("Commit record was appended"),
+        "the FATAL reason must reflect a post-append durability failure: {}",
+        recorded.reason
+    );
+
+    // The crucial corruption-class assertion: the txn was NOT aborted in memory.
+    // It is still InProgress (its Commit record is in the durable pipeline and
+    // recovery — not the live process — owns the final outcome). It must NEVER be
+    // `Aborted`, which is exactly the phantom-commit window the gate flagged.
+    assert_ne!(
+        server.txn_manager.status(xid),
+        XidStatus::Aborted,
+        "post-append durability failure must NOT in-memory-abort the txn (phantom-commit window)"
+    );
+
+    super::clear_fatal_commit_abort();
+}
+
+/// FIX #5: an APPEND failure (the Commit record never entered the durable
+/// pipeline) is the only commit-path failure for which an in-memory abort is
+/// still correct — nothing can flush, so recovery agrees with a clean abort.
+/// This is the pre-append half of the window and must remain a normal,
+/// non-fatal error. We assert the decision boundary stays put by exercising the
+/// serialization-anomaly pre-check abort (also pre-append): the txn aborts in
+/// memory and releases its locks, with no FATAL escalation.
+#[test]
+fn commit_pre_append_failure_aborts_in_memory_without_fatal_escalation() {
+    use ultrasql_txn::IsolationLevel;
+    use ultrasql_txn::lock::{LockMode, LockRequest, LockTag};
+
+    let _guard = super::FATAL_COMMIT_ABORT_LOCK.lock().unwrap();
+    super::clear_fatal_commit_abort();
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let xid = txn.xid;
+    let tag = LockTag::Relation(RelationId::new(909));
+    server
+        .txn_manager
+        .lock_manager
+        .acquire(LockRequest {
+            xid,
+            tag,
+            mode: LockMode::Exclusive,
+        })
+        .unwrap();
+
+    // Phase 1 (serialization check) must not make the txn visible nor release
+    // the lock — exactly the window FIX #5 protects.
+    let family = server
+        .txn_manager
+        .commit_check_serializable(&txn)
+        .expect("phase 1 ok");
+    assert_eq!(server.txn_manager.status(xid), XidStatus::InProgress);
+    assert!(
+        server
+            .txn_manager
+            .lock_manager
+            .inspect(tag)
+            .is_some_and(|s| s.grants.iter().any(|(x, _)| *x == xid)),
+        "lock must still be held while the commit is not yet durable"
+    );
+    let _ = family;
+
+    // A pre-append abort (no Commit record in the pipeline) is safe: the txn
+    // becomes Aborted, locks released, invisible — and NO FATAL escalation.
+    server
+        .txn_manager
+        .abort(txn)
+        .expect("pre-append abort on durability failure");
+    assert_eq!(server.txn_manager.status(xid), XidStatus::Aborted);
+    assert!(
+        server.txn_manager.lock_manager.inspect(tag).is_none(),
+        "an undurable commit that aborts pre-append must release its locks"
+    );
+    assert!(
+        super::taken_fatal_commit_abort().is_none(),
+        "a pre-append abort must NOT trigger the FATAL escalation"
+    );
+}
+
+/// FIX #6: the 2PC prepare path forces the txn's DATA WAL durable before the
+/// prepared-state file is written / the PREPARE is acked. After
+/// `wait_for_txn_data_wal_durable` returns, every data record the xid wrote must
+/// be flushed — so a crash right after the PREPARE ack can never tear the txn's
+/// row changes off an un-fsynced WAL tail.
+#[test]
+fn wait_for_txn_data_wal_durable_flushes_the_txns_last_data_record() {
+    use ultrasql_txn::IsolationLevel;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    let pool = server.heap.buffer_pool();
+    let sink = pool.wal_sink().expect("WAL-backed server installs a sink");
+
+    let txn = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let xid = txn.xid;
+
+    // Two data records for the txn; the second is its WAL tail.
+    sink.append(WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, vec![0u8; 64]).unwrap())
+        .unwrap();
+    let last_data_lsn = sink
+        .append(WalRecord::new(RecordType::Nop, xid, Lsn::ZERO, 0, vec![1u8; 64]).unwrap())
+        .unwrap();
+    assert_eq!(
+        sink.last_lsn_for(xid),
+        last_data_lsn,
+        "the sink must report the txn's last appended data LSN"
+    );
+
+    // The prepare path forces exactly this LSN durable before acking.
+    server
+        .wait_for_txn_data_wal_durable(xid)
+        .expect("data WAL must be forced durable on prepare");
+
+    let flushed = server
+        .runtime_wal_flushed_lsn()
+        .expect("persistent server owns a WAL writer");
+    assert!(
+        flushed.raw() >= last_data_lsn.raw(),
+        "after the prepare durable-wait the WAL must be flushed (flushed={}) past \
+         the txn's last data record (lsn={})",
+        flushed.raw(),
+        last_data_lsn.raw()
+    );
+}

@@ -39,7 +39,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -159,6 +159,25 @@ struct Shared {
     fsync_max_us: AtomicU64,
     /// Most recent observed fsync latency in microseconds.
     fsync_last_us: AtomicU64,
+    /// `true` once the writer thread has terminated with a hard error (an I/O
+    /// failure draining/writing/fsyncing the WAL, a buffer consistency error,
+    /// etc.). The thread is then gone and [`Self::durable_lsn`] will never
+    /// advance again, so this is the *only* way a durability waiter can tell a
+    /// hard WAL-writer failure apart from a merely slow fsync: a live writer
+    /// keeps `fatal == false` and eventually advances `durable_lsn`, whereas a
+    /// dead writer sets `fatal == true` and stalls. A commit waiter that has
+    /// already appended its Commit record relies on this distinction to escalate
+    /// a true failure to a fatal process abort instead of waiting forever (or
+    /// worse, in-memory-aborting a commit whose record may still be durable).
+    fatal: AtomicBool,
+    /// Test-only: when set, the writer thread stops publishing further
+    /// `durable_lsn` advances, so [`Self::durable_lsn`] freezes at its current
+    /// value. Paired with `fatal` by `force_fatal_for_test` to deterministically
+    /// model a writer that died before reaching a target LSN (a live test writer
+    /// would otherwise race ahead and flush the very record we want to leave
+    /// pending). Never set in production.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    freeze_durable: AtomicBool,
 }
 
 impl Shared {
@@ -258,6 +277,14 @@ impl WalDurabilityHandle {
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
     }
+
+    /// `true` once the writer thread has terminated with a hard error.
+    ///
+    /// Equivalent to [`WalWriter::has_fatal_error`].
+    #[must_use]
+    pub fn has_fatal_error(&self) -> bool {
+        self.shared.fatal.load(Ordering::Acquire)
+    }
 }
 
 impl WalWriter {
@@ -303,9 +330,13 @@ impl WalWriter {
             fsync_total_us: AtomicU64::new(0),
             fsync_max_us: AtomicU64::new(0),
             fsync_last_us: AtomicU64::new(0),
+            fatal: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-fault-injection"))]
+            freeze_durable: AtomicBool::new(false),
         });
 
         let thread_shared = Arc::clone(&shared);
+        let thread_shared_for_fatal = Arc::clone(&shared);
         let thread_buffer = Arc::clone(&buffer);
         let thread_dir = dir.clone();
         let handle = thread::Builder::new()
@@ -318,6 +349,11 @@ impl WalWriter {
                     WriterDriver::new(thread_dir, thread_buffer, thread_shared, config, next_index);
                 let result = driver.run();
                 if let Err(ref e) = result {
+                    // Publish the hard-failure signal BEFORE `_closer` releases
+                    // any backpressured appenders, so a durability waiter that
+                    // wakes on the closed buffer also observes `fatal == true`
+                    // and can distinguish this dead writer from a slow one.
+                    thread_shared_for_fatal.fatal.store(true, Ordering::Release);
                     error!(error = %e, "wal writer thread terminated with error");
                 }
                 result
@@ -353,6 +389,32 @@ impl WalWriter {
     /// LSN through which the writer thread has fsynced.
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
+    }
+
+    /// `true` once the writer thread has terminated with a hard error and can no
+    /// longer make any further WAL durable.
+    ///
+    /// This is how a durability waiter (e.g. the commit path) tells a *dead*
+    /// writer apart from a merely *slow* one: a slow but healthy writer keeps
+    /// this `false` and eventually advances [`Self::flushed_lsn`]; a writer that
+    /// hit an unrecoverable I/O/consistency error exits and flips this `true`.
+    #[must_use]
+    pub fn has_fatal_error(&self) -> bool {
+        self.shared.fatal.load(Ordering::Acquire)
+    }
+
+    /// Test-only: simulate the writer thread having terminated with a hard
+    /// error, so a durability waiter observes a dead writer deterministically
+    /// without provoking a real filesystem fault.
+    ///
+    /// Freezes the published durable LSN first (so the still-running thread
+    /// cannot race ahead and flush the very record a test wants left pending),
+    /// then flips the fatal flag. The net effect matches a real dead writer:
+    /// `flushed_lsn` stalls and `has_fatal_error` is true.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn force_fatal_for_test(&self) {
+        self.shared.freeze_durable.store(true, Ordering::Release);
+        self.shared.fatal.store(true, Ordering::Release);
     }
 
     /// Return a cloneable [`WalDurabilityHandle`] sharing this writer's
@@ -425,6 +487,9 @@ mod stats_tests {
             fsync_total_us: AtomicU64::new(0),
             fsync_max_us: AtomicU64::new(0),
             fsync_last_us: AtomicU64::new(0),
+            fatal: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-fault-injection"))]
+            freeze_durable: AtomicBool::new(false),
         });
         let writer = WalWriter {
             shared,
@@ -654,6 +719,13 @@ impl WriterDriver {
             self.shared.record_fsync_latency(elapsed_us);
         }
         self.unflushed_bytes = 0;
+        // Test-only: a frozen writer stops publishing durability advances, so an
+        // external durability waiter sees `flushed_lsn` stuck — modelling a dead
+        // writer that never reaches the target LSN. Production never freezes.
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        if self.shared.freeze_durable.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.durable_lsn = self.pending_lsn;
         let raw = self.durable_lsn.raw();
         self.shared.durable_lsn.store(raw, Ordering::Release);

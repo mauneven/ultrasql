@@ -68,6 +68,10 @@ md5                = { workspace = true }
 hex                = { workspace = true }
 
 [dev-dependencies]
+# Enable the WAL crate's test-only fault-injection seams (e.g.
+# `WalWriter::force_fatal_for_test`) so the commit-durability tests can simulate
+# a dead WAL writer deterministically.
+ultrasql-wal       = { workspace = true, features = ["test-fault-injection"] }
 rcgen              = { workspace = true }
 # Integration tests drive a real PostgreSQL client against an
 # in-process `ultrasqld` — Extended Query (prepare/bind/execute) and

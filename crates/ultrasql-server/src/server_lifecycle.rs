@@ -507,6 +507,23 @@ impl Server {
     }
 
     /// Wait until the runtime WAL writer has fsynced at least `lsn`.
+    ///
+    /// A merely *slow* fsync (a busy or sluggish disk) is NOT a failure: the
+    /// writer thread is alive and will eventually advance `flushed_lsn`, so we
+    /// keep polling. A 5-second timeout that abandoned a still-pending durable
+    /// write would be wrong on the commit path — the Commit record may yet flush
+    /// — so this wait does not give up on slowness alone.
+    ///
+    /// It DOES return promptly with an error in exactly one case: the writer
+    /// thread has terminated with a hard error
+    /// ([`WalWriter::has_fatal_error`](ultrasql_wal::WalWriter::has_fatal_error)).
+    /// Then `flushed_lsn` can never reach the target and waiting longer is
+    /// pointless. A last-resort upper bound ([`WAL_DURABILITY_HARD_CAP`]) guards
+    /// against a writer somehow wedged without flipping the fatal flag; reaching
+    /// it is reported as an error too. Callers on the commit path treat *any*
+    /// error returned here — fatal flag or cap — as an unrecoverable durability
+    /// failure (the Commit record was already appended and may still flush), so
+    /// the precise reason only affects diagnostics.
     pub(crate) fn wait_for_wal_durable(&self, lsn: Lsn) -> Result<(), ServerError> {
         let Some(writer) = &self.wal_writer else {
             return Ok(());
@@ -515,7 +532,12 @@ impl Server {
             return Ok(());
         }
 
-        const WAL_DURABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        // A generous last-resort bound: a healthy writer fsyncs within
+        // milliseconds, so any wait approaching this is a writer that is wedged
+        // (not merely slow) yet did not flip the fatal flag. Far above any
+        // plausible fsync latency, it exists only so a waiter cannot hang
+        // forever; normal slow-disk commits resolve long before it.
+        const WAL_DURABILITY_HARD_CAP: std::time::Duration = std::time::Duration::from_secs(120);
         const WAL_DURABILITY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 
         let started = std::time::Instant::now();
@@ -524,11 +546,21 @@ impl Server {
             if flushed.raw() >= lsn.raw() {
                 return Ok(());
             }
-            if started.elapsed() >= WAL_DURABILITY_TIMEOUT {
+            // Dead writer: it will never advance again. Surface a hard error so
+            // the caller can escalate (the commit path turns this fatal).
+            if writer.has_fatal_error() {
+                return Err(ServerError::Io(std::io::Error::other(format!(
+                    "WAL writer terminated with a hard error before reaching durability: \
+                     flushed_lsn={} target_lsn={}",
+                    flushed.raw(),
+                    lsn.raw()
+                ))));
+            }
+            if started.elapsed() >= WAL_DURABILITY_HARD_CAP {
                 return Err(ServerError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "WAL durability wait timed out at flushed_lsn={} target_lsn={}",
+                        "WAL durability wait exceeded hard cap at flushed_lsn={} target_lsn={}",
                         flushed.raw(),
                         lsn.raw()
                     ),
@@ -539,8 +571,152 @@ impl Server {
         }
     }
 
-    /// Commit a transaction and, when it changed persistent heap/index state,
-    /// force its commit marker durable before reporting success.
+    /// Force every data WAL record written by `xid` durable (fsynced).
+    ///
+    /// Used by 2PC `PREPARE TRANSACTION`: before the prepared-state file is
+    /// written and the PREPARE is acked, ALL of the transaction's data WAL
+    /// records must be on disk. Otherwise a crash after the PREPARE ack but
+    /// before the WAL tail is fsynced would leave the txn in-doubt (the
+    /// prepared-state file is durable) while its row changes were torn off the
+    /// un-fsynced WAL tail and discarded — a later `COMMIT PREPARED` would then
+    /// mark it committed but replay nothing, silently losing an acknowledged
+    /// transaction.
+    ///
+    /// Captures the txn's last appended data WAL LSN via the sink's per-xid
+    /// `last_lsn_for` and waits until it is flushed. A no-WAL sink, or an xid
+    /// that appended no data records, resolves to `Lsn::ZERO` and returns
+    /// immediately.
+    pub(crate) fn wait_for_txn_data_wal_durable(&self, xid: Xid) -> Result<(), ServerError> {
+        let Some(wal) = self.heap.wal_sink() else {
+            return Ok(());
+        };
+        let last_lsn = wal.last_lsn_for(xid);
+        self.wait_for_wal_durable(last_lsn)
+    }
+
+    /// Resolve the durability of a commit whose Commit record has *already been
+    /// appended* to the durable WAL pipeline, returning the only two outcomes
+    /// that path may produce.
+    ///
+    /// Once `append_commit_record` returns `Ok(Some(commit_lsn))` the Commit
+    /// record is in the shared WAL buffer and the background writer will fsync
+    /// it on its own schedule — the live process can neither remove it nor
+    /// reliably observe whether it became durable. So the **only** correct
+    /// outcomes here are:
+    ///
+    /// * [`CommitDurability::Durable`] — `wait_for_wal_durable` confirmed the
+    ///   record is on disk; the commit may now be finalized visible.
+    /// * [`CommitDurability::Fatal`] — the wait failed (the writer died, or the
+    ///   hard cap fired). The record may STILL flush a moment later, so we may
+    ///   NOT abort-in-memory and tell the client the commit failed: a crash
+    ///   would then let recovery find the durable Commit record and resurrect a
+    ///   txn the client was told failed (a phantom commit). The caller must take
+    ///   the process down so recovery decides the true outcome from the WAL.
+    ///
+    /// Crucially, there is no "abort in memory and return a normal error"
+    /// outcome — this is exactly the torn-durability contract the gate flagged.
+    /// Pulled out as a pure function so the decision is unit-testable without
+    /// actually aborting the process.
+    pub(crate) fn resolve_commit_durability_after_append(
+        &self,
+        commit_lsn: Lsn,
+    ) -> CommitDurability {
+        match self.wait_for_wal_durable(commit_lsn) {
+            Ok(()) => CommitDurability::Durable,
+            Err(e) => CommitDurability::Fatal(format!(
+                "WAL could not be made durable after the Commit record was appended \
+                 (commit_lsn={}): {e}",
+                commit_lsn.raw()
+            )),
+        }
+    }
+
+    /// Escalate an unrecoverable commit-durability failure to a controlled, hard
+    /// process termination.
+    ///
+    /// The Commit record is in the durable WAL pipeline and may still flush, so
+    /// the live process can no longer give the client a truthful answer. Per
+    /// PostgreSQL's PANIC-on-commit-flush-failure contract, the backend goes
+    /// down and recovery on restart decides the true outcome from the durable
+    /// WAL — the single source of truth. The client sees a connection drop,
+    /// i.e. an AMBIGUOUS (correct) outcome for an indeterminate commit.
+    ///
+    /// We use [`std::process::abort`] (SIGABRT) rather than `panic!`: a panic
+    /// would UNWIND and be swallowed by the per-statement `catch_unwind` panic
+    /// isolation (FIX #2), leaving the process alive and the phantom-commit
+    /// window open. `abort()` cannot be caught, so the process really
+    /// terminates and recovery runs on restart.
+    ///
+    /// In test builds the abort is replaced by a recorded flag (the
+    /// `record_fatal_commit_abort` test seam) so the decision can be asserted
+    /// without killing the test process.
+    pub(crate) fn fatal_commit_durability_failure(
+        &self,
+        xid: Xid,
+        context: &str,
+        reason: &str,
+    ) -> ! {
+        error!(
+            xid = xid.raw(),
+            context,
+            reason,
+            "FATAL: WAL durability could not be guaranteed for a committing transaction; \
+             its Commit record is already in the durable WAL pipeline and may yet flush. \
+             Durability cannot be guaranteed in-process, so the server is aborting so that \
+             crash recovery decides the transaction's true outcome from the durable WAL on \
+             restart. The client's commit outcome is AMBIGUOUS (connection drop)."
+        );
+        #[cfg(test)]
+        {
+            crate::tests::record_fatal_commit_abort(xid, context, reason);
+            // In tests we must not actually abort. Park the (logically dead)
+            // caller forever on a thread the test never joins: returning would
+            // violate the `-> !` contract and let the phantom-commit path
+            // continue, which is exactly what we are proving cannot happen.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+        #[cfg(not(test))]
+        {
+            std::process::abort();
+        }
+    }
+
+    /// Commit a transaction. When it changed persistent heap/index state, the
+    /// commit is made **durable before it is made visible** (PostgreSQL's commit
+    /// protocol): append the Commit WAL record, fsync it, and only then flip the
+    /// CLOG to `Committed` and release the txn's locks.
+    ///
+    /// Ordering (durable path, `durable_commit_marker == true`):
+    ///
+    /// 1. `commit_check_serializable` — run the SSI dangerous-structure check and
+    ///    compute the committed-subxid family. The CLOG is still `InProgress`, so
+    ///    the txn is MVCC-invisible and holds its locks. A serialization anomaly
+    ///    aborts here (no Commit record written — in-memory abort is safe).
+    /// 2. `append_commit_record` — *before* the record is appended, an append
+    ///    failure means NOTHING entered the durable pipeline, so the txn is
+    ///    aborted in memory (CLOG `Aborted`, locks released) and a normal error
+    ///    returned. *After* a successful append, the Commit record is in the
+    ///    durable WAL pipeline and the background writer may fsync it at any
+    ///    moment. From here the live process can neither undo nor reliably
+    ///    observe that record, so `wait_for_wal_durable` has exactly two
+    ///    outcomes (see [`Self::resolve_commit_durability_after_append`]):
+    ///    durable -> finalize visible; failure -> FATAL process abort (NOT an
+    ///    in-memory abort — that would risk a phantom commit recovery later
+    ///    resurrects).
+    /// 3. `commit_finalize_visible` — flip the CLOG to `Committed` and release
+    ///    locks. Only now can any other backend observe the commit.
+    ///
+    /// This closes the window where a committed-but-not-yet-durable txn was
+    /// visible (and its locks gone): a concurrent reader can never see a commit
+    /// that a subsequent crash would roll back. It also closes the inverse
+    /// window the gate flagged: a client is NEVER told a commit failed (via
+    /// in-memory abort) while its Commit record could still flush to disk.
+    ///
+    /// When `durable_commit_marker == false` (read-only / no-WAL txns) there is
+    /// nothing to make durable, so the check and the visibility flip run
+    /// back-to-back via the single-shot `commit`.
     pub(crate) fn commit_transaction(
         &self,
         txn: ultrasql_txn::Transaction,
@@ -548,18 +724,90 @@ impl Server {
         context: &str,
     ) -> Result<(), ServerError> {
         let xid = txn.xid;
-        let committed_subxids = self.txn_manager.commit(txn).map_err(|e| match e {
-            TxnError::SerializationFailure { detail, .. } => {
-                ServerError::SerializationFailure(detail)
-            }
-            other => ServerError::ddl(format!("{context} commit: {other}")),
-        })?;
-        if durable_commit_marker
-            && let Some(commit_lsn) = self.append_commit_record(xid, committed_subxids)?
-        {
-            self.wait_for_wal_durable(commit_lsn)?;
+
+        if !durable_commit_marker {
+            // No persistent state changed: nothing to fsync, so flip visible
+            // immediately (the single-shot path runs the SSI check + flip).
+            self.txn_manager.commit(txn).map_err(|e| match e {
+                TxnError::SerializationFailure { detail, .. } => {
+                    ServerError::SerializationFailure(detail)
+                }
+                other => ServerError::ddl(format!("{context} commit: {other}")),
+            })?;
+            return Ok(());
         }
-        Ok(())
+
+        // Phase 1: run the serializable check and compute the committed-subxid
+        // family WITHOUT making the txn visible. On a serialization anomaly the
+        // txn is still InProgress and invisible; abort it and surface the error.
+        let committed_subxids = match self.txn_manager.commit_check_serializable(&txn) {
+            Ok(family) => family,
+            Err(TxnError::SerializationFailure { detail, .. }) => {
+                // The CLOG was never flipped; abort to release locks and mark
+                // the txn Aborted, then report the serialization failure.
+                let _ = self.txn_manager.abort(txn);
+                return Err(ServerError::SerializationFailure(detail));
+            }
+            Err(other) => {
+                let _ = self.txn_manager.abort(txn);
+                return Err(ServerError::ddl(format!("{context} commit: {other}")));
+            }
+        };
+
+        // Phase 2a: append the Commit record. The txn is STILL invisible (CLOG
+        // InProgress) and STILL holds its locks, so no other backend can observe
+        // it yet. If the APPEND itself fails the record never entered the durable
+        // pipeline — nothing can flush — so an in-memory abort here is safe and
+        // correct (CLOG Aborted, locks released, normal error to the client).
+        let commit_lsn = match self.append_commit_record(xid, committed_subxids.clone()) {
+            Ok(Some(commit_lsn)) => commit_lsn,
+            Ok(None) => {
+                // No WAL sink (in-memory): nothing to fsync, so the commit is
+                // trivially "durable". Fall straight through to finalize.
+                return self.finalize_commit_visible(&txn, &committed_subxids, context);
+            }
+            Err(e) => {
+                // Append failed BEFORE the record entered the pipeline: safe to
+                // abort in memory and surface the error.
+                let _ = self.txn_manager.abort(txn);
+                return Err(e);
+            }
+        };
+
+        // Phase 2b: the Commit record is NOW in the durable WAL pipeline. From
+        // here we MUST NOT abort-in-memory-and-return-an-error on a durability
+        // failure: the record may still flush, and a crash would let recovery
+        // resurrect a txn we told the client had failed (a phantom commit). The
+        // only outcomes are durable (-> finalize) or fatal (-> process abort so
+        // recovery decides from the durable WAL).
+        match self.resolve_commit_durability_after_append(commit_lsn) {
+            CommitDurability::Durable => {
+                self.finalize_commit_visible(&txn, &committed_subxids, context)
+            }
+            CommitDurability::Fatal(reason) => {
+                // Does NOT call txn_manager.abort: that is the phantom-commit
+                // window. Takes the process down (bypassing catch_unwind) so the
+                // durable WAL is the single source of truth on restart.
+                self.fatal_commit_durability_failure(xid, context, &reason)
+            }
+        }
+    }
+
+    /// Phase 3 of the durable commit: flip the CLOG to `Committed` and release
+    /// the txn's locks. Only reached once the commit is durable (or there is no
+    /// WAL to make durable), so the txn becoming visible can never be rolled
+    /// back by a later crash. The lifecycle is driven linearly (phase 1 just
+    /// succeeded), so this only fails on a mis-driven double-commit, surfaced
+    /// unchanged.
+    fn finalize_commit_visible(
+        &self,
+        txn: &ultrasql_txn::Transaction,
+        committed_subxids: &[Xid],
+        context: &str,
+    ) -> Result<(), ServerError> {
+        self.txn_manager
+            .commit_finalize_visible(txn, committed_subxids)
+            .map_err(|e| ServerError::ddl(format!("{context} commit finalize: {e}")))
     }
 
     /// Abort a transaction and, when it changed persistent heap/index state,
@@ -775,4 +1023,23 @@ fn force_wal_durable_to(
         durability.notify();
         std::thread::sleep(WAL_DURABILITY_POLL);
     }
+}
+
+/// Outcome of waiting for a commit to become durable *after* its Commit record
+/// has been appended to the durable WAL pipeline.
+///
+/// Deliberately has no "abort in memory" variant: once the Commit record is in
+/// the pipeline the live process can neither undo nor reliably observe it, so a
+/// durability failure can only be escalated to a fatal process abort (recovery
+/// then decides the true outcome from the durable WAL). Telling the client the
+/// commit failed while the record could still flush is the phantom-commit bug
+/// this type exists to make unrepresentable.
+#[derive(Debug)]
+pub(crate) enum CommitDurability {
+    /// The Commit record is on disk; the commit may be finalized visible.
+    Durable,
+    /// The durable-wait failed (dead WAL writer, or the hard cap fired). The
+    /// record may still flush, so the process must abort and let recovery
+    /// decide. Carries a human-readable reason for the FATAL log.
+    Fatal(String),
 }

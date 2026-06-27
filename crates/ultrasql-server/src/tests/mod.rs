@@ -46,6 +46,49 @@ fn server() -> Arc<Server> {
     Arc::new(Server::with_sample_database())
 }
 
+/// Test seam for the commit-path FATAL durability escalation.
+///
+/// In non-test builds [`Server::fatal_commit_durability_failure`] calls
+/// `std::process::abort()`. That cannot be unit-tested directly, so in test
+/// builds it instead records the escalation here (and parks the calling thread
+/// forever, since the call site is logically dead — returning would let the
+/// phantom-commit path continue, which is exactly what we prove cannot happen).
+///
+/// A test serializes access with [`FATAL_COMMIT_ABORT_LOCK`], clears the
+/// recorder, runs the failing commit on a scoped thread, then asserts the
+/// escalation was recorded. The parked commit thread is simply abandoned (the
+/// scope is exited via the recorder signal, not a join), mirroring how the real
+/// process never returns from the abort.
+#[derive(Clone, Debug)]
+pub(crate) struct FatalCommitAbort {
+    pub xid: u64,
+    pub context: String,
+    pub reason: String,
+}
+
+pub(crate) static FATAL_COMMIT_ABORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FATAL_COMMIT_ABORT_RECORD: std::sync::Mutex<Option<FatalCommitAbort>> =
+    std::sync::Mutex::new(None);
+
+/// Record that the commit-path FATAL escalation was hit (test builds only).
+pub(crate) fn record_fatal_commit_abort(xid: ultrasql_core::Xid, context: &str, reason: &str) {
+    *FATAL_COMMIT_ABORT_RECORD.lock().unwrap() = Some(FatalCommitAbort {
+        xid: xid.raw(),
+        context: context.to_owned(),
+        reason: reason.to_owned(),
+    });
+}
+
+/// Clear any previously recorded escalation. Call under [`FATAL_COMMIT_ABORT_LOCK`].
+pub(crate) fn clear_fatal_commit_abort() {
+    *FATAL_COMMIT_ABORT_RECORD.lock().unwrap() = None;
+}
+
+/// Read the recorded escalation, if any.
+pub(crate) fn taken_fatal_commit_abort() -> Option<FatalCommitAbort> {
+    FATAL_COMMIT_ABORT_RECORD.lock().unwrap().clone()
+}
+
 #[test]
 fn validation_report_covers_required_admin_checks() {
     let server = Server::with_sample_database();

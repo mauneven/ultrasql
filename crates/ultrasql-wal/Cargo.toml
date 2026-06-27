@@ -11,6 +11,13 @@ repository.workspace   = true
 [lints]
 workspace = true
 
+[features]
+# Exposes test-only fault-injection seams (e.g. `WalWriter::force_fatal_for_test`)
+# so downstream crates can deterministically simulate a dead WAL writer in their
+# own tests without provoking a real filesystem fault. Off by default; enabled by
+# dependents under `[dev-dependencies]`.
+test-fault-injection = []
+
 [dependencies]
 ultrasql-core = { workspace = true }
 thiserror     = { workspace = true }
