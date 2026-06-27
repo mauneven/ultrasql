@@ -44,6 +44,61 @@ async fn alter_table_drop_column_rewrite_survives_restart() {
     shutdown(running).await;
 }
 
+/// `DROP COLUMN` must persist its dependent-index adjustments: bootstrap
+/// rebuilds each surviving index at its shifted key position, and an index on
+/// the dropped column stays gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_drop_column_index_adjustments_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "drop_column_index_restart").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE dci (a INT, b INT, c INT)")
+        .await
+        .expect("create");
+    running
+        .client
+        .batch_execute("CREATE INDEX idx_c ON dci (c)")
+        .await
+        .expect("index on c (attnum 2)");
+    running
+        .client
+        .batch_execute("CREATE INDEX idx_a ON dci (a)")
+        .await
+        .expect("index on a (the column to drop)");
+    running
+        .client
+        .batch_execute("INSERT INTO dci VALUES (1, 20, 300), (4, 50, 600)")
+        .await
+        .expect("seed");
+    running
+        .client
+        .batch_execute("ALTER TABLE dci DROP COLUMN a")
+        .await
+        .expect("drop column a");
+    shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "drop_column_index_restart").await;
+    // idx_c was [2]; after the drop + restart it must resolve to the shifted
+    // position so the probe still hits c.
+    let rows = running
+        .client
+        .query("SELECT b, c FROM dci WHERE c = 600", &[])
+        .await
+        .expect("probe shifted idx_c after restart");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 50);
+    assert_eq!(rows[0].get::<_, i32>(1), 600);
+    // idx_a (on the dropped column) stays dropped: its name is reusable.
+    running
+        .client
+        .batch_execute("CREATE INDEX idx_a ON dci (b)")
+        .await
+        .expect("dropped idx_a does not resurrect after restart");
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alter_table_rename_column_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();

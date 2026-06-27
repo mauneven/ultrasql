@@ -29,6 +29,33 @@ struct AlterRewriteIndexUpdate<'a> {
     xid: ultrasql_core::Xid,
 }
 
+/// The catalog adjustments `ALTER TABLE DROP COLUMN` must apply to the
+/// table's dependent indexes and position-referencing constraints so the
+/// physical schema compaction (which shifts every column after the dropped
+/// one down by one slot) does not leave index `columns` / constraint
+/// `conkey` pointing at the wrong — or out-of-bounds — positions.
+///
+/// PostgreSQL drops an index outright if any of its key columns is the
+/// dropped column, and re-points the surviving ones; it likewise drops a
+/// UNIQUE / PRIMARY KEY whose key includes the dropped column (together with
+/// its backing index) and a CHECK that references the dropped column, while
+/// shifting the survivors. UltraSQL compacts attnums (rather than keeping a
+/// `pg.dropped.N` tombstone column like PostgreSQL), so the survivors are
+/// re-pointed by decrementing every position greater than the dropped one.
+#[derive(Default)]
+struct DropColumnDependents {
+    /// Indexes that must be dropped entirely (a key column was dropped).
+    indexes_to_drop: Vec<ultrasql_catalog::IndexEntry>,
+    /// Surviving indexes with their `columns` already shifted to the new
+    /// post-compaction positions.
+    indexes_to_shift: Vec<ultrasql_catalog::IndexEntry>,
+    /// Constraints (UNIQUE / PRIMARY KEY / CHECK) that must be dropped
+    /// because their key / referenced columns included the dropped column.
+    constraints_to_drop: Vec<ultrasql_catalog::persistent::ConstraintRow>,
+    /// Surviving constraints with their `conkey` already shifted.
+    constraints_to_shift: Vec<ultrasql_catalog::persistent::ConstraintRow>,
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -988,6 +1015,272 @@ where
         Ok(run_ddl_command("ALTER TABLE"))
     }
 
+    /// Classify the table's dependent indexes and position-referencing
+    /// constraints into the ones that must be dropped (a key column equals the
+    /// dropped column) and the ones that survive with shifted positions.
+    ///
+    /// `column_index` is the 0-based position being dropped; index `columns`
+    /// are 0-based attnums and constraint `conkey` entries are 1-based attnums.
+    /// A surviving entry decrements every position strictly greater than the
+    /// dropped one, matching the physical heap compaction.
+    fn plan_drop_column_dependents(
+        &self,
+        table_oid: ultrasql_core::Oid,
+        column_index: usize,
+        snapshot: &CatalogSnapshot,
+    ) -> DropColumnDependents {
+        let dropped_attnum_0 = u16::try_from(column_index).unwrap_or(u16::MAX);
+        let dropped_attnum_1 = i16::try_from(column_index.saturating_add(1)).unwrap_or(i16::MAX);
+        let mut plan = DropColumnDependents::default();
+
+        if let Some(indexes) = snapshot.indexes_by_table.get(&table_oid) {
+            for index in indexes {
+                if index.columns.contains(&dropped_attnum_0) {
+                    plan.indexes_to_drop.push(index.clone());
+                } else if index.columns.iter().any(|&c| c > dropped_attnum_0) {
+                    let mut shifted = index.clone();
+                    for col in &mut shifted.columns {
+                        if *col > dropped_attnum_0 {
+                            *col -= 1;
+                        }
+                    }
+                    plan.indexes_to_shift.push(shifted);
+                }
+            }
+        }
+
+        // CHECK predicates carry no `conkey` (it is persisted empty); their
+        // column dependency lives in the bound runtime expression. Collect the
+        // (case-folded) names of CHECKs that reference the dropped column so the
+        // matching `pg_constraint` rows are tombstoned (PostgreSQL drops a CHECK
+        // that references a dropped column).
+        let dropped_check_names: std::collections::HashSet<String> = self
+            .state
+            .table_constraints
+            .get(&table_oid)
+            .map(|guard| {
+                guard
+                    .checks
+                    .iter()
+                    .filter(|check| scalar_expr_references_column(&check.expr, column_index))
+                    .map(|check| check.name.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for row in snapshot.constraints.values() {
+            if row.conrelid != table_oid {
+                continue;
+            }
+            // Only key-referencing constraint kinds carry positional `conkey`
+            // entries that the compaction can invalidate. FK `conkey` on the
+            // referencing side is out of scope (documented for the gate).
+            if !matches!(
+                row.contype,
+                ultrasql_catalog::persistent::ConType::PrimaryKey
+                    | ultrasql_catalog::persistent::ConType::Unique
+                    | ultrasql_catalog::persistent::ConType::Check
+                    | ultrasql_catalog::persistent::ConType::Exclusion
+            ) {
+                continue;
+            }
+            // A CHECK referencing the dropped column (detected from its bound
+            // expression, since `conkey` is empty) is dropped outright.
+            if matches!(row.contype, ultrasql_catalog::persistent::ConType::Check)
+                && dropped_check_names.contains(&row.conname.to_ascii_lowercase())
+            {
+                plan.constraints_to_drop.push(row.clone());
+                continue;
+            }
+            if row.conkey.contains(&dropped_attnum_1) {
+                plan.constraints_to_drop.push(row.clone());
+            } else if row.conkey.iter().any(|&k| k > dropped_attnum_1) {
+                let mut shifted = row.clone();
+                for key in &mut shifted.conkey {
+                    if *key > dropped_attnum_1 {
+                        *key -= 1;
+                    }
+                }
+                plan.constraints_to_shift.push(shifted);
+            }
+        }
+
+        plan
+    }
+
+    /// Persist the durable catalog effects of [`Self::plan_drop_column_dependents`]
+    /// into the in-flight DROP COLUMN transaction: a `pg_class` tombstone for
+    /// each dropped index, a re-persisted `pg_index` row carrying the shifted
+    /// key for each survivor, and `pg_constraint` tombstone / re-persist rows.
+    ///
+    /// Riding the same `xid` / `command_id` as the schema replacement makes the
+    /// whole adjustment atomic with the column drop: a COMMIT makes it durable,
+    /// a ROLLBACK (or restart before commit) reconstructs the pre-drop state.
+    fn persist_drop_column_dependents(
+        &self,
+        plan: &DropColumnDependents,
+        xid: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), ServerError> {
+        let heap = self.state.heap.as_ref();
+        for index in &plan.indexes_to_drop {
+            self.state
+                .persistent_catalog
+                .persist_index_drop_tombstone(index, heap, xid, command_id)
+                .map_err(ServerError::Catalog)?;
+        }
+        for index in &plan.indexes_to_shift {
+            // `pg_index` is append-only and bootstrap keeps the latest row per
+            // index OID, so a fresh row with the shifted `indkey` re-points the
+            // survivor durably without disturbing its built `root_block`.
+            self.state
+                .persistent_catalog
+                .persist_index_rows(index, heap, xid, command_id)
+                .map_err(ServerError::Catalog)?;
+        }
+        for row in &plan.constraints_to_drop {
+            self.state
+                .persistent_catalog
+                .persist_constraint_drop_tombstone(
+                    row.oid,
+                    row.conrelid,
+                    &row.conname,
+                    heap,
+                    xid,
+                    command_id,
+                )
+                .map_err(ServerError::Catalog)?;
+        }
+        for row in &plan.constraints_to_shift {
+            self.state
+                .persistent_catalog
+                .persist_constraint_row(row, heap, xid, command_id)
+                .map_err(ServerError::Catalog)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the in-memory catalog half of [`Self::plan_drop_column_dependents`]
+    /// after the DROP COLUMN transaction has durably committed: drop the dead
+    /// indexes, re-point the survivors, and reconcile `pg_constraint`. Mirrors
+    /// the post-commit catalog teardown in `execute_alter_drop_constraint`.
+    fn apply_drop_column_dependents(&self, plan: &DropColumnDependents) {
+        let catalog = &self.state.persistent_catalog;
+        for index in &plan.indexes_to_drop {
+            catalog.clear_descriptions_for_object(index.oid);
+            let key = ultrasql_catalog::index_lookup_key(&index.schema_name, &index.name);
+            if let Err(e) = catalog.drop_index(&key) {
+                tracing::error!(
+                    error = %e,
+                    index = %index.name,
+                    "ALTER TABLE DROP COLUMN: removing dependent index from catalog failed; \
+                     the durable tombstone is authoritative and a restart rebuilds the same state"
+                );
+            }
+        }
+        for index in &plan.indexes_to_shift {
+            // No in-place index mutator exists; drop the stale by-name/by-table
+            // entries then re-register the shifted clone (same OID/root_block).
+            let key = ultrasql_catalog::index_lookup_key(&index.schema_name, &index.name);
+            let _ = catalog.drop_index(&key);
+            if let Err(e) = catalog.create_index(index.clone()) {
+                tracing::error!(
+                    error = %e,
+                    index = %index.name,
+                    "ALTER TABLE DROP COLUMN: re-pointing dependent index failed; \
+                     the durable pg_index row is authoritative and a restart rebuilds it"
+                );
+            }
+        }
+        for row in &plan.constraints_to_drop {
+            catalog.remove_constraint(row.oid);
+        }
+        if !plan.constraints_to_shift.is_empty() {
+            catalog.install_constraint_rows(plan.constraints_to_shift.iter().cloned());
+        }
+    }
+
+    /// Re-index the per-column runtime metadata (defaults, generated-column
+    /// expressions, SERIAL sequence bindings, identity flags) to the shifted
+    /// positions, and drop any bound CHECK predicate whose constraint was
+    /// dropped because it referenced the removed column.
+    ///
+    /// The persistent compaction (`persist_table_schema_replacement`) already
+    /// narrows `pg_attribute`, but the position-keyed runtime side map is a
+    /// separate artifact the existing compaction never touched — leaving it
+    /// misaligned would mis-apply defaults / generated expressions to the wrong
+    /// column on the next INSERT.
+    fn compact_runtime_constraints_after_drop_column(
+        &self,
+        table_oid: ultrasql_core::Oid,
+        table_name: &str,
+        column_index: usize,
+        plan: &DropColumnDependents,
+    ) {
+        let Some(previous) = self
+            .state
+            .table_constraints
+            .get(&table_oid)
+            .map(|guard| guard.clone())
+        else {
+            return;
+        };
+        let mut runtime = previous.as_ref().clone();
+        let mut changed = false;
+        // Drop the dropped column's slot from every per-column vector.
+        changed |= remove_at(&mut runtime.defaults, column_index);
+        changed |= remove_at(&mut runtime.sequence_defaults, column_index);
+        changed |= remove_at(&mut runtime.identity_always, column_index);
+        changed |= remove_at(&mut runtime.generated_stored, column_index);
+        // Re-point any surviving bound DEFAULT / generated-column expression at
+        // the compacted positions (they reference other columns by index).
+        for default in runtime.defaults.iter_mut().flatten() {
+            scalar_expr_shift_columns(default, column_index);
+            changed = true;
+        }
+        for generated in runtime.generated_stored.iter_mut().flatten() {
+            scalar_expr_shift_columns(generated, column_index);
+            changed = true;
+        }
+        // Drop bound CHECK predicates whose constraint was dropped (its
+        // expression references the removed column by old position).
+        let dropped_checks: std::collections::HashSet<String> = plan
+            .constraints_to_drop
+            .iter()
+            .filter(|row| matches!(row.contype, ultrasql_catalog::persistent::ConType::Check))
+            .map(|row| row.conname.to_ascii_lowercase())
+            .collect();
+        if !dropped_checks.is_empty() {
+            let before = runtime.checks.len();
+            runtime
+                .checks
+                .retain(|check| !dropped_checks.contains(&check.name.to_ascii_lowercase()));
+            changed |= runtime.checks.len() != before;
+        }
+        // Re-point the SURVIVING CHECK predicates at the compacted positions.
+        for check in &mut runtime.checks {
+            scalar_expr_shift_columns(&mut check.expr, column_index);
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.state
+            .table_constraints
+            .insert(table_oid, Arc::new(runtime));
+        if let Err(e) = self.state.persist_table_runtime_constraints_metadata() {
+            // The schema is already committed narrower; restore the prior side
+            // map so DML keeps using consistent (if slightly stale) metadata and
+            // surface the flush failure rather than silently corrupting it.
+            self.state.table_constraints.insert(table_oid, previous);
+            tracing::error!(
+                error = %e,
+                table = %table_name,
+                "ALTER TABLE DROP COLUMN: flushing re-indexed runtime constraints failed"
+            );
+        }
+    }
+
     /// Execute `ALTER TABLE t DROP COLUMN c`: rewrite every visible
     /// tuple without that slot, then publish the narrower schema.
     pub(crate) fn execute_alter_drop_column(
@@ -1029,6 +1322,11 @@ where
         } else {
             Vec::new()
         };
+
+        // Classify dependent indexes / constraints against the OLD positions
+        // (the `snapshot` still describes the pre-drop schema) BEFORE any
+        // catalog mutation, so we know which to drop and which to re-point.
+        let dependents = self.plan_drop_column_dependents(entry.oid, column_index, snapshot);
 
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let rel = RelationId(entry.oid);
@@ -1165,6 +1463,19 @@ where
                         "ALTER TABLE DROP COLUMN catalog rollback after persist error",
                     ));
                 }
+                // Drop / re-point dependent indexes and constraints durably in
+                // the SAME transaction so the adjustment is atomic with the
+                // column drop (commits together, rolls back together).
+                if let Err(e) =
+                    self.persist_drop_column_dependents(&dependents, txn.xid, txn.current_command)
+                {
+                    return Err(self.rollback_catalog_transaction_after_error(
+                        txn,
+                        e,
+                        "ALTER TABLE DROP COLUMN catalog rollback after dependent index/constraint \
+                         persist error",
+                    ));
+                }
                 for chunk_entry in &partition_chunks {
                     let chunk_key = ultrasql_catalog::table_lookup_key(
                         &chunk_entry.schema_name,
@@ -1195,6 +1506,16 @@ where
                 }
                 self.state
                     .commit_transaction(txn, true, "ALTER TABLE DROP COLUMN")?;
+                // The durable side committed; reconcile the in-memory catalog
+                // (drop dead indexes, re-point survivors, prune constraints)
+                // and re-index the per-column runtime metadata to the shift.
+                self.apply_drop_column_dependents(&dependents);
+                self.compact_runtime_constraints_after_drop_column(
+                    updated_entry.oid,
+                    &updated_entry.name,
+                    column_index,
+                    &dependents,
+                );
                 if let Some((_, partition)) = self.state.time_partitions.remove(&table_key) {
                     let partition_column_index = if column_index < partition.partition_column_index
                     {
@@ -2174,6 +2495,79 @@ fn map_index_build_duplicate(err: ServerError, constraint_name: &str) -> ServerE
         ));
     }
     err
+}
+
+/// Whether a bound scalar expression references the table column at 0-based
+/// `column_index` through any [`ScalarExpr::Column`]. CHECK predicates bind to
+/// the table row schema, so a positive answer means the CHECK depends on the
+/// column being dropped (PostgreSQL drops such a CHECK).
+fn scalar_expr_references_column(expr: &ScalarExpr, column_index: usize) -> bool {
+    match expr {
+        ScalarExpr::Column { index, .. } => *index == column_index,
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            scalar_expr_references_column(expr, column_index)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            scalar_expr_references_column(left, column_index)
+                || scalar_expr_references_column(right, column_index)
+        }
+        ScalarExpr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| scalar_expr_references_column(arg, column_index)),
+        // A table CHECK predicate cannot contain subqueries / parameters /
+        // outer columns; those variants carry no table-column reference to
+        // shift, so they are inert here.
+        ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => false,
+    }
+}
+
+/// Decrement every [`ScalarExpr::Column`] index strictly greater than
+/// `dropped_index` by one, re-pointing a surviving CHECK predicate at the
+/// compacted schema. Assumes the expression does not itself reference the
+/// dropped column (callers drop those CHECKs instead of shifting them).
+fn scalar_expr_shift_columns(expr: &mut ScalarExpr, dropped_index: usize) {
+    match expr {
+        ScalarExpr::Column { index, .. } => {
+            if *index > dropped_index {
+                *index -= 1;
+            }
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            scalar_expr_shift_columns(expr, dropped_index);
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            scalar_expr_shift_columns(left, dropped_index);
+            scalar_expr_shift_columns(right, dropped_index);
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                scalar_expr_shift_columns(arg, dropped_index);
+            }
+        }
+        ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
+    }
+}
+
+/// Remove the element at `index` from a per-column runtime vector, returning
+/// whether a removal happened. An out-of-range index (the vector is shorter
+/// than the schema, e.g. trailing-default elision) is a no-op.
+fn remove_at<T>(vec: &mut Vec<T>, index: usize) -> bool {
+    if index < vec.len() {
+        vec.remove(index);
+        true
+    } else {
+        false
+    }
 }
 
 fn alter_constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {
