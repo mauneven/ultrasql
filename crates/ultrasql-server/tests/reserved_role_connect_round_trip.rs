@@ -136,12 +136,22 @@ async fn bootstrap_owned_rls_table_survives_restart() {
     // Restart: the table's owner ("ultrasql") is a persisted role, so the
     // RLS sidecar replay accepts it and the rows are recoverable.
     let running = start_persistent_server(data_dir.path(), "reserved_recovery_verify").await;
-    let count: i64 = running
-        .client
+
+    // Read back as the owner `ultrasql`. The implicit `tester` session that
+    // `start_persistent_server` opens is a non-persisted, non-superuser login
+    // that neither owns the table nor holds a grant on it, so a column-less
+    // read like `count(*)` is correctly denied for it (PostgreSQL requires
+    // SELECT on every table a query reads). The owner round-trips the rows.
+    let (owner_client, owner_handle) = connect_as(running.bound, "ultrasql")
+        .await
+        .expect("bootstrap login must succeed after restart");
+    let count: i64 = owner_client
         .query_one("SELECT COUNT(*) FROM reserved_recovery_docs", &[])
         .await
         .expect("RLS table must survive restart")
         .get(0);
     assert_eq!(count, 2);
+    drop(owner_client);
+    let _ = owner_handle.await;
     shutdown(running).await;
 }
