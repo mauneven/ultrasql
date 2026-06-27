@@ -184,9 +184,29 @@ pub(in crate::binder) fn bind_runtime_cast(
         DataType::Bool if actual_type.is_textlike() => "__ultrasql_cast_bool",
         DataType::Date if actual_type.is_textlike() => "__ultrasql_cast_date",
         DataType::Time if actual_type.is_textlike() => "__ultrasql_cast_time",
-        DataType::Timestamp if actual_type.is_textlike() => "__ultrasql_cast_timestamp",
-        DataType::TimestampTz if actual_type.is_textlike() => "__ultrasql_cast_timestamptz",
+        // `timestamp` accepts text plus the narrower temporal `date`
+        // (date -> midnight timestamp); set-op supertype resolution relies
+        // on the latter (`DATE UNION TIMESTAMP`).
+        DataType::Timestamp
+            if actual_type.is_textlike() || matches!(actual_type, DataType::Date) =>
+        {
+            "__ultrasql_cast_timestamp"
+        }
+        // `timestamptz` accepts text plus the narrower `date`/`timestamp`
+        // (the engine stores both as UTC-epoch micros, so the conversion is
+        // identity on the instant).
+        DataType::TimestampTz
+            if actual_type.is_textlike()
+                || matches!(actual_type, DataType::Date | DataType::Timestamp) =>
+        {
+            "__ultrasql_cast_timestamptz"
+        }
         DataType::TimeTz if actual_type.is_textlike() => "__ultrasql_cast_timetz",
+        // `inet` accepts text plus `cidr` (cidr -> inet is an implicit cast);
+        // set-op supertype resolution unifies inet/cidr to inet.
+        DataType::Inet if actual_type.is_textlike() || matches!(actual_type, DataType::Cidr) => {
+            "__ultrasql_cast_inet"
+        }
         DataType::Uuid if actual_type.is_textlike() => "__ultrasql_cast_uuid",
         DataType::Json if actual_type.is_textlike() => "__ultrasql_cast_json",
         DataType::Jsonb if actual_type.is_textlike() => "__ultrasql_cast_jsonb",

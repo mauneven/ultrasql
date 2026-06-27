@@ -596,3 +596,259 @@ async fn same_width_union_unchanged() {
 
     shutdown(client, server_handle).await;
 }
+
+// ---------------------------------------------------------------------------
+// Cross-category supertype battery (PG `select_common_type`).
+//
+// Set operations over corresponding columns whose types differ across a
+// PG type category (temporal date/timestamp/timestamptz, string
+// char/varchar/text, network inet/cidr) must resolve to the common
+// supertype and cast every branch to it, so rows compare / dedupe / match
+// in that type. Before the fix the binder kept the LEFT column's type and
+// compared physically-different values, silently dropping rows.
+// ---------------------------------------------------------------------------
+
+/// PG type OIDs for the resolved cross-category set-op output type.
+const OID_TIMESTAMP: u32 = 1114;
+const OID_TIMESTAMPTZ: u32 = 1184;
+const OID_TEXT: u32 = 25;
+const OID_INET: u32 = 869;
+
+/// Count the data rows in a `simple_query` result.
+fn row_count(rows: &[tokio_postgres::SimpleQueryMessage]) -> usize {
+    rows.iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count()
+}
+
+/// TEMPORAL #1 — `date 'd' UNION timestamp 'd 00:00:00'`. The date and the
+/// midnight timestamp denote the same instant, so once both branches are
+/// cast to `timestamp` they DEDUP to one row, and the output type is
+/// `timestamp`.
+#[tokio::test]
+async fn temporal_date_union_timestamp_dedups_same_instant() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .simple_query("SELECT date '2024-01-01' UNION SELECT timestamp '2024-01-01 00:00:00'")
+        .await
+        .expect("date/timestamp UNION succeeds");
+    assert_eq!(
+        row_count(&rows),
+        1,
+        "date and midnight timestamp dedupe to one row"
+    );
+
+    let prepared = client
+        .prepare("SELECT date '2024-01-01' UNION SELECT timestamp '2024-01-01 00:00:00'")
+        .await
+        .expect("prepare date/timestamp UNION");
+    assert_eq!(prepared.columns()[0].type_().oid(), OID_TIMESTAMP);
+
+    shutdown(client, server_handle).await;
+}
+
+/// TEMPORAL #2 — `date 'd' INTERSECT timestamp 'd 00:00:00'` returns the
+/// matching instant (NOT silently 0 rows); a non-midnight timestamp does
+/// NOT match the date and INTERSECT returns 0 rows correctly.
+#[tokio::test]
+async fn temporal_date_intersect_timestamp_matches_instant() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    // Matching instant: date midnight == timestamp midnight -> one row.
+    let rows = client
+        .simple_query("SELECT date '2024-01-01' INTERSECT SELECT timestamp '2024-01-01 00:00:00'")
+        .await
+        .expect("date/timestamp INTERSECT succeeds");
+    assert_eq!(
+        row_count(&rows),
+        1,
+        "matching instant must intersect, not silently drop"
+    );
+
+    // Non-matching: the timestamp has a non-zero time, so no shared instant.
+    let rows = client
+        .simple_query("SELECT date '2024-01-01' INTERSECT SELECT timestamp '2024-01-01 12:00:00'")
+        .await
+        .expect("date/timestamp INTERSECT (no match) succeeds");
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "non-matching instants intersect to zero rows"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// TEMPORAL #3 — `date 'd' UNION timestamptz 'd 00:00:00+00'` resolves to
+/// `timestamptz` and dedupes the same instant to one row.
+#[tokio::test]
+async fn temporal_date_union_timestamptz_resolves_timestamptz() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .simple_query("SELECT date '2024-01-01' UNION SELECT timestamptz '2024-01-01 00:00:00+00'")
+        .await
+        .expect("date/timestamptz UNION succeeds");
+    assert_eq!(row_count(&rows), 1, "same instant dedupes to one row");
+
+    let prepared = client
+        .prepare("SELECT date '2024-01-01' UNION SELECT timestamptz '2024-01-01 00:00:00+00'")
+        .await
+        .expect("prepare date/timestamptz UNION");
+    assert_eq!(prepared.columns()[0].type_().oid(), OID_TIMESTAMPTZ);
+
+    shutdown(client, server_handle).await;
+}
+
+/// STRING #1 — `'abc'::char(3) UNION 'abc'::text` casts both to `text`;
+/// equal text values dedupe to one row, output type is `text`.
+#[tokio::test]
+async fn string_char_union_text_dedups_equal() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .simple_query("SELECT 'abc'::char(3) UNION SELECT 'abc'::text")
+        .await
+        .expect("char/text UNION succeeds");
+    assert_eq!(
+        row_count(&rows),
+        1,
+        "equal char(3)/text values dedupe to one row"
+    );
+
+    let prepared = client
+        .prepare("SELECT 'abc'::char(3) UNION SELECT 'abc'::text")
+        .await
+        .expect("prepare char/text UNION");
+    assert_eq!(prepared.columns()[0].type_().oid(), OID_TEXT);
+
+    shutdown(client, server_handle).await;
+}
+
+/// STRING #2 — `varchar INTERSECT text` returns the matching strings (not
+/// silently empty).
+#[tokio::test]
+async fn string_varchar_intersect_text_matches() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .simple_query(
+            "SELECT 'x'::varchar(8) UNION ALL SELECT 'y'::varchar(8) \
+             INTERSECT \
+             SELECT 'y'::text",
+        )
+        .await
+        .expect("varchar/text INTERSECT succeeds");
+    let vals = rows_to_text_col(&rows, 0);
+    assert_eq!(vals, vec!["y".to_owned()], "matching string must survive");
+
+    shutdown(client, server_handle).await;
+}
+
+/// NETWORK — `inet UNION cidr` of the same address dedupes to one row and
+/// resolves to `inet`; `inet INTERSECT cidr` returns the matching address.
+#[tokio::test]
+async fn network_inet_cidr_union_intersect() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    // 192.168.1.0/24 as inet and as cidr denote the same address; once cidr
+    // is cast to inet they dedupe to one row.
+    let rows = client
+        .simple_query("SELECT inet '192.168.1.0/24' UNION SELECT cidr '192.168.1.0/24'")
+        .await
+        .expect("inet/cidr UNION succeeds");
+    assert_eq!(row_count(&rows), 1, "same address dedupes to one row");
+
+    let prepared = client
+        .prepare("SELECT inet '192.168.1.0/24' UNION SELECT cidr '192.168.1.0/24'")
+        .await
+        .expect("prepare inet/cidr UNION");
+    assert_eq!(prepared.columns()[0].type_().oid(), OID_INET);
+
+    // INTERSECT must return the matching address, not silently zero rows.
+    let rows = client
+        .simple_query("SELECT inet '10.0.0.0/8' INTERSECT SELECT cidr '10.0.0.0/8'")
+        .await
+        .expect("inet/cidr INTERSECT succeeds");
+    assert_eq!(
+        row_count(&rows),
+        1,
+        "matching inet/cidr address must intersect"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// NO-COMMON-TYPE — `int UNION date` has no implicit cast in either
+/// direction, so PG raises `datatype_mismatch` (SQLSTATE 42804). It must
+/// error cleanly, not return 0 rows or panic.
+#[tokio::test]
+async fn no_common_type_int_union_date_errors_42804() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let result = client
+        .simple_query("SELECT 1 UNION SELECT '2024-01-01'::date")
+        .await;
+    let err = result.expect_err("int UNION date must error");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        code, "42804",
+        "no-common-type set op must be datatype_mismatch"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// CHAINED — a 3-branch UNION mixing date/timestamp/timestamptz resolves to
+/// `timestamptz` across all three branches (the supertype of the whole
+/// chain), and the three distinct instants stay distinct.
+#[tokio::test]
+async fn chained_date_timestamp_timestamptz_resolves_timestamptz() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let sql = "SELECT date '2024-01-01' \
+               UNION SELECT timestamp '2024-06-01 12:00:00' \
+               UNION SELECT timestamptz '2024-12-01 00:00:00+00'";
+    let rows = client
+        .simple_query(sql)
+        .await
+        .expect("3-branch temporal UNION succeeds");
+    assert_eq!(row_count(&rows), 3, "three distinct instants stay distinct");
+
+    let prepared = client.prepare(sql).await.expect("prepare chained UNION");
+    assert_eq!(
+        prepared.columns()[0].type_().oid(),
+        OID_TIMESTAMPTZ,
+        "chain resolves to timestamptz across all branches"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// EXCEPT ALL multiplicity under a cross-category cast: `date` rows minus a
+/// `timestamp` midnight row subtract by instant. Two equal dates minus one
+/// matching timestamp leaves exactly one date row.
+#[tokio::test]
+async fn except_all_multiplicity_under_temporal_cast() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .simple_query(
+            "SELECT date '2024-01-01' UNION ALL SELECT date '2024-01-01' \
+             EXCEPT ALL \
+             SELECT timestamp '2024-01-01 00:00:00'",
+        )
+        .await
+        .expect("temporal EXCEPT ALL succeeds");
+    assert_eq!(
+        row_count(&rows),
+        1,
+        "EXCEPT ALL subtracts one matching instant, leaving one"
+    );
+
+    shutdown(client, server_handle).await;
+}

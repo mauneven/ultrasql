@@ -835,6 +835,108 @@ fn apply_column_aliases(
     Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("CTE column aliases: {e}")))
 }
 
+/// Resolve the common supertype of two corresponding set-op branch column
+/// types, following PostgreSQL's `UNION`/`INTERSECT`/`EXCEPT` type
+/// resolution (the `select_common_type` algorithm).
+///
+/// The pair must belong to the same type *category*. The supertype is the
+/// preferred type of that category, or the one to which the other branch's
+/// type implicitly coerces. Every branch column is later cast to this type
+/// (see [`cast_set_op_side`]) so deduplication / matching happens in the
+/// common physical type — without this, e.g. `DATE INTERSECT TIMESTAMP`
+/// compares `Date(d)` against `Timestamp(us)` and never matches, silently
+/// dropping rows.
+///
+/// # Rules
+///
+/// * Identical types resolve to themselves (unchanged).
+/// * `NULL` / untyped-literal columns adopt the other branch's type.
+/// * NUMERIC: int2/int4/int8/numeric/float resolve to the common numeric
+///   supertype (decimal > float > wider integer).
+/// * TEMPORAL: `date`+`timestamp` → `timestamp`; `date`/`timestamp`
+///   +`timestamptz` → `timestamptz`; `date`+`timestamptz` → `timestamptz`.
+///   `time`/`timetz`/`interval` only unify with themselves.
+/// * STRING: `char(n)` / `varchar(n)` / `text` (any mix) → `text`, the
+///   preferred string type. Comparison then follows PG `text` semantics.
+/// * NETWORK: `inet`+`cidr` → `inet` (cidr implicitly casts to inet).
+///   `macaddr`/`macaddr8` only unify with themselves.
+///
+/// Returns [`PlanError::TypeMismatch`] (SQLSTATE 42804, datatype_mismatch)
+/// when the two types share no common supertype, mirroring PostgreSQL's
+/// `UNION/INTERSECT/EXCEPT types <a> and <b> cannot be matched` error.
+fn setop_common_type(left: &DataType, right: &DataType) -> Result<DataType, PlanError> {
+    // 1. Identical types — including identical typmods — pass through.
+    if left == right {
+        return Ok(left.clone());
+    }
+    // 2. An untyped NULL / unknown-literal column adopts the other side.
+    if matches!(left, DataType::Null) {
+        return Ok(right.clone());
+    }
+    if matches!(right, DataType::Null) {
+        return Ok(left.clone());
+    }
+
+    // 3. NUMERIC: preserve the mixed-width behaviour (decimal > float >
+    //    wider integer).
+    if left.is_numeric() && right.is_numeric() {
+        return left
+            .numeric_join(right)
+            .map_err(|_| setop_mismatch(left, right));
+    }
+
+    // 4. TEMPORAL: date/timestamp/timestamptz promote to the widest member.
+    if let Some(ty) = temporal_common_type(left, right) {
+        return Ok(ty);
+    }
+
+    // 5. STRING: char/varchar/text collapse to text (the preferred type).
+    if left.is_textlike() && right.is_textlike() {
+        return Ok(DataType::Text { max_len: None });
+    }
+
+    // 6. NETWORK: inet + cidr promote to inet (cidr -> inet is implicit).
+    if left.is_ip_network() && right.is_ip_network() {
+        return Ok(DataType::Inet);
+    }
+
+    // 7. OID aliases (oid/regclass/regtype) and oid-alias/integer mixes
+    //    already compare same-width as oid; keep the left (oid-alias) type.
+    if left.is_oid_alias() && (right.is_oid_alias() || right.is_integer()) {
+        return Ok(left.clone());
+    }
+    if right.is_oid_alias() && left.is_integer() {
+        return Ok(right.clone());
+    }
+
+    // 8. Otherwise the two branches have no common supertype: PG raises
+    //    `... types <a> and <b> cannot be matched` (datatype_mismatch).
+    Err(setop_mismatch(left, right))
+}
+
+/// The PostgreSQL `cannot be matched` error for two un-unifiable set-op
+/// branch column types (SQLSTATE 42804 via [`PlanError::TypeMismatch`]).
+fn setop_mismatch(left: &DataType, right: &DataType) -> PlanError {
+    PlanError::TypeMismatch(format!(
+        "UNION/INTERSECT/EXCEPT types {left} and {right} cannot be matched"
+    ))
+}
+
+/// Common supertype for two temporal types, or `None` when they do not
+/// promote (e.g. `time` vs `date`). Implements PG's date/timestamp
+/// promotion lattice: `date` < `timestamp` < `timestamptz`, with
+/// `timestamptz` absorbing either narrower instant type.
+fn temporal_common_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    use DataType::{Date, Timestamp, TimestampTz};
+    match (left, right) {
+        (TimestampTz, Date | Timestamp | TimestampTz) | (Date | Timestamp, TimestampTz) => {
+            Some(TimestampTz)
+        }
+        (Timestamp, Date | Timestamp) | (Date, Timestamp) => Some(Timestamp),
+        _ => None,
+    }
+}
+
 fn bind_set_op(
     left: LogicalPlan,
     op: SetOp,
@@ -855,30 +957,7 @@ fn bind_set_op(
         .iter()
         .zip(right.schema().fields().iter())
         .map(|(lf, rf)| {
-            let out_ty = if matches!(lf.data_type, DataType::Null) {
-                rf.data_type.clone()
-            } else if matches!(rf.data_type, DataType::Null) {
-                lf.data_type.clone()
-            } else if lf.data_type.is_numeric() && rf.data_type.is_numeric() {
-                lf.data_type.numeric_join(&rf.data_type).map_err(|_| {
-                    PlanError::TypeMismatch(format!(
-                        "set operation column type mismatch: {} vs {}",
-                        lf.data_type, rf.data_type
-                    ))
-                })?
-            } else if (lf.data_type.is_textlike() && rf.data_type.is_textlike())
-                || expr_type::comparable(&lf.data_type, &rf.data_type)
-            {
-                lf.data_type.clone()
-            } else {
-                // Reject corresponding columns whose types are not unifiable
-                // (e.g. INT vs TEXT) rather than silently coercing the right
-                // side into the left column's type and returning wrong data.
-                return Err(PlanError::TypeMismatch(format!(
-                    "set operation column type mismatch: {} vs {}",
-                    lf.data_type, rf.data_type
-                )));
-            };
+            let out_ty = setop_common_type(&lf.data_type, &rf.data_type)?;
             Ok(Field::nullable(lf.name.clone(), out_ty))
         })
         .collect();

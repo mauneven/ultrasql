@@ -448,6 +448,7 @@ fn eval_function_call(
         "__ultrasql_cast_regclass" => eval_cast_regclass(args),
         "__ultrasql_cast_regtype" => eval_cast_regtype(args),
         "__ultrasql_cast_text" => eval_cast_text(args),
+        "__ultrasql_cast_inet" => eval_cast_inet(args),
         "__ultrasql_cast_money" => eval_cast_money(args),
         "__ultrasql_cast_numeric" => eval_cast_numeric(args),
         "l2_distance" => eval_vector_metric(args, VectorDistanceOp::L2),

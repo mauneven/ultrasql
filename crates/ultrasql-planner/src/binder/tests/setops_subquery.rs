@@ -527,3 +527,105 @@ fn set_op_three_column_mixed_positions_casts_each_differing_column() {
         exprs[2].0
     );
 }
+
+/// The resolved set-op output type for `sql`'s first column.
+fn setop_out_type(sql: &str) -> DataType {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(sql, &cat).expect("bind ok");
+    let LogicalPlan::SetOp { schema, .. } = &plan else {
+        panic!("expected SetOp, got {plan:?}");
+    };
+    schema.fields()[0].data_type.clone()
+}
+
+/// TEMPORAL supertype resolution: date/timestamp/timestamptz promote to the
+/// widest member per the PG date/timestamp lattice.
+#[test]
+fn set_op_temporal_supertype_resolution() {
+    assert_eq!(
+        setop_out_type("SELECT date '2024-01-01' UNION SELECT timestamp '2024-01-01 00:00:00'"),
+        DataType::Timestamp,
+        "date + timestamp -> timestamp"
+    );
+    assert_eq!(
+        setop_out_type(
+            "SELECT date '2024-01-01' UNION SELECT timestamptz '2024-01-01 00:00:00+00'"
+        ),
+        DataType::TimestampTz,
+        "date + timestamptz -> timestamptz"
+    );
+    assert_eq!(
+        setop_out_type(
+            "SELECT timestamp '2024-01-01 00:00:00' \
+             UNION SELECT timestamptz '2024-01-01 00:00:00+00'"
+        ),
+        DataType::TimestampTz,
+        "timestamp + timestamptz -> timestamptz"
+    );
+}
+
+/// CHAINED temporal resolution: a 3-branch UNION mixing all three temporal
+/// types resolves to `timestamptz` across the whole chain.
+#[test]
+fn set_op_chained_temporal_resolves_timestamptz() {
+    assert_eq!(
+        setop_out_type(
+            "SELECT date '2024-01-01' \
+             UNION SELECT timestamp '2024-06-01 12:00:00' \
+             UNION SELECT timestamptz '2024-12-01 00:00:00+00'"
+        ),
+        DataType::TimestampTz,
+        "chain date/timestamp/timestamptz -> timestamptz"
+    );
+}
+
+/// STRING supertype resolution: char/varchar/text collapse to `text`.
+#[test]
+fn set_op_string_supertype_is_text() {
+    assert_eq!(
+        setop_out_type("SELECT 'abc'::char(3) UNION SELECT 'abc'::text"),
+        DataType::Text { max_len: None },
+        "char(n) + text -> text"
+    );
+    assert_eq!(
+        setop_out_type("SELECT 'abc'::varchar(8) UNION SELECT 'abc'::char(3)"),
+        DataType::Text { max_len: None },
+        "varchar(n) + char(n) -> text"
+    );
+}
+
+/// NETWORK supertype resolution: inet + cidr promote to `inet`, and the
+/// cidr branch gains an inet cast Project.
+#[test]
+fn set_op_network_inet_cidr_resolves_inet() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT inet '10.0.0.0/8' UNION SELECT cidr '10.0.0.0/8'",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::SetOp { right, schema, .. } = &plan else {
+        panic!("expected SetOp, got {plan:?}");
+    };
+    assert_eq!(schema.fields()[0].data_type, DataType::Inet);
+    assert!(
+        project_casts_col_to(right, 0, &DataType::Inet, "__ultrasql_cast_inet"),
+        "cidr branch must be cast to inet, got {right:?}"
+    );
+}
+
+/// NO-COMMON-TYPE: `int UNION date` shares no supertype, so the binder
+/// rejects it with a `cannot be matched` TypeMismatch (SQLSTATE 42804).
+#[test]
+fn set_op_no_common_type_is_rejected() {
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("SELECT 1 UNION SELECT '2024-01-01'::date", &cat)
+        .expect_err("int UNION date must be rejected");
+    let PlanError::TypeMismatch(msg) = err else {
+        panic!("expected TypeMismatch, got {err:?}");
+    };
+    assert!(
+        msg.contains("cannot be matched"),
+        "message must mirror PG, got {msg}"
+    );
+}

@@ -173,6 +173,25 @@ pub(crate) fn eval_cast_time(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 pub(crate) fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "timestamp cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    // `date -> timestamp`: midnight of the date (engine stores both as
+    // UTC-epoch micros, with `date` measured in whole days). Used by set-op
+    // supertype resolution for `DATE UNION TIMESTAMP`.
+    if let Value::Date(days) = &args[0] {
+        return i64::from(*days)
+            .checked_mul(MICROS_PER_DAY)
+            .map(Value::Timestamp)
+            .ok_or_else(|| {
+                EvalError::NumericFieldOverflow(
+                    "timestamp cast: date out of timestamp range".to_owned(),
+                )
+            });
+    }
     let Some(text) = textlike_cast_arg("timestamp cast", args)? else {
         return Ok(Value::Null);
     };
@@ -184,6 +203,29 @@ pub(crate) fn eval_cast_timestamp(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 pub(crate) fn eval_cast_timestamptz(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "timestamptz cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    // `date`/`timestamp` -> `timestamptz`: the engine stores all three as
+    // UTC-epoch micros, so the instant is preserved. Used by set-op
+    // supertype resolution (`DATE`/`TIMESTAMP UNION TIMESTAMPTZ`).
+    match &args[0] {
+        Value::Timestamp(micros) => return Ok(Value::TimestampTz(*micros)),
+        Value::Date(days) => {
+            return i64::from(*days)
+                .checked_mul(MICROS_PER_DAY)
+                .map(Value::TimestampTz)
+                .ok_or_else(|| {
+                    EvalError::NumericFieldOverflow(
+                        "timestamptz cast: date out of timestamp range".to_owned(),
+                    )
+                });
+        }
+        _ => {}
+    }
     let Some(text) = textlike_cast_arg("timestamptz cast", args)? else {
         return Ok(Value::Null);
     };
@@ -356,6 +398,39 @@ pub(crate) fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
         ));
     }
     Ok(Value::Text(args[0].to_string()))
+}
+
+pub(crate) fn eval_cast_inet(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "inet cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        // Already `inet`: pass through unchanged.
+        Value::Network(net @ ultrasql_core::NetworkValue::Inet(_)) => Ok(Value::Network(*net)),
+        // `cidr -> inet`: keep the same address payload, change the family.
+        // Used by set-op supertype resolution (`inet UNION cidr`); without
+        // this the `Cidr(x)` and `Inet(x)` variants never compare equal.
+        Value::Network(ultrasql_core::NetworkValue::Cidr(addr)) => {
+            Ok(Value::Network(ultrasql_core::NetworkValue::Inet(*addr)))
+        }
+        Value::Text(text) | Value::Char(text) => {
+            ultrasql_core::NetworkValue::parse_for_type(&DataType::Inet, text.trim())
+                .map(Value::Network)
+                .ok_or_else(|| {
+                    EvalError::InvalidTextRepresentation(format!(
+                        "inet cast: invalid syntax: {text}"
+                    ))
+                })
+        }
+        other => Err(EvalError::Type(format!(
+            "inet cast: inet/cidr/text argument required, got {:?}",
+            other.data_type()
+        ))),
+    }
 }
 
 pub(crate) fn eval_cast_money(args: &[Value]) -> Result<Value, EvalError> {
