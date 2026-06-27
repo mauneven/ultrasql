@@ -43,8 +43,18 @@ use ultrasql_wal::payload::{
 
 use crate::btree::{BTree, BTreeError};
 use crate::buffer_pool::PageLoader;
-use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog};
+use crate::heap::{HeapAccess, Int32PairUndoBatch, UndoEntry, UndoRelationLog};
 use crate::page::{ItemId, PageError};
+
+/// Returns `true` when `batch` covers exactly the slot set `slots` (same
+/// length and same membership). Used to dedup a compact int32-pair undo
+/// batch during recovery replay so re-applying the same WAL record across
+/// restart cycles does not double-count its delta in the read-time
+/// pre-image sum. Handles both representations of `batch`
+/// (explicit `slots` and the contiguous `first_slot..+slot_count` form).
+fn batch_covers_exact_slots(batch: &Int32PairUndoBatch, slots: &[u16]) -> bool {
+    batch.slot_len() == slots.len() && slots.iter().all(|&slot| batch.contains_slot(slot))
+}
 
 fn should_skip_redo(page: &crate::page::Page, record_lsn: Lsn) -> bool {
     let raw = record_lsn.raw();
@@ -434,73 +444,87 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     detail: format!("buffer pool: {e}"),
                 })?;
             let mut page = guard.write();
-            if should_skip_redo(&page, record_lsn) {
-                return Ok(());
-            }
-            let existing = page
-                .read_tuple(payload.tid.slot)
-                .map_err(|e| ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: format!("read slot: {e}"),
-                })?;
-            if existing.len() < TUPLE_HEADER_SIZE {
-                return Err(ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: String::from("slot shorter than tuple header"),
-                });
-            }
-            let (mut hdr, _) =
-                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
-                    ApplyError::Refused {
+            // ON-PAGE REDO is LSN-gated: if the page is already durable
+            // past this record, do NOT re-apply the bytes. The UNDO-LOG
+            // reconstruction below runs UNCONDITIONALLY (it lives outside
+            // this block), because the in-memory undo log is volatile MVCC
+            // state that no flushed page carries — a snapshot-predating
+            // reader needs the pre-image rebuilt even when the page redo
+            // is skipped.
+            if !should_skip_redo(&page, record_lsn) {
+                let existing =
+                    page.read_tuple(payload.tid.slot)
+                        .map_err(|e| ApplyError::Refused {
+                            operation: "heap_update_in_place",
+                            detail: format!("read slot: {e}"),
+                        })?;
+                if existing.len() < TUPLE_HEADER_SIZE {
+                    return Err(ApplyError::Refused {
                         operation: "heap_update_in_place",
-                        detail: String::from("header decode failed"),
+                        detail: String::from("slot shorter than tuple header"),
+                    });
+                }
+                let (mut hdr, _) =
+                    TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                        ApplyError::Refused {
+                            operation: "heap_update_in_place",
+                            detail: String::from("header decode failed"),
+                        }
+                    })?;
+
+                // Idempotency: if xmax + UPDATED_IN_PLACE bit are already
+                // set to this writer the record was already replayed.
+                // Confirm by also checking the slot bytes match the post
+                // image so a stale matching xmax across distinct cmax
+                // values still falls through to a full rewrite.
+                let post_matches = existing.len()
+                    == TUPLE_HEADER_SIZE + payload.post_image_bytes.len()
+                    && &existing[TUPLE_HEADER_SIZE..] == payload.post_image_bytes.as_slice();
+                if post_matches
+                    && hdr.xmax == payload.writer_xid
+                    && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
+                {
+                    stamp_replayed_lsn(&mut page, record_lsn);
+                } else {
+                    hdr.xmax = payload.writer_xid;
+                    hdr.cmax = payload.command_id;
+                    hdr.infomask.set(InfoMask::UPDATED);
+                    hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+                    let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                    hdr.encode(&mut hdr_bytes);
+
+                    let page_bytes = page.as_bytes_mut();
+                    let item = item_id_from_page_bytes(
+                        page_bytes,
+                        payload.tid.slot,
+                        "heap_update_in_place",
+                    )?;
+                    let slot_off = item_offset_usize(item, "heap_update_in_place")?;
+                    let slot_len = item_length_usize(item, "heap_update_in_place")?;
+                    if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
+                        return Err(ApplyError::Refused {
+                            operation: "heap_update_in_place",
+                            detail: format!(
+                                "slot length {slot_len} too small for header + post-image"
+                            ),
+                        });
                     }
-                })?;
-
-            // Idempotency: if xmax + UPDATED_IN_PLACE bit are already set
-            // to this writer the record was already replayed. Confirm by
-            // also checking the slot bytes match the post image so a
-            // stale matching xmax across distinct cmax values still falls
-            // through to a full rewrite.
-            let post_matches = existing.len() == TUPLE_HEADER_SIZE + payload.post_image_bytes.len()
-                && &existing[TUPLE_HEADER_SIZE..] == payload.post_image_bytes.as_slice();
-            if post_matches
-                && hdr.xmax == payload.writer_xid
-                && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
-            {
-                stamp_replayed_lsn(&mut page, record_lsn);
-                return Ok(());
+                    page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                    let payload_off = slot_off + TUPLE_HEADER_SIZE;
+                    page_bytes[payload_off..payload_off + payload.post_image_bytes.len()]
+                        .copy_from_slice(&payload.post_image_bytes);
+                    stamp_replayed_lsn(&mut page, record_lsn);
+                }
             }
-
-            hdr.xmax = payload.writer_xid;
-            hdr.cmax = payload.command_id;
-            hdr.infomask.set(InfoMask::UPDATED);
-            hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
-            let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-            hdr.encode(&mut hdr_bytes);
-
-            let page_bytes = page.as_bytes_mut();
-            let item =
-                item_id_from_page_bytes(page_bytes, payload.tid.slot, "heap_update_in_place")?;
-            let slot_off = item_offset_usize(item, "heap_update_in_place")?;
-            let slot_len = item_length_usize(item, "heap_update_in_place")?;
-            if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
-                return Err(ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: format!("slot length {slot_len} too small for header + post-image"),
-                });
-            }
-            page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-            let payload_off = slot_off + TUPLE_HEADER_SIZE;
-            page_bytes[payload_off..payload_off + payload.post_image_bytes.len()]
-                .copy_from_slice(&payload.post_image_bytes);
-            stamp_replayed_lsn(&mut page, record_lsn);
         }
 
-        // Rebuild the in-memory undo entry. Push idempotently: if an
-        // entry for the same `(tid, writer_xid, pre_image)` triple
-        // already exists, skip — recovery may walk the same record
-        // twice across restart cycles.
+        // Rebuild the in-memory undo entry UNCONDITIONALLY (independent of
+        // the LSN-gated page redo above) from the pre-image carried by the
+        // WAL record itself — never from the post-redo page bytes, which on
+        // an already-flushed page are the POST image. Push idempotently: if
+        // an entry for the same `(tid, writer_xid, pre_image)` triple
+        // already exists, skip — recovery may walk the same record twice
+        // across restart cycles.
         {
             let log_handle = self
                 .undo_log
@@ -554,57 +578,64 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     detail: format!("buffer pool: {e}"),
                 })?;
             let mut page = guard.write();
-            if should_skip_redo(&page, record_lsn) {
-                return Ok(());
-            }
-
-            for entry in &payload.entries {
-                let existing = page
-                    .read_tuple(entry.slot)
-                    .map_err(|e| ApplyError::Refused {
-                        operation: "heap_update_in_place_batch",
-                        detail: format!("read slot: {e}"),
-                    })?;
-                if existing.len() < TUPLE_HEADER_SIZE {
-                    return Err(ApplyError::Refused {
-                        operation: "heap_update_in_place_batch",
-                        detail: String::from("slot shorter than tuple header"),
-                    });
-                }
-                let (mut hdr, _) =
-                    TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
-                        ApplyError::Refused {
+            // ON-PAGE REDO is LSN-gated; the UNDO-LOG reconstruction below
+            // is unconditional (see `apply_update_in_place_at_lsn`).
+            if !should_skip_redo(&page, record_lsn) {
+                for entry in &payload.entries {
+                    let existing =
+                        page.read_tuple(entry.slot)
+                            .map_err(|e| ApplyError::Refused {
+                                operation: "heap_update_in_place_batch",
+                                detail: format!("read slot: {e}"),
+                            })?;
+                    if existing.len() < TUPLE_HEADER_SIZE {
+                        return Err(ApplyError::Refused {
+                            operation: "heap_update_in_place_batch",
+                            detail: String::from("slot shorter than tuple header"),
+                        });
+                    }
+                    let (mut hdr, _) = TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE])
+                        .ok_or_else(|| ApplyError::Refused {
                             operation: "heap_update_in_place_batch",
                             detail: String::from("header decode failed"),
-                        }
-                    })?;
+                        })?;
 
-                hdr.xmax = payload.writer_xid;
-                hdr.cmax = payload.command_id;
-                hdr.infomask.set(InfoMask::UPDATED);
-                hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
-                let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-                hdr.encode(&mut hdr_bytes);
+                    hdr.xmax = payload.writer_xid;
+                    hdr.cmax = payload.command_id;
+                    hdr.infomask.set(InfoMask::UPDATED);
+                    hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+                    let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                    hdr.encode(&mut hdr_bytes);
 
-                let page_bytes = page.as_bytes_mut();
-                let item =
-                    item_id_from_page_bytes(page_bytes, entry.slot, "heap_update_in_place_batch")?;
-                let slot_off = item_offset_usize(item, "heap_update_in_place_batch")?;
-                let slot_len = item_length_usize(item, "heap_update_in_place_batch")?;
-                if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
-                    return Err(ApplyError::Refused {
-                        operation: "heap_update_in_place_batch",
-                        detail: format!("slot length {slot_len} too small for header + post-image"),
-                    });
+                    let page_bytes = page.as_bytes_mut();
+                    let item = item_id_from_page_bytes(
+                        page_bytes,
+                        entry.slot,
+                        "heap_update_in_place_batch",
+                    )?;
+                    let slot_off = item_offset_usize(item, "heap_update_in_place_batch")?;
+                    let slot_len = item_length_usize(item, "heap_update_in_place_batch")?;
+                    if slot_len < TUPLE_HEADER_SIZE + entry.post_image.len() {
+                        return Err(ApplyError::Refused {
+                            operation: "heap_update_in_place_batch",
+                            detail: format!(
+                                "slot length {slot_len} too small for header + post-image"
+                            ),
+                        });
+                    }
+                    page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                    let payload_off = slot_off + TUPLE_HEADER_SIZE;
+                    page_bytes[payload_off..payload_off + entry.post_image.len()]
+                        .copy_from_slice(&entry.post_image);
                 }
-                page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-                let payload_off = slot_off + TUPLE_HEADER_SIZE;
-                page_bytes[payload_off..payload_off + entry.post_image.len()]
-                    .copy_from_slice(&entry.post_image);
+                stamp_replayed_lsn(&mut page, record_lsn);
             }
-            stamp_replayed_lsn(&mut page, record_lsn);
         }
 
+        // Rebuild the in-memory undo entries UNCONDITIONALLY from the
+        // per-slot pre-images carried by the WAL record (never from the
+        // post-redo page bytes). Idempotent dedup by (tid, writer_xid,
+        // pre_image).
         {
             let log_handle = self
                 .undo_log
@@ -648,7 +679,13 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let rel = page_id.relation;
         self.advance_counter(rel, page_id.block)?;
 
-        let mut undo_entries: Vec<(u16, [u8; 9])> = Vec::with_capacity(payload.slots.len());
+        if payload.target_col > 1 {
+            return Err(ApplyError::Refused {
+                operation: "heap_update_int32_pair_delta_batch",
+                detail: format!("target_col {} out of range", payload.target_col),
+            });
+        }
+
         {
             let guard = self
                 .pool
@@ -658,105 +695,108 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     detail: format!("buffer pool: {e}"),
                 })?;
             let mut page = guard.write();
-            if should_skip_redo(&page, record_lsn) {
-                return Ok(());
-            }
-            let page_bytes = page.as_bytes_mut();
-            for &slot in &payload.slots {
-                let item = item_id_from_page_bytes(
-                    page_bytes,
-                    slot,
-                    "heap_update_int32_pair_delta_batch",
-                )?;
-                let slot_off = item_offset_usize(item, "heap_update_int32_pair_delta_batch")?;
-                let slot_len = item_length_usize(item, "heap_update_int32_pair_delta_batch")?;
-                if slot_len < TUPLE_HEADER_SIZE + 9 {
-                    return Err(ApplyError::Refused {
-                        operation: "heap_update_int32_pair_delta_batch",
-                        detail: format!("slot length {slot_len} too small for int32 pair update"),
-                    });
-                }
-
-                let (mut hdr, _) =
-                    TupleHeader::decode(&page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE])
-                        .ok_or_else(|| ApplyError::Refused {
+            // ON-PAGE REDO is LSN-gated; the compact UNDO-LOG batch below
+            // is reconstructed UNCONDITIONALLY (see
+            // `apply_update_in_place_at_lsn`). The compact form's pre-image
+            // is `current − delta` per the read-time lookup, so the undo
+            // batch needs only `writer_xid + target_col + delta + slots`
+            // from the (durable) WAL record — never the page bytes.
+            if !should_skip_redo(&page, record_lsn) {
+                let page_bytes = page.as_bytes_mut();
+                for &slot in &payload.slots {
+                    let item = item_id_from_page_bytes(
+                        page_bytes,
+                        slot,
+                        "heap_update_int32_pair_delta_batch",
+                    )?;
+                    let slot_off = item_offset_usize(item, "heap_update_int32_pair_delta_batch")?;
+                    let slot_len = item_length_usize(item, "heap_update_int32_pair_delta_batch")?;
+                    if slot_len < TUPLE_HEADER_SIZE + 9 {
+                        return Err(ApplyError::Refused {
                             operation: "heap_update_int32_pair_delta_batch",
-                            detail: String::from("header decode failed"),
-                        })?;
-                let payload_off = slot_off + TUPLE_HEADER_SIZE;
-                let mut pre_image = [0_u8; 9];
-                pre_image.copy_from_slice(&page_bytes[payload_off..payload_off + 9]);
-                let target_off = payload_off
-                    + match payload.target_col {
-                        0 => 1,
-                        1 => 5,
-                        _ => {
-                            return Err(ApplyError::Refused {
-                                operation: "heap_update_int32_pair_delta_batch",
-                                detail: format!("target_col {} out of range", payload.target_col),
-                            });
-                        }
-                    };
-                let current = i32::from_le_bytes([
-                    page_bytes[target_off],
-                    page_bytes[target_off + 1],
-                    page_bytes[target_off + 2],
-                    page_bytes[target_off + 3],
-                ]);
-                let already_applied = hdr.xmax == payload.writer_xid
-                    && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE);
-                if already_applied {
-                    let restored =
-                        current
-                            .checked_sub(payload.delta)
+                            detail: format!(
+                                "slot length {slot_len} too small for int32 pair update"
+                            ),
+                        });
+                    }
+
+                    let (mut hdr, _) =
+                        TupleHeader::decode(&page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE])
                             .ok_or_else(|| ApplyError::Refused {
                                 operation: "heap_update_int32_pair_delta_batch",
-                                detail: String::from("pre-image delta subtraction overflow"),
+                                detail: String::from("header decode failed"),
                             })?;
-                    pre_image[target_off - payload_off..target_off - payload_off + 4]
-                        .copy_from_slice(&restored.to_le_bytes());
-                } else {
-                    let updated =
-                        current
-                            .checked_add(payload.delta)
-                            .ok_or_else(|| ApplyError::Refused {
+                    let payload_off = slot_off + TUPLE_HEADER_SIZE;
+                    let target_off = payload_off + if payload.target_col == 0 { 1 } else { 5 };
+                    let already_applied = hdr.xmax == payload.writer_xid
+                        && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE);
+                    if !already_applied {
+                        let current = i32::from_le_bytes([
+                            page_bytes[target_off],
+                            page_bytes[target_off + 1],
+                            page_bytes[target_off + 2],
+                            page_bytes[target_off + 3],
+                        ]);
+                        let updated = current.checked_add(payload.delta).ok_or_else(|| {
+                            ApplyError::Refused {
                                 operation: "heap_update_int32_pair_delta_batch",
                                 detail: String::from("post-image delta addition overflow"),
-                            })?;
-                    page_bytes[target_off..target_off + 4].copy_from_slice(&updated.to_le_bytes());
-                    hdr.xmax = payload.writer_xid;
-                    hdr.cmax = payload.command_id;
-                    hdr.infomask.set(InfoMask::UPDATED);
-                    hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
-                    let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
-                    hdr.encode(&mut hdr_bytes);
-                    page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+                            }
+                        })?;
+                        page_bytes[target_off..target_off + 4]
+                            .copy_from_slice(&updated.to_le_bytes());
+                        hdr.xmax = payload.writer_xid;
+                        hdr.cmax = payload.command_id;
+                        hdr.infomask.set(InfoMask::UPDATED);
+                        hdr.infomask.set(InfoMask::UPDATED_IN_PLACE);
+                        let mut hdr_bytes = [0_u8; TUPLE_HEADER_SIZE];
+                        hdr.encode(&mut hdr_bytes);
+                        page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE]
+                            .copy_from_slice(&hdr_bytes);
+                    }
                 }
-                undo_entries.push((slot, pre_image));
+                stamp_replayed_lsn(&mut page, record_lsn);
             }
-            stamp_replayed_lsn(&mut page, record_lsn);
         }
 
-        if !undo_entries.is_empty() {
+        if !payload.slots.is_empty() {
+            // Reconstruct the compact undo batch UNCONDITIONALLY from the
+            // WAL record. The read-time lookup
+            // (`undo_pre_image_from_log`, compact path) recovers the
+            // pre-image as `current − sum(invisible deltas)`, so we record
+            // the same `target_col + delta + slots` the producer
+            // (`update_int32_pair_inplace_undo`) appends — keeping recovery
+            // consistent with the live path. Because that lookup SUMS the
+            // deltas of every invisible batch, pushing the same batch twice
+            // would over-reverse; dedup by the full batch shape so a
+            // re-replay across restart cycles is idempotent.
             let log_handle = self
                 .undo_log
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            for (slot, pre_image) in undo_entries {
-                let tid = TupleId::new(page_id, slot);
-                let already = log.entries.iter().rev().any(|existing| {
-                    existing.tid == tid
-                        && existing.writer_xid == payload.writer_xid
-                        && existing.old_payload == pre_image
+            let already = log.int32_pair_batches.iter().rev().any(|existing| {
+                existing.page == page_id
+                    && existing.writer_xid == payload.writer_xid
+                    && existing.target_col == payload.target_col
+                    && existing.delta == payload.delta
+                    && batch_covers_exact_slots(existing, &payload.slots)
+            });
+            if !already {
+                let slot_count =
+                    u16::try_from(payload.slots.len()).map_err(|_| ApplyError::Refused {
+                        operation: "heap_update_int32_pair_delta_batch",
+                        detail: format!("slot count {} exceeds u16", payload.slots.len()),
+                    })?;
+                log.int32_pair_batches.push(Int32PairUndoBatch {
+                    page: page_id,
+                    writer_xid: payload.writer_xid,
+                    target_col: payload.target_col,
+                    delta: payload.delta,
+                    first_slot: *payload.slots.first().unwrap_or(&0),
+                    slot_count,
+                    slots: payload.slots.clone(),
                 });
-                if !already {
-                    log.entries.push(UndoEntry {
-                        tid,
-                        writer_xid: payload.writer_xid,
-                        old_payload: pre_image,
-                    });
-                }
             }
             self.column_cache.bump_version(rel, payload.writer_xid);
         }

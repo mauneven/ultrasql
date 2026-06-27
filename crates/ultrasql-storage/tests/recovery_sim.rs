@@ -20,9 +20,10 @@ use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::BufferPool;
 use ultrasql_storage::heap::{
     DeleteInt32PairScan, DeleteInt32PairStamp, DeleteOptions, HeapAccess, InsertOptions,
-    UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp, UpdateOptions,
+    UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp, UpdateInt32PairTid,
+    UpdateOptions,
 };
-use ultrasql_wal::applier::dispatch_record;
+use ultrasql_wal::applier::{dispatch_record, dispatch_record_at_lsn};
 
 // ---------------------------------------------------------------------------
 // Shared test infrastructure
@@ -579,26 +580,56 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
         "post-recovery payloads must match the live post-image"
     );
 
-    // Phase 4: undo log must have been rebuilt with one pre-image
-    // entry per row so cross-snapshot readers still resolve pre-image.
-    let log_handle = recovery_heap
-        .undo_log
-        .get(&rel())
-        .expect("undo log entry for rel");
-    let log = log_handle.read();
-    assert_eq!(
-        log.entries.len(),
-        ROWS,
-        "undo log must carry one pre-image entry per replayed row"
+    // Phase 4: the compact int32-pair undo batches must have been rebuilt
+    // (one slot per replayed row), matching the live producer's
+    // representation, so a cross-snapshot reader can still resolve the
+    // pre-image via `current - sum(invisible deltas)`.
+    {
+        let log_handle = recovery_heap
+            .undo_log
+            .get(&rel())
+            .expect("undo log entry for rel");
+        let log = log_handle.read();
+        let rebuilt_slots: usize = log.int32_pair_batches.iter().map(|b| b.slot_len()).sum();
+        assert_eq!(
+            rebuilt_slots, ROWS,
+            "compact undo batches must cover one slot per replayed row"
+        );
+        for batch in log.int32_pair_batches.iter() {
+            assert_eq!(batch.writer_xid, Xid::new(2));
+            assert_eq!(batch.target_col, 1);
+            assert_eq!(batch.delta, DELTA);
+        }
+    }
+
+    // Phase 5: a reader whose snapshot PREDATES the in-place writer
+    // (xid=2) must observe the PRE-image (original `val`), proving the
+    // rebuilt undo log feeds the read-time `current - delta` lookup. A
+    // snapshot with xid=2 in-progress treats the writer as invisible.
+    let pre_snapshot = Snapshot::new(
+        Xid::new(2),
+        Xid::new(3),
+        Xid::new(3),
+        CommandId::FIRST,
+        [Xid::new(2)],
     );
-    for entry in log.entries.iter() {
-        let (id, val) = pair_decode(&entry.old_payload);
+    for tuple in recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+    {
+        let pre = recovery_heap
+            .fetch_visible_pre_image(tuple.tid, &pre_snapshot, &oracle)
+            .expect("pre-image lookup")
+            .expect("undo entry present for snapshot-predating reader");
+        let (id, val) = pair_decode(&pre);
         let original_val = original_pairs
             .iter()
             .find_map(|(oid, oval)| if *oid == id { Some(*oval) } else { None })
             .expect("id should match an original row");
-        assert_eq!(val, original_val, "undo pre-image should be original value");
-        assert_eq!(entry.writer_xid, Xid::new(2));
+        assert_eq!(
+            val, original_val,
+            "snapshot-predating reader must see the pre-image (V0), not the post-image"
+        );
     }
 }
 
@@ -691,4 +722,470 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
         undeleted_rows, 0,
         "no row should be left without an xmax stamp"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Post-crash undo-log rebuild for ALREADY-FLUSHED in-place pages.
+//
+// The in-memory undo log is volatile MVCC state — it is NOT stored on the
+// heap page. When a page was flushed durably past an in-place UPDATE's LSN
+// before a crash, recovery SKIPS the on-page redo (`should_skip_redo`) for
+// that page. The bug: the undo-log reconstruction was tied to that redo, so
+// after recovery a reader whose snapshot predates the in-place writer found
+// NO undo entry and wrongly saw the POST-image — a snapshot-isolation
+// violation that surfaced only after a crash/restart.
+//
+// These tests reproduce the skip path by replaying a record stream twice:
+// the first replay applies the post-image and stamps each page's LSN to the
+// record LSN (the "flushed" durable state); the second replay then finds
+// `page_lsn >= record_lsn` and SKIPS the on-page redo. We clear the
+// in-memory undo log between the two replays to model the volatile state
+// lost on crash. After the second (skip) replay the undo log must have been
+// rebuilt so a snapshot-predating reader still resolves the pre-image (V0).
+// ---------------------------------------------------------------------------
+
+/// A snapshot under which `writer` is in progress (hence invisible): the
+/// reader's snapshot predates the in-place writer.
+fn predating_snapshot(writer: u64) -> ultrasql_mvcc::Snapshot {
+    ultrasql_mvcc::Snapshot::new(
+        Xid::new(writer),
+        Xid::new(writer + 1),
+        Xid::new(writer + 1),
+        CommandId::FIRST,
+        [Xid::new(writer)],
+    )
+}
+
+/// FULL-PAYLOAD form (`HeapUpdateInPlace`, one `UndoEntry` per row).
+///
+/// After recovery SKIPS the on-page redo for an already-flushed page, the
+/// undo log must still be rebuilt so a snapshot-predating reader sees the
+/// PRE-image (V0). Without the fix the reader sees the post-image.
+#[test]
+fn crash_recovery_rebuilds_undo_for_flushed_full_payload_inplace_update() {
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 64;
+    const WRITER: u64 = 2;
+    const DELTA: i32 = 7;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(WRITER));
+
+    // Phase 1: insert + per-tuple full-payload in-place UPDATE (the point
+    // form emits one `HeapUpdateInPlace` record per row).
+    let mut original_pairs: Vec<(i32, i32)> = Vec::with_capacity(ROWS);
+    let mut tids: Vec<TupleId> = Vec::with_capacity(ROWS);
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        for i in 0..ROWS {
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("value fits i32");
+            original_pairs.push((id, val));
+            let tid = heap
+                .insert(
+                    rel(),
+                    &pair_payload(id, val),
+                    insert_opts(Xid::new(1), sink.as_ref()),
+                )
+                .expect("insert");
+            tids.push(tid);
+        }
+        let writer_snap = ultrasql_mvcc::Snapshot::new(
+            Xid::new(WRITER),
+            Xid::new(WRITER + 1),
+            Xid::new(WRITER),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        for &tid in &tids {
+            let updated = heap
+                .update_int32_pair_tid_inplace_undo(
+                    UpdateInt32PairTid {
+                        tid,
+                        snapshot: &writer_snap,
+                        oracle: &oracle,
+                        predicate: |_id, _val| true,
+                    },
+                    UpdateInt32PairEdit {
+                        target_col: 1,
+                        delta: DELTA,
+                    },
+                    UpdateInt32PairStamp {
+                        xid: Xid::new(WRITER),
+                        command_id: CommandId::FIRST,
+                    },
+                    Some(sink.as_ref() as &dyn ultrasql_storage::wal_sink::WalSink),
+                    None,
+                )
+                .expect("in-place update");
+            assert_eq!(updated, 1);
+        }
+        // heap drops — simulated crash.
+    }
+    let records = sink.records();
+    assert!(
+        records
+            .iter()
+            .any(|(_, r)| r.header.record_type
+                == ultrasql_wal::record::RecordType::HeapUpdateInPlace),
+        "workload must emit full-payload in-place records"
+    );
+
+    // Phase 2: first replay onto a fresh heap stamps each page's LSN to the
+    // record LSN (the durable "flushed" image).
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    for (lsn, rec) in &records {
+        dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("first replay");
+    }
+
+    // Simulate the crash that lost the volatile in-memory undo log while the
+    // post-image pages stayed durable.
+    recovery_heap.undo_log.clear();
+    assert_eq!(
+        recovery_heap.undo_log_len(rel()),
+        0,
+        "undo log must be empty going into the skip replay"
+    );
+
+    // Phase 3: replay AGAIN. Each page's LSN now covers the record LSN, so
+    // `should_skip_redo` SKIPS the on-page redo — the page bytes already
+    // hold the post-image. The undo log must be rebuilt regardless.
+    for (lsn, rec) in &records {
+        dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("skip replay");
+    }
+
+    // The physical slot is still the post-image (redo was skipped, not
+    // re-applied — proving the page redo really was gated).
+    let expected_post: Vec<(i32, i32)> = original_pairs
+        .iter()
+        .map(|(id, val)| (*id, val.wrapping_add(DELTA)))
+        .collect();
+    let mut recovered: Vec<(i32, i32)> = recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+        .map(|t| pair_decode(&t.data))
+        .collect();
+    recovered.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        recovered, expected_post,
+        "physical slot must hold the post-image"
+    );
+
+    // The undo log was rebuilt from the WAL records' pre-images: a reader
+    // whose snapshot predates the writer must see V0, not the post-image.
+    assert_eq!(
+        recovery_heap.undo_log_len(rel()),
+        ROWS,
+        "undo log must be rebuilt with one full-payload entry per flushed row"
+    );
+    let reader = predating_snapshot(WRITER);
+    for &tid in &tids {
+        let pre = recovery_heap
+            .fetch_visible_pre_image(tid, &reader, &oracle)
+            .expect("pre-image lookup")
+            .expect("undo entry must exist after the skip replay");
+        let (id, val) = pair_decode(&pre);
+        let original_val = original_pairs
+            .iter()
+            .find_map(|(oid, oval)| (*oid == id).then_some(*oval))
+            .expect("matching original row");
+        assert_eq!(
+            val, original_val,
+            "snapshot-predating reader must see V0 even though the page redo was skipped"
+        );
+    }
+}
+
+/// COMPACT DELTA form (`HeapUpdateInt32PairDeltaBatch`).
+///
+/// Same scenario via the compact delta batch: after recovery skips the
+/// on-page redo for a flushed page, the rebuilt compact undo batch must let
+/// a snapshot-predating reader resolve `current - delta` = V0.
+#[test]
+fn crash_recovery_rebuilds_undo_for_flushed_compact_delta_inplace_update() {
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 200;
+    const WRITER: u64 = 2;
+    const DELTA: i32 = 5;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(WRITER));
+
+    let mut original_pairs: Vec<(i32, i32)> = Vec::with_capacity(ROWS);
+    let mut tids: Vec<TupleId> = Vec::with_capacity(ROWS);
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        for i in 0..ROWS {
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("value fits i32");
+            original_pairs.push((id, val));
+            let tid = heap
+                .insert(
+                    rel(),
+                    &pair_payload(id, val),
+                    insert_opts(Xid::new(1), sink.as_ref()),
+                )
+                .expect("insert");
+            tids.push(tid);
+        }
+        let n_blocks = heap.block_count(rel());
+        let writer_snap = ultrasql_mvcc::Snapshot::new(
+            Xid::new(WRITER),
+            Xid::new(WRITER + 1),
+            Xid::new(WRITER),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let updated = heap
+            .update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel: rel(),
+                    block_count: n_blocks,
+                    snapshot: &writer_snap,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: DELTA,
+                },
+                UpdateInt32PairStamp {
+                    xid: Xid::new(WRITER),
+                    command_id: CommandId::FIRST,
+                },
+                Some(sink.as_ref() as &dyn ultrasql_storage::wal_sink::WalSink),
+                None,
+            )
+            .expect("in-place update");
+        assert_eq!(updated, ROWS);
+    }
+    let records = sink.records();
+    assert!(
+        records.iter().any(|(_, r)| matches!(
+            r.header.record_type,
+            ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaBatch
+                | ultrasql_wal::record::RecordType::HeapUpdateInt32PairDeltaRangeBatch
+        )),
+        "workload must emit compact delta batch records"
+    );
+
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    for (lsn, rec) in &records {
+        dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("first replay");
+    }
+    recovery_heap.undo_log.clear();
+    assert_eq!(recovery_heap.int32_pair_undo_slot_len(rel()), 0);
+
+    for (lsn, rec) in &records {
+        dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("skip replay");
+    }
+
+    // Physical slot holds the post-image (redo skipped, not double-applied).
+    let expected_post: Vec<(i32, i32)> = original_pairs
+        .iter()
+        .map(|(id, val)| (*id, val.wrapping_add(DELTA)))
+        .collect();
+    let mut recovered: Vec<(i32, i32)> = recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+        .map(|t| pair_decode(&t.data))
+        .collect();
+    recovered.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        recovered, expected_post,
+        "physical slot must hold the post-image"
+    );
+
+    // Compact undo batch rebuilt: a predating reader resolves current-delta.
+    assert_eq!(
+        recovery_heap.int32_pair_undo_slot_len(rel()),
+        ROWS,
+        "compact undo batch must be rebuilt with one slot per flushed row"
+    );
+    let reader = predating_snapshot(WRITER);
+    for &tid in &tids {
+        let pre = recovery_heap
+            .fetch_visible_pre_image(tid, &reader, &oracle)
+            .expect("pre-image lookup")
+            .expect("compact undo batch must exist after the skip replay");
+        let (id, val) = pair_decode(&pre);
+        let original_val = original_pairs
+            .iter()
+            .find_map(|(oid, oval)| (*oid == id).then_some(*oval))
+            .expect("matching original row");
+        assert_eq!(
+            val, original_val,
+            "snapshot-predating reader must see V0 (current - delta) after a skipped redo"
+        );
+    }
+}
+
+/// IDEMPOTENCY: replaying the same in-place record stream twice (both the
+/// full-payload and compact forms) must not double-push undo entries, so the
+/// pre-image stays V0 rather than being over-reversed (e.g. current - 2*delta
+/// for the compact form, or a duplicated full-payload entry).
+#[test]
+fn crash_recovery_inplace_undo_rebuild_is_idempotent() {
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 48;
+    const WRITER: u64 = 2;
+    const FULL_DELTA: i32 = 4;
+    const COMPACT_DELTA: i32 = 6;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(WRITER));
+
+    // Two relations: one driven by the full-payload point form, one by the
+    // compact scan form, so both undo representations are exercised.
+    let full_rel = RelationId::new(1);
+    let compact_rel = RelationId::new(2);
+    let mut full_pairs: Vec<(i32, i32)> = Vec::new();
+    let mut full_tids: Vec<TupleId> = Vec::new();
+    let mut compact_pairs: Vec<(i32, i32)> = Vec::new();
+    let mut compact_tids: Vec<TupleId> = Vec::new();
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        let writer_snap = ultrasql_mvcc::Snapshot::new(
+            Xid::new(WRITER),
+            Xid::new(WRITER + 1),
+            Xid::new(WRITER),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        for i in 0..ROWS {
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("fits");
+            full_pairs.push((id, val));
+            let tid = heap
+                .insert(
+                    full_rel,
+                    &pair_payload(id, val),
+                    insert_opts(Xid::new(1), sink.as_ref()),
+                )
+                .expect("insert full");
+            full_tids.push(tid);
+        }
+        for &tid in &full_tids {
+            heap.update_int32_pair_tid_inplace_undo(
+                UpdateInt32PairTid {
+                    tid,
+                    snapshot: &writer_snap,
+                    oracle: &oracle,
+                    predicate: |_id, _val| true,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: FULL_DELTA,
+                },
+                UpdateInt32PairStamp {
+                    xid: Xid::new(WRITER),
+                    command_id: CommandId::FIRST,
+                },
+                Some(sink.as_ref() as &dyn ultrasql_storage::wal_sink::WalSink),
+                None,
+            )
+            .expect("full update");
+        }
+        for i in 0..ROWS {
+            let id = usize_to_i32(i);
+            let val = id.checked_mul(10).expect("fits");
+            compact_pairs.push((id, val));
+            let tid = heap
+                .insert(
+                    compact_rel,
+                    &pair_payload(id, val),
+                    insert_opts(Xid::new(1), sink.as_ref()),
+                )
+                .expect("insert compact");
+            compact_tids.push(tid);
+        }
+        let n_blocks = heap.block_count(compact_rel);
+        heap.update_int32_pair_inplace_undo(
+            UpdateInt32PairScan {
+                rel: compact_rel,
+                block_count: n_blocks,
+                snapshot: &writer_snap,
+                oracle: &oracle,
+                predicate: |_id, _val| true,
+            },
+            UpdateInt32PairEdit {
+                target_col: 1,
+                delta: COMPACT_DELTA,
+            },
+            UpdateInt32PairStamp {
+                xid: Xid::new(WRITER),
+                command_id: CommandId::FIRST,
+            },
+            Some(sink.as_ref() as &dyn ultrasql_storage::wal_sink::WalSink),
+            None,
+        )
+        .expect("compact update");
+    }
+    let records = sink.records();
+
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    // Replay the WHOLE stream THREE times. The first applies; the second and
+    // third hit the skip path (pages durable) and must not double-push undo.
+    for _ in 0..3 {
+        for (lsn, rec) in &records {
+            dispatch_record_at_lsn(&recovery_heap, rec, *lsn).expect("replay");
+        }
+    }
+
+    assert_eq!(
+        recovery_heap.undo_log_len(full_rel),
+        ROWS,
+        "full-payload undo entries must not be duplicated by repeated replay"
+    );
+    assert_eq!(
+        recovery_heap.int32_pair_undo_slot_len(compact_rel),
+        ROWS,
+        "compact undo slots must not be duplicated by repeated replay"
+    );
+
+    let reader = predating_snapshot(WRITER);
+    for &tid in &full_tids {
+        let (id, val) = pair_decode(
+            &recovery_heap
+                .fetch_visible_pre_image(tid, &reader, &oracle)
+                .expect("lookup")
+                .expect("full undo present"),
+        );
+        let original = full_pairs
+            .iter()
+            .find_map(|(oid, oval)| (*oid == id).then_some(*oval))
+            .expect("match");
+        assert_eq!(
+            val, original,
+            "full pre-image must be V0, not duplicated/over-reversed"
+        );
+    }
+    for &tid in &compact_tids {
+        let (id, val) = pair_decode(
+            &recovery_heap
+                .fetch_visible_pre_image(tid, &reader, &oracle)
+                .expect("lookup")
+                .expect("compact undo present"),
+        );
+        let original = compact_pairs
+            .iter()
+            .find_map(|(oid, oval)| (*oid == id).then_some(*oval))
+            .expect("match");
+        assert_eq!(
+            val, original,
+            "compact pre-image must be current-delta (V0), not over-reversed by a doubled batch"
+        );
+    }
 }
