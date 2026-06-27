@@ -252,6 +252,174 @@ impl ScalarExpr {
             Self::FunctionCall { args, .. } => args.iter().any(Self::contains_subquery),
         }
     }
+
+    /// Visit every [`LogicalPlan`] embedded directly in this expression tree.
+    ///
+    /// The three subquery-bearing variants ([`Self::ScalarSubquery`],
+    /// [`Self::Exists`], [`Self::InSubquery`]) each carry a `subplan`; this
+    /// walker descends the scalar tree (through `Unary`, `Binary`, `IsNull`,
+    /// `FunctionCall`, and the `InSubquery` test expression) and calls
+    /// `visit` once for each such embedded plan. It does NOT recurse *inside*
+    /// a visited subplan — the caller decides whether to do that (e.g. the
+    /// SSI read-lock walker re-enters the subplan itself).
+    ///
+    /// Used as the read-side mirror of [`Self::try_rewrite_subplans`]: where
+    /// that one substitutes a rewritten subplan back, this one only observes.
+    pub fn for_each_subplan<F>(&self, visit: &mut F)
+    where
+        F: FnMut(&LogicalPlan),
+    {
+        match self {
+            Self::ScalarSubquery { subplan, .. } | Self::Exists { subplan, .. } => {
+                visit(subplan);
+            }
+            Self::InSubquery { expr, subplan, .. } => {
+                expr.for_each_subplan(visit);
+                visit(subplan);
+            }
+            Self::Unary { expr, .. } | Self::IsNull { expr, .. } => expr.for_each_subplan(visit),
+            Self::Binary { left, right, .. } => {
+                left.for_each_subplan(visit);
+                right.for_each_subplan(visit);
+            }
+            Self::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.for_each_subplan(visit);
+                }
+            }
+            Self::Column { .. }
+            | Self::Literal { .. }
+            | Self::Parameter { .. }
+            | Self::OuterColumn { .. } => {}
+        }
+    }
+
+    /// Rewrite every [`LogicalPlan`] embedded in this expression tree.
+    ///
+    /// For each subplan carried by [`Self::ScalarSubquery`], [`Self::Exists`],
+    /// or [`Self::InSubquery`], `rewrite` is called; when it returns
+    /// `Ok(Some(new_subplan))` the embedded plan is replaced, when it returns
+    /// `Ok(None)` the subplan is left untouched, and any `Err` aborts and
+    /// propagates (the fail-closed path the RLS walker relies on). Returns
+    /// `Ok(Some(new_expr))` if any subplan changed, `Ok(None)` if nothing did
+    /// (so the caller can avoid a needless clone), and `Err` on the first
+    /// rewrite failure.
+    ///
+    /// This is the substitution primitive both security walkers share: the
+    /// RLS walker passes a closure that recursively applies row-level security
+    /// to the subplan and substitutes the policy-wrapped plan back, so no base
+    /// table reachable through an embedded subquery escapes its policy.
+    pub fn try_rewrite_subplans<F, E>(&self, rewrite: &mut F) -> Result<Option<Self>, E>
+    where
+        F: FnMut(&LogicalPlan) -> Result<Option<LogicalPlan>, E>,
+    {
+        match self {
+            Self::ScalarSubquery {
+                subplan,
+                correlated,
+                data_type,
+            } => Ok(rewrite(subplan)?.map(|new_subplan| Self::ScalarSubquery {
+                subplan: Box::new(new_subplan),
+                correlated: *correlated,
+                data_type: data_type.clone(),
+            })),
+            Self::Exists {
+                subplan,
+                negated,
+                correlated,
+            } => Ok(rewrite(subplan)?.map(|new_subplan| Self::Exists {
+                subplan: Box::new(new_subplan),
+                negated: *negated,
+                correlated: *correlated,
+            })),
+            Self::InSubquery {
+                expr,
+                subplan,
+                negated,
+                correlated,
+                data_type,
+            } => {
+                let new_expr = expr.try_rewrite_subplans(rewrite)?;
+                let new_subplan = rewrite(subplan)?;
+                if new_expr.is_none() && new_subplan.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Self::InSubquery {
+                    expr: Box::new(new_expr.unwrap_or_else(|| (**expr).clone())),
+                    subplan: new_subplan.map_or_else(|| subplan.clone(), Box::new),
+                    negated: *negated,
+                    correlated: *correlated,
+                    data_type: data_type.clone(),
+                }))
+            }
+            Self::Unary {
+                op,
+                expr,
+                data_type,
+            } => Ok(expr
+                .try_rewrite_subplans(rewrite)?
+                .map(|new_expr| Self::Unary {
+                    op: *op,
+                    expr: Box::new(new_expr),
+                    data_type: data_type.clone(),
+                })),
+            Self::IsNull { expr, negated } => {
+                Ok(expr
+                    .try_rewrite_subplans(rewrite)?
+                    .map(|new_expr| Self::IsNull {
+                        expr: Box::new(new_expr),
+                        negated: *negated,
+                    }))
+            }
+            Self::Binary {
+                op,
+                left,
+                right,
+                data_type,
+            } => {
+                let new_left = left.try_rewrite_subplans(rewrite)?;
+                let new_right = right.try_rewrite_subplans(rewrite)?;
+                if new_left.is_none() && new_right.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Self::Binary {
+                    op: *op,
+                    left: Box::new(new_left.unwrap_or_else(|| (**left).clone())),
+                    right: Box::new(new_right.unwrap_or_else(|| (**right).clone())),
+                    data_type: data_type.clone(),
+                }))
+            }
+            Self::FunctionCall {
+                name,
+                args,
+                data_type,
+            } => {
+                let mut changed = false;
+                let mut new_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    match arg.try_rewrite_subplans(rewrite)? {
+                        Some(new_arg) => {
+                            changed = true;
+                            new_args.push(new_arg);
+                        }
+                        None => new_args.push(arg.clone()),
+                    }
+                }
+                if !changed {
+                    return Ok(None);
+                }
+                Ok(Some(Self::FunctionCall {
+                    name: name.clone(),
+                    args: new_args,
+                    data_type: data_type.clone(),
+                }))
+            }
+            Self::Column { .. }
+            | Self::Literal { .. }
+            | Self::Parameter { .. }
+            | Self::OuterColumn { .. } => Ok(None),
+        }
+    }
 }
 
 impl fmt::Display for ScalarExpr {

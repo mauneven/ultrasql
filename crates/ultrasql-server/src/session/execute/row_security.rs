@@ -1,6 +1,161 @@
 //! Plan-cache invalidation and row-level security predicate application.
 
+use ultrasql_planner::{LogicalAggregateExpr, LogicalJoinCondition, SortKey};
+
 use super::*;
+
+/// Apply `rewrite_expr` to a projection's `(expr, alias)` list, returning a
+/// new list when any expression changed and `None` otherwise.
+fn rewrite_projection_exprs<F>(
+    exprs: &[(ScalarExpr, String)],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<(ScalarExpr, String)>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(exprs.len());
+    for (expr, alias) in exprs {
+        match rewrite_expr(expr)? {
+            Some(new_expr) => {
+                changed = true;
+                out.push((new_expr, alias.clone()));
+            }
+            None => out.push((expr.clone(), alias.clone())),
+        }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to a bare expression list, returning a new list when
+/// any expression changed and `None` otherwise.
+fn rewrite_expr_list<F>(
+    exprs: &[ScalarExpr],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<ScalarExpr>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        match rewrite_expr(expr)? {
+            Some(new_expr) => {
+                changed = true;
+                out.push(new_expr);
+            }
+            None => out.push(expr.clone()),
+        }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to each [`SortKey`]'s expression, returning a new list
+/// when any changed and `None` otherwise.
+fn rewrite_sort_keys<F>(
+    keys: &[SortKey],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<SortKey>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        match rewrite_expr(&key.expr)? {
+            Some(expr) => {
+                changed = true;
+                out.push(SortKey {
+                    expr,
+                    asc: key.asc,
+                    nulls_first: key.nulls_first,
+                });
+            }
+            None => out.push(key.clone()),
+        }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to every expression an aggregate call carries (the
+/// argument, the direct argument, and a `WITHIN GROUP` sort key), returning a
+/// new list when any changed and `None` otherwise.
+fn rewrite_aggregate_exprs<F>(
+    aggregates: &[LogicalAggregateExpr],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<LogicalAggregateExpr>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        let new_arg = rewrite_optional_expr(agg.arg.as_ref(), rewrite_expr)?;
+        let new_direct = rewrite_optional_expr(agg.direct_arg.as_ref(), rewrite_expr)?;
+        let new_order = match agg.order_by.as_ref() {
+            Some(key) => rewrite_expr(&key.expr)?.map(|expr| SortKey {
+                expr,
+                asc: key.asc,
+                nulls_first: key.nulls_first,
+            }),
+            None => None,
+        };
+        if new_arg.is_none() && new_direct.is_none() && new_order.is_none() {
+            out.push(agg.clone());
+            continue;
+        }
+        changed = true;
+        out.push(LogicalAggregateExpr {
+            func: agg.func,
+            arg: new_arg.or_else(|| agg.arg.clone()),
+            direct_arg: new_direct.or_else(|| agg.direct_arg.clone()),
+            order_by: new_order.or_else(|| agg.order_by.clone()),
+            distinct: agg.distinct,
+            output_name: agg.output_name.clone(),
+            data_type: agg.data_type.clone(),
+        });
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to each `(column, expr)` assignment in an UPDATE,
+/// returning a new list when any expression changed and `None` otherwise.
+fn rewrite_assignments<F>(
+    assignments: &[(usize, ScalarExpr)],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<(usize, ScalarExpr)>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(assignments.len());
+    for (column, expr) in assignments {
+        match rewrite_expr(expr)? {
+            Some(new_expr) => {
+                changed = true;
+                out.push((*column, new_expr));
+            }
+            None => out.push((*column, expr.clone())),
+        }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to an optional expression, preserving the `None`/`Some`
+/// distinction (`Ok(None)` means "no change", which the caller folds back to
+/// the original `Option`).
+fn rewrite_optional_expr<F>(
+    expr: Option<&ScalarExpr>,
+    rewrite_expr: &mut F,
+) -> Result<Option<ScalarExpr>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    match expr {
+        Some(expr) => rewrite_expr(expr),
+        None => Ok(None),
+    }
+}
 
 impl<RW> Session<RW>
 where
@@ -20,7 +175,44 @@ where
         self.simple_batch_cache.borrow_mut().clear();
     }
 
+    /// Apply row-level security to `plan`, returning the policy-wrapped plan
+    /// (`Some`) or `None` when no rewrite was needed.
+    ///
+    /// Two independent rewrites compose here:
+    ///
+    /// 1. [`Self::apply_row_security_node`] descends the `LogicalPlan` tree
+    ///    and injects each base-table scan's policy `Filter` (the historical
+    ///    behaviour, plus the fail-closed default for unenumerated shapes).
+    /// 2. [`Self::apply_row_security_embedded_subplans`] descends the
+    ///    *expressions* the node carries (Filter predicate, Project list,
+    ///    Join ON, HAVING, Sort keys, …) and recursively applies RLS to every
+    ///    [`LogicalPlan`] embedded in a subquery expression
+    ///    (`EXISTS` / `IN` / scalar / `= ANY`). This closes the
+    ///    uncorrelated-`EXISTS` bypass: such a subquery is NOT decorrelated to
+    ///    a join, so its raw subplan would otherwise reach the executor with
+    ///    no policy applied and leak RLS-hidden rows.
+    ///
+    /// Correlated subqueries are decorrelated to joins *before* this walker
+    /// runs (RLS executes on the optimised plan), so they no longer carry an
+    /// embedded subplan here and are handled purely by step 1 — no double
+    /// filtering.
     pub(crate) fn apply_row_security(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &CatalogSnapshot,
+        command: crate::RuntimeRlsCommand,
+    ) -> Result<Option<LogicalPlan>, ServerError> {
+        // Step 1: rewrite the plan-node tree (inject scan-site policy filters).
+        let node_rewritten = self.apply_row_security_node(plan, catalog_snapshot, command)?;
+        // Step 2: rewrite subplans embedded in the (possibly already
+        // node-rewritten) plan's own expressions. Operate on whichever plan
+        // step 1 produced so both rewrites compose.
+        let basis = node_rewritten.as_ref().unwrap_or(plan);
+        let expr_rewritten = self.apply_row_security_embedded_subplans(basis, catalog_snapshot)?;
+        Ok(expr_rewritten.or(node_rewritten))
+    }
+
+    fn apply_row_security_node(
         &self,
         plan: &LogicalPlan,
         catalog_snapshot: &CatalogSnapshot,
@@ -402,6 +594,200 @@ where
                  execute to avoid a possible policy bypass",
                 std::mem::discriminant(other),
             ))),
+        }
+    }
+
+    /// Recursively apply RLS to every [`LogicalPlan`] embedded in `plan`'s own
+    /// expressions (subqueries in a Filter predicate, Project list, Join ON,
+    /// HAVING, Sort keys, etc.), substituting the policy-wrapped subplan back.
+    ///
+    /// Returns `Some(rewritten_plan)` when at least one embedded subplan was
+    /// rewritten, `None` when none were. A subquery is always a *read*, so the
+    /// recursion uses [`crate::RuntimeRlsCommand::Select`] regardless of the
+    /// enclosing statement's command.
+    ///
+    /// This is the second half of [`Self::apply_row_security`]; it never
+    /// descends into child *plan* nodes (step 1 does that) — only into the
+    /// expressions attached to this single node.
+    fn apply_row_security_embedded_subplans(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &CatalogSnapshot,
+    ) -> Result<Option<LogicalPlan>, ServerError> {
+        // Rewrite a single expression's embedded subplans, recursing through
+        // the full `apply_row_security` so a subplan that itself embeds
+        // further subqueries (or scans an RLS table) is fully protected.
+        let mut rewrite_expr = |expr: &ScalarExpr| -> Result<Option<ScalarExpr>, ServerError> {
+            expr.try_rewrite_subplans(&mut |subplan: &LogicalPlan| {
+                self.apply_row_security(subplan, catalog_snapshot, crate::RuntimeRlsCommand::Select)
+            })
+        };
+
+        match plan {
+            LogicalPlan::Filter { input, predicate } => Ok(rewrite_expr(predicate)?.map(
+                |predicate| LogicalPlan::Filter {
+                    input: input.clone(),
+                    predicate,
+                },
+            )),
+            LogicalPlan::Project {
+                input,
+                exprs,
+                schema,
+            } => Ok(
+                rewrite_projection_exprs(exprs, &mut rewrite_expr)?.map(|exprs| {
+                    LogicalPlan::Project {
+                        input: input.clone(),
+                        exprs,
+                        schema: schema.clone(),
+                    }
+                }),
+            ),
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                condition,
+                schema,
+            } => {
+                let LogicalJoinCondition::On(on_expr) = condition else {
+                    return Ok(None);
+                };
+                Ok(rewrite_expr(on_expr)?.map(|on_expr| LogicalPlan::Join {
+                    left: left.clone(),
+                    right: right.clone(),
+                    join_type: *join_type,
+                    condition: LogicalJoinCondition::On(on_expr),
+                    schema: schema.clone(),
+                }))
+            }
+            LogicalPlan::Sort { input, keys } => Ok(rewrite_sort_keys(keys, &mut rewrite_expr)?
+                .map(|keys| LogicalPlan::Sort {
+                    input: input.clone(),
+                    keys,
+                })),
+            LogicalPlan::Window {
+                input,
+                partition_by,
+                order_by,
+                func,
+                frame,
+                output_name,
+                schema,
+            } => {
+                let new_partition = rewrite_expr_list(partition_by, &mut rewrite_expr)?;
+                let new_order = rewrite_sort_keys(order_by, &mut rewrite_expr)?;
+                if new_partition.is_none() && new_order.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(LogicalPlan::Window {
+                    input: input.clone(),
+                    partition_by: new_partition.unwrap_or_else(|| partition_by.clone()),
+                    order_by: new_order.unwrap_or_else(|| order_by.clone()),
+                    func: func.clone(),
+                    frame: frame.clone(),
+                    output_name: output_name.clone(),
+                    schema: schema.clone(),
+                }))
+            }
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                schema,
+            } => {
+                let new_group = rewrite_expr_list(group_by, &mut rewrite_expr)?;
+                let new_aggs = rewrite_aggregate_exprs(aggregates, &mut rewrite_expr)?;
+                if new_group.is_none() && new_aggs.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(LogicalPlan::Aggregate {
+                    input: input.clone(),
+                    group_by: new_group.unwrap_or_else(|| group_by.clone()),
+                    aggregates: new_aggs.unwrap_or_else(|| aggregates.clone()),
+                    schema: schema.clone(),
+                }))
+            }
+            LogicalPlan::DistinctOn { input, on_keys } => Ok(rewrite_expr_list(
+                on_keys,
+                &mut rewrite_expr,
+            )?
+            .map(|on_keys| LogicalPlan::DistinctOn {
+                input: input.clone(),
+                on_keys,
+            })),
+            LogicalPlan::Update {
+                table,
+                assignments,
+                input,
+                returning,
+                schema,
+            } => {
+                let new_assignments = rewrite_assignments(assignments, &mut rewrite_expr)?;
+                let new_returning = rewrite_projection_exprs(returning, &mut rewrite_expr)?;
+                if new_assignments.is_none() && new_returning.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(LogicalPlan::Update {
+                    table: table.clone(),
+                    assignments: new_assignments.unwrap_or_else(|| assignments.clone()),
+                    input: input.clone(),
+                    returning: new_returning.unwrap_or_else(|| returning.clone()),
+                    schema: schema.clone(),
+                }))
+            }
+            // INSERT/DELETE: the data-read subtree (`source` / `input`) is
+            // rewritten by step 1's recursion; here we only need their
+            // `RETURNING` expressions, which can embed a subquery scanning an
+            // RLS table.
+            LogicalPlan::Insert {
+                table,
+                columns,
+                source,
+                on_conflict,
+                returning,
+                schema,
+            } => Ok(
+                rewrite_projection_exprs(returning, &mut rewrite_expr)?.map(|returning| {
+                    LogicalPlan::Insert {
+                        table: table.clone(),
+                        columns: columns.clone(),
+                        source: source.clone(),
+                        on_conflict: on_conflict.clone(),
+                        returning,
+                        schema: schema.clone(),
+                    }
+                }),
+            ),
+            LogicalPlan::Delete {
+                table,
+                input,
+                returning,
+                schema,
+            } => Ok(
+                rewrite_projection_exprs(returning, &mut rewrite_expr)?.map(|returning| {
+                    LogicalPlan::Delete {
+                        table: table.clone(),
+                        input: input.clone(),
+                        returning,
+                        schema: schema.clone(),
+                    }
+                }),
+            ),
+            // Remaining shapes carry no expression position that can embed a
+            // subquery plan reachable from here: leaves (`Scan`, `Values`,
+            // `Empty`, `FunctionScan`, `Summarize`), pure pass-through unary
+            // nodes whose only expressions are column references
+            // (`Limit`, `LockRows`, `SingleRowAssert`, `Pivot`, `Unpivot`),
+            // wrappers handled via their child plan (`SetOp`, `Cte`,
+            // `Explain`, `Copy`, `Merge` source), and control/DDL plans
+            // dispatched before the walker. The node-tree walker (step 1)
+            // already enumerates and fail-closes on unknown shapes, so
+            // returning `None` here is safe: any subquery plan they *did*
+            // carry would have to live under a child plan node, which step
+            // 1's recursion (back through the full `apply_row_security`)
+            // covers.
+            _ => Ok(None),
         }
     }
 

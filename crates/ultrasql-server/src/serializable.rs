@@ -100,6 +100,106 @@ fn collect_serializable_read_locks(
         // serializable read. They legitimately need no predicate lock.
         _ => {}
     }
+    // A node's own *expressions* can embed a [`LogicalPlan`] subquery
+    // (uncorrelated `EXISTS` / `IN` / scalar / `= ANY`). Such a subplan is
+    // NOT decorrelated to a join, so the match above — which only descends
+    // child plan nodes — never reaches the relation it scans. Descend into
+    // every embedded subplan so its scans acquire predicate read-locks too;
+    // otherwise a SERIALIZABLE reader probing a relation only through a
+    // subquery would take no lock and miss a read-write conflict (the SSI
+    // mirror of the RLS-bypass hole).
+    collect_node_expr_subplan_read_locks(plan, catalog_snapshot, out);
+}
+
+/// Descend into every [`LogicalPlan`] embedded in `plan`'s own expressions and
+/// collect its serializable read-locks. Mirrors the RLS walker's
+/// `apply_row_security_embedded_subplans`: it visits exactly the expression
+/// positions that can carry a subquery plan and re-enters
+/// [`collect_serializable_read_locks`] on each.
+fn collect_node_expr_subplan_read_locks(
+    plan: &LogicalPlan,
+    catalog_snapshot: &CatalogSnapshot,
+    out: &mut Vec<PredicateLockTag>,
+) {
+    let mut visit = |subplan: &LogicalPlan| {
+        collect_serializable_read_locks(subplan, catalog_snapshot, out);
+    };
+    match plan {
+        LogicalPlan::Filter { predicate, .. } => predicate.for_each_subplan(&mut visit),
+        LogicalPlan::Project { exprs, .. } => {
+            for (expr, _) in exprs {
+                expr.for_each_subplan(&mut visit);
+            }
+        }
+        LogicalPlan::Join {
+            condition: ultrasql_planner::LogicalJoinCondition::On(on_expr),
+            ..
+        } => on_expr.for_each_subplan(&mut visit),
+        LogicalPlan::Sort { keys, .. } => {
+            for key in keys {
+                key.expr.for_each_subplan(&mut visit);
+            }
+        }
+        LogicalPlan::DistinctOn { on_keys, .. } => {
+            for key in on_keys {
+                key.for_each_subplan(&mut visit);
+            }
+        }
+        LogicalPlan::Window {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in partition_by {
+                expr.for_each_subplan(&mut visit);
+            }
+            for key in order_by {
+                key.expr.for_each_subplan(&mut visit);
+            }
+        }
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            ..
+        } => {
+            for expr in group_by {
+                expr.for_each_subplan(&mut visit);
+            }
+            for agg in aggregates {
+                if let Some(arg) = &agg.arg {
+                    arg.for_each_subplan(&mut visit);
+                }
+                if let Some(direct) = &agg.direct_arg {
+                    direct.for_each_subplan(&mut visit);
+                }
+                if let Some(key) = &agg.order_by {
+                    key.expr.for_each_subplan(&mut visit);
+                }
+            }
+        }
+        LogicalPlan::Update {
+            assignments,
+            returning,
+            ..
+        } => {
+            for (_, expr) in assignments {
+                expr.for_each_subplan(&mut visit);
+            }
+            for (expr, _) in returning {
+                expr.for_each_subplan(&mut visit);
+            }
+        }
+        LogicalPlan::Insert { returning, .. } | LogicalPlan::Delete { returning, .. } => {
+            for (expr, _) in returning {
+                expr.for_each_subplan(&mut visit);
+            }
+        }
+        // Other shapes carry no expression position that can embed a subquery
+        // plan reachable from here. (`Join { condition: Using | None }` has no
+        // scalar predicate; child-plan subqueries are covered by the main
+        // match's recursion.)
+        _ => {}
+    }
 }
 
 pub(crate) fn record_serializable_write_conflicts(

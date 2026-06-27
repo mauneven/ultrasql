@@ -1089,6 +1089,110 @@ async fn serializable_time_same_class_write_skew_aborts_one_wire() {
     shutdown(running).await;
 }
 
+/// SSI predicate read-locks must reach a relation read THROUGH an uncorrelated
+/// `EXISTS` subquery. Each serializable transaction reads `ssi_sub_roster`
+/// *only* through `WHERE EXISTS (SELECT 1 FROM ssi_sub_roster WHERE on_call =
+/// 1)` against a throwaway 1-row `ssi_sub_anchor`, then writes a roster row the
+/// other side's predicate depends on — the EXISTS write-skew analogue of the
+/// Hermitage G2 test. Before the fix the SSI walker never descended into the
+/// embedded subplan, so neither transaction took a predicate lock on
+/// `ssi_sub_roster` and both could commit (a serialization hole). With the
+/// fix the embedded scan acquires the read-lock, so exactly one transaction
+/// aborts with SQLSTATE 40001.
+#[tokio::test]
+async fn serializable_subquery_predicate_read_lock_aborts_one_wire() {
+    let running = start_sample_server("ssi_subquery_predicate_lock").await;
+    let (peer, peer_handle) = connect_peer(running.bound, "ssi_subquery_predicate_lock_peer").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE ssi_sub_anchor (id INT NOT NULL)")
+        .await
+        .expect("create anchor table");
+    running
+        .client
+        .batch_execute("INSERT INTO ssi_sub_anchor VALUES (1)")
+        .await
+        .expect("seed anchor table");
+    running
+        .client
+        .batch_execute("CREATE TABLE ssi_sub_roster (id INT NOT NULL, on_call INT)")
+        .await
+        .expect("create roster table");
+    running
+        .client
+        .batch_execute("INSERT INTO ssi_sub_roster VALUES (1, 1), (2, 1)")
+        .await
+        .expect("seed roster table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // Both transactions read `ssi_sub_roster` ONLY through the uncorrelated
+    // EXISTS subquery; the anchor row is returned iff the roster has an
+    // on-call row. Each side observes the row, taking a predicate read-lock on
+    // `ssi_sub_roster` (only if the SSI walker descends into the subplan).
+    assert_eq!(
+        scalar_i32(
+            &running.client,
+            "SELECT id FROM ssi_sub_anchor \
+             WHERE EXISTS (SELECT 1 FROM ssi_sub_roster WHERE on_call = 1)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i32(
+            &peer,
+            "SELECT id FROM ssi_sub_anchor \
+             WHERE EXISTS (SELECT 1 FROM ssi_sub_roster WHERE on_call = 1)",
+        )
+        .await,
+        1
+    );
+
+    // Each side now clears one of the on-call rows the other side's EXISTS
+    // predicate read. The two writes form a dangerous structure: a correct
+    // serial order cannot reproduce both reads-then-writes.
+    running
+        .client
+        .batch_execute("UPDATE ssi_sub_roster SET on_call = 0 WHERE id = 1")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE ssi_sub_roster SET on_call = 0 WHERE id = 2")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "one subquery-read serializable tx must commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "the predicate read THROUGH the EXISTS subquery must force a 40001 on \
+         exactly one tx: a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 async fn setup_hermitage_table(client: &Client) {
     client
         .batch_execute("CREATE TABLE isolation_hermitage (id INT NOT NULL, value INT)")

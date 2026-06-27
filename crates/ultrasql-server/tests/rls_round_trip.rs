@@ -1526,3 +1526,267 @@ async fn rls_no_bypass_through_common_shapes() {
 
     shutdown(client, server_handle).await;
 }
+
+/// The confirmed uncorrelated-EXISTS RLS bypass and the full matrix of
+/// expression-embedded subquery shapes.
+///
+/// Uncorrelated `EXISTS` / `NOT EXISTS` are NOT decorrelated to a join (the
+/// decorrelation rule gates on `correlated: true`), so before the fix their
+/// raw subplan reached the executor with no policy filter and saw RLS-hidden
+/// rows. The fix makes `apply_row_security` descend into every embedded
+/// subplan. Here the OUTER table (`driver`) is deliberately NON-RLS and always
+/// visible, so the only thing that can change the result is whether the INNER
+/// RLS table (`secret`) is policy-filtered inside the subquery.
+#[tokio::test]
+async fn rls_applies_through_uncorrelated_exists_and_embedded_subplans() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    for sql in [
+        // Non-RLS outer table: a single row that must survive iff the inner
+        // subquery, after RLS, is empty/zero for a non-matching tenant.
+        "CREATE TABLE driver (id INT NOT NULL)",
+        "INSERT INTO driver VALUES (1)",
+        // RLS-protected inner table.
+        "CREATE TABLE secret (tenant_id TEXT NOT NULL, val INT NOT NULL)",
+        "INSERT INTO secret VALUES ('tenant-a', 10), ('tenant-b', 20)",
+        "CREATE POLICY secret_isolation ON secret \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE secret ENABLE ROW LEVEL SECURITY",
+    ] {
+        client.batch_execute(sql).await.expect(sql);
+    }
+
+    // ── Non-matching tenant: every embedded-subplan shape must see ZERO
+    // permitted `secret` rows. The control `SELECT * FROM secret` returns 0,
+    // so any probe that lets a hidden row influence its result is a leak.
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'nobody'")
+        .await
+        .expect("set non-matching tenant guc");
+
+    let control = simple_rows(
+        &client
+            .simple_query("SELECT val FROM secret")
+            .await
+            .expect("control direct select"),
+    );
+    assert!(
+        control.is_empty(),
+        "control: non-matching tenant must see no secret rows, got {control:?}"
+    );
+
+    // THE LEAK CLOSED: uncorrelated EXISTS must see zero permitted rows, so the
+    // driver row is filtered out (matches `SELECT * FROM secret` -> 0 rows).
+    let leak = simple_rows(
+        &client
+            .simple_query("SELECT id FROM driver WHERE EXISTS (SELECT 1 FROM secret)")
+            .await
+            .expect("uncorrelated EXISTS over RLS table"),
+    );
+    assert!(
+        leak.is_empty(),
+        "uncorrelated EXISTS leaked RLS-hidden rows: driver row returned ({leak:?})"
+    );
+
+    // Each probe: the driver row appears iff the embedded subquery's truth
+    // value reflects an EMPTY/zero `secret` (i.e. RLS applied). With RLS the
+    // outer row is kept for `NOT EXISTS` / `NOT IN` / `count = 0`, and dropped
+    // for `EXISTS` / `IN` / `= ANY`. A leak would flip these.
+    let kept_when_inner_empty = [
+        "SELECT id FROM driver WHERE NOT EXISTS (SELECT 1 FROM secret)",
+        "SELECT id FROM driver WHERE 10 NOT IN (SELECT val FROM secret)",
+        "SELECT id FROM driver WHERE (SELECT count(*) FROM secret) = 0",
+        // scalar subquery returning no row -> NULL -> coalesce to 0
+        "SELECT id FROM driver WHERE coalesce((SELECT val FROM secret LIMIT 1), 0) = 0",
+        // nested: subquery inside a subquery, both over the RLS table
+        "SELECT id FROM driver WHERE NOT EXISTS \
+            (SELECT 1 FROM secret WHERE val IN (SELECT val FROM secret))",
+        // EXISTS inside a CTE body
+        "WITH d AS (SELECT id FROM driver) \
+            SELECT id FROM d WHERE NOT EXISTS (SELECT 1 FROM secret)",
+        // subquery in a HAVING-style aggregate over driver
+        "SELECT id FROM driver GROUP BY id \
+            HAVING (SELECT count(*) FROM secret) = 0",
+    ];
+    for sql in kept_when_inner_empty {
+        let rows = simple_rows(&client.simple_query(sql).await.expect(sql));
+        assert_eq!(
+            rows,
+            vec![vec!["1".to_owned()]],
+            "RLS-applied subquery should keep the driver row (inner empty): {sql} -> {rows:?}"
+        );
+    }
+
+    let dropped_when_inner_empty = [
+        "SELECT id FROM driver WHERE EXISTS (SELECT 1 FROM secret)",
+        "SELECT id FROM driver WHERE 10 IN (SELECT val FROM secret)",
+        "SELECT id FROM driver WHERE (SELECT count(*) FROM secret) > 0",
+        "SELECT id FROM driver WHERE 10 = ANY (SELECT val FROM secret)",
+        "WITH d AS (SELECT id FROM driver) \
+            SELECT id FROM d WHERE EXISTS (SELECT 1 FROM secret)",
+    ];
+    for sql in dropped_when_inner_empty {
+        let rows = simple_rows(&client.simple_query(sql).await.expect(sql));
+        assert!(
+            rows.is_empty(),
+            "embedded subquery leaked an RLS-hidden row: {sql} -> {rows:?}"
+        );
+    }
+
+    // ── Matching tenant: the same shapes now reflect the visible row
+    // (tenant-a owns `val = 10`), proving the fix does not over-filter.
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set matching tenant guc");
+
+    for sql in [
+        "SELECT id FROM driver WHERE EXISTS (SELECT 1 FROM secret)",
+        "SELECT id FROM driver WHERE 10 IN (SELECT val FROM secret)",
+        "SELECT id FROM driver WHERE (SELECT count(*) FROM secret) = 1",
+        "SELECT id FROM driver WHERE 10 = ANY (SELECT val FROM secret)",
+    ] {
+        let rows = simple_rows(&client.simple_query(sql).await.expect(sql));
+        assert_eq!(
+            rows,
+            vec![vec!["1".to_owned()]],
+            "matching tenant should see its row through the subquery: {sql} -> {rows:?}"
+        );
+    }
+    // tenant-a does NOT own val = 20, so an IN over 20 misses.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT id FROM driver WHERE 20 IN (SELECT val FROM secret)")
+            .await
+            .expect("IN over a non-owned value"),
+    );
+    assert!(
+        rows.is_empty(),
+        "matching tenant must not match another tenant's value: {rows:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// Correlated EXISTS/IN are decorrelated to a semi/anti join BEFORE RLS runs,
+/// so they carry no embedded subplan at the walker stage and are filtered
+/// purely through the join's scanned input. This guards the no-regression /
+/// no-double-filter property: the join-side scan still gets exactly one policy
+/// filter.
+#[tokio::test]
+async fn rls_correlated_subqueries_still_enforce_without_double_filter() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    for sql in [
+        "CREATE TABLE corr_driver (id INT NOT NULL, tenant_id TEXT NOT NULL)",
+        "INSERT INTO corr_driver VALUES (1, 'tenant-a'), (2, 'tenant-b')",
+        "CREATE TABLE corr_secret (owner INT NOT NULL, tenant_id TEXT NOT NULL)",
+        "INSERT INTO corr_secret VALUES (1, 'tenant-a'), (2, 'tenant-b')",
+        "CREATE POLICY corr_secret_isolation ON corr_secret \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE corr_secret ENABLE ROW LEVEL SECURITY",
+        "SET ultrasql.tenant_id = 'tenant-a'",
+    ] {
+        client.batch_execute(sql).await.expect(sql);
+    }
+
+    // Correlated EXISTS: only corr_secret rows that pass RLS (tenant-a) can
+    // satisfy the correlation. corr_driver id=1 correlates to owner=1
+    // (tenant-a, visible); id=2 correlates to owner=2 (tenant-b, hidden).
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT id FROM corr_driver d \
+                 WHERE EXISTS (SELECT 1 FROM corr_secret s WHERE s.owner = d.id) \
+                 ORDER BY id",
+            )
+            .await
+            .expect("correlated EXISTS respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_owned()]],
+        "correlated EXISTS must keep only the row whose RLS-visible match exists"
+    );
+
+    // Correlated IN: same expectation via a different decorrelated shape.
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT id FROM corr_driver d \
+                 WHERE d.id IN (SELECT owner FROM corr_secret s WHERE s.tenant_id = d.tenant_id) \
+                 ORDER BY id",
+            )
+            .await
+            .expect("correlated IN respects RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_owned()]],
+        "correlated IN must reflect only RLS-visible inner rows (no double-filter dropping it)"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// No-regression for non-RLS tables: every embedded-subplan shape returns the
+/// correct result when no policy is in play, so the new recursion does not
+/// alter ordinary subquery semantics.
+#[tokio::test]
+async fn non_rls_embedded_subqueries_unaffected() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    for sql in [
+        "CREATE TABLE plain_driver (id INT NOT NULL)",
+        "INSERT INTO plain_driver VALUES (1), (2), (3)",
+        "CREATE TABLE plain_lookup (val INT NOT NULL)",
+        "INSERT INTO plain_lookup VALUES (2), (3)",
+    ] {
+        client.batch_execute(sql).await.expect(sql);
+    }
+
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT id FROM plain_driver \
+                 WHERE id IN (SELECT val FROM plain_lookup) ORDER BY id",
+            )
+            .await
+            .expect("uncorrelated IN over non-RLS table"),
+    );
+    assert_eq!(rows, vec![vec!["2".to_owned()], vec!["3".to_owned()]]);
+
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT id FROM plain_driver \
+                 WHERE EXISTS (SELECT 1 FROM plain_lookup) ORDER BY id",
+            )
+            .await
+            .expect("uncorrelated EXISTS over non-RLS table"),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_owned()],
+            vec!["2".to_owned()],
+            vec!["3".to_owned()]
+        ],
+        "non-RLS EXISTS must keep all rows (lookup is non-empty)"
+    );
+
+    // Scalar subquery in a projection over a 1-row driver (the uncorrelated
+    // shape decorrelation supports — a bare no-FROM `SELECT (subquery)` is a
+    // separate, pre-existing limitation and not exercised here).
+    let rows = simple_rows(
+        &client
+            .simple_query(
+                "SELECT (SELECT count(*) FROM plain_lookup) FROM plain_driver WHERE id = 1",
+            )
+            .await
+            .expect("scalar subquery over non-RLS table"),
+    );
+    assert_eq!(rows, vec![vec!["2".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
