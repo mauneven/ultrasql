@@ -138,6 +138,7 @@ pub(super) fn decode_binary_copy_payload(
     schema: &Schema,
     codec: &RowCodec,
     jsonb_shape_cache: &mut JsonbShapeCache,
+    apply_defaults: bool,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
     const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
     if bytes.len() < MAGIC.len() + 8 || &bytes[..MAGIC.len()] != MAGIC {
@@ -175,7 +176,16 @@ pub(super) fn decode_binary_copy_payload(
                 "binary COPY expected {expected} columns, got {field_count}"
             )));
         }
-        let mut row = vec![Value::Null; entry.schema.len()];
+        // When applying defaults, encode a NARROW row (only the streamed
+        // columns, in stream order, against `schema`) so the downstream INSERT
+        // operator fills the omitted columns from their default machinery —
+        // PostgreSQL parity, identical to the text/CSV column-list path. Omitted
+        // columns are NOT defaulted to NULL here in that case.
+        let mut row = if apply_defaults {
+            Vec::with_capacity(usize::try_from(field_count).unwrap_or(0))
+        } else {
+            vec![Value::Null; entry.schema.len()]
+        };
         for stream_idx in 0..usize::try_from(field_count).unwrap_or(0) {
             let len = read_i32_be(bytes, &mut pos)?;
             let value = if len == -1 {
@@ -201,8 +211,12 @@ pub(super) fn decode_binary_copy_payload(
                 pos = end;
                 value
             };
-            let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
-            row[target_idx] = value;
+            if apply_defaults {
+                row.push(value);
+            } else {
+                let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
+                row[target_idx] = value;
+            }
         }
         payloads.push(
             codec

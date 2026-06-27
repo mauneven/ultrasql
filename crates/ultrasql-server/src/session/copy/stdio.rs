@@ -21,8 +21,8 @@ use super::binary::decode_binary_copy_payload;
 use super::decode::{decode_one_copy_row, value_to_copy_cell_with_options};
 use super::fs_io::{check_copy_stdin_within_limit, copy_binary_file_limit_bytes, copy_format_code};
 use super::{
-    COPY_INSERT_BATCH_ROWS, CopyOptions, CopyRowDecodeContext, ServerCopyFormat, ServerError,
-    add_copy_batch_rows, copy_in_response_with_format, copy_out_response_with_format,
+    COPY_INSERT_BATCH_ROWS, CopyInsertBatch, CopyOptions, CopyRowDecodeContext, ServerCopyFormat,
+    ServerError, add_copy_batch_rows, copy_in_response_with_format, copy_out_response_with_format,
     copy_rows_from_usize, copy_table_key, encode_csv_row, encode_text_row, increment_copy_rows,
 };
 
@@ -214,6 +214,12 @@ where
                 .await;
         }
 
+        // PostgreSQL fills columns a `COPY t(col-list)` omits from their
+        // DEFAULT / sequence / identity / generated machinery. When such an
+        // omitted column exists, decode rows NARROW (only the streamed columns)
+        // and apply defaults downstream; otherwise keep the full-width decode.
+        let apply_defaults = self.copy_column_list_applies_defaults(entry, columns);
+
         let mut buffer: Vec<u8> = Vec::new();
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
         // Shape A: in an explicit transaction block, COPY rides the SESSION
@@ -244,7 +250,13 @@ where
         } else {
             self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
         };
-        let codec = RowCodec::new(entry.schema.clone());
+        // When applying defaults, rows are encoded NARROW against the stream
+        // schema; otherwise FULL-WIDTH against the table schema.
+        let codec = if apply_defaults {
+            RowCodec::new(schema.clone())
+        } else {
+            RowCodec::new(entry.schema.clone())
+        };
 
         let mut rows_inserted: u64 = 0;
         let mut header_skipped = !opts.header;
@@ -292,6 +304,7 @@ where
                                     schema,
                                     codec: &codec,
                                     jsonb_shape_cache: &mut jsonb_shape_cache,
+                                    apply_defaults,
                                 },
                             )
                         };
@@ -326,7 +339,12 @@ where
                             }
                             if let Err(e) = self.flush_copy_insert_batch(
                                 entry,
-                                &payload_batch,
+                                CopyInsertBatch {
+                                    payloads: &payload_batch,
+                                    columns,
+                                    stream_schema: schema,
+                                    apply_defaults,
+                                },
                                 &txn,
                                 !session_mode,
                             ) {
@@ -397,6 +415,7 @@ where
                             schema,
                             codec: &codec,
                             jsonb_shape_cache: &mut jsonb_shape_cache,
+                            apply_defaults,
                         },
                     )
                 };
@@ -436,8 +455,17 @@ where
                     "COPY FROM autocommit rollback after row count overflow",
                 ));
             }
-            if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn, !session_mode)
-            {
+            if let Err(e) = self.flush_copy_insert_batch(
+                entry,
+                CopyInsertBatch {
+                    payloads: &payload_batch,
+                    columns,
+                    stream_schema: schema,
+                    apply_defaults,
+                },
+                &txn,
+                !session_mode,
+            ) {
                 return Err(self.fail_or_rollback_copy_from(
                     session_mode,
                     txn,
@@ -531,7 +559,15 @@ where
         bytes: &[u8],
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
-        let codec = RowCodec::new(entry.schema.clone());
+        // PostgreSQL applies omitted-column defaults under binary COPY exactly
+        // as under text/CSV. When a defaulted column is omitted, decode NARROW
+        // (stream schema) and apply defaults downstream; otherwise full-width.
+        let apply_defaults = self.copy_column_list_applies_defaults(entry, columns);
+        let codec = if apply_defaults {
+            RowCodec::new(schema.clone())
+        } else {
+            RowCodec::new(entry.schema.clone())
+        };
         let payloads = {
             let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
             decode_binary_copy_payload(
@@ -541,6 +577,7 @@ where
                 schema,
                 &codec,
                 &mut jsonb_shape_cache,
+                apply_defaults,
             )?
         };
         let rows = copy_rows_from_usize(payloads.len(), "binary COPY FROM")?;
@@ -564,7 +601,17 @@ where
         } else {
             self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
         };
-        if let Err(e) = self.flush_copy_insert_batch(entry, &payloads, &txn, !session_mode) {
+        if let Err(e) = self.flush_copy_insert_batch(
+            entry,
+            CopyInsertBatch {
+                payloads: &payloads,
+                columns,
+                stream_schema: schema,
+                apply_defaults,
+            },
+            &txn,
+            !session_mode,
+        ) {
             return Err(self.fail_or_rollback_copy_from(
                 session_mode,
                 txn,
@@ -636,12 +683,32 @@ where
     pub(in crate::session) fn flush_copy_insert_batch(
         &self,
         entry: &TableEntry,
-        payloads: &[Vec<u8>],
+        batch: CopyInsertBatch<'_>,
         txn: &Transaction,
         mark_all_visible: bool,
     ) -> Result<(), ServerError> {
+        let CopyInsertBatch {
+            payloads,
+            columns,
+            stream_schema,
+            apply_defaults,
+        } = batch;
         if payloads.is_empty() {
             return Ok(());
+        }
+        // COPY t(col-list) FROM that omits a defaulted column: every row was
+        // decoded NARROW (only the streamed columns), so route through the
+        // default-applying INSERT path that fills omitted columns from their
+        // DEFAULT / sequence / identity / generated machinery — PostgreSQL
+        // parity with `INSERT t(col-list)`.
+        if apply_defaults {
+            return self.flush_copy_insert_batch_with_defaults(
+                entry,
+                columns,
+                stream_schema,
+                payloads,
+                txn,
+            );
         }
         // A table with a secondary/unique index or a CHECK/FK/EXCLUDE
         // constraint must take the maintained INSERT path so the index is kept

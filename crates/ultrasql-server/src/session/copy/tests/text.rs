@@ -282,6 +282,7 @@ fn copy_row_and_binary_cell_helpers_cover_projection_and_errors() {
             schema: &stream_schema,
             codec: &codec,
             jsonb_shape_cache: &mut cache,
+            apply_defaults: false,
         };
         let payload = decode_copy_cells_to_payload(&[Some(b"ada"), Some(b"7")], &mut context)
             .expect("decode projected payload");
@@ -303,6 +304,7 @@ fn copy_row_and_binary_cell_helpers_cover_projection_and_errors() {
             schema: &stream_schema,
             codec: &codec,
             jsonb_shape_cache: &mut cache,
+            apply_defaults: false,
         },
     )
     .expect("fast csv decode");
@@ -320,6 +322,7 @@ fn copy_row_and_binary_cell_helpers_cover_projection_and_errors() {
                 schema: &stream_schema,
                 codec: &codec,
                 jsonb_shape_cache: &mut cache,
+                apply_defaults: false,
             },
         )
         .is_err()

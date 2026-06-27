@@ -29,10 +29,11 @@ use super::fs_io::{
     write_copy_output_file,
 };
 use super::{
-    COPY_INSERT_BATCH_ROWS, CopyInsertTxn, CopyOptions, CopyRejectState, CopyRejectTarget,
-    CopyRowDecodeContext, CopyTextFileStreamArgs, ServerCopyFormat, ServerError,
-    add_copy_batch_rows, copy_add_row_counts, copy_out_response_with_format, copy_table_key,
-    encode_csv_row, encode_text_row, increment_copy_rows,
+    COPY_INSERT_BATCH_ROWS, CopyDefaultRouting, CopyInsertBatch, CopyInsertTxn, CopyOptions,
+    CopyRejectState, CopyRejectTarget, CopyRowDecodeContext, CopyTextFileStreamArgs,
+    ServerCopyFormat, ServerError, add_copy_batch_rows, copy_add_row_counts,
+    copy_out_response_with_format, copy_table_key, encode_csv_row, encode_text_row,
+    increment_copy_rows,
 };
 
 impl<RW> Session<RW>
@@ -75,7 +76,15 @@ where
         let effective_opts = self.effective_copy_file_options(path, opts)?;
         let file = open_copy_input_file(path)?;
         let mut reader = BufReader::new(file);
-        let codec = RowCodec::new(entry.schema.clone());
+        // PostgreSQL applies omitted-column defaults under file COPY exactly as
+        // under STDIN. When a defaulted column is omitted, decode NARROW (stream
+        // schema) and apply defaults downstream; otherwise decode full-width.
+        let apply_defaults = self.copy_column_list_applies_defaults(entry, columns);
+        let codec = if apply_defaults {
+            RowCodec::new(schema.clone())
+        } else {
+            RowCodec::new(entry.schema.clone())
+        };
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
         // Resolve the reject state BEFORE taking the session txn out. This call
         // is fallible (a missing or invalid REJECT_TABLE errors), and it does
@@ -118,6 +127,7 @@ where
             reject_state: reject_state.as_mut(),
             path,
             mark_all_visible: !session_mode,
+            apply_defaults,
         });
         let rows = match stream_result {
             Ok(rows) => rows,
@@ -305,9 +315,16 @@ where
         if target.payload_batch.is_empty() {
             return Ok(());
         }
+        // The reject target is written with its FULL schema (no COPY column
+        // list), so it never takes the narrow default-applying path.
         self.flush_copy_insert_batch(
             &target.entry,
-            &target.payload_batch,
+            CopyInsertBatch {
+                payloads: &target.payload_batch,
+                columns: &[],
+                stream_schema: &target.entry.schema,
+                apply_defaults: false,
+            },
             insert.txn,
             insert.mark_all_visible,
         )?;
@@ -331,10 +348,16 @@ where
             mut reject_state,
             path,
             mark_all_visible,
+            apply_defaults,
         } = args;
         let insert = CopyInsertTxn {
             txn,
             mark_all_visible,
+        };
+        let routing = CopyDefaultRouting {
+            columns,
+            stream_schema: schema,
+            apply_defaults,
         };
         let mut rows_inserted = 0_u64;
         let mut header_skipped = !opts.header;
@@ -378,6 +401,7 @@ where
                         schema,
                         codec,
                         jsonb_shape_cache: &mut jsonb_shape_cache,
+                        apply_defaults,
                     },
                 )
             };
@@ -403,7 +427,12 @@ where
             payload_batch.push(payload);
             if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
                 add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
-                self.flush_copy_insert_batch(entry, payload_batch, txn, mark_all_visible)?;
+                self.flush_copy_insert_batch(
+                    entry,
+                    routing.batch(payload_batch),
+                    txn,
+                    mark_all_visible,
+                )?;
                 payload_batch.clear();
             }
         }
@@ -431,6 +460,7 @@ where
                             schema,
                             codec,
                             jsonb_shape_cache: &mut jsonb_shape_cache,
+                            apply_defaults,
                         },
                     )
                 };
@@ -449,6 +479,7 @@ where
                             record.clear();
                             return self.finish_copy_stream_batches(
                                 entry,
+                                routing,
                                 payload_batch,
                                 rows_inserted,
                                 reject_state,
@@ -462,12 +493,20 @@ where
             }
         }
 
-        self.finish_copy_stream_batches(entry, payload_batch, rows_inserted, reject_state, insert)
+        self.finish_copy_stream_batches(
+            entry,
+            routing,
+            payload_batch,
+            rows_inserted,
+            reject_state,
+            insert,
+        )
     }
 
     fn finish_copy_stream_batches(
         &self,
         entry: &TableEntry,
+        routing: CopyDefaultRouting<'_>,
         payload_batch: &mut Vec<Vec<u8>>,
         mut rows_inserted: u64,
         reject_state: Option<&mut CopyRejectState>,
@@ -477,7 +516,7 @@ where
             add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
             self.flush_copy_insert_batch(
                 entry,
-                payload_batch,
+                routing.batch(payload_batch),
                 insert.txn,
                 insert.mark_all_visible,
             )?;

@@ -133,6 +133,29 @@ pub(super) fn decode_copy_cells_to_payload(
         )));
     }
 
+    // Default-applying column-list path: encode a NARROW row holding only the
+    // streamed columns (in stream order, typed by `schema`), and leave default
+    // filling, generated-column evaluation, and the NOT NULL check to the
+    // downstream INSERT operator (`flush_copy_insert_batch_with_defaults`),
+    // exactly like a normal `INSERT t(col-list)`. We must NOT enforce NOT NULL
+    // here: an omitted NOT NULL column with a DEFAULT is valid in PostgreSQL,
+    // and the operator re-checks NOT NULL after defaults are applied.
+    if context.apply_defaults {
+        let mut narrow_row = Vec::with_capacity(raw_cells.len());
+        for (stream_idx, (table_col_idx, raw)) in columns.iter().zip(raw_cells.iter()).enumerate() {
+            let field = entry.schema.field_at(*table_col_idx);
+            narrow_row.push(decode_copy_cell(
+                *raw,
+                &field.data_type,
+                stream_idx,
+                context.jsonb_shape_cache,
+            )?);
+        }
+        return codec
+            .encode(&narrow_row)
+            .map_err(|e| ServerError::CopyFormat(format!("COPY FROM row encode: {e}")));
+    }
+
     let mut row = vec![Value::Null; entry.schema.len()];
     if columns.is_empty() {
         for (col_idx, raw) in raw_cells.iter().enumerate() {

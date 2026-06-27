@@ -131,8 +131,16 @@ pub fn encode_text_row(columns: &[Option<Vec<u8>>], opts: &CopyOptions) -> Vec<u
 /// Parse a text-format COPY line into column byte-strings.
 ///
 /// The trailing `\n` is stripped if present. Backslash escape sequences
-/// `\\`, `\t`, `\n`, `\r` are decoded. A column equal to `null_str` is
-/// returned as `None` (SQL NULL).
+/// `\\`, `\t`, `\n`, `\r` are decoded.
+///
+/// The SQL-NULL decision mirrors PostgreSQL's `CopyReadAttributesText`: a
+/// field is NULL iff its **raw** token (the bytes between delimiters, *before*
+/// backslash de-escaping) is exactly equal to `null_str` (default `\N`). The
+/// literal 2-character string `\N` is written in the file as `\\N` (which
+/// de-escapes to `\N`); deciding NULL on the raw slice keeps `\\N` a literal
+/// value rather than mis-detecting it as NULL after de-escaping. An empty raw
+/// field is the empty string in text format, never NULL (the default marker is
+/// non-empty).
 pub fn parse_text_row(
     line: &[u8],
     opts: &CopyOptions,
@@ -156,44 +164,69 @@ pub fn parse_text_row(
         b[0]
     };
 
+    let null_bytes = opts.null_str.as_bytes();
     let mut columns = Vec::new();
-    let mut current: Vec<u8> = Vec::new();
+    // The raw byte offset where the current field begins (before de-escaping).
+    let mut field_start = 0_usize;
     let mut i = 0;
 
     while i < line.len() {
         let b = line[i];
         if b == b'\\' && i + 1 < line.len() {
-            i += 1;
-            match line[i] {
-                b'\\' => current.push(b'\\'),
-                b't' => current.push(b'\t'),
-                b'n' => current.push(b'\n'),
-                b'r' => current.push(b'\r'),
-                other => {
-                    current.push(b'\\');
-                    current.push(other);
-                }
-            }
+            // Skip the escaped byte so an escaped delimiter is not treated as a
+            // field separator. De-escaping itself happens in `decode_text_field`.
+            i += 2;
         } else if b == delim_byte {
-            columns.push(decode_null(&current, opts));
-            current.clear();
+            columns.push(decode_text_field(&line[field_start..i], null_bytes));
+            field_start = i + 1;
+            i += 1;
         } else {
-            current.push(b);
+            i += 1;
         }
-        i += 1;
     }
-    columns.push(decode_null(&current, opts));
+    columns.push(decode_text_field(&line[field_start..], null_bytes));
 
     Ok(columns)
 }
 
-/// Return `None` if `bytes` equals `null_str`, otherwise `Some(bytes.to_vec())`.
-fn decode_null(bytes: &[u8], opts: &CopyOptions) -> Option<Vec<u8>> {
-    if bytes == opts.null_str.as_bytes() {
-        None
-    } else {
-        Some(bytes.to_vec())
+/// Decide a single text-format field from its RAW (pre-de-escape) byte slice.
+///
+/// Returns `None` (SQL NULL) iff the raw slice exactly equals the NULL marker;
+/// otherwise de-escapes the raw slice into the field's value bytes.
+fn decode_text_field(raw: &[u8], null_bytes: &[u8]) -> Option<Vec<u8>> {
+    if raw == null_bytes {
+        return None;
     }
+    Some(unescape_text_field(raw))
+}
+
+/// De-escape a text-format field's raw bytes (`\\`, `\t`, `\n`, `\r`).
+///
+/// An unrecognised escape `\x` is passed through verbatim as `\x`, matching the
+/// permissive decoding the previous parser applied.
+fn unescape_text_field(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b == b'\\' && i + 1 < raw.len() {
+            i += 1;
+            match raw[i] {
+                b'\\' => out.push(b'\\'),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                other => {
+                    out.push(b'\\');
+                    out.push(other);
+                }
+            }
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +548,48 @@ mod tests {
         let opts = default_opts();
         let cols = parse_text_row(b"a\\\\b\\tc\\nd\n", &opts).expect("parse ok");
         assert_eq!(cols, vec![Some(b"a\\b\tc\nd".to_vec())]);
+    }
+
+    #[test]
+    fn parse_text_row_null_marker_decided_on_raw_field() {
+        // PostgreSQL `CopyReadAttributesText` decides NULL on the RAW token
+        // before de-escaping. Raw `\N` is the NULL marker; raw `\\N`
+        // de-escapes to the literal 2-char string `\N` and must NOT be NULL.
+        let opts = default_opts();
+
+        // Raw `\N` -> SQL NULL.
+        let cols = parse_text_row(b"\\N\n", &opts).expect("parse ok");
+        assert_eq!(cols, vec![None]);
+
+        // Raw `\\N` -> literal `\N` (backslash, N), not NULL.
+        let cols = parse_text_row(b"\\\\N\n", &opts).expect("parse ok");
+        assert_eq!(cols, vec![Some(b"\\N".to_vec())]);
+
+        // Mixed columns: literal `\N`, NULL, empty string.
+        let cols = parse_text_row(b"\\\\N\t\\N\t\n", &opts).expect("parse ok");
+        assert_eq!(cols, vec![Some(b"\\N".to_vec()), None, Some(Vec::new())]);
+    }
+
+    #[test]
+    fn parse_text_row_empty_field_is_empty_string_not_null() {
+        let opts = default_opts();
+        let cols = parse_text_row(b"a\t\tb\n", &opts).expect("parse ok");
+        assert_eq!(
+            cols,
+            vec![Some(b"a".to_vec()), Some(Vec::new()), Some(b"b".to_vec())]
+        );
+    }
+
+    #[test]
+    fn encode_then_parse_round_trip_literal_backslash_n() {
+        // Round-trip parity with PG: INSERT a literal `\N`, COPY TO emits
+        // `\\N`, COPY FROM that line yields the literal `\N` again — not NULL.
+        let opts = default_opts();
+        let original = vec![Some(b"\\N".to_vec())];
+        let line = encode_text_row(&original, &opts);
+        assert_eq!(line, b"\\\\N\n");
+        let parsed = parse_text_row(&line, &opts).expect("parse ok");
+        assert_eq!(parsed, original);
     }
 
     // ── Round-trip ──────────────────────────────────────────────────────────

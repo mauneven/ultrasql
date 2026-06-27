@@ -39,11 +39,14 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::RelationId;
+use ultrasql_core::{RelationId, Schema};
 use ultrasql_executor::{
-    MemTableScan, ModifyKind, ModifyTable, ModifyTableStamps, Operator, RowCodec, build_batch,
+    MemTableScan, ModifyKind, ModifyTable, ModifyTableStamps, Operator, RowCodec, SequenceDefault,
+    SequenceNextvalObserver, build_batch,
 };
 use ultrasql_txn::Transaction;
+
+use crate::BlankPageLoader;
 
 use super::super::Session;
 use crate::error::ServerError;
@@ -117,6 +120,10 @@ where
         if payloads.is_empty() {
             return Ok(());
         }
+        // Full-width payloads (no COPY column list, or a column list that omits
+        // no defaulted column): decode straight into the table schema and feed
+        // the operator with no column map or default metadata. The decode layer
+        // already filled omitted columns with NULL and enforced NOT NULL.
         let codec = RowCodec::new(entry.schema.clone());
         let mut rows = Vec::with_capacity(payloads.len());
         for payload in payloads {
@@ -128,7 +135,120 @@ where
         let batch = build_batch(&rows, &entry.schema)?;
         let child: Box<dyn Operator> =
             Box::new(MemTableScan::new(entry.schema.clone(), vec![batch]));
+        let modify = self.build_copy_modify(entry, txn, child)?;
+        let mut op: Box<dyn Operator> = Box::new(modify);
+        while op.next_batch()?.is_some() {}
+        self.state.flush_dirty_heap_pages_if_needed()?;
+        Ok(())
+    }
 
+    /// Whether a `COPY t(col-list) FROM` must take the default-applying insert
+    /// path because at least one OMITTED table column carries a DEFAULT,
+    /// sequence (`SERIAL`), `GENERATED ... AS IDENTITY`, or `GENERATED ... AS
+    /// (expr) STORED` — matching PostgreSQL, which fills every omitted column
+    /// from its default machinery rather than NULL.
+    ///
+    /// `false` (no column list, or every omitted column has no default) keeps
+    /// the existing decode-fills-NULL path: an omitted column there becomes
+    /// NULL, and a NOT NULL omitted column with no default raises 23502 — both
+    /// already PostgreSQL-correct.
+    pub(in crate::session) fn copy_column_list_applies_defaults(
+        &self,
+        entry: &TableEntry,
+        columns: &[usize],
+    ) -> bool {
+        if columns.is_empty() || columns.len() == entry.schema.len() {
+            return false;
+        }
+        let Some(constraints) = self.state.table_constraints.get(&entry.oid) else {
+            return false;
+        };
+        (0..entry.schema.len())
+            .filter(|idx| !columns.contains(idx))
+            .any(|idx| {
+                constraints.defaults.get(idx).is_some_and(Option::is_some)
+                    || constraints
+                        .sequence_defaults
+                        .get(idx)
+                        .is_some_and(Option::is_some)
+                    || constraints.identity_always.get(idx).copied() == Some(true)
+                    || constraints
+                        .generated_stored
+                        .get(idx)
+                        .is_some_and(Option::is_some)
+            })
+    }
+
+    /// Insert a COPY batch decoded over the NARROW stream schema (only the
+    /// columns named in the COPY column list, in stream order), applying the
+    /// target table's DEFAULT / sequence / identity / generated-stored
+    /// machinery to omitted columns exactly as a normal `INSERT t(col-list)`
+    /// does — via [`ModifyTable::with_insert_column_map`] and the default
+    /// metadata setters.
+    ///
+    /// `stream_schema` is the projected schema of `columns`; `payloads` are
+    /// narrow rows encoded against it. The operator expands each narrow row to
+    /// full width, fills omitted cells from the default metadata, evaluates
+    /// generated columns, then runs NOT NULL / CHECK / FK / UNIQUE / EXCLUDE
+    /// and index maintenance — identical to INSERT.
+    pub(in crate::session) fn flush_copy_insert_batch_with_defaults(
+        &self,
+        entry: &TableEntry,
+        columns: &[usize],
+        stream_schema: &Schema,
+        payloads: &[Vec<u8>],
+        txn: &Transaction,
+    ) -> Result<(), ServerError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let stream_codec = RowCodec::new(stream_schema.clone());
+        let mut rows = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let row = stream_codec.decode(payload).map_err(|e| {
+                ServerError::ddl(format!("COPY FROM narrow row decode for defaults: {e}"))
+            })?;
+            rows.push(row);
+        }
+        let batch = build_batch(&rows, stream_schema)?;
+        let child: Box<dyn Operator> =
+            Box::new(MemTableScan::new(stream_schema.clone(), vec![batch]));
+
+        let mut modify = self
+            .build_copy_modify(entry, txn, child)?
+            .with_insert_column_map(columns.to_vec());
+
+        // Same default metadata the INSERT lowering attaches (see
+        // `lower_real_insert`): the operator applies these to columns the COPY
+        // column list omitted, keyed off the column map's `omitted` mask.
+        if let Some(constraints) = self.state.table_constraints.get(&entry.oid) {
+            let constraints = constraints.clone();
+            modify = modify
+                .with_column_defaults(constraints.defaults.clone())
+                .with_sequence_defaults(
+                    self.build_copy_sequence_defaults(&constraints.sequence_defaults, txn)?,
+                )
+                .with_identity_always(constraints.identity_always.clone())
+                .with_generated_stored(constraints.generated_stored.clone());
+        }
+
+        let mut op: Box<dyn Operator> = Box::new(modify);
+        while op.next_batch()?.is_some() {}
+        self.state.flush_dirty_heap_pages_if_needed()?;
+        Ok(())
+    }
+
+    /// Build the shared INSERT [`ModifyTable`] for a COPY batch: visibility
+    /// map, uniqueness recheck, secondary/vector index maintenance, and
+    /// CHECK / FOREIGN KEY / EXCLUDE constraints — the same machinery a normal
+    /// INSERT uses. Callers attach the child operator and (for the column-list
+    /// path) the column map plus default metadata.
+    fn build_copy_modify(
+        &self,
+        entry: &TableEntry,
+        txn: &Transaction,
+        child: Box<dyn Operator>,
+    ) -> Result<ModifyTable<BlankPageLoader>, ServerError> {
         let xid = txn.current_xid();
         let command_id = txn.current_command;
 
@@ -205,9 +325,46 @@ where
             }
         }
 
-        let mut op: Box<dyn Operator> = Box::new(modify);
-        while op.next_batch()?.is_some() {}
-        self.state.flush_dirty_heap_pages_if_needed()?;
-        Ok(())
+        Ok(modify)
+    }
+
+    /// Build the per-column [`SequenceDefault`] descriptors for a COPY default
+    /// batch, mirroring the INSERT lowering's `build_sequence_defaults`: each
+    /// named sequence is looked up in the session's sequence map, WAL-stamped
+    /// with the COPY xid, and given the session observer that records the
+    /// generated value for `currval`/`lastval`.
+    fn build_copy_sequence_defaults(
+        &self,
+        defaults: &[Option<String>],
+        txn: &Transaction,
+    ) -> Result<Vec<Option<SequenceDefault>>, ServerError> {
+        let sequence_state = self.sequence_state.clone();
+        let observer: SequenceNextvalObserver = Arc::new(move |name: &str, value| {
+            sequence_state.record_nextval(name, value);
+        });
+        let wal = self.state.heap.wal_sink().cloned();
+        let xid = txn.current_xid();
+        defaults
+            .iter()
+            .map(|name| {
+                let Some(name) = name else {
+                    return Ok(None);
+                };
+                let sequence = self
+                    .state
+                    .sequences
+                    .get(name)
+                    .map(|seq| Arc::clone(seq.value()))
+                    .ok_or_else(|| {
+                        ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(
+                            name.clone(),
+                        ))
+                    })?;
+                let default = SequenceDefault::new(name.clone(), sequence)
+                    .with_wal(wal.clone(), xid, ultrasql_core::RelationId::INVALID)
+                    .with_observer(Arc::clone(&observer));
+                Ok(Some(default))
+            })
+            .collect()
     }
 }

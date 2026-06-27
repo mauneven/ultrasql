@@ -132,6 +132,10 @@ struct CopyTextFileStreamArgs<'a> {
     payload_batch: &'a mut Vec<Vec<u8>>,
     reject_state: Option<&'a mut CopyRejectState>,
     path: &'a str,
+    /// Whether the COPY column list omits a defaulted column, so rows are
+    /// decoded NARROW and omitted-column defaults are applied downstream. See
+    /// [`CopyInsertBatch`].
+    apply_defaults: bool,
     /// Whether freshly bulk-filled pages may be stamped all-visible. `true`
     /// only for autocommit COPY (the implicit txn commits immediately); `false`
     /// when riding the open session txn, whose uncommitted rows must stay
@@ -145,6 +149,14 @@ struct CopyRowDecodeContext<'a> {
     schema: &'a Schema,
     codec: &'a RowCodec,
     jsonb_shape_cache: &'a mut JsonbShapeCache,
+    /// When `true`, the COPY column list omits at least one column that carries
+    /// a DEFAULT / sequence / identity / generated value, so each row is encoded
+    /// NARROW (only the streamed columns, against `schema`) and the omitted-
+    /// column defaults are applied downstream by [`Session::
+    /// flush_copy_insert_batch_with_defaults`]. When `false`, rows are encoded
+    /// FULL-WIDTH against `entry.schema` with NULL in omitted positions and the
+    /// NOT NULL check enforced here, as before.
+    apply_defaults: bool,
 }
 
 /// The transaction a COPY batch inserts under, plus whether freshly bulk-filled
@@ -156,4 +168,43 @@ struct CopyRowDecodeContext<'a> {
 struct CopyInsertTxn<'a> {
     txn: &'a Transaction,
     mark_all_visible: bool,
+}
+
+/// One decoded COPY FROM batch handed to [`Session::flush_copy_insert_batch`].
+///
+/// `apply_defaults` distinguishes the two payload encodings that share the
+/// flush path:
+/// - `false`: `payloads` are FULL-WIDTH rows (against `entry.schema`), omitted
+///   columns already NULL and NOT NULL already enforced at decode. `columns`
+///   and `stream_schema` are unused.
+/// - `true`: `payloads` are NARROW rows (only the streamed `columns`, against
+///   `stream_schema`); the flush path expands them and applies omitted-column
+///   defaults / generated values via the INSERT operator.
+#[derive(Clone, Copy)]
+pub(in crate::session) struct CopyInsertBatch<'a> {
+    pub(in crate::session) payloads: &'a [Vec<u8>],
+    pub(in crate::session) columns: &'a [usize],
+    pub(in crate::session) stream_schema: &'a Schema,
+    pub(in crate::session) apply_defaults: bool,
+}
+
+/// The column-list / default-routing metadata for a COPY FROM, minus the
+/// payload slice. Bundled so per-batch helpers stay under the argument budget;
+/// combine with a payload slice to build a [`CopyInsertBatch`].
+#[derive(Clone, Copy)]
+struct CopyDefaultRouting<'a> {
+    columns: &'a [usize],
+    stream_schema: &'a Schema,
+    apply_defaults: bool,
+}
+
+impl<'a> CopyDefaultRouting<'a> {
+    fn batch(self, payloads: &'a [Vec<u8>]) -> CopyInsertBatch<'a> {
+        CopyInsertBatch {
+            payloads,
+            columns: self.columns,
+            stream_schema: self.stream_schema,
+            apply_defaults: self.apply_defaults,
+        }
+    }
 }

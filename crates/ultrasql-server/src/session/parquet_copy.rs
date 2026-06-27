@@ -18,7 +18,7 @@ use ultrasql_executor::RowCodec;
 use ultrasql_txn::IsolationLevel;
 
 use super::Session;
-use super::copy::{add_copy_batch_rows, copy_table_key, increment_copy_rows};
+use super::copy::{CopyInsertBatch, add_copy_batch_rows, copy_table_key, increment_copy_rows};
 use crate::error::ServerError;
 
 const PARQUET_COPY_BATCH_ROWS: usize = 4096;
@@ -134,7 +134,15 @@ where
         } else {
             self.state.txn_manager.begin(IsolationLevel::ReadCommitted)
         };
-        let codec = RowCodec::new(entry.schema.clone());
+        // PostgreSQL applies omitted-column defaults under parquet COPY exactly
+        // as under text/CSV/binary. When a defaulted column is omitted, build
+        // NARROW rows (stream schema) and apply defaults downstream.
+        let apply_defaults = self.copy_column_list_applies_defaults(entry, columns);
+        let codec = if apply_defaults {
+            RowCodec::new(stream_schema.clone())
+        } else {
+            RowCodec::new(entry.schema.clone())
+        };
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(PARQUET_COPY_BATCH_ROWS);
         let mut rows_inserted = 0_u64;
 
@@ -146,7 +154,13 @@ where
                     })?;
                     validate_parquet_copy_schema(batch.schema().as_ref(), stream_schema, path)?;
                     for row_index in 0..batch.num_rows() {
-                        let row = parquet_batch_row_to_values(&batch, row_index, entry, columns)?;
+                        let row = parquet_batch_row_to_values(
+                            &batch,
+                            row_index,
+                            entry,
+                            columns,
+                            apply_defaults,
+                        )?;
                         let payload = codec.encode(&row).map_err(|err| {
                             ServerError::CopyFormat(format!("COPY FROM parquet row encode: {err}"))
                         })?;
@@ -159,7 +173,12 @@ where
                             )?;
                             self.flush_copy_insert_batch(
                                 entry,
-                                &payload_batch,
+                                CopyInsertBatch {
+                                    payloads: &payload_batch,
+                                    columns,
+                                    stream_schema,
+                                    apply_defaults,
+                                },
                                 &txn,
                                 !session_mode,
                             )?;
@@ -173,7 +192,17 @@ where
                         payload_batch.len(),
                         "COPY FROM parquet",
                     )?;
-                    self.flush_copy_insert_batch(entry, &payload_batch, &txn, !session_mode)?;
+                    self.flush_copy_insert_batch(
+                        entry,
+                        CopyInsertBatch {
+                            payloads: &payload_batch,
+                            columns,
+                            stream_schema,
+                            apply_defaults,
+                        },
+                        &txn,
+                        !session_mode,
+                    )?;
                     payload_batch.clear();
                 }
                 Ok(rows_inserted)
@@ -407,8 +436,16 @@ fn parquet_batch_row_to_values(
     row_index: usize,
     entry: &TableEntry,
     columns: &[usize],
+    apply_defaults: bool,
 ) -> Result<Vec<Value>, ServerError> {
-    let mut row = vec![Value::Null; entry.schema.len()];
+    // `apply_defaults` builds a NARROW row (only the streamed columns, in stream
+    // order) so the downstream INSERT operator fills omitted-column defaults;
+    // otherwise build a FULL-WIDTH row with NULL in omitted positions.
+    let mut row = if apply_defaults {
+        Vec::with_capacity(batch.schema().fields().len())
+    } else {
+        vec![Value::Null; entry.schema.len()]
+    };
     for (stream_index, arrow_field) in batch.schema().fields().iter().enumerate() {
         let table_index = projected_column_index(columns, stream_index);
         let field = entry.schema.field_at(table_index);
@@ -420,11 +457,16 @@ fn parquet_batch_row_to_values(
                 arrow_field.name()
             )));
         }
-        row[table_index] = arrow_cell_to_value(
+        let value = arrow_cell_to_value(
             batch.column(stream_index).as_ref(),
             row_index,
             &field.data_type,
         )?;
+        if apply_defaults {
+            row.push(value);
+        } else {
+            row[table_index] = value;
+        }
     }
     Ok(row)
 }
