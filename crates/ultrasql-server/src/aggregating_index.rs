@@ -35,6 +35,22 @@ const OPTION_STALE: &str = "aggregating.stale";
 const OPTION_VERSION: &str = "aggregating.version";
 const OPTION_DURABLE_STATE: &str = "aggregating.durable_state";
 
+/// Sentinel `Int32` value that, when present in a visible base-table row,
+/// triggers the debug-only panic inside [`build_aggregating_index_rows`] used
+/// by the dirty/rows-torn isolation test. Chosen so no ordinary test or
+/// workload row carries it. Compiled out of release/ship binaries (the trigger
+/// is `#[cfg(debug_assertions)]`).
+#[cfg(debug_assertions)]
+const TEST_PANIC_AGG_REBUILD_SENTINEL: i32 = 0x6543_2100;
+
+/// One-shot gate so the sentinel above panics exactly ONCE: the first rebuild
+/// to scan the sentinel row wins the `compare_exchange` and panics; every later
+/// rebuild observes the gate set and scans the (still-present) sentinel row
+/// normally, producing the correct recovered aggregate the test asserts on.
+#[cfg(debug_assertions)]
+static TEST_PANIC_AGG_REBUILD_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Clone, Debug)]
 struct AggregateState {
     func: AggregateFunc,
@@ -152,6 +168,29 @@ pub(crate) fn build_aggregating_index_rows(
         let row = codec
             .decode(&tuple.data)
             .map_err(|e| ServerError::ddl(format!("aggregating index decode: {e}")))?;
+        // Debug-only panic DURING the rebuild, for the dirty/rows-torn
+        // isolation test. Fires ONCE when a visible row first carries the
+        // sentinel `Int32`, mid-scan — after the dirty-claim compare_exchange
+        // but before the fresh rows are stored — exactly the window where an
+        // unwind would otherwise leave `dirty == false` + stale `rows`. The
+        // `DirtyRestore` guard must re-dirty so the next serve rebuilds from
+        // heap truth. The one-shot gate lets that NEXT rebuild scan the same
+        // (still present) sentinel row WITHOUT re-panicking, so the test can
+        // assert the recovered aggregate is correct. Compiled out of
+        // release/ship binaries.
+        #[cfg(debug_assertions)]
+        if row
+            .iter()
+            .any(|value| matches!(value, Value::Int32(v) if *v == TEST_PANIC_AGG_REBUILD_SENTINEL))
+            && TEST_PANIC_AGG_REBUILD_FIRED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            #[allow(clippy::panic)]
+            {
+                panic!("ultrasql test panic (debug-only, during aggregating-index rebuild)");
+            }
+        }
         let mut key = Vec::with_capacity(spec.group_columns.len());
         for &col in &spec.group_columns {
             key.push(row.get(col).cloned().ok_or_else(|| {
@@ -567,10 +606,17 @@ fn current_summary_rows(
         &ctx.snapshot,
         ctx.oracle.as_ref(),
     )?;
+    // Poison recovery: if a prior reader/writer panicked while holding this
+    // lock (now that panics unwind instead of aborting the process), the
+    // std `RwLock` is poisoned. Recover the inner `Vec` rather than propagate
+    // the poison — otherwise one caught query panic would permanently brick
+    // this aggregating index for every other connection (a poison-cascade DoS
+    // that would defeat per-connection isolation). The summary is rebuilt from
+    // heap truth on the next serve, so a possibly-torn write is self-healing.
     let rows = runtime
         .rows
         .read()
-        .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let rows = if let Some(pred) = predicate {
         rows.into_iter()
@@ -651,10 +697,13 @@ fn rebuild_runtime_for_snapshot(
     // passes on subsequent serves once the heap truth is materialised.
     let rows = build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle)?;
     {
+        // Poison recovery (see `current_summary_rows`): a caught panic must not
+        // brick this index for sibling connections. We overwrite the rows
+        // wholesale here, so any torn prior state is discarded.
         let mut guard = runtime
             .rows
             .write()
-            .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = rows;
     }
     runtime.clear_last_writer();
@@ -679,20 +728,56 @@ fn rebuild_runtime_if_dirty(
     {
         return Ok(false);
     }
-    match build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle) {
-        Ok(rows) => {
-            let mut guard = runtime
-                .rows
-                .write()
-                .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
-            *guard = rows;
-            Ok(true)
-        }
-        Err(err) => {
-            runtime.dirty.store(true, Ordering::Release);
-            Err(err)
+    // We have CLAIMED the rebuild (dirty: true -> false). From here the
+    // `dirty`/`rows` pair is momentarily torn: `dirty` says "clean" but `rows`
+    // still holds the STALE pre-write summary until the build below stores the
+    // fresh rows. `build_aggregating_index_rows` is executor-grade code over
+    // user data (visible-row decode, `AggregateState` add/finish arithmetic,
+    // sort) and can PANIC; under panic=unwind that unwind would skip every
+    // restore below, leaving `dirty == false` + stale `rows` + a stale
+    // `last_writer_xid` — a later reader (any connection) would then serve the
+    // stale aggregate, silently OMITTING the committed write that dirtied us.
+    //
+    // The drop-guard restores `dirty == true` on ANY non-success exit (panic
+    // OR early `?`-return), so the next serve re-rebuilds from heap truth and
+    // never hands out the torn stale summary. It is `disarm`ed only after the
+    // fresh rows are stored, i.e. once the pair is consistent again. Claiming
+    // dirty=false first still prevents two threads both rebuilding; the guard
+    // only matters on the failure/panic path.
+    struct DirtyRestore<'a> {
+        runtime: &'a RuntimeAggregatingIndex,
+        armed: bool,
+    }
+    impl Drop for DirtyRestore<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // Re-dirty so the next serve rebuilds from the heap. We never
+                // stored fresh rows, so the stale summary must not be served.
+                self.runtime.dirty.store(true, Ordering::Release);
+            }
         }
     }
+    let mut restore = DirtyRestore {
+        runtime,
+        armed: true,
+    };
+    let rows = build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle)?;
+    {
+        // Poison recovery (see `current_summary_rows`): recover rather than
+        // propagate, so one caught panic cannot brick this index. The rows
+        // are overwritten wholesale, discarding any torn prior state.
+        let mut guard = runtime
+            .rows
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = rows;
+    }
+    // Fresh rows are stored: the `dirty`/`rows` pair is consistent again.
+    // Disarm so the guard does not re-dirty a correctly-rebuilt summary. Any
+    // panic BEFORE this point (in the build, decode, aggregate, sort, or the
+    // rows store) leaves the guard armed and re-dirties on unwind.
+    restore.armed = false;
+    Ok(true)
 }
 
 fn summary_base_rows_represented(spec: &LogicalAggregatingIndex, rows: &[Vec<Value>]) -> u64 {

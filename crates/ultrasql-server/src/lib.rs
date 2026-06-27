@@ -208,6 +208,50 @@ pub(crate) use serializable::{
     record_serializable_predicate_locks, record_serializable_write_conflicts,
 };
 
+/// Install a process-wide panic hook that logs every panic through
+/// `tracing` (message + location, plus a backtrace when
+/// `RUST_BACKTRACE` is set) before the unwind proceeds.
+///
+/// This complements — it does not replace — the per-statement
+/// `catch_unwind` guards in the session loop. The release profile now
+/// *unwinds* on panic (`Cargo.toml`), so when a statement panics:
+///
+/// 1. this hook runs and records full server-side detail, then
+/// 2. the unwind is caught by the per-statement guard
+///    (`session/run.rs` / `session/ext.rs`), which rolls back the open
+///    transaction, returns a generic `XX000` to the client, and keeps
+///    the connection — and every other connection, and the process —
+///    alive.
+///
+/// Idempotent and safe to call from multiple entry points (the server
+/// binary's `main`, an in-process embedded server, and integration
+/// tests): the hook is installed at most once via [`std::sync::Once`].
+pub fn install_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let location = info
+                .location()
+                .map_or_else(|| "<unknown location>".to_owned(), ToString::to_string);
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+            let backtrace = std::backtrace::Backtrace::capture();
+            tracing::error!(
+                target: "ultrasqld",
+                panic_message = %message,
+                panic_location = %location,
+                panic_backtrace = %backtrace,
+                "panic captured by hook; unwinding (the per-statement guard \
+                 isolates query panics to the offending connection)"
+            );
+        }));
+    });
+}
+
 /// Default initial read buffer. Picked to fit a small startup message
 /// without resizing; the buffer grows on demand.
 pub(crate) const READ_BUFFER_INITIAL: usize = 1 << 12;

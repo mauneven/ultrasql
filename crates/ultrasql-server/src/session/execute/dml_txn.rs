@@ -1,6 +1,7 @@
 //! DML/SELECT execution wrapper and transaction finalisation / rollback helpers.
 
 use super::*;
+use crate::session::AutocommitAbortGuard;
 
 impl<RW> Session<RW>
 where
@@ -151,6 +152,18 @@ where
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                // Arm an unwind guard for the autocommit XID. If
+                // `run_plan_in_txn` (executor-grade code over user data, full of
+                // panic sites) or `finalise_autocommit` panics, this guard's
+                // Drop aborts the XID — releasing the per-tuple locks the
+                // statement acquired, which `Transaction`'s own Drop (it has
+                // none) cannot. On every NORMAL return below the guard is
+                // disarmed: `finalise_autocommit` either commits (buffered Ok),
+                // aborts (Err), or hands the XID to `drive_streaming_select`
+                // (streaming Ok, which installs its own guard), so the guard
+                // must only fire on a panic between here and that return.
+                let mut abort_guard =
+                    AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid);
                 let outcome = run_plan_in_txn(RunPlanInTxnArgs {
                     plan,
                     txn: &txn,
@@ -197,7 +210,13 @@ where
                     // exists for it.
                     streaming_commit_txn: allow_streaming.then(|| txn.clone()),
                 });
-                self.finalise_autocommit(plan, txn, outcome)
+                let result = self.finalise_autocommit(plan, txn, outcome);
+                // Reached only on a NORMAL return from `finalise_autocommit`
+                // (it committed, aborted, or handed off to the streaming drive
+                // loop). Disarm so the guard does not also abort. A panic inside
+                // `finalise_autocommit` skips this and the guard fires.
+                abort_guard.disarm();
+                result
             }
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);

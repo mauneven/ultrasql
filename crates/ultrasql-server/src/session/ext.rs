@@ -13,6 +13,7 @@ use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 use ultrasql_txn::IsolationLevel;
 
+use super::AutocommitAbortGuard;
 use super::Session;
 use super::timeout::StatementTimeoutGuard;
 use crate::error::ServerError;
@@ -518,7 +519,24 @@ where
                 .workload_recorder
                 .set_session_active(self.pid, query.clone());
         }
-        let outcome = self.run_portal_routed(portal, max_rows);
+        // Wrap the synchronous executor entry in `catch_unwind` so a panic on
+        // the Extended-Query execution path is isolated to this Execute (and
+        // its connection) instead of unwinding the connection task / aborting
+        // the process. On a caught panic the open explicit block is aborted
+        // and `ServerError::Internal` (query-scoped XX000) is returned, then
+        // surfaced through the normal query-scoped error path below — the
+        // panic string is logged server-side but never sent to the client.
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_portal_routed(portal, max_rows)
+        })) {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                let portal_sql = workload_meta
+                    .as_ref()
+                    .map_or("<extended>", |(query, ..)| query.as_str());
+                Err(self.on_caught_statement_panic(payload, portal_sql))
+            }
+        };
         self.state.workload_recorder.set_session_idle(self.pid);
         drop(timeout_guard);
         let elapsed = started.elapsed();
@@ -569,6 +587,24 @@ where
         portal: &str,
         max_rows: i32,
     ) -> Result<crate::extended::ExecuteOutcome, ServerError> {
+        // Debug-only panic sentinel for the Extended-Query panic-isolation
+        // test. This runs INSIDE the per-statement `catch_unwind` in
+        // `handle_execute`, so the panic is caught and isolated exactly as a
+        // real executor-path panic would be. Compiled out of release/ship
+        // binaries via `debug_assertions`.
+        #[cfg(debug_assertions)]
+        if self.extended.portals.get(portal).is_some_and(|p| {
+            p.sql
+                .trim()
+                .eq_ignore_ascii_case("SELECT __ultrasql_test_panic()")
+        }) {
+            // INTENTIONAL: test-only trigger, compiled out of release/ship
+            // binaries (`debug_assertions`). See `execute_query`'s twin.
+            #[allow(clippy::panic)]
+            {
+                panic!("ultrasql test panic (debug-only, intentionally triggered, extended path)");
+            }
+        }
         let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let portal_plan = self
             .extended
@@ -581,6 +617,14 @@ where
                     self.enforce_column_privileges(plan, &catalog_snapshot)?;
                 }
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                // Unwind guard for this Extended-Execute autocommit XID. Mirrors
+                // the Simple-Query `run_dml_or_select` site: `execute_portal`
+                // below is panic-prone executor code, and `Transaction` has no
+                // `Drop`, so a caught panic would drop `txn` without releasing
+                // its per-tuple locks. The guard aborts the XID on the unwind;
+                // it is disarmed once the normal commit/abort path has run.
+                let mut abort_guard =
+                    AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid);
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
@@ -640,6 +684,11 @@ where
                 }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                // `execute_portal` (the panic-prone executor entry) has
+                // returned: from here on the XID is finalised by the normal
+                // commit/abort below, so disarm. A panic INSIDE `execute_portal`
+                // skips this line and the guard releases the leaked locks.
+                abort_guard.disarm();
                 match res {
                     Ok(outcome) => {
                         let is_dml = portal_plan

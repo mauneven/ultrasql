@@ -724,6 +724,14 @@ pub(crate) fn encode_batch_into(
 /// independent of result cardinality.
 pub(crate) const STREAM_WINDOW_HIGH_WATER_BYTES: usize = 256 * 1024;
 
+/// Sentinel `Int32` value that, when present in a streamed batch column,
+/// triggers the debug-only mid-stream panic in [`encode_window`] used by the
+/// streaming-txn lock-leak isolation test. Chosen so no ordinary test or
+/// workload row carries it. Compiled out of release/ship binaries (the trigger
+/// is `#[cfg(debug_assertions)]`).
+#[cfg(debug_assertions)]
+pub(crate) const TEST_PANIC_STREAM_SENTINEL: i32 = 0x5432_1000;
+
 /// A lazily-driven SELECT result: the still-live root operator plus the
 /// running state needed to encode the remainder of the wire body one
 /// window at a time.
@@ -842,6 +850,24 @@ pub(crate) fn encode_window(
             encode_backend(&BackendMessage::CommandComplete { tag }, out);
             return Ok(false);
         };
+        // Debug-only panic MID-STREAM, for the streaming-txn lock-leak
+        // isolation test. Fires when a streamed batch carries the sentinel
+        // `Int32` in any column; a row placed deep in a large result surfaces
+        // only after window 0, i.e. inside `drive_streaming_select`'s drive
+        // loop, OUTSIDE the per-statement `catch_unwind`. The
+        // `AutocommitAbortGuard` armed around that loop must abort the
+        // autocommit txn so its locks are not leaked. Compiled out of
+        // release/ship binaries.
+        #[cfg(debug_assertions)]
+        if batch.columns().iter().any(|column| {
+            matches!(column, Column::Int32(c)
+                if c.data().contains(&TEST_PANIC_STREAM_SENTINEL))
+        }) {
+            #[allow(clippy::panic)]
+            {
+                panic!("ultrasql test panic (debug-only, mid stream encode)");
+            }
+        }
         encode_batch_into(out, &batch, &s.schema, &s.options, &mut s.rows)?;
     }
     Ok(true)

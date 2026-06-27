@@ -44,6 +44,30 @@ pub fn handle_parse(
     bind_ctx: &dyn ultrasql_planner::Catalog,
 ) -> Result<BackendMessage, ServerError> {
     let trimmed = sql.trim();
+    // Debug-only panic sentinel for the panic-isolation test's Extended-Query
+    // path. The function name does not bind, so we substitute a trivially-bound
+    // `SELECT 1` plan here (a valid portal must exist) while keeping the
+    // sentinel `sql` text; `run_portal_routed` recognises that text and panics
+    // at *execution* time, inside the per-statement `catch_unwind`. Compiled
+    // out of release/ship binaries via `debug_assertions`.
+    #[cfg(debug_assertions)]
+    if trimmed.eq_ignore_ascii_case("SELECT __ultrasql_test_panic()") {
+        let stmt = Parser::new("SELECT 1").parse_statement()?;
+        let plan = bind(&stmt, bind_ctx)?;
+        let plan_hash = plan_hash_for_plan(&plan);
+        state.statements.insert(
+            name,
+            PreparedStatement {
+                sql,
+                plan: Some(plan),
+                plan_hash,
+                param_type_oids,
+                n_params: 0,
+                limit_offset_param_indexes: Vec::new(),
+            },
+        );
+        return Ok(BackendMessage::ParseComplete);
+    }
     let (plan, n_params, limit_offset_param_indexes) = if trimmed.is_empty() || trimmed == ";" {
         (None, 0, Vec::new())
     } else {

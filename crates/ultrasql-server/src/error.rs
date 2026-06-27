@@ -212,6 +212,20 @@ pub enum ServerError {
     /// SQLSTATE `42501`.
     #[error("permission denied: {0}")]
     InsufficientPrivilege(String),
+
+    /// A statement's synchronous execution panicked and the panic was
+    /// caught by the per-statement `catch_unwind` guard in the session
+    /// loop (see `session/run.rs` / `session/ext.rs`). The panic payload
+    /// is logged server-side with full detail; this carries only a
+    /// fixed, generic message so the panic string is never leaked to the
+    /// client. Maps to PostgreSQL SQLSTATE `XX000` (`internal_error`).
+    ///
+    /// Query-scoped: the connection survives and the client receives a
+    /// generic `ErrorResponse`; the active explicit transaction (if any)
+    /// is aborted at the catch site, exactly as a normal in-block error
+    /// would do.
+    #[error("internal error")]
+    Internal,
 }
 
 impl ServerError {
@@ -271,6 +285,11 @@ impl ServerError {
                 | Self::CopyAborted(_)
                 | Self::ObjectNotInPrerequisiteState(_)
                 | Self::InsufficientPrivilege(_)
+                // A caught panic is reported to the client and the session
+                // is kept alive: the whole point of the per-statement
+                // catch_unwind is that one bad query never tears down the
+                // connection (let alone the process).
+                | Self::Internal
         )
     }
 
@@ -550,6 +569,17 @@ mod tests {
         ));
         assert!(err.is_query_scoped());
         assert_eq!(err.sqlstate(), "40001");
+    }
+
+    #[test]
+    fn caught_panic_is_query_scoped_internal_error() {
+        // A panic caught by the per-statement guard must be reported to the
+        // client as a query-scoped XX000 (session survives) and must NOT
+        // leak the panic payload — `Display` is the fixed generic string.
+        let err = ServerError::Internal;
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "XX000");
+        assert_eq!(err.to_string(), "internal error");
     }
 
     #[test]

@@ -54,6 +54,23 @@ where
             standby = self.state.is_standby_mode()
         )
         .entered();
+        // Deterministic panic trigger for the panic-isolation integration
+        // test. Compiled only in debug builds (`debug_assertions`), so it is
+        // absent from optimised release/ship binaries entirely — it cannot be
+        // reached in production. Exercising it proves the per-statement
+        // `catch_unwind` guard isolates an executor-path panic to the calling
+        // connection while the server and every other connection survive.
+        #[cfg(debug_assertions)]
+        if trimmed.eq_ignore_ascii_case("SELECT __ultrasql_test_panic()") {
+            // INTENTIONAL: this is the test-only panic trigger the
+            // panic-isolation suite exercises; it is `#[cfg(debug_assertions)]`
+            // so it is compiled out of release/ship binaries entirely.
+            #[allow(clippy::panic)]
+            {
+                panic!("ultrasql test panic (debug-only, intentionally triggered)");
+            }
+        }
+
         if let Some(function_name) = Self::try_parse_backup_function(trimmed) {
             return self.execute_backup_function(function_name);
         }

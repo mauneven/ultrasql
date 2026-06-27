@@ -58,6 +58,10 @@ fn main() -> std::process::ExitCode {
         eprintln!("ultrasqld: failed to initialise tracing: {e}");
         return std::process::ExitCode::from(1);
     }
+    // Log every panic with full detail before the unwind proceeds. With
+    // panic=unwind (Cargo.toml) the per-statement catch_unwind in the session
+    // loop then isolates a query panic to its own connection.
+    ultrasql_server::install_panic_hook();
     let autovacuum_config = match autovacuum_config_from_cli(&cli) {
         Ok(config) => config,
         Err(e) => {

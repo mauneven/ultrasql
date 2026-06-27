@@ -28,6 +28,10 @@ pub(crate) fn connection_limit_semaphore() -> Arc<tokio::sync::Semaphore> {
 }
 
 pub async fn run_server(addr: SocketAddr, state: Arc<Server>) -> Result<(), ServerError> {
+    // Ensure the panic-logging hook is installed for every server that
+    // actually serves connections — including in-process / embedded / test
+    // servers that bypass the binary's `main`. Idempotent.
+    crate::install_panic_hook();
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     info!(target: "ultrasqld", listen = %bound, "ultrasqld is ready");
@@ -99,6 +103,8 @@ pub async fn serve_listener_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    // Idempotent: covers test/embedded servers that drive a listener directly.
+    crate::install_panic_hook();
     tokio::pin!(shutdown);
     let mut sessions = tokio::task::JoinSet::new();
     let conn_limiter = connection_limit_semaphore();

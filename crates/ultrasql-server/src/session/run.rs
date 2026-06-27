@@ -14,6 +14,7 @@ use tracing::debug;
 use ultrasql_parser::Parser;
 use ultrasql_protocol::{BackendMessage, FrontendMessage, encode_backend};
 
+use super::AutocommitAbortGuard;
 use super::Session;
 use super::notify::ReadOrNotify;
 use super::timeout::StatementTimeoutGuard;
@@ -165,6 +166,78 @@ where
         }
     }
 
+    /// Run the synchronous executor entry point for one statement under a
+    /// `catch_unwind` guard so a panic anywhere on the execution path
+    /// (hundreds of `unwrap`/`expect`/`panic!`/index/arithmetic sites in the
+    /// planner / optimizer / executor / storage layers) tears down only this
+    /// statement, never the connection task and never — now that the release
+    /// profile unwinds rather than aborts (`Cargo.toml`) — the whole process.
+    ///
+    /// On a caught panic this:
+    /// - logs the panic payload + location server-side at `error` level (full
+    ///   detail for operators), and
+    /// - transitions an open explicit transaction block to `Failed` via
+    ///   [`Self::fail_if_in_transaction`] so the trailing `ReadyForQuery`
+    ///   reports `'E'` and every subsequent statement in the block is rejected
+    ///   with `25P02` until the client issues `ROLLBACK`/`COMMIT` — exactly the
+    ///   abort behaviour a normal in-block error produces. (An autocommit
+    ///   statement's own `Transaction` was a local inside `execute_query`. It
+    ///   is dropped during the unwind, but `Transaction` has no `Drop`, so the
+    ///   drop alone does NOT release its row locks — an
+    ///   [`AutocommitAbortGuard`](super::AutocommitAbortGuard) armed around the
+    ///   autocommit txn (in `run_dml_or_select`, and around the streaming drive
+    ///   loop) aborts the XID on the unwind, releasing every lock and marking
+    ///   the CLOG entry `Aborted`. No durable effects survive.)
+    ///
+    /// It returns [`ServerError::Internal`] (query-scoped → SQLSTATE `XX000`,
+    /// generic "internal error" message). The caller surfaces it through the
+    /// normal query-scoped error path, so the panic string is logged but never
+    /// sent to the client.
+    ///
+    /// `AssertUnwindSafe` is sound here: on a caught panic we do not resume
+    /// using any executor-internal state that the panic might have left torn —
+    /// we only touch `self.txn_state` (to mark the block failed) and return an
+    /// error. The shared cross-connection state lives behind `parking_lot` /
+    /// `DashMap` / `ArcSwap` (no lock poisoning) or has explicit
+    /// poison-recovery, so a sibling connection is unaffected.
+    pub(crate) fn execute_query_catching_panics(
+        &mut self,
+        sql: &str,
+        allow_streaming: bool,
+    ) -> Result<SelectResult, ServerError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.execute_query(sql, allow_streaming)
+        })) {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(self.on_caught_statement_panic(payload, sql)),
+        }
+    }
+
+    /// Shared handling for a panic caught by a per-statement guard
+    /// (`'Q'` and Extended-Query paths). Logs full detail, aborts an open
+    /// explicit block, and returns the generic [`ServerError::Internal`].
+    pub(crate) fn on_caught_statement_panic(
+        &mut self,
+        payload: Box<dyn std::any::Any + Send>,
+        sql: &str,
+    ) -> ServerError {
+        let detail = panic_payload_message(&payload);
+        // Server-side log carries the full payload + offending statement; the
+        // client never sees either (it gets only a generic `XX000`).
+        tracing::error!(
+            target: "ultrasqld",
+            pid = self.pid,
+            panic = %detail,
+            statement = %sql,
+            "statement execution panicked; isolating to this connection \
+             (server and other connections keep running)"
+        );
+        // Abort an open explicit transaction block so its uncommitted effects
+        // are discarded and the block reports `'E'` / rejects further
+        // statements with 25P02, mirroring a normal in-block error.
+        self.fail_if_in_transaction(ServerError::Internal)
+    }
+
     /// Execute a simple `'Q'` query end-to-end and write the response.
     ///
     /// The trailing `ReadyForQuery`'s status byte reflects the
@@ -244,8 +317,10 @@ where
         // Single-statement Simple-Query path: this is the only consumer that
         // drives a streaming handle (`send_query_result_with_ready` →
         // `drive_streaming_select`), so it is the only caller that may
-        // request streaming.
-        let outcome = self.execute_query(trimmed, true);
+        // request streaming. Wrapped in `catch_unwind` so an executor-path
+        // panic is isolated to this statement instead of unwinding the
+        // connection task (and, under the old panic=abort, the whole server).
+        let outcome = self.execute_query_catching_panics(trimmed, true);
         self.state.workload_recorder.set_session_idle(self.pid);
         let elapsed = started.elapsed();
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
@@ -355,7 +430,8 @@ where
             // A streamed SELECT here would ship only window 0 (no
             // CommandComplete → wire corruption) and leak the XID held by
             // the dropped handle. Force the whole-buffer path with `false`.
-            let outcome = self.execute_query(trimmed, false);
+            // Caught-panic isolated per statement, as on the single path.
+            let outcome = self.execute_query_catching_panics(trimmed, false);
             self.state.workload_recorder.set_session_idle(self.pid);
             drop(timeout_guard);
             let elapsed = started.elapsed();
@@ -616,6 +692,28 @@ where
         // the per-window loop never moves it.
         let mut commit_txn = handle.take_commit_txn();
 
+        // Unwind guard for the autocommit XID. This drive loop runs the
+        // panic-prone synchronous `encode_window` (executor-grade operator pull
+        // over user data) OUTSIDE the per-statement `catch_unwind`, so a panic
+        // here unwinds the connection future and drops `commit_txn` without
+        // abort — leaking its row locks exactly like the buffered path did.
+        // The guard aborts the XID on any unwind; it is disarmed before every
+        // normal `commit_txn.take()` (each of which itself commits or aborts the
+        // handle). `None` `commit_txn` is an explicit-txn streaming SELECT whose
+        // handle lives in `txn_state` — no autocommit XID to guard.
+        let mut abort_guard = commit_txn
+            .as_ref()
+            .map(|txn| AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid));
+        // Disarm the guard for a normal `commit_txn.take()` site. After this the
+        // taken handle's own commit/abort owns the XID's fate.
+        macro_rules! disarm_abort_guard {
+            () => {
+                if let Some(guard) = abort_guard.as_mut() {
+                    guard.disarm();
+                }
+            };
+        }
+
         // Window 0 is already encoded (RowDescription + first DataRows);
         // ship it first. If even this fails, the connection is dead.
         if let Err(e) = self.io.write_all(&window0).await {
@@ -623,6 +721,7 @@ where
             self.write_buf = window0;
             // No data acknowledged on our side; abort to release CLOG state.
             if let Some(txn) = commit_txn.take() {
+                disarm_abort_guard!();
                 let _ = self
                     .state
                     .abort_transaction(txn, false, "streaming SELECT write error");
@@ -650,6 +749,7 @@ where
                         buf.clear();
                         self.write_buf = buf;
                         if let Some(txn) = commit_txn.take() {
+                            disarm_abort_guard!();
                             let _ = self.state.abort_transaction(
                                 txn,
                                 false,
@@ -676,6 +776,7 @@ where
                         // reached — a read-only txn writes no heap, so there
                         // is nothing to roll back.
                         if let Some(txn) = commit_txn.take() {
+                            disarm_abort_guard!();
                             match self.state.commit_transaction(
                                 txn,
                                 false,
@@ -702,10 +803,12 @@ where
                     // Operator error after ≥1 window flushed: report inline
                     // (no CommandComplete) and abort the txn. We own error
                     // reporting from here, so return Ok to avoid a second
-                    // ErrorResponse from `handle_query`.
-                    return self
-                        .report_streaming_error_inline(buf, commit_txn.take(), e)
-                        .await;
+                    // ErrorResponse from `handle_query`. This is a normal
+                    // `Err` return from `encode_window`, not an unwind, so
+                    // `report_streaming_error_inline` owns the abort — disarm.
+                    let txn = commit_txn.take();
+                    disarm_abort_guard!();
+                    return self.report_streaming_error_inline(buf, txn, e).await;
                 }
             }
         }
@@ -808,6 +911,20 @@ where
         res?;
         self.io.flush().await?;
         Ok(())
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload for
+/// server-side logging. Panics carry either a `&'static str` (from
+/// `panic!("literal")`) or a `String` (from `panic!("{}", x)` /
+/// `unwrap`/`expect`); anything else is reported opaquely.
+pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 

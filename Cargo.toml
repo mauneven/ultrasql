@@ -186,7 +186,13 @@ opt-level       = 3
 lto             = "thin"
 codegen-units   = 16
 strip           = "symbols"
-panic           = "abort"
+# Panics UNWIND rather than abort the process: a single edge-case query that
+# panics mid-execution must tear down only its own connection task, not the
+# whole server (see the per-statement `catch_unwind` in
+# `crates/ultrasql-server/src/session/run.rs` / `ext.rs`). `abort` would drop
+# every connection and every in-flight uncommitted transaction — a trivially
+# weaponizable DoS. The unwind-table cost is negligible for a network DB.
+panic           = "unwind"
 debug           = 0
 incremental     = true
 overflow-checks = false

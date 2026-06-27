@@ -17,6 +17,8 @@ use crate::notify::NotificationRecord;
 use crate::replication::LogicalChangeKind;
 use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
+mod abort_guard;
+pub(crate) use abort_guard::AutocommitAbortGuard;
 mod advisory;
 mod alter;
 mod alter_in_txn;

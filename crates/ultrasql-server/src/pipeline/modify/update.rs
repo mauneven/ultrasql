@@ -25,6 +25,13 @@ use super::insert::build_rls_update_checks;
 use super::lowering::build_filtered_tid_scan;
 use super::referential::build_referenced_by_update_checks;
 
+/// Sentinel `SET col = col + <delta>` value that triggers the debug-only
+/// post-row-lock panic used by the lock-leak isolation test. Chosen to be a
+/// value no ordinary test or workload would update by. Compiled out of
+/// release/ship binaries (the trigger is `#[cfg(debug_assertions)]`).
+#[cfg(debug_assertions)]
+const TEST_PANIC_AFTER_ROW_LOCK_DELTA: i32 = 0x7654_3210;
+
 /// Recursively rebuild `expr`, adding `by` to every
 /// [`ScalarExpr::Column`] index. Used by UPDATE / DELETE lowering: the
 /// scan now emits `[tid_block, tid_slot, ...orig_cols]`, but the
@@ -198,7 +205,23 @@ fn try_build_fused_update(
             let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
             let xid = ctx.xid;
             op.with_target_tids(target_tids).with_target_tid_lock(
-                move |tid| acquire_indexed_update_row_lock(&lock_manager, xid, tid),
+                move |tid| {
+                    let acquired = acquire_indexed_update_row_lock(&lock_manager, xid, tid)?;
+                    // Debug-only panic AFTER the per-tuple Exclusive lock is held,
+                    // for the lock-leak isolation test. Keyed off the sentinel
+                    // delta so it fires only for `SET col = col + <SENTINEL>`;
+                    // ordinary updates are untouched. Driven entirely by the SQL
+                    // the test issues (no shared flag), so it is deterministic and
+                    // thread-safe. Compiled out of release/ship binaries.
+                    #[cfg(debug_assertions)]
+                    if delta == TEST_PANIC_AFTER_ROW_LOCK_DELTA {
+                        #[allow(clippy::panic)]
+                        {
+                            panic!("ultrasql test panic (debug-only, after row lock acquired)");
+                        }
+                    }
+                    Ok(acquired)
+                },
                 refresh_after_lock,
             )
         } else {

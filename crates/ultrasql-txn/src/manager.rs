@@ -602,6 +602,51 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Best-effort, idempotent abort of an autocommit transaction identified by
+    /// `xid` alone, used by the server's per-statement unwind/scope guards when
+    /// the panic has already moved the owning [`Transaction`] handle out of
+    /// reach.
+    ///
+    /// Returns `true` iff this call performed the abort (the XID was still
+    /// `InProgress` and is now `Aborted`); `false` if the XID was already
+    /// terminated (committed or aborted) or never existed. Being a no-op on an
+    /// already-terminated XID makes it **safe to call on every unwind path even
+    /// when the normal commit/abort already ran** — there is no double-abort.
+    ///
+    /// This is for the *autocommit* path only: such transactions never open a
+    /// savepoint, so the savepoint family is just the parent `xid`. It marks
+    /// the CLOG entry `Aborted` and releases every row/relation lock the XID
+    /// held (the leak this exists to prevent), then notifies SSI. It does **not**
+    /// append a durable abort marker — an autocommit statement that unwound
+    /// mid-flight has no committed effects, and recovery's default-abort sweep
+    /// treats a never-committed XID as aborted regardless.
+    ///
+    /// Explicit `BEGIN` blocks must NOT route through here: their handle lives
+    /// in the session state and is aborted with its full savepoint family by
+    /// the client's `ROLLBACK`/`COMMIT`.
+    pub fn abort_in_progress_by_xid(&self, xid: Xid) -> bool {
+        // Flip only if still InProgress. `terminate_with_subxids` enforces the
+        // same precondition and returns `Err(AlreadyTerminated)` otherwise; we
+        // map that to "did nothing" so the guard's Drop is a clean no-op after a
+        // normal commit/abort.
+        if self
+            .terminate_with_subxids(xid, &[xid], XidStatus::Aborted, false)
+            .is_err()
+        {
+            return false;
+        }
+        // Release all row-level and relation-level locks held by the XID — the
+        // permanent leak this method exists to close.
+        self.lock_manager.release_all(xid);
+        // Mirror `abort`'s SSI notification. The XID's isolation level is not
+        // available here, so notify unconditionally when an SSI manager is
+        // installed; `SsiManager::abort` is a no-op for an unregistered XID.
+        if let Some(ssi) = &self.ssi {
+            ssi.abort(xid);
+        }
+        true
+    }
+
     /// The merged-up subxid family folded into a parent **commit**: every
     /// `RELEASE`d-while-parent-open subxid that is still `InProgress`
     /// (rolled-back ones are already Aborted and excluded by
@@ -1785,6 +1830,68 @@ mod tests {
         assert!(
             mgr.lock_manager.inspect(tag).is_none(),
             "lock must be released on abort"
+        );
+    }
+
+    #[test]
+    fn abort_in_progress_by_xid_releases_locks_and_is_idempotent() {
+        use crate::lock::{LockMode, LockRequest, LockTag};
+        use ultrasql_core::RelationId;
+
+        let mgr = TransactionManager::new();
+        let t = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid = t.xid;
+
+        let tag = LockTag::Relation(RelationId::new(3));
+        mgr.lock_manager
+            .acquire(LockRequest {
+                xid,
+                tag,
+                mode: LockMode::Exclusive,
+            })
+            .unwrap();
+
+        // Simulate the unwind path: the autocommit guard aborts by xid alone
+        // (the `Transaction` handle was dropped during the panic).
+        assert!(
+            mgr.abort_in_progress_by_xid(xid),
+            "first by-xid abort of an in-progress txn performs the abort"
+        );
+        assert_eq!(
+            XidStatusOracle::status(&mgr, xid),
+            XidStatus::Aborted,
+            "the XID is marked Aborted"
+        );
+        assert!(
+            mgr.lock_manager.inspect(tag).is_none(),
+            "the leaked lock is released by the by-xid abort"
+        );
+
+        // Idempotent: a second call (or a call after the normal commit/abort
+        // already ran) is a no-op and returns false — NO double-abort.
+        assert!(
+            !mgr.abort_in_progress_by_xid(xid),
+            "by-xid abort of an already-terminated XID is a no-op"
+        );
+
+        // A committed XID is never flipped to Aborted by the guard.
+        let t2 = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid2 = t2.xid;
+        mgr.commit(t2).unwrap();
+        assert!(
+            !mgr.abort_in_progress_by_xid(xid2),
+            "a committed XID is not aborted by the guard (no double-termination)"
+        );
+        assert_eq!(
+            XidStatusOracle::status(&mgr, xid2),
+            XidStatus::Committed,
+            "the committed XID stays Committed"
+        );
+
+        // An XID never registered (no CLOG entry) is a no-op.
+        assert!(
+            !mgr.abort_in_progress_by_xid(Xid::new(999_999)),
+            "an unregistered XID is a no-op"
         );
     }
 
