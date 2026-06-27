@@ -284,23 +284,23 @@ pub(crate) fn decimal_float_operands(left: &Value, right: &Value) -> Option<(f64
     }
 }
 
-pub(crate) fn decimal_value_to_f64(value: i64, scale: i32) -> Option<f64> {
+pub(crate) fn decimal_value_to_f64(value: i128, scale: i32) -> Option<f64> {
     value.to_f64().map(|raw| raw / 10_f64.powi(scale))
 }
 
-pub(crate) fn numeric_to_decimal(value: &Value) -> Result<Option<(i64, i32)>, EvalError> {
+pub(crate) fn numeric_to_decimal(value: &Value) -> Result<Option<(i128, i32)>, EvalError> {
     match value {
         Value::Decimal { value, scale } => Ok(Some((*value, *scale))),
-        Value::Int16(v) => Ok(Some((i64::from(*v), 0))),
-        Value::Int32(v) => Ok(Some((i64::from(*v), 0))),
-        Value::Int64(v) => Ok(Some((*v, 0))),
+        Value::Int16(v) => Ok(Some((i128::from(*v), 0))),
+        Value::Int32(v) => Ok(Some((i128::from(*v), 0))),
+        Value::Int64(v) => Ok(Some((i128::from(*v), 0))),
         Value::Float32(v) => decimal_from_f64(f64::from(*v)).map(Some),
         Value::Float64(v) => decimal_from_f64(*v).map(Some),
         _ => Ok(None),
     }
 }
 
-pub(crate) fn decimal_from_f64(value: f64) -> Result<(i64, i32), EvalError> {
+pub(crate) fn decimal_from_f64(value: f64) -> Result<(i128, i32), EvalError> {
     if !value.is_finite() {
         return Err(EvalError::Type(
             "cannot coerce non-finite float to decimal".to_owned(),
@@ -311,7 +311,7 @@ pub(crate) fn decimal_from_f64(value: f64) -> Result<(i64, i32), EvalError> {
         .ok_or_else(|| EvalError::Type(format!("cannot coerce float literal `{text}` to decimal")))
 }
 
-pub(crate) fn decimal_from_text(text: &str) -> Option<(i64, i32)> {
+pub(crate) fn decimal_from_text(text: &str) -> Option<(i128, i32)> {
     if text.contains('e') || text.contains('E') {
         return None;
     }
@@ -323,7 +323,7 @@ pub(crate) fn decimal_from_text(text: &str) -> Option<(i64, i32)> {
     let mut digits = String::with_capacity(whole.len() + frac.len());
     digits.push_str(if whole.is_empty() { "0" } else { whole });
     digits.push_str(frac);
-    let mut value = digits.parse::<i64>().ok()?;
+    let mut value = digits.parse::<i128>().ok()?;
     if negative {
         value = value.checked_neg()?;
     }
@@ -432,9 +432,9 @@ pub(crate) fn int64_arith(l: i64, r: i64, op: ArithOp) -> Result<Value, EvalErro
 }
 
 pub(crate) fn decimal_arith(
-    left_value: i64,
+    left_value: i128,
     left_scale: i32,
-    right_value: i64,
+    right_value: i128,
     right_scale: i32,
     op: ArithOp,
 ) -> Result<Value, EvalError> {
@@ -443,8 +443,7 @@ pub(crate) fn decimal_arith(
             let common_scale = left_scale.max(right_scale);
             let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
             let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
-            let result = left.checked_add(right).ok_or(EvalError::Overflow)?;
-            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            let value = left.checked_add(right).ok_or(EvalError::Overflow)?;
             Ok(Value::Decimal {
                 value,
                 scale: common_scale,
@@ -454,8 +453,7 @@ pub(crate) fn decimal_arith(
             let common_scale = left_scale.max(right_scale);
             let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
             let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
-            let result = left.checked_sub(right).ok_or(EvalError::Overflow)?;
-            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            let value = left.checked_sub(right).ok_or(EvalError::Overflow)?;
             Ok(Value::Decimal {
                 value,
                 scale: common_scale,
@@ -468,9 +466,8 @@ pub(crate) fn decimal_arith(
             if right == 0 {
                 return Err(EvalError::DivByZero);
             }
-            let value = i64::try_from(left % right).map_err(|_| EvalError::Overflow)?;
             Ok(Value::Decimal {
-                value,
+                value: left % right,
                 scale: common_scale,
             })
         }
@@ -478,10 +475,9 @@ pub(crate) fn decimal_arith(
             let scale = left_scale
                 .checked_add(right_scale)
                 .ok_or(EvalError::Overflow)?;
-            let result = i128::from(left_value)
-                .checked_mul(i128::from(right_value))
+            let value = left_value
+                .checked_mul(right_value)
                 .ok_or(EvalError::Overflow)?;
-            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
             Ok(Value::Decimal { value, scale })
         }
         ArithOp::Div => {
@@ -495,10 +491,8 @@ pub(crate) fn decimal_arith(
                 .ok_or(EvalError::Overflow)?;
             let factor = pow10_i128(u32::try_from(exponent).map_err(|_| EvalError::Overflow)?)
                 .ok_or(EvalError::Overflow)?;
-            let numerator = i128::from(left_value)
-                .checked_mul(factor)
-                .ok_or(EvalError::Overflow)?;
-            let denominator = i128::from(right_value);
+            let numerator = left_value.checked_mul(factor).ok_or(EvalError::Overflow)?;
+            let denominator = right_value;
             let mut quotient = numerator / denominator;
             let remainder = numerator % denominator;
             if remainder != 0 {
@@ -518,9 +512,8 @@ pub(crate) fn decimal_arith(
                         .ok_or(EvalError::Overflow)?;
                 }
             }
-            let value = i64::try_from(quotient).map_err(|_| EvalError::Overflow)?;
             Ok(Value::Decimal {
-                value,
+                value: quotient,
                 scale: result_scale,
             })
         }

@@ -258,14 +258,10 @@ fn raw_ordering_matches_logical_ordering(left: &DataType, right: &DataType) -> b
         | (DataType::TimestampTz, DataType::TimestampTz)
         | (DataType::Timestamp, DataType::TimestampTz)
         | (DataType::TimestampTz, DataType::Timestamp) => true,
-        (
-            DataType::Decimal {
-                scale: left_scale, ..
-            },
-            DataType::Decimal {
-                scale: right_scale, ..
-            },
-        ) => left_scale.unwrap_or(0) == right_scale.unwrap_or(0),
+        // Decimal columns materialise as decimal text (not a raw i64
+        // column), so they never reach the i64 fast path; they are
+        // compared through the general decode/eval path which aligns
+        // scales and handles the full i128 mantissa.
         _ => false,
     }
 }

@@ -61,7 +61,7 @@ fn lit_f64(v: f64) -> ScalarExpr {
     }
 }
 
-fn lit_decimal(value: i64, scale: i32) -> ScalarExpr {
+fn lit_decimal(value: i128, scale: i32) -> ScalarExpr {
     ScalarExpr::Literal {
         value: Value::Decimal { value, scale },
         data_type: DataType::Decimal {

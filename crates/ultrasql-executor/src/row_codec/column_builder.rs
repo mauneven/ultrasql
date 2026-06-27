@@ -149,7 +149,13 @@ impl ColumnBuilder {
                 data: Vec::with_capacity(capacity),
                 nulls: NullTracker::default(),
             },
-            DataType::Decimal { scale: None, .. } => Self::Utf8 {
+            DataType::Decimal { .. } => Self::Utf8 {
+                // `Decimal` storage materialises as decimal text so the
+                // full i128-backed mantissa (~38 digits) round-trips
+                // losslessly through the batch column; the schema field
+                // carries the semantic tag and scale. (A fixed-width
+                // `Int64` batch column would silently truncate values
+                // beyond i64.)
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
                     o.push(0);
@@ -158,8 +164,7 @@ impl ColumnBuilder {
                 values: Vec::with_capacity(capacity.saturating_mul(16)),
                 nulls: NullTracker::default(),
             },
-            DataType::Decimal { .. }
-            | DataType::Money
+            DataType::Money
             | DataType::Oid
             | DataType::RegClass
             | DataType::RegType
@@ -167,9 +172,9 @@ impl ColumnBuilder {
             | DataType::TimestampTz
             | DataType::Time
             | DataType::TimeTz => Self::Int64 {
-                // `Decimal` / `Timestamp` / `Time` storage shares the
+                // `Timestamp` / `Time` / `Money` storage shares the
                 // `Int64` builder; the schema field carries the
-                // semantic tag and (for Decimal) the scale.
+                // semantic tag.
                 data: Vec::with_capacity(capacity),
                 nulls: NullTracker::default(),
             },

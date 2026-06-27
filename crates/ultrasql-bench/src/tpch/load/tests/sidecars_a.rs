@@ -67,7 +67,7 @@ fn tpch_q1_direct_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 1_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -93,7 +93,7 @@ fn tpch_q6_direct_sidecar_rejects_revenue_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [1_00_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -155,7 +155,7 @@ fn tpch_q3_sidecar_reads_lineitem_payload_without_resplitting_text() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -191,7 +191,7 @@ fn tpch_q3_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -219,7 +219,7 @@ fn tpch_q4_sidecar_counts_priority_when_lineitem_commits_before_receipt() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -268,7 +268,7 @@ fn tpch_q5_sidecar_sums_asia_revenue_for_matching_customer_supplier_nation() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -315,7 +315,7 @@ fn tpch_q5_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
 
     let err = state
@@ -356,7 +356,7 @@ fn tpch_q7_sidecar_sums_france_germany_revenue_by_year() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -407,7 +407,7 @@ fn tpch_q7_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'N');
@@ -457,7 +457,7 @@ fn tpch_q8_sidecar_computes_brazil_market_share_by_year() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
 
     state
@@ -505,7 +505,7 @@ fn tpch_q8_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
 
     let err = state
@@ -546,7 +546,7 @@ fn tpch_q9_sidecar_computes_green_part_profit_by_nation_year() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
 
     state
@@ -591,7 +591,7 @@ fn tpch_q9_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
 
     let err = state

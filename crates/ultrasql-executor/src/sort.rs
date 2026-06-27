@@ -617,7 +617,7 @@ pub(crate) fn compare_f64_sql(left: f64, right: f64) -> Ordering {
     }
 }
 
-fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
+fn compare_decimals(l: i128, l_scale: i32, r: i128, r_scale: i32) -> Ordering {
     match (l.cmp(&0), r.cmp(&0)) {
         (Ordering::Equal, Ordering::Equal) => return Ordering::Equal,
         (Ordering::Equal, Ordering::Less) | (Ordering::Greater, Ordering::Less) => {
@@ -646,11 +646,8 @@ struct DecimalMagnitude {
 }
 
 impl DecimalMagnitude {
-    fn new(value: i64, scale: i32) -> Self {
-        let mut magnitude = i128::from(value);
-        if magnitude < 0 {
-            magnitude = -magnitude;
-        }
+    fn new(value: i128, scale: i32) -> Self {
+        let mut magnitude = value.unsigned_abs();
         let mut scale = i64::from(scale);
         while magnitude != 0 && magnitude % 10 == 0 {
             magnitude /= 10;

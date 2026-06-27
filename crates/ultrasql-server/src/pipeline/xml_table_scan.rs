@@ -447,8 +447,24 @@ fn values_to_column(
             }
             i32_column(values, validity)
         }
-        DataType::Decimal { .. }
-        | DataType::Money
+        DataType::Decimal { .. } => {
+            // Decimal columns materialise as decimal text (i128-backed,
+            // lossless) rather than a fixed-width Int64 column.
+            let mut values = Vec::with_capacity(rows.len());
+            let mut validity = Bitmap::new(rows.len(), true);
+            for (row_idx, row) in rows.iter().enumerate() {
+                match row.get(idx) {
+                    Some(value @ Value::Decimal { .. }) => values.push(value.to_string()),
+                    Some(Value::Null) | None => {
+                        values.push(String::new());
+                        validity.set(row_idx, false);
+                    }
+                    other => return Err(type_mismatch(idx, "numeric", other)),
+                }
+            }
+            string_column(values, validity)
+        }
+        DataType::Money
         | DataType::Time
         | DataType::Timestamp
         | DataType::TimestampTz
@@ -494,7 +510,6 @@ fn numeric_payload(
     data_type: &DataType,
 ) -> Result<Option<i64>, ServerError> {
     match (value, data_type) {
-        (Some(Value::Decimal { value, .. }), DataType::Decimal { .. }) => Ok(Some(*value)),
         (Some(Value::Money(value)), DataType::Money) => Ok(Some(*value)),
         (Some(Value::Time(value)), DataType::Time) => Ok(Some(*value)),
         (Some(Value::Timestamp(value)), DataType::Timestamp) => Ok(Some(*value)),

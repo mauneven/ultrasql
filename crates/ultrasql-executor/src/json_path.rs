@@ -470,16 +470,16 @@ fn json_path_decimal_text(value: &JsonValue) -> Option<String> {
     }
 }
 
-fn json_path_decimal_fits_precision(value: i64, precision: u32) -> bool {
+fn json_path_decimal_fits_precision(value: i128, precision: u32) -> bool {
     let digits = if value == 0 {
         1
     } else {
-        i128::from(value).abs().to_string().len()
+        value.unsigned_abs().to_string().len()
     };
     usize::try_from(precision).is_ok_and(|precision| digits <= precision)
 }
 
-fn json_path_decimal_to_json(value: i64, scale: i32) -> JsonValue {
+fn json_path_decimal_to_json(value: i128, scale: i32) -> JsonValue {
     let rendered = SqlValue::Decimal { value, scale }.to_string();
     match serde_json::from_str::<JsonValue>(&rendered) {
         Ok(value @ JsonValue::Number(_)) => value,

@@ -197,7 +197,10 @@ pub(crate) fn eval_extract(args: &[Value]) -> Result<Value, EvalError> {
     // path stringifies each value with its own scale — so the per-unit
     // scale survives to the wire.
     let (value, scale) = extract_datetime_part(&unit_norm, &args[1])?;
-    Ok(Value::Decimal { value, scale })
+    Ok(Value::Decimal {
+        value: i128::from(value),
+        scale,
+    })
 }
 
 pub(crate) fn extract_datetime_part(unit: &str, source: &Value) -> Result<(i64, i32), EvalError> {

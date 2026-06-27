@@ -1211,14 +1211,12 @@ pub(crate) fn encode_text_value_typed_with_options(
     }
     match (logical_type, col) {
         (DataType::Date, Column::Int32(c)) => Some(options.format_date(c.data()[row]).into()),
-        (DataType::Decimal { scale, .. }, Column::Int64(c)) => Some(
-            Value::Decimal {
-                value: c.data()[row],
-                scale: scale.unwrap_or(0),
-            }
-            .to_string()
-            .into(),
-        ),
+        // Decimal columns materialise as decimal text (i128-backed); the
+        // column text already carries the correctly-formatted value, so it
+        // passes straight through `encode_text_value` below.
+        (DataType::Decimal { .. }, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
+            encode_text_value(col, row)
+        }
         (DataType::Money, Column::Int64(c)) => Some(options.format_money(c.data()[row]).into()),
         (DataType::Oid | DataType::RegClass | DataType::RegType, Column::Int64(c)) => {
             u32::try_from(c.data()[row])
@@ -1582,9 +1580,12 @@ mod tests {
             ),
         ])
         .unwrap();
+        // Decimal columns materialise as decimal text (i128-backed).
         let batch = Batch::new([
             Column::Int32(NumericColumn::from_data(vec![0])),
-            Column::Int64(NumericColumn::from_data(vec![17_366_547])),
+            Column::Utf8(ultrasql_vec::column::StringColumn::from_data([
+                "173665.47".to_owned()
+            ])),
         ])
         .unwrap();
         let mut scan = MemTableScan::new(schema, vec![batch]);

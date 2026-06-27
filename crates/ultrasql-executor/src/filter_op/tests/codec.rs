@@ -226,7 +226,8 @@ fn batch_to_rows_decodes_sql_storage_families_and_reports_bad_shapes() {
         ])),
         Column::Utf8(StringColumn::from_data(["\\xdeadbeef".to_owned()])),
         Column::Int32(NumericColumn::from_data(vec![42])),
-        Column::Int64(NumericColumn::from_data(vec![1234])),
+        // Decimal columns now materialise as decimal text (i128-backed).
+        Column::Utf8(StringColumn::from_data(["12.34".to_owned()])),
         Column::Int64(NumericColumn::from_data(vec![111])),
         Column::Int64(NumericColumn::from_data(vec![222])),
         Column::Int64(NumericColumn::from_data(vec![333])),

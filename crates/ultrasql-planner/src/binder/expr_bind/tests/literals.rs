@@ -347,36 +347,90 @@ fn narrow_integer_literals_keep_their_natural_width() {
 }
 
 #[test]
-fn out_of_i64_integer_literal_errors_instead_of_saturating() {
-    // 20-digit literal: previously parked at i64::MAX (silent corruption);
-    // now raises numeric_value_out_of_range (22003).
-    let err = bind_literal(&Literal::Integer {
+fn out_of_i64_integer_literal_binds_exact_numeric() {
+    // 20-digit literal: previously parked at i64::MAX (silent corruption),
+    // then the i64 stopgap errored. With the i128-backed NUMERIC it now
+    // binds exactly to a `Decimal` (scale 0), matching PostgreSQL which
+    // types large integer literals as `numeric`.
+    let ScalarExpr::Literal { value, data_type } = bind_literal(&Literal::Integer {
         text: "99999999999999999999".to_owned(),
         span: Span::default(),
     })
-    .expect_err("20-digit literal must error, not saturate");
+    .expect("20-digit literal binds exactly") else {
+        panic!("expected literal");
+    };
+    assert_eq!(
+        value,
+        Value::Decimal {
+            value: 99_999_999_999_999_999_999,
+            scale: 0,
+        }
+    );
+    assert!(matches!(
+        data_type,
+        DataType::Decimal { scale: Some(0), .. }
+    ));
+}
+
+#[test]
+fn integer_literal_at_i64_boundary_plus_one_binds_numeric() {
+    // i64::MAX + 1 = 9223372036854775808 (unsigned) is the first value
+    // that no longer fits an i64; it now binds to an exact i128 NUMERIC.
+    let ScalarExpr::Literal { value, .. } = bind_literal(&Literal::Integer {
+        text: "9223372036854775808".to_owned(),
+        span: Span::default(),
+    })
+    .expect("i64::MAX + 1 binds exactly") else {
+        panic!("expected literal");
+    };
+    assert_eq!(
+        value,
+        Value::Decimal {
+            value: 9_223_372_036_854_775_808,
+            scale: 0,
+        }
+    );
+}
+
+#[test]
+fn beyond_i128_integer_literal_errors() {
+    // A 40-digit integer literal exceeds i128 (~38 digits) and must raise
+    // numeric_value_out_of_range (22003) rather than truncate.
+    let err = bind_literal(&Literal::Integer {
+        text: "9999999999999999999999999999999999999999".to_owned(),
+        span: Span::default(),
+    })
+    .expect_err("beyond-i128 literal must error");
     assert!(matches!(err, PlanError::NumericValueOutOfRange(_)));
 }
 
 #[test]
-fn integer_literal_at_i64_boundary_plus_one_errors() {
-    // i64::MAX + 1 = 9223372036854775808 (unsigned) is the first value
-    // that no longer fits an i64; it must error rather than truncate.
-    let err = bind_literal(&Literal::Integer {
-        text: "9223372036854775808".to_owned(),
+fn in_range_decimal_literal_beyond_i64_binds_exactly() {
+    // 9999999999999999999.99 has an unscaled mantissa that overflows i64;
+    // previously it silently fell back to a lossy Float64 (and later the
+    // i64 stopgap errored). With i128 it now binds exactly.
+    let ScalarExpr::Literal { value, .. } = bind_literal(&Literal::Float {
+        text: "9999999999999999999.99".to_owned(),
         span: Span::default(),
     })
-    .expect_err("i64::MAX + 1 must error");
-    assert!(matches!(err, PlanError::NumericValueOutOfRange(_)));
+    .expect("beyond-i64 decimal binds exactly") else {
+        panic!("expected literal");
+    };
+    assert_eq!(
+        value,
+        Value::Decimal {
+            value: 999_999_999_999_999_999_999,
+            scale: 2,
+        }
+    );
 }
 
 #[test]
 fn out_of_range_decimal_literal_errors_instead_of_lossy_float() {
-    // 9999999999999999999.99 has an unscaled mantissa that overflows the
-    // i64-backed NUMERIC; previously it silently fell back to a lossy
-    // Float64. Now it raises numeric_value_out_of_range (22003).
+    // A mantissa beyond i128 (~38 digits) still raises
+    // numeric_value_out_of_range (22003) rather than a lossy Float64.
     let err = bind_literal(&Literal::Float {
-        text: "9999999999999999999.99".to_owned(),
+        text: "999999999999999999999999999999999999999.99".to_owned(),
         span: Span::default(),
     })
     .expect_err("out-of-range decimal must error");

@@ -41,7 +41,7 @@ fn tpch_q10_sidecar_keeps_returned_customer_revenue() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, 5, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'R');
@@ -79,7 +79,7 @@ fn tpch_q10_sidecar_rejects_discount_factor_overflow() {
         payload.extend_from_slice(&value.to_le_bytes());
     }
     for value in [100_i64, 10_000, i64::MIN, 0] {
-        encode_direct_decimal(&mut payload, value, 2, 0).expect("decimal payload");
+        encode_direct_decimal(&mut payload, i128::from(value), 2, 0).expect("decimal payload");
     }
     payload.extend_from_slice(&1_u32.to_le_bytes());
     payload.push(b'R');

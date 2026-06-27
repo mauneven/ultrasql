@@ -103,7 +103,7 @@ pub(super) fn binary_copy_cell_bytes(
                 .map_err(|err| ServerError::CopyFormat(format!("binary COPY numeric: {err}")))?
         }
         (DataType::Decimal { scale, .. }, Value::Int64(v)) => {
-            encode_pg_numeric_binary(*v, scale.unwrap_or(0))
+            encode_pg_numeric_binary(i128::from(*v), scale.unwrap_or(0))
                 .map_err(|err| ServerError::CopyFormat(format!("binary COPY numeric: {err}")))?
         }
         (DataType::Text { .. } | DataType::TsVector | DataType::TsQuery, Value::Text(v))

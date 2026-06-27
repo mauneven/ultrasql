@@ -204,11 +204,15 @@ pub(crate) fn build_grouped_vectorized_plan(
 }
 
 fn numeric_storage_kind(data_type: &DataType) -> bool {
+    // NB: `Decimal` is intentionally excluded. Decimal columns now
+    // materialise as decimal text (i128-backed, lossless) rather than a
+    // raw i64 batch column, so the i64 vectorised SUM path does not apply;
+    // decimal SUM/SUM(a*b) falls back to the row-based i128 accumulator,
+    // which carries the full mantissa and raises 22003 on i128 overflow.
     matches!(
         data_type,
         DataType::Int32
             | DataType::Int64
-            | DataType::Decimal { .. }
             | DataType::Date
             | DataType::Timestamp
             | DataType::TimestampTz
@@ -330,8 +334,12 @@ pub(crate) fn read_numeric_value(
 
 pub(crate) fn finalize_grouped_sum(sum: i64, data_type: &DataType) -> Result<Value, ExecError> {
     match data_type {
+        // Decimal columns no longer use the i64 vectorised SUM path
+        // (`numeric_storage_kind` excludes Decimal), so this arm is not
+        // reached for decimals in practice; kept for totality with an
+        // exact i64->i128 widening (no truncation).
         DataType::Decimal { scale, .. } => Ok(Value::Decimal {
-            value: sum,
+            value: i128::from(sum),
             scale: scale.unwrap_or(0),
         }),
         DataType::Int64 => Ok(Value::Int64(sum)),

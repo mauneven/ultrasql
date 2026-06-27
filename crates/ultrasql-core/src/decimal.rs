@@ -1,8 +1,9 @@
 //! Decimal parsing and PostgreSQL numeric binary helpers.
 //!
-//! UltraSQL's runtime decimal value is still a scaled `i64`, but the SQL
-//! surface and PostgreSQL wire/COPY formats need shared exact parsing,
-//! scale rounding, and base-10000 numeric payload conversion.
+//! UltraSQL's runtime decimal value is a scaled `i128` (~38 significant
+//! digits), and the SQL surface and PostgreSQL wire/COPY formats need
+//! shared exact parsing, scale rounding, and base-10000 numeric payload
+//! conversion. Values beyond `i128` raise SQLSTATE `22003`.
 
 use crate::Value;
 
@@ -39,7 +40,7 @@ struct NumericBinaryParts {
     digits: Vec<u16>,
 }
 
-/// Parse SQL decimal text into UltraSQL's scaled `i64` runtime value.
+/// Parse SQL decimal text into UltraSQL's scaled `i128` runtime value.
 ///
 /// When `target_scale` is `Some`, the value is rounded to that scale
 /// using PostgreSQL-style half-away-from-zero numeric rounding. When it
@@ -110,7 +111,6 @@ pub fn parse_decimal_text(raw: &str, target_scale: Option<i32>) -> Result<Value,
             .checked_neg()
             .ok_or_else(|| DecimalError::new("decimal overflow"))?;
     }
-    let value = i64::try_from(value).map_err(|_| DecimalError::new("decimal overflow"))?;
     Ok(Value::Decimal { value, scale })
 }
 
@@ -119,7 +119,7 @@ pub fn parse_decimal_text(raw: &str, target_scale: Option<i32>) -> Result<Value,
 /// Returned bytes are the field payload used by numeric send/receive and
 /// binary COPY: `ndigits`, `weight`, `sign`, `dscale`, then base-10000
 /// digit groups, all big-endian.
-pub fn encode_pg_numeric_binary(value: i64, scale: i32) -> Result<Vec<u8>, DecimalError> {
+pub fn encode_pg_numeric_binary(value: i128, scale: i32) -> Result<Vec<u8>, DecimalError> {
     let parts = decimal_to_numeric_parts(value, scale)?;
     let payload_len = NUMERIC_BINARY_HEADER_WIDTH
         .checked_add(
@@ -205,9 +205,9 @@ fn read_u16_be(raw: Option<&[u8]>, message: &'static str) -> Result<u16, Decimal
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn decimal_to_numeric_parts(value: i64, scale: i32) -> Result<NumericBinaryParts, DecimalError> {
+fn decimal_to_numeric_parts(value: i128, scale: i32) -> Result<NumericBinaryParts, DecimalError> {
     let sign = if value < 0 { NUMERIC_NEG } else { NUMERIC_POS };
-    let mut magnitude = i128::from(value)
+    let mut magnitude = value
         .checked_abs()
         .ok_or_else(|| DecimalError::new("numeric magnitude overflow"))?;
     let dscale_i32 = if scale < 0 {
@@ -413,8 +413,7 @@ fn numeric_parts_to_value(
             .ok_or_else(|| DecimalError::new("numeric value overflow"))?;
     }
     Ok(Value::Decimal {
-        value: i64::try_from(acc)
-            .map_err(|_| DecimalError::new("numeric value overflows i64 runtime"))?,
+        value: acc,
         scale: i32::from(dscale),
     })
 }

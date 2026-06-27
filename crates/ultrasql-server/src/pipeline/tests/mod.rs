@@ -21,30 +21,36 @@ pub(super) fn plan(sql: &str, catalog: &InMemoryCatalog) -> LogicalPlan {
 }
 
 #[test]
-fn out_of_i64_integer_literal_binds_to_22003_over_the_wire() {
-    // FIX A end-to-end: a 20-digit integer literal must not silently
-    // saturate to i64::MAX. The binder raises numeric_value_out_of_range,
-    // which the server surfaces as SQLSTATE 22003.
+fn out_of_i64_integer_literal_binds_exact_numeric() {
+    // A 20-digit integer literal exceeds i64 but fits the i128-backed
+    // NUMERIC; it now binds exactly (matching PostgreSQL, which types
+    // large integer literals as `numeric`) rather than saturating or
+    // erroring.
     let (catalog, _) = fixture();
     let stmt = Parser::new("SELECT 99999999999999999999")
         .parse_statement()
         .expect("parses");
-    let err = bind(&stmt, &catalog).expect_err("out-of-i64 literal must error");
-    assert!(matches!(
-        err,
-        ultrasql_planner::PlanError::NumericValueOutOfRange(_)
-    ));
-    let server_err: crate::ServerError = err.into();
-    assert_eq!(server_err.sqlstate(), "22003");
+    bind(&stmt, &catalog).expect("20-digit literal binds exactly");
 }
 
 #[test]
-fn out_of_i64_numeric_literal_binds_to_22003_over_the_wire() {
+fn out_of_i64_numeric_literal_binds_exact_numeric() {
     let (catalog, _) = fixture();
     let stmt = Parser::new("SELECT 9999999999999999999.99")
         .parse_statement()
         .expect("parses");
-    let err = bind(&stmt, &catalog).expect_err("out-of-range numeric literal must error");
+    bind(&stmt, &catalog).expect("beyond-i64 numeric binds exactly");
+}
+
+#[test]
+fn beyond_i128_literal_binds_to_22003_over_the_wire() {
+    // A literal beyond i128 (~38 digits) still raises
+    // numeric_value_out_of_range, surfaced as SQLSTATE 22003.
+    let (catalog, _) = fixture();
+    let stmt = Parser::new("SELECT 9999999999999999999999999999999999999999")
+        .parse_statement()
+        .expect("parses");
+    let err = bind(&stmt, &catalog).expect_err("beyond-i128 literal must error");
     let server_err: crate::ServerError = err.into();
     assert_eq!(server_err.sqlstate(), "22003");
 }

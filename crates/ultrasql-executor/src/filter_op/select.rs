@@ -122,15 +122,17 @@ pub(super) fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             DataType::Int64 | DataType::Oid | DataType::RegClass | DataType::RegType => {
                 Column::Int64(NumericColumn::from_data(vec![]))
             }
-            DataType::Decimal { .. }
-            | DataType::Money
+            DataType::Money
             | DataType::Time
             | DataType::TimeTz
             | DataType::Timestamp
             | DataType::TimestampTz => Column::Int64(NumericColumn::from_data(vec![])),
             DataType::Float32 => Column::Float32(NumericColumn::from_data(vec![])),
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
-            DataType::Text { .. }
+            // Decimal columns materialise as decimal text (i128-backed,
+            // lossless) rather than a fixed-width Int64 column.
+            DataType::Decimal { .. }
+            | DataType::Text { .. }
             | DataType::Enum { .. }
             | DataType::Composite { .. }
             | DataType::Char { .. }

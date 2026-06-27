@@ -68,7 +68,9 @@ pub fn parse_money_text(raw: &str) -> Result<Value, MoneyError> {
     let Value::Decimal { value, .. } = decimal else {
         return Err(MoneyError::new("money parser returned non-decimal value"));
     };
-    Ok(Value::Money(value))
+    let cents = i64::try_from(value)
+        .map_err(|_| MoneyError::new(format!("money value {raw:?} out of range")))?;
+    Ok(Value::Money(cents))
 }
 
 fn strip_currency_markers(mut text: &str) -> &str {

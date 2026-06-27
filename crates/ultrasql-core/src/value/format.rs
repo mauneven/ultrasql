@@ -26,7 +26,7 @@ pub(crate) fn packed_bit_position(idx: usize) -> Option<(usize, u32)> {
 
 pub(crate) fn write_decimal_text(
     f: &mut fmt::Formatter<'_>,
-    value: i64,
+    value: i128,
     scale: i32,
 ) -> fmt::Result {
     let sign = if value < 0 { "-" } else { "" };

@@ -1033,7 +1033,7 @@ fn sql_literal(value: &Value, dtype: &DataType) -> Result<String, ServerError> {
             Ok(cast_literal(&Value::Money(*v).to_string(), dtype))
         }
         (DataType::Decimal { scale, .. }, Value::Int64(v)) => Ok(Value::Decimal {
-            value: *v,
+            value: i128::from(*v),
             scale: scale.unwrap_or(0),
         }
         .to_string()),

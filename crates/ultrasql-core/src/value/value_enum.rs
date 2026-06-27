@@ -92,8 +92,11 @@ pub enum Value {
     /// PostgreSQL-style base-10000 numeric payload; the executor keeps
     /// this shape to keep current eval paths numeric-fast.
     Decimal {
-        /// Scaled integer payload.
-        value: i64,
+        /// Scaled integer payload. Backed by `i128` (~38 significant
+        /// digits) so that NUMERIC literals and computed values that
+        /// exceed `i64` are represented exactly rather than silently
+        /// truncated. Values beyond `i128` raise SQLSTATE `22003`.
+        value: i128,
         /// Number of digits after the decimal point.
         scale: i32,
     },

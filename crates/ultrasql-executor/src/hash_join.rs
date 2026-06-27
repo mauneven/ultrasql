@@ -1270,8 +1270,22 @@ mod tests {
         Batch::new([Column::Int32(NumericColumn::from_data(rows.to_vec()))]).expect("batch ok")
     }
 
-    fn decimal_batch(rows: &[i64]) -> Batch {
-        Batch::new([Column::Int64(NumericColumn::from_data(rows.to_vec()))]).expect("batch ok")
+    fn decimal_batch(rows: &[i64], scale: i32) -> Batch {
+        // Decimal columns materialise as decimal text (i128-backed).
+        let text: Vec<String> = rows
+            .iter()
+            .map(|v| {
+                ultrasql_core::Value::Decimal {
+                    value: i128::from(*v),
+                    scale,
+                }
+                .to_string()
+            })
+            .collect();
+        Batch::new([Column::Utf8(ultrasql_vec::column::StringColumn::from_data(
+            text,
+        ))])
+        .expect("batch ok")
     }
 
     fn i32_pair_batch(rows: &[(i32, i32)]) -> Batch {
@@ -1382,7 +1396,7 @@ mod tests {
         out
     }
 
-    fn drain_decimal_pairs(op: &mut dyn Operator) -> Vec<((i64, i32), (i64, i32))> {
+    fn drain_decimal_pairs(op: &mut dyn Operator) -> Vec<((i128, i32), (i128, i32))> {
         let schema = op.schema().clone();
         let mut out = Vec::new();
         while let Some(batch) = op.next_batch().expect("no error") {
@@ -1429,8 +1443,8 @@ mod tests {
     fn hash_join_matches_decimal_keys_across_scales() {
         let left_schema = schema_decimal("id", 1);
         let right_schema = schema_decimal("val", 0);
-        let left = MemTableScan::new(left_schema.clone(), vec![decimal_batch(&[10, 25])]);
-        let right = MemTableScan::new(right_schema.clone(), vec![decimal_batch(&[1, 3])]);
+        let left = MemTableScan::new(left_schema.clone(), vec![decimal_batch(&[10, 25], 1)]);
+        let right = MemTableScan::new(right_schema.clone(), vec![decimal_batch(&[1, 3], 0)]);
         let mut op = HashJoin::new(
             Box::new(left),
             Box::new(right),

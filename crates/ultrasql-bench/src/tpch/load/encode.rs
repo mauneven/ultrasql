@@ -265,15 +265,13 @@ pub(crate) fn parse_direct_decimal(
             .checked_neg()
             .ok_or_else(|| anyhow::anyhow!("column {column_idx}: decimal overflow"))?;
     }
-    let value =
-        i64::try_from(value).with_context(|| format!("column {column_idx}: decimal overflow"))?;
     Ok(ultrasql_core::Value::Decimal { value, scale })
 }
 
 #[cfg(feature = "sql-bench")]
 pub(crate) fn encode_direct_decimal(
     out: &mut Vec<u8>,
-    value: i64,
+    value: i128,
     scale: i32,
     column_idx: usize,
 ) -> Result<()> {
@@ -304,7 +302,7 @@ pub(crate) fn encode_direct_decimal(
 
 #[cfg(feature = "sql-bench")]
 pub(crate) fn direct_decimal_parts(
-    value: i64,
+    value: i128,
     scale: i32,
     column_idx: usize,
 ) -> Result<(i16, u16, i16, Vec<u16>)> {
@@ -313,7 +311,7 @@ pub(crate) fn direct_decimal_parts(
     } else {
         DIRECT_NUMERIC_POS
     };
-    let magnitude = i128::from(value)
+    let magnitude = value
         .checked_abs()
         .ok_or_else(|| anyhow::anyhow!("column {column_idx}: decimal magnitude overflow"))?;
     let dscale = i16::try_from(scale)

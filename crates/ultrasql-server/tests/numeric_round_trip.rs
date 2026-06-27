@@ -203,15 +203,40 @@ async fn runtime_numeric_text_overflow_reports_sqlstate() {
         .batch_execute("CREATE TABLE numeric_text_overflow (raw TEXT NOT NULL)")
         .await
         .expect("create numeric text overflow table");
+    // i64::MAX + 1 now fits the i128-backed NUMERIC and round-trips exactly.
     client
         .batch_execute("INSERT INTO numeric_text_overflow VALUES ('9223372036854775808')")
         .await
-        .expect("insert oversized numeric text");
+        .expect("insert past-i64 numeric text");
+    // A value beyond i128 (~39 digits) still overflows and must report 22003.
+    client
+        .batch_execute(
+            "INSERT INTO numeric_text_overflow VALUES \
+             ('999999999999999999999999999999999999999999')",
+        )
+        .await
+        .expect("insert beyond-i128 numeric text");
+
+    let rows = client
+        .simple_query(
+            "SELECT CAST(raw AS NUMERIC) FROM numeric_text_overflow \
+             WHERE raw = '9223372036854775808'",
+        )
+        .await
+        .expect("past-i64 numeric text casts exactly");
+    let value = rows.iter().find_map(|msg| match msg {
+        tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(ToOwned::to_owned),
+        _ => None,
+    });
+    assert_eq!(value.as_deref(), Some("9223372036854775808"));
 
     let err = client
-        .simple_query("SELECT CAST(raw AS NUMERIC) FROM numeric_text_overflow")
+        .simple_query(
+            "SELECT CAST(raw AS NUMERIC) FROM numeric_text_overflow \
+             WHERE raw = '999999999999999999999999999999999999999999'",
+        )
         .await
-        .expect_err("oversized runtime numeric text must fail");
+        .expect_err("beyond-i128 runtime numeric text must fail");
     assert_eq!(
         err.code().map(tokio_postgres::error::SqlState::code),
         Some("22003")

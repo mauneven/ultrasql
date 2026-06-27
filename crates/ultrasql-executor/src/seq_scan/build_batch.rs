@@ -375,7 +375,11 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Int32(col)
             }
-            DataType::Decimal { scale: None, .. } => {
+            DataType::Decimal { .. } => {
+                // Decimal columns materialise as decimal text so the full
+                // i128-backed mantissa (~38 digits) round-trips losslessly
+                // through the batch; a fixed-width Int64 batch column would
+                // silently truncate values beyond i64.
                 let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
@@ -397,19 +401,16 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                     StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
                 }
             }
-            DataType::Decimal { .. }
-            | DataType::Money
+            DataType::Money
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Time
             | DataType::TimeTz => {
-                // Decimal / Money / Timestamp / Time values share the Int64
-                // batch column. Schema field carries the semantic
-                // tag (and scale, for Decimal).
+                // Money / Timestamp / Time values share the Int64
+                // batch column. Schema field carries the semantic tag.
                 let mut data: Vec<i64> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     let v_i64 = match &row[col_idx] {
-                        Value::Decimal { value, .. } => *value,
                         Value::Money(v) => *v,
                         Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => *v,
                         Value::TimeTz {

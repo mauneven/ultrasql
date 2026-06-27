@@ -632,19 +632,17 @@ fn divide_value(sum: Value, count: i64) -> Value {
 }
 
 fn add_decimal_values(
-    left_value: i64,
+    left_value: i128,
     left_scale: i32,
-    right_value: i64,
+    right_value: i128,
     right_scale: i32,
 ) -> Result<Value, ExecError> {
     let common_scale = left_scale.max(right_scale);
     let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
     let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
-    let sum = left
+    let value = left
         .checked_add(right)
-        .ok_or_else(|| ExecError::TypeMismatch("decimal sum overflow".to_owned()))?;
-    let value = i64::try_from(sum)
-        .map_err(|_| ExecError::TypeMismatch("decimal sum overflow".to_owned()))?;
+        .ok_or_else(|| ExecError::NumericFieldOverflow("decimal sum overflow".to_owned()))?;
     Ok(Value::Decimal {
         value,
         scale: common_scale,
@@ -652,7 +650,7 @@ fn add_decimal_values(
 }
 
 fn rescale_decimal_value(
-    value: i64,
+    value: i128,
     current_scale: i32,
     target_scale: i32,
 ) -> Result<i128, ExecError> {
@@ -664,21 +662,31 @@ fn rescale_decimal_value(
     }
     let factor = pow10_i128(
         u32::try_from(scale_delta)
-            .map_err(|_| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))?,
+            .map_err(|_| ExecError::NumericFieldOverflow("decimal rescale overflow".to_owned()))?,
     )
-    .ok_or_else(|| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))?;
-    i128::from(value)
+    .ok_or_else(|| ExecError::NumericFieldOverflow("decimal rescale overflow".to_owned()))?;
+    value
         .checked_mul(factor)
-        .ok_or_else(|| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))
+        .ok_or_else(|| ExecError::NumericFieldOverflow("decimal rescale overflow".to_owned()))
 }
 
 fn pow10_i128(exp: u32) -> Option<i128> {
     (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
 }
 
-fn decimal_to_f64(value: i64, scale: i32) -> f64 {
-    let raw = i64_to_f64_saturating(value);
+fn decimal_to_f64(value: i128, scale: i32) -> f64 {
+    let raw = i128_to_f64_saturating(value);
     raw / 10_f64.powi(scale)
+}
+
+fn i128_to_f64_saturating(value: i128) -> f64 {
+    value.to_f64().unwrap_or_else(|| {
+        if value.is_negative() {
+            f64::MIN
+        } else {
+            f64::MAX
+        }
+    })
 }
 
 fn i64_to_f64_saturating(value: i64) -> f64 {

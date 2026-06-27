@@ -180,12 +180,12 @@ impl RoundMode {
     /// path), producing the integer result. PG's `numeric` rounding is
     /// half **away from zero** (not banker's); floor/ceil/trunc are
     /// directional.
-    fn apply_decimal(self, value: i64, scale: i32) -> Result<i64, EvalError> {
+    fn apply_decimal(self, value: i128, scale: i32) -> Result<i128, EvalError> {
         if scale <= 0 {
             // Already an integer (or negative scale, which we do not mint).
             return Ok(value);
         }
-        let divisor = 10_i64.checked_pow(u32::try_from(scale).map_err(|_| EvalError::Overflow)?);
+        let divisor = 10_i128.checked_pow(u32::try_from(scale).map_err(|_| EvalError::Overflow)?);
         let Some(divisor) = divisor else {
             return Err(EvalError::Overflow);
         };
@@ -259,7 +259,10 @@ pub(crate) fn eval_round_family(
         }),
         // Integer arguments cast to `numeric` in PG, so return `numeric`.
         other => match other.as_i64() {
-            Some(v) => Ok(Value::Decimal { value: v, scale: 0 }),
+            Some(v) => Ok(Value::Decimal {
+                value: i128::from(v),
+                scale: 0,
+            }),
             None => Err(EvalError::Type(format!(
                 "{func}: argument must be numeric, got {:?}",
                 other.data_type()

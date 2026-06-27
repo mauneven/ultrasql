@@ -265,13 +265,15 @@ impl RowCodec {
                     nulls.push_valid();
                 }
                 (
-                    DataType::Decimal { scale: None, .. },
+                    DataType::Decimal { .. },
                     ColumnBuilder::Utf8 {
                         offsets,
                         values,
                         nulls,
                     },
                 ) => {
+                    // Decimal columns materialise as decimal text so the
+                    // full i128-backed mantissa round-trips losslessly.
                     let value =
                         decode_numeric_value(bytes, &mut cursor, col_idx, &field.data_type)?;
                     let text = value.to_string();
@@ -283,12 +285,6 @@ impl RowCodec {
                         }
                     })?;
                     offsets.push(new_end);
-                    nulls.push_valid();
-                }
-                (DataType::Decimal { .. }, ColumnBuilder::Int64 { data, nulls }) => {
-                    let value =
-                        decode_numeric_scaled_i64(bytes, &mut cursor, col_idx, &field.data_type)?;
-                    data.push(value);
                     nulls.push_valid();
                 }
                 (DataType::Timestamp, ColumnBuilder::Int64 { data, nulls })

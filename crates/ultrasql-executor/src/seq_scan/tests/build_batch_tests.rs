@@ -165,10 +165,9 @@ fn build_batch_covers_sql_storage_families_and_null_bitmaps() {
         Column::Bool(c) => assert!(c.nulls().is_some_and(|n| n.get(0) && !n.get(1))),
         other => panic!("expected bool column, got {other:?}"),
     }
-    match &batch.columns()[34] {
-        Column::Int64(c) => assert_eq!(c.data()[0], 1234),
-        other => panic!("expected decimal int64 column, got {other:?}"),
-    }
+    // Decimal columns now materialise as decimal text (i128-backed,
+    // lossless) rather than a fixed-width Int64 batch column.
+    assert_eq!(batch.columns()[34].text_value(0), Some("12.34"));
     assert_eq!(batch.columns()[35].text_value(0), Some("0.166667"));
     assert_eq!(batch.columns()[35].text_value(1), None);
 

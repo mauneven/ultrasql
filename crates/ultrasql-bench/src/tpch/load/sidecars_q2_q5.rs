@@ -199,7 +199,7 @@ pub(crate) fn q2_parse_decimal2(raw: &str, label: &str) -> Result<i64> {
     else {
         unreachable!("parse_direct_decimal always returns Decimal");
     };
-    Ok(value)
+    i64::try_from(value).with_context(|| format!("{label} `{raw}` out of range"))
 }
 
 #[cfg(feature = "sql-bench")]
@@ -363,7 +363,7 @@ pub(crate) fn q3_parse_decimal2(raw: &str, label: &str) -> Result<i64> {
     else {
         unreachable!("parse_direct_decimal always returns Decimal");
     };
-    Ok(value)
+    i64::try_from(value).with_context(|| format!("{label} `{raw}` out of range"))
 }
 
 #[cfg(feature = "sql-bench")]

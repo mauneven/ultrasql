@@ -13,7 +13,7 @@ pub(crate) struct NumericBinaryParts {
 
 pub(crate) fn encode_numeric_value_payload(
     payload: &mut Vec<u8>,
-    value: i64,
+    value: i128,
     scale: i32,
     column: usize,
     ty: &DataType,
@@ -45,13 +45,13 @@ pub(crate) fn encode_numeric_value_payload(
 }
 
 pub(crate) fn decimal_to_numeric_parts(
-    value: i64,
+    value: i128,
     scale: i32,
     column: usize,
     ty: &DataType,
 ) -> Result<NumericBinaryParts, RowCodecError> {
     let sign = if value < 0 { NUMERIC_NEG } else { NUMERIC_POS };
-    let mut magnitude = i128::from(value)
+    let mut magnitude = value
         .checked_abs()
         .ok_or_else(|| numeric_type_error(column, ty, "numeric magnitude overflow"))?;
     let dscale_i32 = if scale < 0 {
@@ -155,7 +155,7 @@ pub(crate) fn decimal_to_numeric_parts(
 }
 
 pub(crate) fn validate_decimal_precision(
-    value: i64,
+    value: i128,
     value_scale: i32,
     precision: Option<u32>,
     declared_scale: Option<i32>,
@@ -172,7 +172,7 @@ pub(crate) fn validate_decimal_precision(
     let declared_scale = usize::try_from(declared_scale.unwrap_or(0).max(0))
         .map_err(|_| numeric_field_overflow(column, ty, "numeric scale out of range"))?;
 
-    let magnitude = i128::from(value)
+    let magnitude = value
         .checked_abs()
         .ok_or_else(|| numeric_field_overflow(column, ty, "numeric magnitude overflow"))?;
     let total_digits = decimal_magnitude_digits(magnitude);
@@ -223,18 +223,6 @@ pub(crate) fn decode_numeric_value(
 ) -> Result<Value, RowCodecError> {
     let payload = read_varlena_slice(bytes, cursor)?;
     decode_numeric_payload(payload, column, ty)
-}
-
-pub(crate) fn decode_numeric_scaled_i64(
-    bytes: &[u8],
-    cursor: &mut usize,
-    column: usize,
-    ty: &DataType,
-) -> Result<i64, RowCodecError> {
-    match decode_numeric_value(bytes, cursor, column, ty)? {
-        Value::Decimal { value, .. } => Ok(value),
-        _ => unreachable!("decode_numeric_value always returns Decimal"),
-    }
 }
 
 pub(crate) fn decode_numeric_payload(
@@ -366,8 +354,7 @@ pub(crate) fn numeric_parts_to_value(
             .ok_or_else(|| numeric_type_error(column, ty, "numeric value overflow"))?;
     }
     Ok(Value::Decimal {
-        value: i64::try_from(acc)
-            .map_err(|_| numeric_type_error(column, ty, "numeric value overflows i64 runtime"))?,
+        value: acc,
         scale: i32::from(dscale),
     })
 }

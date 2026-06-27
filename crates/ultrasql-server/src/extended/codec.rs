@@ -380,9 +380,8 @@ pub(super) fn encode_binary_value_typed(
         (DataType::Int16, Column::Int32(c)) => i16::try_from(c.data()[row])
             .ok()
             .map(|v| v.to_be_bytes().to_vec()),
-        (DataType::Decimal { scale, .. }, Column::Int64(c)) => {
-            encode_pg_numeric_binary(c.data()[row], scale.unwrap_or(0)).ok()
-        }
+        // Decimal columns materialise as decimal text (i128-backed); the
+        // base-10000 numeric binary payload is computed from the text.
         (DataType::Decimal { .. }, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
             let Value::Decimal { value, scale } =
                 parse_decimal_text(col.text_value(row)?, None).ok()?
@@ -844,7 +843,10 @@ mod tests {
 
     #[test]
     fn binary_numeric_result_encodes_pg_numeric_payload() {
-        let column = Column::Int64(NumericColumn::from_data(vec![12_340]));
+        // Decimal columns materialise as decimal text (i128-backed); 12.340.
+        let column = Column::Utf8(ultrasql_vec::column::StringColumn::from_data([
+            "12.340".to_owned()
+        ]));
         assert_eq!(
             encode_binary_value_typed(
                 &column,

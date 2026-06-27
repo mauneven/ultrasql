@@ -196,7 +196,10 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
         DataType::Float32 => numeric_column!(f32, Value::Float32(v) => *v, 0.0_f32, Float32),
         DataType::Float64 => numeric_column!(f64, Value::Float64(v) => *v, 0.0_f64, Float64),
         DataType::Date => numeric_column!(i32, Value::Date(v) => *v, 0_i32, Int32),
-        DataType::Decimal { scale: None, .. } => {
+        DataType::Decimal { .. } => {
+            // Decimal columns materialise as decimal text so the full
+            // i128-backed mantissa round-trips losslessly; a fixed-width
+            // Int64 column would silently truncate values beyond i64.
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
@@ -220,12 +223,6 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
-        DataType::Decimal { .. } => numeric_column!(
-            i64,
-            Value::Decimal { value, .. } => *value,
-            0_i64,
-            Int64
-        ),
         DataType::Money => numeric_column!(i64, Value::Money(v) => *v, 0_i64, Int64),
         DataType::Oid | DataType::RegClass | DataType::RegType => {
             let mut data: Vec<i64> = Vec::with_capacity(n);
@@ -607,7 +604,9 @@ mod tests {
             &[42],
             None,
         );
-        assert_i64_values(
+        // Scaled decimals now project to decimal text (i128-backed,
+        // lossless) rather than a fixed-width Int64 column.
+        assert_text_values(
             build_column(
                 &DataType::Decimal {
                     precision: Some(10),
@@ -619,8 +618,7 @@ mod tests {
                 }],
             )
             .expect("decimal"),
-            &[1234],
-            None,
+            &[Some("12.34")],
         );
         assert_text_values(
             build_column(

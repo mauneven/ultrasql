@@ -193,7 +193,7 @@ pub(super) fn value_to_copy_cell_with_options(
         }
         (DataType::Decimal { scale, .. }, Value::Int64(v)) => Some(
             Value::Decimal {
-                value: *v,
+                value: i128::from(*v),
                 scale: scale.unwrap_or(0),
             }
             .to_string()

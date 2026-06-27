@@ -485,7 +485,9 @@ pub(crate) fn eval_cast_numeric(args: &[Value]) -> Result<Value, EvalError> {
     let (precision, target_scale) = numeric_cast_typmod(args)?;
     match &args[0] {
         Value::Null => Ok(Value::Null),
-        Value::Money(cents) => coerce_numeric_typmod(*cents, 2, precision, target_scale),
+        Value::Money(cents) => {
+            coerce_numeric_typmod(i128::from(*cents), 2, precision, target_scale)
+        }
         Value::Decimal { value, scale } => {
             coerce_numeric_typmod(*value, *scale, precision, target_scale)
         }
@@ -541,7 +543,7 @@ pub(crate) fn numeric_cast_typmod(args: &[Value]) -> Result<(Option<u32>, Option
 }
 
 pub(crate) fn coerce_numeric_typmod(
-    value: i64,
+    value: i128,
     scale: i32,
     precision: Option<u32>,
     target_scale: Option<i32>,
@@ -575,7 +577,7 @@ pub(crate) fn numeric_cast_parse_error(err: impl std::fmt::Display) -> EvalError
 }
 
 pub(crate) fn validate_numeric_precision(
-    value: i64,
+    value: i128,
     scale: i32,
     precision: Option<u32>,
     declared_scale: Option<i32>,
@@ -589,7 +591,7 @@ pub(crate) fn validate_numeric_precision(
         .map_err(|_| EvalError::NumericFieldOverflow("numeric scale out of range".into()))?;
     let declared_scale = usize::try_from(declared_scale.unwrap_or(0).max(0))
         .map_err(|_| EvalError::NumericFieldOverflow("numeric scale out of range".into()))?;
-    let magnitude = i128::from(value)
+    let magnitude = value
         .checked_abs()
         .ok_or_else(|| EvalError::NumericFieldOverflow("numeric magnitude overflow".into()))?;
     let total_digits = decimal_magnitude_digits(magnitude);

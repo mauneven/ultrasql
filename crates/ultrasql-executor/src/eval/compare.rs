@@ -267,7 +267,7 @@ pub(crate) fn date_as_timestamp(days_since_2000_01_01: i32) -> Result<i64, EvalE
 }
 
 pub(crate) fn rescale_decimal_value(
-    value: i64,
+    value: i128,
     current_scale: i32,
     target_scale: i32,
 ) -> Result<i128, EvalError> {
@@ -277,15 +277,13 @@ pub(crate) fn rescale_decimal_value(
     }
     let factor = pow10_i128(u32::try_from(scale_delta).map_err(|_| EvalError::Overflow)?)
         .ok_or(EvalError::Overflow)?;
-    i128::from(value)
-        .checked_mul(factor)
-        .ok_or(EvalError::Overflow)
+    value.checked_mul(factor).ok_or(EvalError::Overflow)
 }
 
 pub(crate) fn compare_decimal_values(
-    left_value: i64,
+    left_value: i128,
     left_scale: i32,
-    right_value: i64,
+    right_value: i128,
     right_scale: i32,
 ) -> std::cmp::Ordering {
     match (left_value.cmp(&0), right_value.cmp(&0)) {
@@ -321,12 +319,9 @@ pub(crate) struct DecimalMagnitude {
 }
 
 impl DecimalMagnitude {
-    fn new(value: i64, scale: i32) -> Self {
-        let mut magnitude = i128::from(value);
-        let negative = magnitude < 0;
-        if negative {
-            magnitude = -magnitude;
-        }
+    fn new(value: i128, scale: i32) -> Self {
+        let negative = value < 0;
+        let mut magnitude = value.unsigned_abs();
         let mut scale = i64::from(scale);
         while magnitude != 0 && magnitude % 10 == 0 {
             magnitude /= 10;

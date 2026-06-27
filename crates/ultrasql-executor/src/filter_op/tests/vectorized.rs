@@ -310,16 +310,23 @@ fn vectorized_column_column_i32_merges_nulls() {
     assert_eq!(got, vec![5, 13]);
 }
 
-/// Decimal columns store as Int64, but different scales do not
-/// share raw integer ordering. The column-vs-column fast path must
-/// decline so Eval can rescale before compare.
+/// Decimal columns materialise as decimal text. Different scales do not
+/// share raw integer ordering, so the column-vs-column fast path declines
+/// and Eval rescales before compare on the full i128 mantissa.
 #[test]
 fn decimal_column_column_different_scales_falls_back() {
-    let left_values = vec![10_000_i64, 1_000, 500];
-    let right_values = vec![200_000_i64, 2_000, 600];
+    // Logical: left = 100.00, 10.00, 5.00; right = 20.0000, 0.2000, 0.0600.
     let batch = Batch::new([
-        Column::Int64(NumericColumn::from_data(left_values)),
-        Column::Int64(NumericColumn::from_data(right_values)),
+        Column::Utf8(StringColumn::from_data([
+            "100.00".to_owned(),
+            "10.00".to_owned(),
+            "5.00".to_owned(),
+        ])),
+        Column::Utf8(StringColumn::from_data([
+            "20.0000".to_owned(),
+            "0.2000".to_owned(),
+            "0.0600".to_owned(),
+        ])),
     ])
     .expect("batch ok");
     let left_type = DataType::Decimal {
@@ -353,14 +360,16 @@ fn decimal_column_column_different_scales_falls_back() {
     let mut filter = Filter::new(Box::new(scan), pred);
 
     let out = filter.next_batch().unwrap().unwrap();
-    let got: Vec<i64> = match &out.columns()[0] {
-        Column::Int64(c) => c.data().to_vec(),
+    let got: Vec<String> = match &out.columns()[0] {
+        Column::Utf8(_) | Column::DictionaryUtf8(_) => (0..out.rows())
+            .map(|r| out.columns()[0].text_value(r).unwrap_or("").to_owned())
+            .collect(),
         other => panic!("unexpected column type: {other:?}"),
     };
-    // Logical values: 100.00 > 20.0000, 10.00 > 0.2000,
-    // 5.00 > 0.0600. Raw Int64 ordering would incorrectly drop
-    // row 0 (10000 < 200000).
-    assert_eq!(got, vec![10_000, 1_000, 500]);
+    // Logical values: 100.00 > 20.0000, 10.00 > 0.2000, 5.00 > 0.0600 all
+    // pass. Raw Int64 ordering would incorrectly drop row 0 (10000 <
+    // 200000); the scale-aligning compare keeps all three.
+    assert_eq!(got, vec!["100.00", "10.00", "5.00"]);
 }
 
 /// `col + 1 > 5` does not match the col-op-literal shape (LHS is a

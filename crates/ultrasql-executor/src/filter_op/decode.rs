@@ -421,27 +421,7 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                     }
                 }
             }
-            (Column::Int64(c), DataType::Decimal { scale, .. }) => {
-                // Decimal columns store as `Int64` with a schema
-                // scale tag. Re-tag the materialised value as
-                // `Value::Decimal { value, scale }`.
-                let s = scale.unwrap_or(0);
-                let nulls = c.nulls();
-                for (row_idx, row) in rows.iter_mut().enumerate() {
-                    if is_null(nulls, row_idx) {
-                        row.push(Value::Null);
-                    } else {
-                        row.push(Value::Decimal {
-                            value: c.data()[row_idx],
-                            scale: s,
-                        });
-                    }
-                }
-            }
-            (
-                Column::Utf8(_) | Column::DictionaryUtf8(_),
-                DataType::Decimal { scale: None, .. },
-            ) => {
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Decimal { .. }) => {
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     if column_is_null(col, row_idx) {
                         row.push(Value::Null);

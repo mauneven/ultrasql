@@ -1140,13 +1140,20 @@ fn value_to_f64(v: &Value) -> Option<f64> {
         Value::Int64(x) => Some(i64_to_f64(*x)),
         Value::Float32(x) => Some(f64::from(*x)),
         Value::Float64(x) => Some(*x),
-        Value::Decimal { value, scale } => Some(i64_to_f64(*value) / 10_f64.powi(*scale)),
+        Value::Decimal { value, scale } => Some(i128_to_f64(*value) / 10_f64.powi(*scale)),
         _ => None,
     }
 }
 
 /// Convert `i64` to `f64` without a lossy-cast lint trip.
 fn i64_to_f64(v: i64) -> f64 {
+    use num_traits::ToPrimitive;
+    v.to_f64()
+        .unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
+}
+
+/// Convert `i128` to `f64` without a lossy-cast lint trip.
+fn i128_to_f64(v: i128) -> f64 {
     use num_traits::ToPrimitive;
     v.to_f64()
         .unwrap_or(if v < 0 { f64::MIN } else { f64::MAX })
@@ -1295,7 +1302,7 @@ impl RangeAxis {
                         // holds and the rescale is an exact upscale.
                         let vscale = u32::try_from((*vscale).max(0)).unwrap_or(0);
                         let up = scale.saturating_sub(vscale);
-                        i128::from(*value).checked_mul(pow10_i128(up))
+                        value.checked_mul(pow10_i128(up))
                     }
                     _ => {
                         return Err(ExecError::WindowFrameError(

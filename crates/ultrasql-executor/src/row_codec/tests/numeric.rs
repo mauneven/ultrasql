@@ -174,10 +174,36 @@ fn decode_into_builders_reads_decimal_numeric_payload() {
 
     codec.decode_into_builders(&encoded, &mut builders).unwrap();
     let batch = RowCodec::finish_batch(builders).unwrap();
+    // Decimal columns now materialise as decimal text (i128-backed,
+    // lossless) rather than a fixed-width Int64 batch column.
     match &batch.columns()[0] {
-        Column::Int64(c) => assert_eq!(c.data()[0], 1_234_567_890_123),
-        other => panic!("expected decimal Int64 builder output, got {other:?}"),
+        Column::Utf8(_) | Column::DictionaryUtf8(_) => {
+            assert_eq!(batch.columns()[0].text_value(0), Some("123456789.0123"));
+        }
+        other => panic!("expected decimal text column output, got {other:?}"),
     }
+}
+
+#[test]
+fn decode_into_builders_round_trips_decimal_beyond_i64() {
+    // A 30-significant-digit value far beyond i64 round-trips exactly
+    // through the heap codec and the (text) batch column.
+    let schema = schema_decimal(Some(4));
+    let codec = RowCodec::new(schema.clone());
+    let big = 123_456_789_012_345_678_901_234_567_890_i128;
+    let encoded = codec
+        .encode(&[Value::Decimal {
+            value: big,
+            scale: 4,
+        }])
+        .unwrap();
+    let mut builders = vec![ColumnBuilder::new(&schema.field_at(0).data_type, 1, 0).unwrap()];
+    codec.decode_into_builders(&encoded, &mut builders).unwrap();
+    let batch = RowCodec::finish_batch(builders).unwrap();
+    assert_eq!(
+        batch.columns()[0].text_value(0),
+        Some("12345678901234567890123456.7890")
+    );
 }
 
 #[test]

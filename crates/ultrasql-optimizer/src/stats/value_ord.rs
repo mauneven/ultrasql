@@ -451,7 +451,7 @@ fn numeric_integral_i64(v: &Value) -> Option<i64> {
     float.to_i64()
 }
 
-fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
+fn compare_decimals(l: i128, l_scale: i32, r: i128, r_scale: i32) -> Ordering {
     match (l.cmp(&0), r.cmp(&0)) {
         (Ordering::Equal, Ordering::Equal) => return Ordering::Equal,
         (Ordering::Equal, Ordering::Less) | (Ordering::Greater, Ordering::Less) => {
@@ -482,7 +482,7 @@ struct DecimalMagnitude {
 }
 
 impl DecimalMagnitude {
-    fn new(value: i64, scale: i32) -> Self {
+    fn new(value: i128, scale: i32) -> Self {
         if value == 0 {
             return Self {
                 negative: false,
@@ -492,11 +492,8 @@ impl DecimalMagnitude {
             };
         }
 
-        let mut magnitude = i128::from(value);
-        let negative = magnitude < 0;
-        if negative {
-            magnitude = -magnitude;
-        }
+        let negative = value < 0;
+        let mut magnitude = value.unsigned_abs();
 
         let mut scale = i64::from(scale);
         while magnitude % 10 == 0 {

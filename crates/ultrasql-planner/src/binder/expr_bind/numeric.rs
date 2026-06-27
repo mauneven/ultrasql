@@ -49,6 +49,19 @@ pub(in crate::binder) fn parse_integer_literal(text: &str) -> Result<(Value, Dat
     if let Ok(v) = text.parse::<i64>() {
         return Ok((Value::Int64(v), DataType::Int64));
     }
+    // Beyond i64, PostgreSQL types the literal as `numeric`. Represent it
+    // exactly with the i128-backed `Decimal` (scale 0). Magnitudes beyond
+    // i128 (~38 digits) raise `numeric_value_out_of_range` (22003) rather
+    // than saturate.
+    if let Ok(v) = text.parse::<i128>() {
+        return Ok((
+            Value::Decimal { value: v, scale: 0 },
+            DataType::Decimal {
+                precision: None,
+                scale: Some(0),
+            },
+        ));
+    }
     Err(PlanError::NumericValueOutOfRange(format!(
         "integer literal {text} is out of range for the supported numeric types"
     )))
@@ -73,17 +86,18 @@ pub(in crate::binder) fn bind_numeric_literal(text: &str) -> Result<ScalarExpr, 
     })
 }
 
-/// Parse a fixed-point decimal literal into its scaled-`i64` form.
+/// Parse a fixed-point decimal literal into its scaled-`i128` form.
 ///
 /// Returns `Ok(None)` when the text is not a fixed-point decimal we
 /// represent exactly (exponent notation), so the caller can fall back
 /// to `Float64`. Returns `Err` with `numeric_value_out_of_range`
 /// (SQLSTATE 22003) when the literal *is* a fixed-point decimal but its
-/// unscaled mantissa overflows the i64-backed `NUMERIC` representation
-/// — erroring instead of silently dropping to a lossy `Float64`.
+/// unscaled mantissa overflows the i128-backed `NUMERIC` representation
+/// (~38 significant digits) — erroring instead of silently dropping to
+/// a lossy `Float64`.
 pub(in crate::binder) fn parse_decimal_literal(
     text: &str,
-) -> Result<Option<(i64, i32)>, PlanError> {
+) -> Result<Option<(i128, i32)>, PlanError> {
     if text.contains('e') || text.contains('E') {
         return Ok(None);
     }
@@ -109,8 +123,8 @@ pub(in crate::binder) fn parse_bool_text(text: &str) -> Option<bool> {
     }
 }
 
-pub(in crate::binder) fn pow10_i64(exp: u32) -> Option<i64> {
-    (0..exp).try_fold(1_i64, |acc, _| acc.checked_mul(10))
+pub(in crate::binder) fn pow10_i128(exp: u32) -> Option<i128> {
+    (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
 }
 
 pub(in crate::binder) fn infer_decimal_scale(value: &Value) -> Option<i32> {
@@ -132,7 +146,7 @@ pub(in crate::binder) fn infer_decimal_scale_from_text(text: &str) -> Option<i32
 pub(in crate::binder) fn decimal_from_numeric_value(
     value: &Value,
     target_scale: Option<i32>,
-) -> Option<(i64, i32)> {
+) -> Option<(i128, i32)> {
     let inferred_scale = infer_decimal_scale(value);
     let scale = match (target_scale, inferred_scale) {
         (Some(target), _) => target,
@@ -142,15 +156,17 @@ pub(in crate::binder) fn decimal_from_numeric_value(
     if scale < 0 {
         return None;
     }
-    let factor = pow10_i64(u32::try_from(scale).ok()?)?;
+    let factor = pow10_i128(u32::try_from(scale).ok()?)?;
     match value {
-        Value::Int16(v) => i64::from(*v)
+        Value::Int16(v) => i128::from(*v)
             .checked_mul(factor)
             .map(|scaled| (scaled, scale)),
-        Value::Int32(v) => i64::from(*v)
+        Value::Int32(v) => i128::from(*v)
             .checked_mul(factor)
             .map(|scaled| (scaled, scale)),
-        Value::Int64(v) => v.checked_mul(factor).map(|scaled| (scaled, scale)),
+        Value::Int64(v) => i128::from(*v)
+            .checked_mul(factor)
+            .map(|scaled| (scaled, scale)),
         Value::Float32(v) => decimal_from_f64(f64::from(*v), scale).map(|scaled| (scaled, scale)),
         Value::Float64(v) => decimal_from_f64(*v, scale).map(|scaled| (scaled, scale)),
         Value::Decimal {
@@ -161,7 +177,7 @@ pub(in crate::binder) fn decimal_from_numeric_value(
     }
 }
 
-pub(in crate::binder) fn decimal_value_to_f64(value: i64, scale: i32) -> Option<f64> {
+pub(in crate::binder) fn decimal_value_to_f64(value: i128, scale: i32) -> Option<f64> {
     value.to_f64().map(|raw| raw / 10_f64.powi(scale))
 }
 
@@ -319,16 +335,16 @@ pub(in crate::binder) fn resolve_regtype_literal(text: &str, catalog: &dyn Catal
     }
 }
 
-pub(in crate::binder) fn decimal_from_f64(value: f64, scale: i32) -> Option<i64> {
+pub(in crate::binder) fn decimal_from_f64(value: f64, scale: i32) -> Option<i128> {
     if !value.is_finite() {
         return None;
     }
     let scale_usize = usize::try_from(scale).ok()?;
     let rendered = format!("{value:.scale_usize$}");
-    scaled_decimal_text_to_i64(&rendered)
+    scaled_decimal_text_to_i128(&rendered)
 }
 
-pub(in crate::binder) fn scaled_decimal_text_to_i64(text: &str) -> Option<i64> {
+pub(in crate::binder) fn scaled_decimal_text_to_i128(text: &str) -> Option<i128> {
     let (negative, unsigned) = text
         .strip_prefix('-')
         .map_or((false, text), |stripped| (true, stripped));
@@ -336,7 +352,7 @@ pub(in crate::binder) fn scaled_decimal_text_to_i64(text: &str) -> Option<i64> {
     let mut digits = String::with_capacity(whole.len() + frac.len());
     digits.push_str(if whole.is_empty() { "0" } else { whole });
     digits.push_str(frac);
-    let mut value = digits.parse::<i64>().ok()?;
+    let mut value = digits.parse::<i128>().ok()?;
     if negative {
         value = value.checked_neg()?;
     }

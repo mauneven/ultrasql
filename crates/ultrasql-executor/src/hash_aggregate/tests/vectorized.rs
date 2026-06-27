@@ -376,9 +376,16 @@ fn grouped_vectorized_sum_mul_matches_scalar() {
         Field::required("qty", DataType::Int32),
     ])
     .expect("schema ok");
+    // Decimal columns materialise as decimal text (i128-backed); cost
+    // values 1.50, 2.00, 0.25, 4.00 at scale 2.
     let batch = Batch::new([
         Column::Int32(NumericColumn::from_data(vec![1_i32, 2, 1, 3])),
-        Column::Int64(NumericColumn::from_data(vec![150_i64, 200, 25, 400])),
+        Column::Utf8(StringColumn::from_data([
+            "1.50".to_owned(),
+            "2.00".to_owned(),
+            "0.25".to_owned(),
+            "4.00".to_owned(),
+        ])),
         Column::Int32(NumericColumn::from_data(vec![2_i32, 5, 4, 1])),
     ])
     .expect("batch ok");
