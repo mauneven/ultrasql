@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::cmp::Reverse;
 
 use ultrasql_core::{Field, Schema};
-use ultrasql_planner::{LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, UnaryOp};
 
 use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
@@ -237,10 +237,21 @@ fn maybe_hoist(
     // textually-identical volatile expressions into a single shared evaluation
     // changes results (e.g. two independent `random()` calls must be free to
     // differ). Opaque subquery/outer-column leaves are likewise excluded.
+    //
+    // Additionally, a *fallible* sub-tree (`can_raise()`) must not be hoisted
+    // when any of its occurrences sits in a short-circuit-guarded position
+    // (right operand of `AND`/`OR`): the injected `Project` evaluates it for
+    // every row unconditionally, so a row the short-circuit would have skipped
+    // could now raise a runtime error, turning an empty result into a failure.
+    // Pure (total) sub-trees, and fallible ones that are always evaluated
+    // anyway, remain eligible.
     let mut candidates: Vec<(usize, ScalarExpr)> = freq
         .into_values()
         .filter(|(count, expr)| {
-            *count >= 2 && expr_size(expr) >= MIN_TREE_SIZE && !contains_volatile(expr)
+            *count >= 2
+                && expr_size(expr) >= MIN_TREE_SIZE
+                && !contains_volatile(expr)
+                && !(can_raise(expr) && fallible_guarded_in(&exprs, expr))
         })
         .collect();
 
@@ -354,6 +365,127 @@ fn contains_volatile(expr: &ScalarExpr) -> bool {
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::Exists { .. }
         | ScalarExpr::InSubquery { .. } => true,
+    }
+}
+
+// ============================================================================
+// Fallibility (can_raise) + short-circuit guarding
+// ============================================================================
+
+/// Returns `true` if evaluating `expr` on some row can raise a per-row runtime
+/// error (division/modulo by zero, checked-arithmetic overflow, `Pow`, casts,
+/// array subscript out of bounds, bit shifts, or any non-total builtin).
+///
+/// CSE hoists a shared sub-tree into a `Project` that is evaluated for **every**
+/// input row, unconditionally. If the sub-tree's original position was guarded
+/// by a short-circuiting `AND`/`OR` (Kleene three-valued, see the executor's
+/// `eval_and`/`eval_or`), hoisting evaluates it for rows where the short-circuit
+/// would have skipped it — turning an empty/filtered result into a runtime
+/// error. We therefore refuse to hoist a `can_raise()` candidate that appears in
+/// any short-circuit-guarded position (see [`appears_guarded`]).
+///
+/// The predicate is intentionally conservative: only operators that are
+/// *provably total* over all inputs are reported as non-raising. Anything not
+/// recognised as total (notably every `FunctionCall`, since casts/`array`
+/// indexing/most builtins can fail) is treated as fallible. A false `true` only
+/// costs a missed hoist; a false `false` would be a correctness bug.
+fn can_raise(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {
+            false
+        }
+        ScalarExpr::IsNull { expr: inner, .. } => can_raise(inner),
+        ScalarExpr::Unary {
+            op, expr: inner, ..
+        } => {
+            // `+x`, `NOT x`, and bitwise `~x` are total over their domains; only
+            // the operand can raise. `-x` can overflow on `i32::MIN`/`i64::MIN`.
+            let op_raises = matches!(op, UnaryOp::Neg);
+            op_raises || can_raise(inner)
+        }
+        ScalarExpr::Binary {
+            op, left, right, ..
+        } => binary_op_can_raise(*op) || can_raise(left) || can_raise(right),
+        // Every builtin is treated as potentially fallible: casts overflow,
+        // array subscript can be out of bounds, `sqrt`/`ln` reject some inputs,
+        // etc. Conservatism here is sound (only forgoes an optimisation).
+        ScalarExpr::FunctionCall { .. } => true,
+        // Subquery / outer-column leaves are never CSE candidates anyway
+        // (`contains_volatile` already excludes them); treat as fallible.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => true,
+    }
+}
+
+/// Returns `true` if a binary operator can raise a runtime error for some
+/// well-typed operands. Only operators that are provably total are `false`.
+fn binary_op_can_raise(op: BinaryOp) -> bool {
+    match op {
+        // Provably total: comparisons, Kleene boolean connectives, string
+        // concatenation, and bitwise AND/OR/XOR never error on valid operands.
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq
+        | BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Concat
+        | BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor => false,
+        // Everything else can raise: Add/Sub/Mul overflow (checked arithmetic),
+        // Div/Mod divide-by-zero, Pow, bit shifts, and the pattern/regex/JSON/
+        // network/vector operators (malformed patterns, missing paths, …).
+        _ => true,
+    }
+}
+
+/// Returns `true` if `candidate` occurs in a short-circuit-guarded position in
+/// any of the `source` expressions collected from the current node.
+fn fallible_guarded_in(source: &[ScalarExpr], candidate: &ScalarExpr) -> bool {
+    let key = ExprKey::new(candidate);
+    source
+        .iter()
+        .any(|e| appears_guarded(e, &key, /* guarded = */ false))
+}
+
+/// Returns `true` if `target` appears anywhere inside `expr` in a position that
+/// a short-circuiting `AND`/`OR` could skip — i.e. nested (at any depth) within
+/// the *right* operand of a `BinaryOp::And` or `BinaryOp::Or`.
+///
+/// The left operand of `AND`/`OR` is always evaluated, so an occurrence reached
+/// only through left operands is *not* guarded. `guarded` starts `false` at the
+/// expression root and flips to `true` once we descend into an `AND`/`OR` right
+/// operand.
+fn appears_guarded(expr: &ScalarExpr, target: &ExprKey, guarded: bool) -> bool {
+    if guarded && &ExprKey::new(expr) == target {
+        return true;
+    }
+    match expr {
+        ScalarExpr::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            // Left operand keeps the current `guarded` flag; the right operand
+            // is short-circuit-skippable, so descend with `guarded = true`.
+            appears_guarded(left, target, guarded) || appears_guarded(right, target, true)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            appears_guarded(left, target, guarded) || appears_guarded(right, target, guarded)
+        }
+        ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
+            appears_guarded(inner, target, guarded)
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            args.iter().any(|a| appears_guarded(a, target, guarded))
+        }
+        _ => false,
     }
 }
 
@@ -589,6 +721,41 @@ mod tests {
             expr: Box::new(e),
             data_type: DataType::Int32,
         }
+    }
+
+    fn div(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Div,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn ne(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn lt(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn three_col_scan() -> LogicalPlan {
+        scan(vec![
+            Field::required("a", DataType::Int32),
+            Field::required("c", DataType::Int32),
+            Field::required("b", DataType::Int32),
+        ])
     }
 
     /// Build a large sub-tree (≥ 4 nodes): `(a + b) * (a + b)`.
@@ -867,5 +1034,126 @@ mod tests {
             twice.is_none(),
             "second pass should be a no-op (fixed point reached); got {twice:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallible-subexpression hoisting under short-circuit (bug #6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn does_not_hoist_fallible_subexpr_below_short_circuit() {
+        // Repro of bug #6:
+        //   WHERE c <> 0 AND ((a/c + b) > 100 OR (a/c + b) < -100)
+        // The `a/c + b` (4 nodes) sub-tree appears twice but is guarded by the
+        // top `AND`: for rows where `c <> 0` is false, the division never runs.
+        // Hoisting it into a Project below the Filter would compute `a/c` for
+        // every row, turning a division-by-zero into a runtime error where the
+        // unoptimised plan returns 0 rows. It must NOT be hoisted.
+        let a_over_c_plus_b = add(div(col("a", 0), col("c", 1)), col("b", 2)); // 5 nodes
+        let predicate = and(
+            ne(col("c", 1), lit_i32(0)),
+            ScalarExpr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(gt(a_over_c_plus_b.clone(), lit_i32(100))),
+                right: Box::new(lt(a_over_c_plus_b, neg(lit_i32(100)))),
+                data_type: DataType::Bool,
+            },
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(three_col_scan()),
+            predicate,
+        };
+
+        let result = CommonSubExprElimination.apply(&plan).expect("no error");
+        assert!(
+            result.is_none(),
+            "fallible sub-tree guarded by a short-circuit must not be hoisted; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hoists_total_subexpr_even_under_short_circuit() {
+        // A *total* (non-raising) sub-tree stays eligible even when guarded:
+        //   WHERE b > 0 AND (neg(a+b) = 0 OR neg(a+b) = 1)
+        // `neg(a+b)` (4 nodes) cannot raise on these operands... but Add CAN
+        // overflow, so this is actually fallible. Use a guaranteed-total tree
+        // instead: a comparison chain. To exercise the pure-but-guarded path we
+        // rely on `can_raise` reporting false for the candidate. Here we hoist
+        // `neg(a)` wrapped to size 4 via `(a = a)`-style is awkward; instead we
+        // assert the *unguarded* fallible case below and the guarded-total case
+        // is covered by `can_raise` returning false for comparison trees.
+        //
+        // Construct a guarded but *total* 4-node duplicate: `(a = b) = (a = b)`
+        // re-using a Bool comparison (Eq is total). Each `(a = b)` is 3 nodes;
+        // wrap in IsNull to reach 4 and keep totality.
+        let eq_ab = ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col("a", 0)),
+            right: Box::new(col("b", 1)),
+            data_type: DataType::Bool,
+        };
+        let isnull_eq = ScalarExpr::IsNull {
+            expr: Box::new(eq_ab),
+            negated: false,
+        }; // 4 nodes, total
+        let predicate = and(
+            gt(col("a", 0), lit_i32(0)),
+            and(isnull_eq.clone(), isnull_eq),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(two_col_scan()),
+            predicate,
+        };
+        let result = CommonSubExprElimination.apply(&plan).expect("no error");
+        assert!(
+            result.is_some(),
+            "a total sub-tree should still be hoisted even when short-circuit-guarded"
+        );
+    }
+
+    #[test]
+    fn hoists_fallible_subexpr_when_not_short_circuit_guarded() {
+        // `a/c + b` used twice but NOT under any short-circuit:
+        //   WHERE (a/c + b) > 0 AND (a/c + b) < 100
+        // is short-circuit-guarded for the *second* conjunct. To get a truly
+        // unguarded case, place both uses in a single non-boolean expression:
+        //   WHERE (a/c + b) = (a/c + b)
+        // Both occurrences are always evaluated (no AND/OR skips them), so the
+        // fallible sub-tree IS eligible — no short-circuit protection is lost.
+        let lhs = add(div(col("a", 0), col("c", 1)), col("b", 2)); // 5 nodes
+        let predicate = ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(lhs.clone()),
+            right: Box::new(lhs),
+            data_type: DataType::Bool,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(three_col_scan()),
+            predicate,
+        };
+        let result = CommonSubExprElimination.apply(&plan).expect("no error");
+        assert!(
+            result.is_some(),
+            "an always-evaluated fallible sub-tree should still be hoisted"
+        );
+    }
+
+    #[test]
+    fn can_raise_classifies_total_and_fallible_ops() {
+        // Total: comparisons, AND/OR, concat, bitwise AND/OR/XOR.
+        assert!(!can_raise(&gt(col("a", 0), col("b", 1))));
+        assert!(!can_raise(&and(
+            gt(col("a", 0), lit_i32(0)),
+            lt(col("b", 1), lit_i32(0))
+        )));
+        // Fallible: division, modulo, checked Add/Sub/Mul, Neg, any function.
+        assert!(can_raise(&div(col("a", 0), col("c", 1))));
+        assert!(can_raise(&add(col("a", 0), col("b", 1)))); // overflow
+        assert!(can_raise(&neg(col("a", 0)))); // i32::MIN
+        assert!(can_raise(&ScalarExpr::FunctionCall {
+            name: "__ultrasql_array_subscript".to_owned(),
+            args: vec![col("a", 0), lit_i32(1)],
+            data_type: DataType::Int32,
+        }));
     }
 }

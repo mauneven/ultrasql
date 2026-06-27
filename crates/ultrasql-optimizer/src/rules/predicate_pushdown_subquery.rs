@@ -35,25 +35,39 @@
 //! Filter(Cte { name, recursive: false, definition, body }, predicate)
 //! ```
 //!
-//! and the CTE is used exactly once in `body` (detected by scanning for a
-//! single `Scan { table: name }` reference), push the filter into the CTE
-//! definition:
+//! and the CTE is used exactly once in `body` **and** the body is a transparent
+//! positional passthrough of the CTE relation (see below), push the filter into
+//! the CTE definition:
 //!
 //! ```text
 //! Cte { definition: Filter(definition, predicate), body }
 //! ```
 //!
-//! This is the "CTE inlining + push" optimisation. It is conservative: if the
-//! CTE name appears more than once in `body` (materialised multiple times), we
-//! do not push because doing so would execute the filter inside the CTE body
-//! multiple times, potentially changing observable behaviour for side-effecting
-//! subqueries (not that v0.6 has those, but the rule is written defensively).
+//! This is the "CTE inlining + push" optimisation. It is conservative on two
+//! axes:
+//!
+//! - **Single use.** If the CTE name appears more than once in `body`
+//!   (materialised multiple times), we do not push because doing so would
+//!   execute the filter inside the CTE body multiple times, potentially changing
+//!   observable behaviour for side-effecting subqueries (not that v0.6 has those,
+//!   but the rule is written defensively).
+//! - **Positional transparency.** The `predicate`'s column indices are relative
+//!   to the CTE *output* (= the body's output schema), but the push injects the
+//!   predicate into the *definition*, whose output columns may sit in a different
+//!   order / arity. We therefore push only when every body-output position maps
+//!   1:1 to the same definition-output position — i.e. the body is the bare CTE
+//!   `Scan` or a chain of identity `Project` / `Filter` over it. Otherwise the
+//!   indices would refer to the wrong columns, silently changing results (#5),
+//!   so we decline. (A full index-remap is a future enhancement.)
 //!
 //! ## Non-applicable conditions
 //!
 //! - Predicate references a synthesised `Project` expression (computed column).
 //! - CTE is recursive (`recursive: true`).
 //! - CTE name appears more than once in the body (materialised multiple times).
+//! - CTE body reorders / drops / renames / computes columns (not a positional
+//!   passthrough), so the predicate's indices would not line up with the
+//!   definition output.
 //! - Predicate contains a parameter (`$N`) that cannot be safely pushed.
 
 #![allow(clippy::match_same_arms)]
@@ -138,8 +152,26 @@ fn push_subquery(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeErro
                 unreachable!()
             };
 
-            // Only push if the CTE is referenced exactly once in the body.
-            if cte_use_count(body, name) == 1 {
+            // Only push if the CTE is referenced exactly once in the body AND
+            // the body is a transparent positional passthrough of the CTE
+            // relation.
+            //
+            // The outer `predicate`'s column indices are relative to the Cte
+            // OUTPUT, which equals the *body's* output schema. The push injects
+            // the predicate into the CTE *definition*, whose output columns may
+            // sit in a different order / have a different arity than the body
+            // output (e.g. the body reorders, drops, renames, or computes
+            // columns). Pushing an unremapped predicate in that case filters the
+            // WRONG column — a silent wrong-result bug (#5).
+            //
+            // We push only when every body-output position maps 1:1 to the same
+            // definition-output position, i.e. the body is the bare CTE scan or
+            // a chain of identity Project / Filter over it (no reorder, drop,
+            // rename, or computed column). Then body-index == definition-index
+            // and the predicate is valid against the definition unchanged.
+            if cte_use_count(body, name) == 1
+                && is_transparent_passthrough(body, name, definition.schema().len())
+            {
                 // Push the predicate into the CTE definition.
                 let new_definition = LogicalPlan::Filter {
                     input: definition.clone(),
@@ -342,6 +374,43 @@ fn cte_use_count(plan: &LogicalPlan, name: &str) -> usize {
             definition, body, ..
         } => cte_use_count(definition, name) + cte_use_count(body, name),
         _ => 0,
+    }
+}
+
+// ============================================================================
+// CTE body transparency
+// ============================================================================
+
+/// Returns `true` when `body` exposes the CTE relation's columns in their
+/// original positions, so that a predicate written against the body output is
+/// also valid against the CTE *definition* output (same index → same column).
+///
+/// `def_width` is the definition's output arity. Accepted shapes:
+///
+/// - `Scan { table: cte_name }` — the bare CTE reference; body output == CTE
+///   relation output == definition output, positionally identical.
+/// - `Filter(child, _)` — a Filter never reorders, drops, or renames columns,
+///   so it is transparent iff its child is.
+/// - `Project(child, exprs)` — transparent only when it is an *identity*
+///   projection: `exprs[i]` is exactly `Column { index: i }` for every `i`, and
+///   the arity equals `def_width` (no reorder / drop / rename / computed
+///   column).
+///
+/// Any other node (reordering/renaming Project, Aggregate, Join, Sort, Limit,
+/// SetOp, nested Cte, …) is treated as non-transparent and blocks the push.
+fn is_transparent_passthrough(body: &LogicalPlan, cte_name: &str, def_width: usize) -> bool {
+    match body {
+        LogicalPlan::Scan { table, .. } => table == cte_name,
+        LogicalPlan::Filter { input, .. } => is_transparent_passthrough(input, cte_name, def_width),
+        LogicalPlan::Project { input, exprs, .. } => {
+            exprs.len() == def_width
+                && exprs
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (e, _))| matches!(e, ScalarExpr::Column { index, .. } if *index == i))
+                && is_transparent_passthrough(input, cte_name, def_width)
+        }
+        _ => false,
     }
 }
 
@@ -707,6 +776,117 @@ mod tests {
         assert!(
             matches!(result.unwrap(), LogicalPlan::Cte { .. }),
             "top node should be Cte after push"
+        );
+    }
+
+    #[test]
+    fn does_not_push_into_cte_when_body_reorders_columns() {
+        // Repro of bug #5: the CTE body REORDERS columns, so the outer filter's
+        // indices (relative to the body output) do not line up with the
+        // definition's output. Pushing the predicate unremapped would filter the
+        // wrong column. The rule must decline to push here.
+        //
+        //   WITH c AS (SELECT a, b FROM t)       -- definition output [a, b]
+        //   SELECT b AS y, a AS z FROM c         -- body output [y(=b), z(=a)]
+        //   ... WHERE y > 5                       -- Column{0} = body's y = b
+        //
+        // Definition output is [a, b]; pushing `Column{0} > 5` there filters `a`,
+        // which is WRONG (it must filter `b`).
+        let cte_def = scan("base"); // output [id, score] (positions 0, 1)
+        // Body: identity-renaming reorder Project over the CTE scan.
+        let cte_body = LogicalPlan::Project {
+            input: Box::new(scan("cte_name")),
+            exprs: vec![
+                (col("score", 1), "y".into()), // body col 0 := definition col 1
+                (col("id", 0), "z".into()),    // body col 1 := definition col 0
+            ],
+            schema: Schema::new(vec![
+                Field::nullable("y", DataType::Int32),
+                Field::required("z", DataType::Int32),
+            ])
+            .expect("schema ok"),
+        };
+        let cte_schema = Schema::new(vec![
+            Field::nullable("y", DataType::Int32),
+            Field::required("z", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let cte = LogicalPlan::Cte {
+            name: "cte_name".into(),
+            recursive: false,
+            definition: Box::new(cte_def),
+            body: Box::new(cte_body),
+            schema: cte_schema,
+        };
+        // Filter(Cte, Column{0} > 5) — references the body's `y` (= score).
+        let plan = LogicalPlan::Filter {
+            input: Box::new(cte),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(col("y", 0)),
+                right: Box::new(lit_i32(5)),
+                data_type: DataType::Bool,
+            },
+        };
+        let result = PredicatePushdownSubquery.apply(&plan).expect("no error");
+        // Must NOT push the filter into the CTE definition (would mis-map).
+        if let Some(r) = result {
+            assert!(
+                !matches!(
+                    &r,
+                    LogicalPlan::Cte { definition, .. }
+                        if matches!(definition.as_ref(), LogicalPlan::Filter { .. })
+                ),
+                "reordering CTE body must not have the outer filter pushed into the definition"
+            );
+        }
+    }
+
+    #[test]
+    fn pushes_into_cte_when_body_is_identity_project() {
+        // Body is an IDENTITY project (no reorder/rename) over the CTE scan:
+        // positions match the definition, so the push is sound and should fire.
+        let cte_def = scan("base"); // output [id, score]
+        let cte_body = LogicalPlan::Project {
+            input: Box::new(scan("cte_name")),
+            exprs: vec![
+                (col("id", 0), "id".into()),
+                (col("score", 1), "score".into()),
+            ],
+            schema: Schema::new(vec![
+                Field::required("id", DataType::Int32),
+                Field::nullable("score", DataType::Int32),
+            ])
+            .expect("schema ok"),
+        };
+        let cte_schema = Schema::new(vec![
+            Field::required("id", DataType::Int32),
+            Field::nullable("score", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let cte = LogicalPlan::Cte {
+            name: "cte_name".into(),
+            recursive: false,
+            definition: Box::new(cte_def),
+            body: Box::new(cte_body),
+            schema: cte_schema,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(cte),
+            predicate: eq(col("id", 0), lit_i32(5)),
+        };
+        let result = PredicatePushdownSubquery.apply(&plan).expect("no error");
+        assert!(
+            result.is_some(),
+            "identity-project CTE body should still allow the push"
+        );
+        assert!(
+            matches!(
+                result.unwrap(),
+                LogicalPlan::Cte { definition, .. }
+                    if matches!(definition.as_ref(), LogicalPlan::Filter { .. })
+            ),
+            "identity passthrough should push the filter into the definition"
         );
     }
 

@@ -827,3 +827,75 @@ async fn autocommit_now_advances_between_statements() {
 
     shutdown(running).await;
 }
+
+/// Regression for optimizer bug #6: CSE must not hoist a fallible sub-expression
+/// out of a short-circuited Filter. The unoptimised plan evaluates `c <> 0`
+/// first, so for the `(10, 0, 5)` row the `a / c` division never runs and the
+/// query returns 0 rows. Hoisting `a / c + b` into a Project below the Filter
+/// would compute the division for every row and raise division-by-zero.
+/// PostgreSQL returns 0 rows with no error.
+#[tokio::test]
+async fn cse_does_not_hoist_fallible_expr_out_of_short_circuit_filter() {
+    let running = start_sample_server("cse_short_circuit_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE cse_bug6 (a INT NOT NULL, c INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO cse_bug6 VALUES (10, 0, 5)")
+        .await
+        .expect("insert row");
+
+    // The short-circuit `c <> 0` protects the `a / c` division; result is 0 rows
+    // with no error. A faulty CSE hoist would surface SQLSTATE 22012 instead.
+    let rows = client
+        .query(
+            "SELECT * FROM cse_bug6
+             WHERE c <> 0 AND ((a / c + b) > 100 OR (a / c + b) < -100)",
+            &[],
+        )
+        .await
+        .expect("short-circuited filter must not raise division-by-zero");
+    assert_eq!(rows.len(), 0, "row is filtered out by c <> 0; no error");
+
+    shutdown(running).await;
+}
+
+/// Regression for optimizer bug #35: constant folding must not evaluate float
+/// division/modulo by zero to Infinity/NaN. It must decline so the executor
+/// raises division-by-zero (SQLSTATE 22012), matching PostgreSQL.
+#[tokio::test]
+async fn constant_fold_declines_float_division_by_zero() {
+    let running = start_sample_server("float_div0_fold_test").await;
+    let client = &running.client;
+
+    for query in [
+        "SELECT 1.0 / 0.0",
+        "SELECT 1.0 % 0.0",
+        "SELECT 1.0::float8 / 0.0::float8",
+        "SELECT 1.0::float4 / 0.0::float4",
+    ] {
+        let err = client
+            .query_one(query, &[])
+            .await
+            .expect_err("float div/mod by zero must error, not fold to Infinity/NaN");
+        let db_err = err.as_db_error().expect("server-side error");
+        assert_eq!(
+            db_err.code().code(),
+            "22012",
+            "{query}: division_by_zero SQLSTATE"
+        );
+    }
+
+    // A non-zero constant divisor still folds and returns the value. Use an
+    // explicit float8 cast: a bare `6.0 / 2.0` is `numeric` in PostgreSQL.
+    let row = client
+        .query_one("SELECT 6.0::float8 / 2.0::float8", &[])
+        .await
+        .expect("non-zero float8 division still works");
+    assert!((row.get::<_, f64>(0) - 3.0).abs() < 1e-12);
+
+    shutdown(running).await;
+}

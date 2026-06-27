@@ -937,6 +937,12 @@ fn eval_arith_f32(op: BinaryOp, a: f32, b: f32) -> Option<Value> {
         BinaryOp::Add => Some(Value::Float32(a + b)),
         BinaryOp::Sub => Some(Value::Float32(a - b)),
         BinaryOp::Mul => Some(Value::Float32(a * b)),
+        // Decline to fold division / modulo by zero: the executor's
+        // `float32_arith` raises `DivByZero` (SQLSTATE 22012, matching
+        // PostgreSQL's `division by zero`). Folding `x / 0.0` to `Infinity`
+        // (or `x % 0.0` to `NaN`) would silently change an error into a
+        // value, so we return `None` and let the executor evaluate the node.
+        BinaryOp::Div | BinaryOp::Mod if b == 0.0 => None,
         BinaryOp::Div => Some(Value::Float32(a / b)),
         BinaryOp::Mod => Some(Value::Float32(a % b)),
         _ => None,
@@ -948,6 +954,12 @@ fn eval_arith_f64(op: BinaryOp, a: f64, b: f64) -> Option<Value> {
         BinaryOp::Add => Some(Value::Float64(a + b)),
         BinaryOp::Sub => Some(Value::Float64(a - b)),
         BinaryOp::Mul => Some(Value::Float64(a * b)),
+        // Decline to fold division / modulo by zero: the executor's
+        // `float64_arith` raises `DivByZero` (SQLSTATE 22012, matching
+        // PostgreSQL's `division by zero`). Folding `x / 0.0` to `Infinity`
+        // (or `x % 0.0` to `NaN`) would silently change an error into a
+        // value, so we return `None` and let the executor evaluate the node.
+        BinaryOp::Div | BinaryOp::Mod if b == 0.0 => None,
         BinaryOp::Div => Some(Value::Float64(a / b)),
         BinaryOp::Mod => Some(Value::Float64(a % b)),
         _ => None,
@@ -1218,6 +1230,91 @@ mod tests {
         if let Some(result) = fold_expr(&e) {
             assert!(!matches!(result, ScalarExpr::Literal { .. }));
         }
+    }
+
+    fn lit_f32(v: f32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Float32(v),
+            data_type: DataType::Float32,
+        }
+    }
+
+    /// Helper: assert that `fold_expr(e)` never collapses to a `Literal`
+    /// (i.e. the folder declined, leaving the node for the executor).
+    fn assert_not_folded_to_literal(e: &ScalarExpr) {
+        if let Some(result) = fold_expr(e) {
+            assert!(
+                !matches!(result, ScalarExpr::Literal { .. }),
+                "must not fold to a literal: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn float64_division_by_zero_is_not_folded() {
+        // `1.0 / 0.0` must NOT fold to `Infinity`; the executor raises
+        // DivByZero (SQLSTATE 22012), matching PostgreSQL.
+        assert_not_folded_to_literal(&bin(
+            BinaryOp::Div,
+            lit_f64(1.0),
+            lit_f64(0.0),
+            DataType::Float64,
+        ));
+    }
+
+    #[test]
+    fn float64_modulo_by_zero_is_not_folded() {
+        // `1.0 % 0.0` must NOT fold to `NaN`.
+        assert_not_folded_to_literal(&bin(
+            BinaryOp::Mod,
+            lit_f64(1.0),
+            lit_f64(0.0),
+            DataType::Float64,
+        ));
+    }
+
+    #[test]
+    fn float32_division_by_zero_is_not_folded() {
+        assert_not_folded_to_literal(&bin(
+            BinaryOp::Div,
+            lit_f32(1.0),
+            lit_f32(0.0),
+            DataType::Float32,
+        ));
+    }
+
+    #[test]
+    fn float32_modulo_by_zero_is_not_folded() {
+        assert_not_folded_to_literal(&bin(
+            BinaryOp::Mod,
+            lit_f32(1.0),
+            lit_f32(0.0),
+            DataType::Float32,
+        ));
+    }
+
+    #[test]
+    fn nonzero_float_division_still_folds() {
+        // Sanity: a non-zero divisor must still fold (no perf regression).
+        let e = bin(BinaryOp::Div, lit_f64(6.0), lit_f64(2.0), DataType::Float64);
+        let folded = fold_expr(&e).expect("should fold");
+        assert_eq!(
+            folded,
+            ScalarExpr::Literal {
+                value: Value::Float64(3.0),
+                data_type: DataType::Float64,
+            }
+        );
+
+        let e32 = bin(BinaryOp::Mod, lit_f32(5.0), lit_f32(3.0), DataType::Float32);
+        let folded32 = fold_expr(&e32).expect("should fold");
+        assert_eq!(
+            folded32,
+            ScalarExpr::Literal {
+                value: Value::Float32(2.0),
+                data_type: DataType::Float32,
+            }
+        );
     }
 
     #[test]

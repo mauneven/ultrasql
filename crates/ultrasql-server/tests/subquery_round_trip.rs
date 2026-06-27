@@ -771,3 +771,43 @@ async fn uncorrelated_scalar_subquery_single_row_assert_battery() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Regression for optimizer bug #5: CTE predicate pushdown must not inject the
+/// outer filter into the CTE definition when the body reorders the columns. The
+/// outer `WHERE sub.y > 5` index is relative to the CTE/body output `[y, z]`,
+/// not the definition output `[a, b]`; an unremapped push would filter the
+/// wrong column. PostgreSQL returns the row with `b = 10` (`y = 10`).
+#[tokio::test]
+async fn cte_in_derived_table_with_reordered_body_filters_correct_column() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE cte_bug5 (a INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO cte_bug5 VALUES (10, 1), (1, 10)")
+        .await
+        .expect("insert rows");
+
+    let rows = client
+        .simple_query(
+            "SELECT y FROM (
+                 WITH c AS (SELECT a, b FROM cte_bug5)
+                 SELECT b AS y, a AS z FROM c
+             ) sub
+             WHERE sub.y > 5",
+        )
+        .await
+        .expect("query succeeds");
+    let ys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    // `y` is the `b` column; only the (1, 10) row has b = 10 > 5.
+    assert_eq!(ys, vec![10], "must filter on b (= y), not a");
+
+    shutdown(client, server_handle).await;
+}
