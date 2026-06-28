@@ -482,10 +482,43 @@ fn appears_guarded(expr: &ScalarExpr, target: &ExprKey, guarded: bool) -> bool {
         ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
             appears_guarded(inner, target, guarded)
         }
-        ScalarExpr::FunctionCall { args, .. } => {
-            args.iter().any(|a| appears_guarded(a, target, guarded))
-        }
+        ScalarExpr::FunctionCall { name, args, .. } => match short_circuit_always_evaluated(name) {
+            // For a short-circuiting builtin, the leading `always` arguments are
+            // evaluated unconditionally; every argument after them sits in a
+            // skippable position (a non-taken CASE branch, or a COALESCE argument
+            // past the first non-NULL), so it is short-circuit-guarded.
+            Some(always) => args
+                .iter()
+                .enumerate()
+                .any(|(i, a)| appears_guarded(a, target, guarded || i >= always)),
+            // Ordinary functions (including NULLIF, whose two operands are always
+            // both evaluated) evaluate every argument; the flag is unchanged.
+            None => args.iter().any(|a| appears_guarded(a, target, guarded)),
+        },
         _ => false,
+    }
+}
+
+/// For the short-circuiting builtins, returns how many *leading* arguments are
+/// always evaluated. Arguments at or after that index occupy short-circuit-
+/// guarded positions, so a fallible sub-tree there must not be hoisted into an
+/// unconditional `Project` (see [`appears_guarded`]). `None` means every
+/// argument is evaluated unconditionally — the default for ordinary functions.
+fn short_circuit_always_evaluated(name: &str) -> Option<usize> {
+    match name {
+        // `coalesce(a1, a2, …)`: a1 is always evaluated; later arguments run only
+        // when every preceding one was NULL.
+        "coalesce" => Some(1),
+        // `case_searched` args `[c1, v1, c2, v2, …, else]`: only the first WHEN
+        // condition `c1` is unconditional; every THEN value, later WHEN
+        // condition, and the ELSE are reached conditionally.
+        "case_searched" => Some(1),
+        // `case_simple` args `[op, w1, v1, w2, v2, …, else]`: the operand and the
+        // first WHEN comparand are always evaluated; everything after them is
+        // conditional.
+        "case_simple" => Some(2),
+        // NULLIF and all other functions evaluate every argument unconditionally.
+        _ => None,
     }
 }
 
@@ -1155,5 +1188,154 @@ mod tests {
             args: vec![col("a", 0), lit_i32(1)],
             data_type: DataType::Int32,
         }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Short-circuit guarding for CASE / COALESCE branches
+    //
+    // Once the executor evaluates CASE/COALESCE lazily, a fallible sub-tree
+    // reachable only through a non-taken branch must be treated as guarded so
+    // CSE does not hoist it into an unconditional Project.
+    // -----------------------------------------------------------------------
+
+    fn case_searched(args: Vec<ScalarExpr>) -> ScalarExpr {
+        ScalarExpr::FunctionCall {
+            name: "case_searched".to_owned(),
+            args,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn case_simple(args: Vec<ScalarExpr>) -> ScalarExpr {
+        ScalarExpr::FunctionCall {
+            name: "case_simple".to_owned(),
+            args,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn coalesce(args: Vec<ScalarExpr>) -> ScalarExpr {
+        ScalarExpr::FunctionCall {
+            name: "coalesce".to_owned(),
+            args,
+            data_type: DataType::Int32,
+        }
+    }
+
+    #[test]
+    fn case_searched_branches_are_guarded_except_first_when() {
+        let candidate = div(col("a", 0), col("c", 1)); // a/c, fallible
+        let key = ExprKey::new(&candidate);
+
+        // [c1, v1, else]: the THEN value is conditional → guarded.
+        let in_then = case_searched(vec![
+            ne(col("c", 1), lit_i32(0)),
+            candidate.clone(),
+            lit_i32(0),
+        ]);
+        assert!(
+            appears_guarded(&in_then, &key, false),
+            "a CASE THEN value is short-circuit-guarded"
+        );
+
+        // [c1, v1, else]: the ELSE value is conditional → guarded.
+        let in_else = case_searched(vec![
+            ne(col("c", 1), lit_i32(0)),
+            lit_i32(0),
+            candidate.clone(),
+        ]);
+        assert!(
+            appears_guarded(&in_else, &key, false),
+            "a CASE ELSE value is short-circuit-guarded"
+        );
+
+        // The first WHEN condition is always evaluated → NOT guarded.
+        let in_first_when = case_searched(vec![gt(candidate, lit_i32(0)), lit_i32(1), lit_i32(0)]);
+        assert!(
+            !appears_guarded(&in_first_when, &key, false),
+            "the first CASE WHEN condition is always evaluated, so not guarded"
+        );
+    }
+
+    #[test]
+    fn case_simple_operand_and_first_comparand_not_guarded() {
+        let candidate = div(col("a", 0), col("c", 1));
+        let key = ExprKey::new(&candidate);
+
+        // [op, w1, v1, else]: op (idx 0) and w1 (idx 1) are always evaluated.
+        let in_operand = case_simple(vec![candidate.clone(), lit_i32(1), lit_i32(2), lit_i32(3)]);
+        assert!(!appears_guarded(&in_operand, &key, false));
+
+        let in_first_comparand =
+            case_simple(vec![lit_i32(0), candidate.clone(), lit_i32(2), lit_i32(3)]);
+        assert!(!appears_guarded(&in_first_comparand, &key, false));
+
+        // v1 (idx 2) is conditional → guarded.
+        let in_then = case_simple(vec![lit_i32(0), lit_i32(1), candidate, lit_i32(3)]);
+        assert!(appears_guarded(&in_then, &key, false));
+    }
+
+    #[test]
+    fn coalesce_guards_all_but_first_argument() {
+        let candidate = div(col("a", 0), col("c", 1));
+        let key = ExprKey::new(&candidate);
+
+        // coalesce(a/c, 0): first argument always evaluated → not guarded.
+        let first = coalesce(vec![candidate.clone(), lit_i32(0)]);
+        assert!(!appears_guarded(&first, &key, false));
+
+        // coalesce(0, a/c): second argument runs only if the first is NULL.
+        let second = coalesce(vec![lit_i32(0), candidate]);
+        assert!(appears_guarded(&second, &key, false));
+    }
+
+    #[test]
+    fn nullif_arguments_are_not_guarded() {
+        // PostgreSQL evaluates both NULLIF operands unconditionally, so neither
+        // is a short-circuit-guarded position.
+        let candidate = div(col("a", 0), col("c", 1));
+        let key = ExprKey::new(&candidate);
+        for args in [
+            vec![candidate.clone(), lit_i32(0)],
+            vec![lit_i32(0), candidate.clone()],
+        ] {
+            let nf = ScalarExpr::FunctionCall {
+                name: "nullif".to_owned(),
+                args,
+                data_type: DataType::Int32,
+            };
+            assert!(!appears_guarded(&nf, &key, false));
+        }
+    }
+
+    #[test]
+    fn does_not_hoist_fallible_subexpr_inside_case_branch() {
+        // Two distinct CASE expressions sharing the fallible 5-node sub-tree
+        // `a/c + b` in their ELSE branch:
+        //   x = CASE WHEN c <> 0 THEN 0 ELSE a/c + b END
+        //   y = CASE WHEN c <> 0 THEN 1 ELSE a/c + b END
+        // For rows where `c = 0`, lazy CASE never evaluates the ELSE. Hoisting
+        // `a/c + b` into a Project would divide by zero for those rows, turning
+        // an empty/valid result into a runtime error. It must NOT be hoisted.
+        let shared = add(div(col("a", 0), col("c", 1)), col("b", 2)); // 5 nodes, fallible
+        let case_with_then =
+            |then: ScalarExpr| case_searched(vec![ne(col("c", 1), lit_i32(0)), then, shared.clone()]);
+        let plan = LogicalPlan::Project {
+            input: Box::new(three_col_scan()),
+            exprs: vec![
+                (case_with_then(lit_i32(0)), "x".to_owned()),
+                (case_with_then(lit_i32(1)), "y".to_owned()),
+            ],
+            schema: Schema::new([
+                Field::nullable("x", DataType::Int32),
+                Field::nullable("y", DataType::Int32),
+            ])
+            .expect("schema ok"),
+        };
+        let result = CommonSubExprElimination.apply(&plan).expect("no error");
+        assert!(
+            result.is_none(),
+            "a fallible sub-tree inside a CASE branch must not be hoisted; got {result:?}"
+        );
     }
 }

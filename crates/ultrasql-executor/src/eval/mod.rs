@@ -252,10 +252,25 @@ pub(crate) fn eval_expr(
             args,
             data_type,
         } => {
-            let evaluated: Result<Vec<Value>, EvalError> =
-                args.iter().map(|a| eval_expr(a, row, params)).collect();
-            let vals = evaluated?;
-            eval_function_call(name, &vals, data_type)
+            // Short-circuiting constructs must evaluate their branch / argument
+            // expressions lazily, exactly like PostgreSQL: CASE evaluates WHEN
+            // conditions in order and only the *selected* result branch;
+            // COALESCE stops at the first non-NULL argument. Evaluating every
+            // branch eagerly would surface errors (e.g. division by zero) from
+            // positions PostgreSQL never reaches, turning a valid result into a
+            // spurious error — so these receive the *unevaluated* branches.
+            // (NULLIF is absent: PostgreSQL always evaluates both operands.)
+            match name.as_str() {
+                "case_searched" => eval_case_searched_lazy(args, row, params),
+                "case_simple" => eval_case_simple_lazy(args, row, params),
+                "coalesce" => eval_coalesce_lazy(args, row, params),
+                _ => {
+                    let evaluated: Result<Vec<Value>, EvalError> =
+                        args.iter().map(|a| eval_expr(a, row, params)).collect();
+                    let vals = evaluated?;
+                    eval_function_call(name, &vals, data_type)
+                }
+            }
         }
     }
 }
@@ -460,6 +475,10 @@ fn eval_function_call(
         )),
         "vector_norm" | "l2_norm" => eval_vector_norm(args),
         "vector_dims" => eval_vector_dims(args),
+        // Value-level (already-evaluated args) variants of the short-circuiting
+        // constructs. The query path in `eval_expr` evaluates these lazily via
+        // `eval_*_lazy` so non-taken branches never run; these arms only serve
+        // the value-level `eval_function_call` API exercised by unit tests.
         "coalesce" => Ok(args
             .iter()
             .find(|v| !matches!(v, Value::Null))

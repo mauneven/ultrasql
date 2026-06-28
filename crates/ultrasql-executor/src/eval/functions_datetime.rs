@@ -77,6 +77,73 @@ pub(crate) fn eval_case_simple(args: &[Value]) -> Result<Value, EvalError> {
     Ok(else_val)
 }
 
+/// Lazy `CASE WHEN c1 THEN v1 … ELSE e END`.
+///
+/// Unlike [`eval_case_searched`], which receives already-evaluated `Value`s and
+/// is reached only via the value-level [`super::eval_function_call`] API, this
+/// walks the *unevaluated* branch expressions: WHEN conditions are evaluated in
+/// order and only the *first* matching THEN (or the ELSE) is evaluated. A
+/// fallible expression in a non-taken branch (e.g. `1/0` guarded by a false
+/// WHEN) is therefore never evaluated — matching PostgreSQL.
+///
+/// Args layout (from the binder): `[c1, v1, c2, v2, …, else]`.
+pub(crate) fn eval_case_searched_lazy(
+    args: &[ScalarExpr],
+    row: &[Value],
+    params: &[Value],
+) -> Result<Value, EvalError> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(EvalError::Type(
+            "case_searched: expected odd arg count (cond, then pairs + else)".into(),
+        ));
+    }
+    let mut i = 0;
+    while i + 1 < args.len() - 1 {
+        match eval_expr(&args[i], row, params)? {
+            Value::Bool(true) => return eval_expr(&args[i + 1], row, params),
+            Value::Bool(false) | Value::Null => {}
+            other => {
+                return Err(EvalError::Type(format!(
+                    "case_searched: WHEN clause must yield bool, got {:?}",
+                    other.data_type()
+                )));
+            }
+        }
+        i += 2;
+    }
+    // No WHEN matched: only now evaluate the ELSE branch.
+    eval_expr(&args[args.len() - 1], row, params)
+}
+
+/// Lazy `CASE op WHEN w1 THEN v1 … ELSE e END`.
+///
+/// Like [`eval_case_searched_lazy`] but compares the operand against each WHEN
+/// comparand in turn. The operand and every comparand examined are evaluated,
+/// but only the *selected* result branch (or the ELSE) is.
+///
+/// Args layout (from the binder): `[op, w1, v1, w2, v2, …, else]`.
+pub(crate) fn eval_case_simple_lazy(
+    args: &[ScalarExpr],
+    row: &[Value],
+    params: &[Value],
+) -> Result<Value, EvalError> {
+    if args.len() < 4 || args.len() % 2 != 0 {
+        return Err(EvalError::Type(
+            "case_simple: expected even arg count ≥ 4 (operand + pairs + else)".into(),
+        ));
+    }
+    let op = eval_expr(&args[0], row, params)?;
+    let mut i = 1;
+    while i + 1 < args.len() - 1 {
+        let comparand = eval_expr(&args[i], row, params)?;
+        if values_equal_for_case(&op, &comparand) {
+            return eval_expr(&args[i + 1], row, params);
+        }
+        i += 2;
+    }
+    eval_expr(&args[args.len() - 1], row, params)
+}
+
 pub(crate) fn eval_now(args: &[Value], return_type: &DataType) -> Result<Value, EvalError> {
     if !args.is_empty() {
         return Err(EvalError::Type(format!(

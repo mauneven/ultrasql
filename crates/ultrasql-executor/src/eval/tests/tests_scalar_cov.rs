@@ -662,3 +662,88 @@ fn split_part_empty_delimiter_matches_postgres() {
         Value::Text("b".to_owned())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Short-circuit semantics for CASE / COALESCE.
+//
+// The whole-expression query path (`eval_expr`) must evaluate these lazily, so
+// a fallible expression (here, division by zero) sitting in a branch / argument
+// that PostgreSQL never reaches returns a value instead of raising. The
+// *selected* branch is still evaluated, so genuine errors are not swallowed.
+// ---------------------------------------------------------------------------
+
+/// `1 / 0` — a well-typed expression that raises [`EvalError::DivByZero`] when
+/// (and only when) it is actually evaluated.
+fn div_by_zero() -> ScalarExpr {
+    binop(BinaryOp::Div, lit_i32(1), lit_i32(0))
+}
+
+/// Evaluate a self-contained scalar (no columns) through the full `eval_expr`
+/// query path, exercising the lazy short-circuit dispatch.
+fn eval_scalar(expr: ScalarExpr) -> Result<Value, EvalError> {
+    Eval::new(expr).eval(&[])
+}
+
+#[test]
+fn case_searched_does_not_evaluate_non_taken_branch() {
+    // CASE WHEN false THEN 1/0 ELSE 99 END -> 99 (THEN never evaluated).
+    let expr = call(
+        "case_searched",
+        vec![lit_bool(false), div_by_zero(), lit_i32(99)],
+        DataType::Int32,
+    );
+    assert_eq!(eval_scalar(expr).expect("no error"), Value::Int32(99));
+
+    // CASE WHEN false THEN 1/0 WHEN true THEN 7 ELSE 1/0 END -> 7
+    // The fallible first THEN and the fallible ELSE are both skipped.
+    let expr = call(
+        "case_searched",
+        vec![
+            lit_bool(false),
+            div_by_zero(),
+            lit_bool(true),
+            lit_i32(7),
+            div_by_zero(),
+        ],
+        DataType::Int32,
+    );
+    assert_eq!(eval_scalar(expr).expect("no error"), Value::Int32(7));
+
+    // The selected branch is still evaluated: a fallible taken THEN must raise.
+    let expr = call(
+        "case_searched",
+        vec![lit_bool(true), div_by_zero(), lit_i32(99)],
+        DataType::Int32,
+    );
+    assert!(matches!(eval_scalar(expr), Err(EvalError::DivByZero)));
+}
+
+#[test]
+fn case_simple_does_not_evaluate_non_taken_branch() {
+    // CASE 1 WHEN 2 THEN 1/0 WHEN 1 THEN 5 ELSE 1/0 END -> 5
+    let expr = call(
+        "case_simple",
+        vec![
+            lit_i32(1),
+            lit_i32(2),
+            div_by_zero(),
+            lit_i32(1),
+            lit_i32(5),
+            div_by_zero(),
+        ],
+        DataType::Int32,
+    );
+    assert_eq!(eval_scalar(expr).expect("no error"), Value::Int32(5));
+}
+
+#[test]
+fn coalesce_stops_at_first_non_null() {
+    // COALESCE(7, 1/0) -> 7 (second argument never evaluated).
+    let expr = call("coalesce", vec![lit_i32(7), div_by_zero()], DataType::Int32);
+    assert_eq!(eval_scalar(expr).expect("no error"), Value::Int32(7));
+
+    // COALESCE(NULL, 1/0) evaluates the second argument (the first is NULL) and
+    // raises — matching PostgreSQL, which does not skip it.
+    let expr = call("coalesce", vec![lit_null(), div_by_zero()], DataType::Int32);
+    assert!(matches!(eval_scalar(expr), Err(EvalError::DivByZero)));
+}

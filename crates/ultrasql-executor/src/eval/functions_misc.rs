@@ -65,6 +65,26 @@ pub(crate) fn eval_nullif(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+/// Lazy `COALESCE(a1, a2, …)`: evaluate arguments left-to-right and return the
+/// first non-NULL, leaving the remaining arguments unevaluated — matching
+/// PostgreSQL. The eager [`super::eval_function_call`] path operates on
+/// already-computed `Value`s, so a fallible later argument (e.g. `a/c` when an
+/// earlier argument is non-NULL) would raise there; this walks the *unevaluated*
+/// `ScalarExpr` arguments instead and stops at the first non-NULL.
+pub(crate) fn eval_coalesce_lazy(
+    args: &[ScalarExpr],
+    row: &[Value],
+    params: &[Value],
+) -> Result<Value, EvalError> {
+    for arg in args {
+        let value = eval_expr(arg, row, params)?;
+        if !matches!(value, Value::Null) {
+            return Ok(value);
+        }
+    }
+    Ok(Value::Null)
+}
+
 pub(crate) fn eval_is_distinct_from(args: &[Value], negated: bool) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::Type(format!(
