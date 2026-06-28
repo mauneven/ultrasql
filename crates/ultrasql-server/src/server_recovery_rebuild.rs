@@ -543,10 +543,9 @@ impl Server {
                 .table_constraints
                 .get(&table.oid)
                 .and_then(|constraints| constraints.indexes.get(&index.oid).cloned());
-            if runtime
-                .as_ref()
-                .is_some_and(|metadata| !metadata.key_exprs.is_empty() || metadata.predicate.is_some())
-            {
+            if runtime.as_ref().is_some_and(|metadata| {
+                !metadata.key_exprs.is_empty() || metadata.predicate.is_some()
+            }) {
                 tracing::warn!(
                     table = %table.name,
                     index = %index.name,

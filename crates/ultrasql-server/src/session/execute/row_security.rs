@@ -165,14 +165,12 @@ where
                 rewrite_assignments(assignments, rewrite_expr)?
                     .map(|assignments| LogicalMergeAction::Update { assignments })
             }
-            LogicalMergeAction::Insert { columns, values } => rewrite_expr_list(
-                values,
-                rewrite_expr,
-            )?
-            .map(|values| LogicalMergeAction::Insert {
-                columns: columns.clone(),
-                values,
-            }),
+            LogicalMergeAction::Insert { columns, values } => {
+                rewrite_expr_list(values, rewrite_expr)?.map(|values| LogicalMergeAction::Insert {
+                    columns: columns.clone(),
+                    values,
+                })
+            }
             LogicalMergeAction::Delete => None,
         };
         if new_condition.is_none() && new_action.is_none() {

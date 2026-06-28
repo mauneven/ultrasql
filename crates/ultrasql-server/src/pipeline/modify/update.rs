@@ -321,7 +321,11 @@ pub(super) fn acquire_indexed_update_row_lock(
         Ok(false) => {}
         Err(e) => return Err(e.to_string()),
     }
-    let acquire = || lock_manager.acquire_for_owner(req, owner).map_err(|e| e.to_string());
+    let acquire = || {
+        lock_manager
+            .acquire_for_owner(req, owner)
+            .map_err(|e| e.to_string())
+    };
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)

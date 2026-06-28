@@ -1269,7 +1269,8 @@ mod tests {
         // r_pre (owner = top) and r_b (owner = surviving sub_b) stay held: a
         // peer conflicts on both.
         assert!(
-            !mgr.try_acquire(req(200, r_pre, LockMode::Exclusive)).unwrap(),
+            !mgr.try_acquire(req(200, r_pre, LockMode::Exclusive))
+                .unwrap(),
             "pre-savepoint lock (owned by the top-level xid) must survive"
         );
         assert!(

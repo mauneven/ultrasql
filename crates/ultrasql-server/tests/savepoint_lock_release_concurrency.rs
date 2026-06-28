@@ -208,8 +208,12 @@ async fn rollback_to_outer_releases_lock_from_released_inner_savepoint() {
     let (b, b_conn) = connect_as(running.bound, "tester", "sp_nested_release_b").await;
 
     a.batch_execute("BEGIN").await.expect("A begin");
-    a.batch_execute("SAVEPOINT s1").await.expect("A savepoint s1");
-    a.batch_execute("SAVEPOINT s2").await.expect("A savepoint s2");
+    a.batch_execute("SAVEPOINT s1")
+        .await
+        .expect("A savepoint s1");
+    a.batch_execute("SAVEPOINT s2")
+        .await
+        .expect("A savepoint s2");
     a.query("SELECT id FROM t WHERE id = 1 FOR UPDATE", &[])
         .await
         .expect("A locks id=1 under s2");
