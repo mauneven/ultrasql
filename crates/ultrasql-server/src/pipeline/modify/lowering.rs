@@ -82,8 +82,14 @@ pub(super) fn build_eval_plan_qual(
     // txn end, so a lock taken inside a savepoint that is later rolled back
     // must still be owned by the (stable) top-level xid — otherwise a re-lock
     // of the same row in a later statement self-blocks behind the dead subxid.
+    // The acquiring subxid (`ctx.xid`) rides along as the grant's *owner* so a
+    // `ROLLBACK TO` releases exactly the row locks taken since the savepoint
+    // (the lock manager keys conflict/`release_all` on `lock_xid`, rollback
+    // release on `owner`). When no savepoint is open the two are equal.
     let lock_xid = ctx.lock_xid;
-    let lock = Arc::new(move |tid| acquire_eval_plan_qual_row_lock(&lock_manager, lock_xid, tid));
+    let lock_owner = ctx.xid;
+    let lock =
+        Arc::new(move |tid| acquire_eval_plan_qual_row_lock(&lock_manager, lock_xid, lock_owner, tid));
 
     let oracle_for_snapshot = Arc::clone(&ctx.oracle);
     let snapshot_xid = ctx.xid;

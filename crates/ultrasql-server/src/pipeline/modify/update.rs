@@ -203,10 +203,16 @@ fn try_build_fused_update(
         let op = if let Some(target_tids) = target_tids {
             let refresh_after_lock = ctx.isolation == ultrasql_txn::IsolationLevel::ReadCommitted;
             let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
-            let xid = ctx.xid;
+            // Hold the row lock under the stable top-level xid (so it releases
+            // at txn end and a re-lock is a no-op) while recording the
+            // stamping subxid (`ctx.xid`) as the grant owner so `ROLLBACK TO`
+            // frees it. When no savepoint is open these are equal.
+            let lock_xid = ctx.lock_xid;
+            let owner = ctx.xid;
             op.with_target_tids(target_tids).with_target_tid_lock(
                 move |tid| {
-                    let acquired = acquire_indexed_update_row_lock(&lock_manager, xid, tid)?;
+                    let acquired =
+                        acquire_indexed_update_row_lock(&lock_manager, lock_xid, owner, tid)?;
                     // Debug-only panic AFTER the per-tuple Exclusive lock is held,
                     // for the lock-leak isolation test. Keyed off the sentinel
                     // delta so it fires only for `SET col = col + <SENTINEL>`;
@@ -302,6 +308,7 @@ fn update_requires_index_maintenance(
 pub(super) fn acquire_indexed_update_row_lock(
     lock_manager: &ultrasql_txn::LockManager,
     xid: Xid,
+    owner: Xid,
     tid: TupleId,
 ) -> Result<bool, String> {
     let req = ultrasql_txn::LockRequest {
@@ -309,12 +316,12 @@ pub(super) fn acquire_indexed_update_row_lock(
         tag: ultrasql_txn::LockTag::Tuple(tid),
         mode: ultrasql_txn::LockMode::Exclusive,
     };
-    match lock_manager.try_acquire(req) {
+    match lock_manager.try_acquire_for_owner(req, owner) {
         Ok(true) => return Ok(false),
         Ok(false) => {}
         Err(e) => return Err(e.to_string()),
     }
-    let acquire = || lock_manager.acquire(req).map_err(|e| e.to_string());
+    let acquire = || lock_manager.acquire_for_owner(req, owner).map_err(|e| e.to_string());
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)
@@ -337,6 +344,7 @@ pub(super) fn acquire_indexed_update_row_lock(
 pub(super) fn acquire_eval_plan_qual_row_lock(
     lock_manager: &ultrasql_txn::LockManager,
     xid: Xid,
+    owner: Xid,
     tid: TupleId,
 ) -> Result<bool, ultrasql_executor::ExecError> {
     use ultrasql_executor::ExecError;
@@ -353,12 +361,12 @@ pub(super) fn acquire_eval_plan_qual_row_lock(
             other => ExecError::SerializationFailure(other.to_string()),
         }
     };
-    match lock_manager.try_acquire(req) {
+    match lock_manager.try_acquire_for_owner(req, owner) {
         Ok(true) => return Ok(false),
         Ok(false) => {}
         Err(e) => return Err(classify(e)),
     }
-    let acquire = || lock_manager.acquire(req).map_err(classify);
+    let acquire = || lock_manager.acquire_for_owner(req, owner).map_err(classify);
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)

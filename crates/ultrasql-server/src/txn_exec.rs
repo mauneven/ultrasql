@@ -465,7 +465,12 @@ fn acquire_skip_locked(
     let offset = shape.offset;
     let mut skipped = 0_u64;
     let mut grabbed: Vec<Vec<ScalarExpr>> = Vec::new();
-    let xid = txn.current_xid();
+    // Hold the lock under the stable top-level xid (released at txn end by
+    // `release_all`, and a no-op on re-lock) while recording the acquiring
+    // subxid as the grant's owner so `ROLLBACK TO` frees locks taken since the
+    // savepoint. Mirrors `acquire_row_locks` (the non-SKIP-LOCKED path).
+    let xid = txn.xid;
+    let owner = txn.current_xid();
 
     for tuple in heap.scan_visible(rel, block_count, &txn.snapshot, oracle) {
         if grabbed.len() as u64 >= limit {
@@ -494,11 +499,14 @@ fn acquire_skip_locked(
         // skip the row entirely (no block, no error, not in the result).
         let acquired = oracle
             .lock_manager
-            .try_acquire(LockRequest {
-                xid,
-                tag: LockTag::Tuple(tuple.tid),
-                mode: mode.to_lock_mode(),
-            })
+            .try_acquire_for_owner(
+                LockRequest {
+                    xid,
+                    tag: LockTag::Tuple(tuple.tid),
+                    mode: mode.to_lock_mode(),
+                },
+                owner,
+            )
             .map_err(|e| match e {
                 LockError::Deadlock { .. } => deadlock_error(),
                 other => ServerError::Execute(ExecError::SerializationFailure(other.to_string())),
@@ -794,9 +802,17 @@ pub(crate) fn lock_rows_index_tids(
 
 /// Acquire row locks on `tids` under the requested wait policy.
 ///
-/// The lock is taken under the session transaction's effective xid, so it
-/// is released by `lock_manager.release_all(xid)` at commit/rollback —
-/// i.e. it is held to the end of the transaction, matching PostgreSQL.
+/// The lock is held by the **top-level** transaction xid, so
+/// `lock_manager.release_all(xid)` frees it at commit/rollback — held to the
+/// end of the transaction, matching PostgreSQL. When a savepoint is open the
+/// acquiring subxid (`txn.current_xid()`) is recorded as the grant's *owner*
+/// so a `ROLLBACK TO` releases exactly the locks taken since that savepoint
+/// (via [`TransactionManager::rollback_to_savepoint`] →
+/// `release_subxact_locks`), again matching PostgreSQL. Owning the lock under
+/// the stable top-level xid (rather than the subxid) is what keeps a re-lock
+/// of the same row in a later statement a no-op instead of a self-block, and
+/// is what stops the lock from leaking past commit when it was first taken
+/// inside a savepoint.
 ///
 /// - `Wait`     — blocking, deadlock-aware `acquire()` (the same path the
 ///   indexed UPDATE write uses). A conflicting holder makes this block
@@ -811,7 +827,8 @@ fn acquire_row_locks(
     mode: RowLockMode,
     wait_policy: LockWaitPolicy,
 ) -> Result<(), ServerError> {
-    let xid = txn.current_xid();
+    let xid = txn.xid;
+    let owner = txn.current_xid();
     let lock_manager = &oracle.lock_manager;
     for tid in tids {
         let req = LockRequest {
@@ -825,9 +842,9 @@ fn acquire_row_locks(
                 // to the blocking, deadlock-detecting acquire — but never
                 // call it twice when this xid already holds the grant
                 // (re-locking the same row inside the same txn is a no-op).
-                match lock_manager.try_acquire(req) {
+                match lock_manager.try_acquire_for_owner(req, owner) {
                     Ok(true) => {}
-                    Ok(false) => block_on_lock(lock_manager, req)?,
+                    Ok(false) => block_on_lock(lock_manager, req, owner)?,
                     Err(LockError::Deadlock { .. }) => {
                         return Err(deadlock_error());
                     }
@@ -838,7 +855,7 @@ fn acquire_row_locks(
                     }
                 }
             }
-            LockWaitPolicy::NoWait => match lock_manager.try_acquire(req) {
+            LockWaitPolicy::NoWait => match lock_manager.try_acquire_for_owner(req, owner) {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(ServerError::LockNotAvailable(
@@ -852,7 +869,7 @@ fn acquire_row_locks(
                     )));
                 }
             },
-            LockWaitPolicy::SkipLocked => match lock_manager.try_acquire(req) {
+            LockWaitPolicy::SkipLocked => match lock_manager.try_acquire_for_owner(req, owner) {
                 // A locked row is skipped: do not block, do not error.
                 Ok(_) => {}
                 Err(LockError::Deadlock { .. }) => return Err(deadlock_error()),
@@ -873,8 +890,12 @@ fn acquire_row_locks(
 /// wrapped in `block_in_place` so the worker thread is released to the
 /// scheduler while parked; otherwise it blocks the current thread
 /// directly (single-thread runtime / non-async caller).
-fn block_on_lock(lock_manager: &LockManager, req: LockRequest) -> Result<(), ServerError> {
-    let acquire = || lock_manager.acquire(req);
+fn block_on_lock(
+    lock_manager: &LockManager,
+    req: LockRequest,
+    owner: Xid,
+) -> Result<(), ServerError> {
+    let acquire = || lock_manager.acquire_for_owner(req, owner);
     let result = if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)

@@ -1085,6 +1085,19 @@ impl TransactionManager {
                 }
             }
         }
+        // Release every row lock taken since the rolled-back savepoint(s).
+        // A row lock acquired under a savepoint is held by the stable
+        // top-level xid (so a re-lock later in the transaction is a no-op),
+        // but carries the acquiring subxid as its *owner*. Releasing by the
+        // rolled-back subxid set frees exactly those locks — matching
+        // PostgreSQL, where a second session can lock the row again right
+        // after the `ROLLBACK TO` — while locks taken before the savepoint
+        // (owned by an outer subxid or the top-level xid) stay held. The full
+        // rolled-back set is used (not just `aborted_xids`) so a lock taken
+        // under a now-pruned merged-up subxid is released too; re-releasing an
+        // already-freed subxid is a no-op.
+        self.lock_manager
+            .release_subxact_locks(&txn.subtxn_stack.rolled_back_subxids());
         // Re-emit the own-subxid sets into the (possibly frozen) snapshot so
         // the rolled-back writes become invisible to this transaction
         // immediately, without disturbing snapshot stability.

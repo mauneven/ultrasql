@@ -185,10 +185,29 @@ pub struct LockTableSnapshot {
 
 // ─── internal state ──────────────────────────────────────────────────────────
 
+/// One granted lock.
+///
+/// `xid` is the conflict / `release_all` / snapshot key: for a row lock taken
+/// inside a savepoint it is the **top-level** transaction xid, so the grant is
+/// released at transaction end and a re-lock of the same row later in the same
+/// transaction (under a different subxid) is a no-op rather than a self-block.
+///
+/// `owner` is the subtransaction that actually acquired the grant — the xid the
+/// write was stamped under (== `xid` when no savepoint is open). It exists only
+/// so [`LockManager::release_subxact_locks`] can free exactly the locks taken
+/// since a savepoint on `ROLLBACK TO`, matching PostgreSQL, while conflict
+/// detection and `release_all` stay keyed on the stable top-level `xid`.
+#[derive(Clone, Copy, Debug)]
+struct Grant {
+    xid: Xid,
+    mode: LockMode,
+    owner: Xid,
+}
+
 /// Mutable state stored under the per-entry mutex.
 struct LockEntryState {
     /// Current grant holders.
-    grants: Vec<(Xid, LockMode)>,
+    grants: Vec<Grant>,
     /// FIFO wait queue.
     waiters: VecDeque<(Xid, LockMode)>,
 }
@@ -448,8 +467,22 @@ impl LockManager {
     ///      waiter entry and return `Err(Deadlock)`.
     ///    - Otherwise check again whether the lock can be granted; if so,
     ///      move from waiters to grants and return `Ok(())`.
-    #[allow(clippy::significant_drop_tightening)] // `state` is intentionally held across `wait`
     pub fn acquire(&self, req: LockRequest) -> Result<(), LockError> {
+        self.acquire_with_owner(req, req.xid)
+    }
+
+    /// Like [`Self::acquire`] but records `owner` (the acquiring
+    /// subtransaction xid) on the grant so `ROLLBACK TO` can release it via
+    /// [`Self::release_subxact_locks`]. Conflict detection, `release_all`, and
+    /// the snapshot views still key on `req.xid` (the stable top-level xid for
+    /// a row lock taken inside a savepoint). Pass `owner == req.xid` when no
+    /// savepoint is open.
+    pub fn acquire_for_owner(&self, req: LockRequest, owner: Xid) -> Result<(), LockError> {
+        self.acquire_with_owner(req, owner)
+    }
+
+    #[allow(clippy::significant_drop_tightening)] // `state` is intentionally held across `wait`
+    fn acquire_with_owner(&self, req: LockRequest, owner: Xid) -> Result<(), LockError> {
         // Register the XID's deadlock state if not already present.
         self.ensure_xid_state(req.xid);
 
@@ -463,7 +496,11 @@ impl LockManager {
 
         if !has_conflict(&state.grants, req.xid, req.mode) {
             // Fast path: no conflict — grant immediately.
-            state.grants.push((req.xid, req.mode));
+            state.grants.push(Grant {
+                xid: req.xid,
+                mode: req.mode,
+                owner,
+            });
             // Clear any stale victim flag from a previous false-positive
             // detection run.
             self.clear_victim(req.xid);
@@ -494,7 +531,11 @@ impl LockManager {
 
             if !has_conflict(&state.grants, req.xid, req.mode) {
                 remove_waiter(&mut state.waiters, req.xid, req.mode);
-                state.grants.push((req.xid, req.mode));
+                state.grants.push(Grant {
+                    xid: req.xid,
+                    mode: req.mode,
+                    owner,
+                });
                 // Clear any stale victim flag (false positive from a
                 // detection run that resolved itself by the time we woke).
                 self.clear_victim(req.xid);
@@ -510,6 +551,17 @@ impl LockManager {
     /// or `Err(LockError::Deadlock)` if — in the unlikely edge case —
     /// the XID is already flagged as a deadlock victim.
     pub fn try_acquire(&self, req: LockRequest) -> Result<bool, LockError> {
+        self.try_acquire_with_owner(req, req.xid)
+    }
+
+    /// Like [`Self::try_acquire`] but records `owner` (the acquiring
+    /// subtransaction xid) on the grant so `ROLLBACK TO` can release it via
+    /// [`Self::release_subxact_locks`]. See [`Self::acquire_for_owner`].
+    pub fn try_acquire_for_owner(&self, req: LockRequest, owner: Xid) -> Result<bool, LockError> {
+        self.try_acquire_with_owner(req, owner)
+    }
+
+    fn try_acquire_with_owner(&self, req: LockRequest, owner: Xid) -> Result<bool, LockError> {
         self.ensure_xid_state(req.xid);
 
         if self.is_victim(req.xid) {
@@ -528,7 +580,11 @@ impl LockManager {
             return Ok(false);
         }
 
-        state.grants.push((req.xid, req.mode));
+        state.grants.push(Grant {
+            xid: req.xid,
+            mode: req.mode,
+            owner,
+        });
         drop(state);
         Ok(true)
     }
@@ -553,7 +609,7 @@ impl LockManager {
             if let Some(pos) = state
                 .grants
                 .iter()
-                .position(|(gxid, gmode)| *gxid == xid && *gmode == mode)
+                .position(|g| g.xid == xid && g.mode == mode)
             {
                 state.grants.remove(pos);
             }
@@ -581,7 +637,7 @@ impl LockManager {
             .iter()
             .filter_map(|entry| {
                 let state = entry.value().inner.lock();
-                if state.grants.iter().any(|(gxid, _)| *gxid == xid) {
+                if state.grants.iter().any(|g| g.xid == xid) {
                     Some(*entry.key())
                 } else {
                     None
@@ -593,7 +649,7 @@ impl LockManager {
             if let Some(entry) = self.table.get(&tag).map(|e| Arc::clone(&e)) {
                 {
                     let mut state = entry.inner.lock();
-                    state.grants.retain(|(gxid, _)| *gxid != xid);
+                    state.grants.retain(|g| g.xid != xid);
                 }
                 entry.waiters_changed.notify_all();
                 self.prune_entry_if_empty(tag);
@@ -604,6 +660,52 @@ impl LockManager {
         self.xid_states.remove(&xid);
     }
 
+    /// Release every grant whose **owner** subtransaction is in `owners`,
+    /// leaving grants owned by other subxids (and by the top-level xid)
+    /// untouched.
+    ///
+    /// Called by `ROLLBACK TO SAVEPOINT` with the set of subxids the rollback
+    /// discarded (the rolled-back savepoints' subxids). A row lock taken since
+    /// the savepoint carries one of those subxids as its `owner`, so it is
+    /// released here — matching PostgreSQL, which frees the locks held by the
+    /// rolled-back subtransactions while the top-level transaction continues.
+    ///
+    /// Unlike [`Self::release_all`] this does **not** touch `xid_states`: the
+    /// top-level transaction is still live, and the owner subxids never had
+    /// their own deadlock state (locks are registered under the top-level
+    /// `xid`). Waiters on each affected tag are notified so a blocked
+    /// concurrent acquirer can re-check.
+    pub fn release_subxact_locks(&self, owners: &[Xid]) {
+        if owners.is_empty() {
+            return;
+        }
+        let owner_set: std::collections::HashSet<Xid> = owners.iter().copied().collect();
+
+        let affected: Vec<LockTag> = self
+            .table
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.value().inner.lock();
+                if state.grants.iter().any(|g| owner_set.contains(&g.owner)) {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for tag in affected {
+            if let Some(entry) = self.table.get(&tag).map(|e| Arc::clone(&e)) {
+                {
+                    let mut state = entry.inner.lock();
+                    state.grants.retain(|g| !owner_set.contains(&g.owner));
+                }
+                entry.waiters_changed.notify_all();
+                self.prune_entry_if_empty(tag);
+            }
+        }
+    }
+
     /// Return a point-in-time snapshot of the grants and waiters for
     /// `tag`, or `None` if no entry exists.
     #[allow(clippy::significant_drop_tightening)] // `entry` must live until after state is used
@@ -611,7 +713,7 @@ impl LockManager {
         let entry = self.table.get(&tag)?;
         let state = entry.inner.lock();
         Some(LockTableSnapshot {
-            grants: state.grants.clone(),
+            grants: state.grants.iter().map(|g| (g.xid, g.mode)).collect(),
             waiters: state.waiters.iter().copied().collect(),
         })
     }
@@ -629,7 +731,7 @@ impl LockManager {
             out.push((
                 tag,
                 LockTableSnapshot {
-                    grants: state.grants.clone(),
+                    grants: state.grants.iter().map(|g| (g.xid, g.mode)).collect(),
                     waiters: state.waiters.iter().copied().collect(),
                 },
             ));
@@ -764,9 +866,9 @@ fn detect_and_resolve(
             waiter_entries
                 .entry(*waiter_xid)
                 .or_insert_with(|| Arc::clone(&entry_arc));
-            for (holder_xid, holder_mode) in &state.grants {
-                if waiter_mode.conflicts_with(*holder_mode) && waiter_xid != holder_xid {
-                    wait_for.entry(*waiter_xid).or_default().push(*holder_xid);
+            for grant in &state.grants {
+                if waiter_mode.conflicts_with(grant.mode) && *waiter_xid != grant.xid {
+                    wait_for.entry(*waiter_xid).or_default().push(grant.xid);
                 }
             }
         }
@@ -876,10 +978,14 @@ fn dfs_find_cycle(
 
 /// Returns `true` if any existing grant in `grants` conflicts with
 /// `mode`.
-fn has_conflict(grants: &[(Xid, LockMode)], requester: Xid, mode: LockMode) -> bool {
+///
+/// Keyed on each grant's `xid` (the top-level transaction for a row lock taken
+/// inside a savepoint), so a transaction never conflicts with a lock it already
+/// holds — including one it took under an earlier savepoint.
+fn has_conflict(grants: &[Grant], requester: Xid, mode: LockMode) -> bool {
     grants
         .iter()
-        .any(|(holder, held)| *holder != requester && mode.conflicts_with(*held))
+        .any(|g| g.xid != requester && mode.conflicts_with(g.mode))
 }
 
 /// Remove the first occurrence of (`xid`, `mode`) from a waiter queue.
@@ -1123,6 +1229,76 @@ mod tests {
         // XID 6's lock on tags[0] must survive.
         let snap = mgr.inspect(tags[0]).expect("entry should exist for xid 6");
         assert!(snap.grants.iter().any(|(x, _)| *x == xid(6)));
+    }
+
+    // ── release_subxact_locks frees by owner, keying conflict on top xid ──
+
+    /// A `ROLLBACK TO SAVEPOINT` analog: row locks taken inside the rolled-back
+    /// subxids are held under the *top-level* xid (so they never self-conflict
+    /// and `release_all` still reclaims them at commit) but carry the acquiring
+    /// subxid as `owner`. `release_subxact_locks` frees exactly the rolled-back
+    /// owners' grants; locks owned by the top-level xid (taken before the
+    /// savepoint) and by surviving subxids stay held.
+    #[test]
+    fn release_subxact_locks_frees_only_rolled_back_owners() {
+        let mgr = LockManager::new();
+        let top = xid(100);
+        let sub_a = xid(101); // a savepoint subxid that will be rolled back
+        let sub_b = xid(102); // a surviving (outer) savepoint subxid
+        let r_pre = tup(20, 0, 0); // locked before any savepoint (owner = top)
+        let r_a = tup(20, 0, 1); // locked under sub_a (rolled back)
+        let r_b = tup(20, 0, 2); // locked under sub_b (survives)
+
+        // All three locks are held under the SAME top-level xid; only the owner
+        // distinguishes them — exactly how the row-lock paths acquire them.
+        mgr.acquire_for_owner(req(100, r_pre, LockMode::Exclusive), top)
+            .unwrap();
+        mgr.acquire_for_owner(req(100, r_a, LockMode::Exclusive), sub_a)
+            .unwrap();
+        mgr.acquire_for_owner(req(100, r_b, LockMode::Exclusive), sub_b)
+            .unwrap();
+
+        // Roll back sub_a.
+        mgr.release_subxact_locks(&[sub_a]);
+
+        // r_a is now free: a different transaction can take it.
+        assert!(
+            mgr.try_acquire(req(200, r_a, LockMode::Exclusive)).unwrap(),
+            "the rolled-back subxid's lock must be released"
+        );
+        // r_pre (owner = top) and r_b (owner = surviving sub_b) stay held: a
+        // peer conflicts on both.
+        assert!(
+            !mgr.try_acquire(req(200, r_pre, LockMode::Exclusive)).unwrap(),
+            "pre-savepoint lock (owned by the top-level xid) must survive"
+        );
+        assert!(
+            !mgr.try_acquire(req(200, r_b, LockMode::Exclusive)).unwrap(),
+            "an outer surviving savepoint's lock must survive"
+        );
+
+        // The top-level xid still holds r_pre and r_b; release_all reclaims
+        // them at commit (including the grant the rolled-back owner left — here
+        // already gone). A re-lock by the same top xid is a no-op throughout.
+        mgr.release_all(top);
+    }
+
+    /// `release_subxact_locks` with an owner set that matches nothing (and the
+    /// empty set) is a no-op and never disturbs unrelated grants.
+    #[test]
+    fn release_subxact_locks_noop_when_no_owner_matches() {
+        let mgr = LockManager::new();
+        let tag = tup(21, 0, 0);
+        mgr.acquire_for_owner(req(1, tag, LockMode::Exclusive), xid(1))
+            .unwrap();
+
+        mgr.release_subxact_locks(&[]); // empty
+        mgr.release_subxact_locks(&[xid(999)]); // no match
+
+        assert!(
+            !mgr.try_acquire(req(2, tag, LockMode::Exclusive)).unwrap(),
+            "unrelated grant must remain held"
+        );
     }
 
     // ── deadlock detector picks the youngest victim ───────────────────────
