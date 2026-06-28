@@ -80,6 +80,42 @@ pub(crate) fn network_or_numeric_arith(
     }
 }
 
+/// PostgreSQL temporal subtraction whose result is not numeric:
+/// `timestamp - timestamp` and `timestamptz - timestamptz` yield an
+/// `interval` (justified to a whole-day `days` field plus a same-sign sub-day
+/// time field, never months), and `date - date` yields an `int4` day count.
+///
+/// Returns `None` for any other operand pair so the caller falls back to the
+/// network/numeric arithmetic path.
+pub(crate) fn temporal_sub(lv: &Value, rv: &Value) -> Option<Result<Value, EvalError>> {
+    match (lv, rv) {
+        (Value::Timestamp(end), Value::Timestamp(start))
+        | (Value::TimestampTz(end), Value::TimestampTz(start)) => {
+            Some(timestamp_diff_interval(*end, *start))
+        }
+        (Value::Date(end), Value::Date(start)) => Some(
+            end.checked_sub(*start)
+                .map(Value::Int32)
+                .ok_or(EvalError::Overflow),
+        ),
+        _ => None,
+    }
+}
+
+/// `timestamp - timestamp` as a justified-hours interval: months stays 0, the
+/// micro delta splits into whole `days` plus a sub-day time field. Integer
+/// `/`/`%` truncate toward zero, so `days` and `time` already share a sign,
+/// matching PostgreSQL's `interval_justify_hours`.
+fn timestamp_diff_interval(end: i64, start: i64) -> Result<Value, EvalError> {
+    let total = end.checked_sub(start).ok_or(EvalError::Overflow)?;
+    let days = i32::try_from(total / MICROS_PER_DAY).map_err(|_| EvalError::Overflow)?;
+    Ok(Value::Interval {
+        months: 0,
+        days,
+        microseconds: total % MICROS_PER_DAY,
+    })
+}
+
 pub(crate) fn integer_delta(value: &Value) -> Result<i64, EvalError> {
     match value {
         Value::Int16(v) => Ok(i64::from(*v)),

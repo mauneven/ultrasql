@@ -233,10 +233,10 @@ fn batch_to_rows_decodes_sql_storage_families_and_reports_bad_shapes() {
         Column::Int64(NumericColumn::from_data(vec![222])),
         Column::Int64(NumericColumn::from_data(vec![333])),
         Column::Int64(NumericColumn::from_data(vec![timetz])),
-        // Interval columns materialise as their `Value::Interval` display text
-        // and must round-trip back into a real `Value::Interval`.
+        // Interval columns materialise as PostgreSQL-canonical text and must
+        // round-trip back into a real `Value::Interval`.
         Column::Utf8(StringColumn::from_data(
-            ["2mon 3d 14706000000us".to_owned()],
+            ["2 mons 3 days 04:05:06".to_owned()],
         )),
     ])
     .expect("batch");

@@ -84,6 +84,75 @@ fn age_negates_all_fields_when_end_before_start() {
 }
 
 // -------------------------------------------------------------------------
+// INTERVAL — temporal subtraction and interval casts
+// -------------------------------------------------------------------------
+
+#[test]
+fn timestamp_minus_timestamp_yields_justified_interval() {
+    // 1 day exactly.
+    assert_eq!(
+        apply_binary(
+            BinaryOp::Sub,
+            ts("2000-01-02 00:00:00"),
+            ts("2000-01-01 00:00:00")
+        )
+        .expect("ts diff"),
+        interval(0, 1, 0)
+    );
+    // `justify_hours` keeps the day and time fields the same sign: PG renders
+    // this `-1 days -12:00:00`.
+    assert_eq!(
+        apply_binary(
+            BinaryOp::Sub,
+            ts("2000-01-01 00:00:00"),
+            ts("2000-01-02 12:00:00")
+        )
+        .expect("ts diff neg"),
+        interval(0, -1, -12 * 3_600_000_000)
+    );
+    // A sub-day difference stays in the time field (months and days are 0).
+    assert_eq!(
+        apply_binary(
+            BinaryOp::Sub,
+            ts("2000-01-01 06:00:00"),
+            ts("2000-01-01 00:00:00")
+        )
+        .expect("ts diff subday"),
+        interval(0, 0, 6 * 3_600_000_000)
+    );
+}
+
+#[test]
+fn date_minus_date_yields_integer_days() {
+    assert_eq!(
+        apply_binary(BinaryOp::Sub, Value::Date(5), Value::Date(1)).expect("date diff"),
+        Value::Int32(4)
+    );
+    assert_eq!(
+        apply_binary(BinaryOp::Sub, Value::Date(1), Value::Date(5)).expect("date diff neg"),
+        Value::Int32(-4)
+    );
+}
+
+#[test]
+fn interval_casts_round_trip_canonical_text() {
+    // text -> interval.
+    assert_eq!(
+        eval_fn(
+            "__ultrasql_cast_interval",
+            vec![Value::Text("1 day 02:03:04".to_owned())]
+        ),
+        interval(0, 1, 2 * 3_600_000_000 + 3 * 60_000_000 + 4_000_000)
+    );
+    // interval -> text uses canonical PostgreSQL output, not the internal
+    // `Value` debug form.
+    assert_eq!(
+        eval_fn("__ultrasql_cast_text", vec![interval(14, 3, 0)]),
+        Value::Text("1 year 2 mons 3 days".to_owned())
+    );
+}
+
+// -------------------------------------------------------------------------
 // BUG 2 — regexp_replace honours flags
 // -------------------------------------------------------------------------
 

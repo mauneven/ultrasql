@@ -1,7 +1,7 @@
 //! Streaming decode directly into column builders.
 
 use super::*;
-use ultrasql_core::{DataType, Lsn, Value};
+use ultrasql_core::{DataType, Lsn, Value, format_interval_pg};
 use ultrasql_vec::Batch;
 
 impl RowCodec {
@@ -345,12 +345,14 @@ impl RowCodec {
                             }
                         })?;
                     cursor = needed;
-                    let text = Value::Interval {
-                        months: i32::from_le_bytes(months_raw),
-                        days: i32::from_le_bytes(days_raw),
-                        microseconds: i64::from_le_bytes(micros_raw),
-                    }
-                    .to_string();
+                    // Materialize PostgreSQL-canonical interval text so the
+                    // streaming path matches the batch path and the result
+                    // encoder emits libpq-readable interval for OID 1186.
+                    let text = format_interval_pg(
+                        i32::from_le_bytes(months_raw),
+                        i32::from_le_bytes(days_raw),
+                        i64::from_le_bytes(micros_raw),
+                    );
                     values.extend_from_slice(text.as_bytes());
                     let new_end = u32::try_from(values.len()).map_err(|_| {
                         RowCodecError::UnsupportedType {

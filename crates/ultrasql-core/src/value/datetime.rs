@@ -1,4 +1,5 @@
 use super::*;
+use num_traits::ToPrimitive;
 
 pub(crate) fn parse_date_days(text: &str) -> Option<i32> {
     let (year, month, day) = parse_date_parts(text)?;
@@ -216,6 +217,379 @@ pub fn format_timetz(micros: i64, offset_seconds: i32) -> String {
         format_time_micros(micros),
         format_timezone_offset(offset_seconds)
     )
+}
+
+/// Format an `INTERVAL` `(months, days, microseconds)` in PostgreSQL's
+/// default `postgres` `IntervalStyle`, e.g. `1 day`, `2 mons 03:04:05`,
+/// `-00:00:01`, `-1 days +02:00:00`.
+///
+/// This is the canonical text a libpq client expects for OID 1186; the
+/// result encoder and batch text materializers use it. The global
+/// [`Value`](crate::Value) `Display` deliberately keeps UltraSQL's internal
+/// `"{months}mon {days}d {micros}us"` debug form, which error/debug messages
+/// rely on, so this is a separate function rather than a `Display` change.
+///
+/// PostgreSQL only splits `months` into years/months for display; `days` and
+/// the time field are emitted verbatim (no 24h→day or 30d→month carry).
+#[must_use]
+pub fn format_interval_pg(months: i32, days: i32, microseconds: i64) -> String {
+    // Year/month split is sign-preserving truncation, matching PG's
+    // `interval2tm` (`month / 12`, `month % 12`).
+    let year = i64::from(months) / 12;
+    let mon = i64::from(months) % 12;
+    let mday = i64::from(days);
+    // Decompose the time field; integer `/`/`%` truncate toward zero so every
+    // component shares the sign of `microseconds`, matching PG.
+    let hour = microseconds / MICROS_PER_HOUR;
+    let rem = microseconds % MICROS_PER_HOUR;
+    let minute = rem / MICROS_PER_MINUTE;
+    let rem = rem % MICROS_PER_MINUTE;
+    let second = rem / MICROS_PER_SECOND;
+    let fsec = rem % MICROS_PER_SECOND;
+
+    let mut out = String::new();
+    let mut is_zero = true;
+    let mut is_before = false;
+    append_interval_int_part(&mut out, year, "year", &mut is_zero, &mut is_before);
+    append_interval_int_part(&mut out, mon, "mon", &mut is_zero, &mut is_before);
+    append_interval_int_part(&mut out, mday, "day", &mut is_zero, &mut is_before);
+
+    if is_zero || hour != 0 || minute != 0 || second != 0 || fsec != 0 {
+        let minus = hour < 0 || minute < 0 || second < 0 || fsec < 0;
+        if !is_zero {
+            out.push(' ');
+        }
+        if minus {
+            out.push('-');
+        } else if is_before {
+            out.push('+');
+        }
+        out.push_str(&format!("{:02}:{:02}:", hour.abs(), minute.abs()));
+        append_interval_seconds(&mut out, second.abs(), fsec.abs());
+    }
+    out
+}
+
+/// Append one signed year/month/day field, mirroring PostgreSQL's
+/// `AddPostgresIntPart`: a leading space between fields, a `+` when the
+/// previous field was negative but this one is positive, and `s`
+/// pluralization for any magnitude other than exactly `1`.
+fn append_interval_int_part(
+    out: &mut String,
+    value: i64,
+    unit: &str,
+    is_zero: &mut bool,
+    is_before: &mut bool,
+) {
+    if value == 0 {
+        return;
+    }
+    if !*is_zero {
+        out.push(' ');
+    }
+    if *is_before && value > 0 {
+        out.push('+');
+    }
+    out.push_str(&value.to_string());
+    out.push(' ');
+    out.push_str(unit);
+    if value != 1 {
+        out.push('s');
+    }
+    *is_before = value < 0;
+    *is_zero = false;
+}
+
+/// Append the seconds field as zero-padded `SS` plus, when nonzero, a
+/// fractional part with trailing zeros trimmed (PG's `AppendSeconds`). Both
+/// arguments are already absolute values.
+fn append_interval_seconds(out: &mut String, sec: i64, fsec: i64) {
+    out.push_str(&format!("{sec:02}"));
+    if fsec != 0 {
+        let mut frac = format!("{fsec:06}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        out.push('.');
+        out.push_str(&frac);
+    }
+}
+
+/// Accumulator for [`parse_interval_pg`] mirroring PostgreSQL's `struct
+/// pg_tm` field-wise decode with fractional-unit cascade.
+#[derive(Default)]
+struct IntervalAccumulator {
+    year: i64,
+    mon: i64,
+    mday: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    fsec: i64,
+}
+
+impl IntervalAccumulator {
+    /// Cascade a fractional quantity (already a fraction of `scale_secs`
+    /// seconds) into whole seconds plus microseconds, matching PG's
+    /// `AdjustFractSeconds`.
+    fn adjust_fract_seconds(&mut self, frac: f64, scale_secs: i64) -> Option<()> {
+        if frac == 0.0 {
+            return Some(());
+        }
+        let total = frac * i64_to_f64(scale_secs);
+        let secs = whole_f64(total)?;
+        self.sec = self.sec.checked_add(secs)?;
+        let remainder = total - i64_to_f64(secs);
+        self.fsec = self
+            .fsec
+            .checked_add(whole_f64((remainder * 1_000_000.0).round())?)?;
+        Some(())
+    }
+
+    /// Cascade a fractional quantity (a fraction of `scale_days` days) into
+    /// whole days then seconds, matching PG's `AdjustFractDays`.
+    fn adjust_fract_days(&mut self, frac: f64, scale_days: i64) -> Option<()> {
+        if frac == 0.0 {
+            return Some(());
+        }
+        let total = frac * i64_to_f64(scale_days);
+        let days = whole_f64(total)?;
+        self.mday = self.mday.checked_add(days)?;
+        let remainder = total - i64_to_f64(days);
+        self.adjust_fract_seconds(remainder, SECS_PER_DAY)
+    }
+
+    /// Apply `<value><unit>` (integer part `val`, fractional part `fval`) for
+    /// a recognized unit word. Returns `None` for an unknown unit.
+    fn apply_unit(&mut self, unit: &str, val: i64, fval: f64) -> Option<()> {
+        match unit.to_ascii_lowercase().as_str() {
+            "year" | "years" | "y" => {
+                self.year = self.year.checked_add(val)?;
+                // PG truncates the fractional months from a fractional year and
+                // does not cascade further (`2.3 years` -> `2 years 3 mons`);
+                // `whole_f64` truncates toward zero.
+                self.mon = self.mon.checked_add(whole_f64(fval * 12.0)?)?;
+                Some(())
+            }
+            "month" | "months" | "mon" | "mons" => {
+                self.mon = self.mon.checked_add(val)?;
+                self.adjust_fract_days(fval, 30)
+            }
+            "week" | "weeks" | "w" => {
+                self.mday = self.mday.checked_add(val.checked_mul(7)?)?;
+                self.adjust_fract_days(fval, 7)
+            }
+            "day" | "days" | "d" => {
+                self.mday = self.mday.checked_add(val)?;
+                self.adjust_fract_seconds(fval, SECS_PER_DAY)
+            }
+            "hour" | "hours" | "hr" | "hrs" | "h" => {
+                self.hour = self.hour.checked_add(val)?;
+                self.adjust_fract_seconds(fval, SECS_PER_HOUR)
+            }
+            "minute" | "minutes" | "min" | "mins" | "m" => {
+                self.min = self.min.checked_add(val)?;
+                self.adjust_fract_seconds(fval, SECS_PER_MINUTE)
+            }
+            "second" | "seconds" | "sec" | "secs" | "s" => {
+                self.sec = self.sec.checked_add(val)?;
+                self.adjust_fract_seconds(fval, 1)
+            }
+            "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => {
+                self.fsec = self.fsec.checked_add(val.checked_mul(1_000)?)?;
+                self.fsec = self
+                    .fsec
+                    .checked_add(whole_f64((fval * 1_000.0).round())?)?;
+                Some(())
+            }
+            "microsecond" | "microseconds" | "usec" | "usecs" | "us" => {
+                self.fsec = self.fsec.checked_add(val)?;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse and add a `HH:MM[:SS[.ffffff]]` time field with an optional
+    /// leading sign, applied to every component.
+    fn add_time_component(&mut self, token: &str) -> Option<()> {
+        let (negative, body) = match token.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, token.strip_prefix('+').unwrap_or(token)),
+        };
+        let mut parts = body.split(':');
+        let hours: i64 = parts.next()?.parse().ok()?;
+        let minutes: i64 = parts.next()?.parse().ok()?;
+        let seconds_text = parts.next();
+        if parts.next().is_some() {
+            return None;
+        }
+        let (seconds, fsec) = match seconds_text {
+            None => (0_i64, 0_i64),
+            Some(text) => {
+                let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+                let seconds: i64 = whole.parse().ok()?;
+                let mut fsec = 0_i64;
+                let mut scale = 100_000_i64;
+                for ch in frac.chars().take(6) {
+                    fsec = fsec.checked_add(i64::from(ch.to_digit(10)?).checked_mul(scale)?)?;
+                    scale /= 10;
+                }
+                (seconds, fsec)
+            }
+        };
+        let sign: i64 = if negative { -1 } else { 1 };
+        self.hour = self.hour.checked_add(sign.checked_mul(hours)?)?;
+        self.min = self.min.checked_add(sign.checked_mul(minutes)?)?;
+        self.sec = self.sec.checked_add(sign.checked_mul(seconds)?)?;
+        self.fsec = self.fsec.checked_add(sign.checked_mul(fsec)?)?;
+        Some(())
+    }
+
+    fn into_triple(self) -> Option<(i32, i32, i64)> {
+        let months = self.year.checked_mul(12)?.checked_add(self.mon)?;
+        let micros = self
+            .hour
+            .checked_mul(MICROS_PER_HOUR)?
+            .checked_add(self.min.checked_mul(MICROS_PER_MINUTE)?)?
+            .checked_add(self.sec.checked_mul(MICROS_PER_SECOND)?)?
+            .checked_add(self.fsec)?;
+        Some((
+            i32::try_from(months).ok()?,
+            i32::try_from(self.mday).ok()?,
+            micros,
+        ))
+    }
+}
+
+/// Truncate a finite `f64` toward zero into `i64`, returning `None` for
+/// non-finite or out-of-range values (so fractional-cascade overflow degrades
+/// to a typed NULL rather than a wrapping cast). `ToPrimitive::to_i64` does
+/// the range-checked truncation without a lossy `as` cast.
+fn whole_f64(value: f64) -> Option<i64> {
+    value.to_i64()
+}
+
+const SECS_PER_DAY: i64 = 86_400;
+const SECS_PER_HOUR: i64 = 3_600;
+const SECS_PER_MINUTE: i64 = 60;
+
+/// Parse a PostgreSQL `INTERVAL` input string into
+/// `(months, days, microseconds)`.
+///
+/// Inverts [`format_interval_pg`] (so batch text round-trips through the
+/// filter/binary paths) and additionally accepts the common PostgreSQL input
+/// spellings: unit phrases (`'1 day'`, `'2 mons 3 days'`, `'1.5 hours'`,
+/// `'90 minutes'`), a trailing `HH:MM:SS[.ffffff]` time field with optional
+/// sign, the SQL `Y-M` and `D H:M:S` shorthands, and a trailing `ago`.
+/// Returns `None` for input it does not recognize; the binder maps that to a
+/// typed NULL, preserving the prior reject-to-NULL behavior.
+#[must_use]
+pub fn parse_interval_pg(text: &str) -> Option<(i32, i32, i64)> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut acc = IntervalAccumulator::default();
+    let mut ago = false;
+    let mut saw_field = false;
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let token = tokens[idx];
+        if token.eq_ignore_ascii_case("ago") {
+            if !saw_field || ago {
+                return None;
+            }
+            ago = true;
+            idx += 1;
+            continue;
+        }
+        // A `:`-bearing token is always a clock time field.
+        if token.contains(':') {
+            acc.add_time_component(token)?;
+            saw_field = true;
+            idx += 1;
+            continue;
+        }
+        // SQL `Y-M` shorthand, distinguished from a negative bare number by
+        // the interior hyphen (`1-2`, `-1-2`).
+        if let Some((years, months)) = parse_year_month_field(token) {
+            acc.year = acc.year.checked_add(years)?;
+            acc.mon = acc.mon.checked_add(months)?;
+            saw_field = true;
+            idx += 1;
+            continue;
+        }
+        let (val, fval) = parse_interval_number(token)?;
+        match tokens.get(idx + 1).copied() {
+            Some(unit) if is_interval_unit(unit) => {
+                acc.apply_unit(unit, val, fval)?;
+                idx += 2;
+            }
+            // SQL `D H:M:S`: a bare number directly before a time field is a
+            // day count; otherwise a bare number is seconds.
+            next => {
+                if next.is_some_and(|t| t.contains(':')) {
+                    acc.mday = acc.mday.checked_add(val)?;
+                    acc.adjust_fract_seconds(fval, SECS_PER_DAY)?;
+                } else {
+                    acc.sec = acc.sec.checked_add(val)?;
+                    acc.adjust_fract_seconds(fval, 1)?;
+                }
+                idx += 1;
+            }
+        }
+        saw_field = true;
+    }
+    if !saw_field {
+        return None;
+    }
+    let (mut months, mut days, mut micros) = acc.into_triple()?;
+    if ago {
+        months = months.checked_neg()?;
+        days = days.checked_neg()?;
+        micros = micros.checked_neg()?;
+    }
+    Some((months, days, micros))
+}
+
+fn is_interval_unit(word: &str) -> bool {
+    IntervalAccumulator::default().apply_unit(word, 0, 0.0).is_some()
+}
+
+/// Split a numeric interval field into `(integer_part, fractional_part)`,
+/// both sign-preserving (`-2.5` -> `(-2, -0.5)`). Returns `None` for tokens
+/// that are not a plain decimal number.
+fn parse_interval_number(token: &str) -> Option<(i64, f64)> {
+    let value: f64 = token.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    // Reject hex/inf/nan spellings that `f64::parse` would otherwise accept.
+    if token
+        .bytes()
+        .any(|b| !matches!(b, b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E'))
+    {
+        return None;
+    }
+    let integer = whole_f64(value)?;
+    let fractional = value - i64_to_f64(integer);
+    Some((integer, fractional))
+}
+
+fn parse_year_month_field(token: &str) -> Option<(i64, i64)> {
+    let (negative, body) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let (years_text, months_text) = body.split_once('-')?;
+    let years: i64 = years_text.parse().ok()?;
+    let months: i64 = months_text.parse().ok()?;
+    if years < 0 || months < 0 {
+        return None;
+    }
+    let sign = if negative { -1 } else { 1 };
+    Some((sign * years, sign * months))
 }
 
 pub(crate) fn format_time_parts(hour: i64, minute: i64, second: i64, frac: i64) -> String {
@@ -568,4 +942,115 @@ pub(crate) fn civil_from_days(days_since_2000_01_01: i32) -> Option<(i32, u32, u
         u32::try_from(month).ok()?,
         u32::try_from(day).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::{format_interval_pg, parse_interval_pg};
+
+    // Reference (m, d, us, canonical text) verified against PostgreSQL 14 via
+    // `make_interval`/text input. See the INTERVAL wire-format fix.
+    const FORMAT_CASES: &[(i32, i32, i64, &str)] = &[
+        (0, 0, 0, "00:00:00"),
+        (0, 1, 0, "1 day"),
+        (0, 2, 0, "2 days"),
+        (1, 0, 0, "1 mon"),
+        (2, 0, 0, "2 mons"),
+        (12, 0, 0, "1 year"),
+        (13, 0, 0, "1 year 1 mon"),
+        (24, 0, 0, "2 years"),
+        (25, 0, 0, "2 years 1 mon"),
+        (14, 3, 0, "1 year 2 mons 3 days"),
+        (0, 0, 3_600_000_000, "01:00:00"),
+        (0, 0, 10_800_000_000, "03:00:00"),
+        (0, 0, 3_845_000_000, "01:04:05"),
+        (0, 1, 3_845_000_000, "1 day 01:04:05"),
+        (0, 0, -1_000_000, "-00:00:01"),
+        (0, -1, 0, "-1 days"),
+        (-1, 0, 0, "-1 mons"),
+        (0, -1, -7_200_000_000, "-1 days -02:00:00"),
+        (0, -1, 7_200_000_000, "-1 days +02:00:00"),
+        (0, 1, -7_200_000_000, "1 day -02:00:00"),
+        (14, 3, 3_845_000_000, "1 year 2 mons 3 days 01:04:05"),
+        (0, 0, 1_500_000, "00:00:01.5"),
+        (0, 0, 1_234_560, "00:00:01.23456"),
+        (0, 0, 90_000_000, "00:01:30"),
+        (-14, -3, -3_845_000_000, "-1 years -2 mons -3 days -01:04:05"),
+        (0, 0, 500_000, "00:00:00.5"),
+        (0, 0, -500_000, "-00:00:00.5"),
+        (1, 0, 500_000, "1 mon 00:00:00.5"),
+        (-1, 2, 0, "-1 mons +2 days"),
+        (0, 0, 86_400_000_000, "24:00:00"),
+        (0, 0, -86_400_000_000, "-24:00:00"),
+    ];
+
+    #[test]
+    fn format_interval_pg_matches_postgres() {
+        for &(months, days, micros, want) in FORMAT_CASES {
+            assert_eq!(
+                format_interval_pg(months, days, micros),
+                want,
+                "format ({months}, {days}, {micros})"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_interval_pg_round_trips_formatter_output() {
+        for &(months, days, micros, _) in FORMAT_CASES {
+            let text = format_interval_pg(months, days, micros);
+            assert_eq!(
+                parse_interval_pg(&text),
+                Some((months, days, micros)),
+                "round-trip {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_interval_pg_accepts_postgres_input_forms() {
+        // (input, expected canonical text) verified against PostgreSQL 14.
+        let cases: &[(&str, &str)] = &[
+            ("1 day", "1 day"),
+            ("1 day 2 hours", "1 day 02:00:00"),
+            ("1 year 2 months 3 days 04:05:06", "1 year 2 mons 3 days 04:05:06"),
+            ("-00:00:01", "-00:00:01"),
+            ("1.5 hours", "01:30:00"),
+            ("2 weeks", "14 days"),
+            ("90 minutes", "01:30:00"),
+            ("1 mon 2 days 03:04:05", "1 mon 2 days 03:04:05"),
+            ("1", "00:00:01"),
+            ("04:05", "04:05:00"),
+            ("100", "00:01:40"),
+            ("1.234 secs", "00:00:01.234"),
+            ("3 days ago", "-3 days"),
+            ("-1 day -2 hours", "-1 days -02:00:00"),
+            ("-1 day +2 hours", "-1 days +02:00:00"),
+            ("1:2:3", "01:02:03"),
+            ("1-2", "1 year 2 mons"),
+            ("3 4:05:06", "3 days 04:05:06"),
+            ("2.3 years", "2 years 3 mons"),
+            ("1.5 mons", "1 mon 15 days"),
+            ("5 ms", "00:00:00.005"),
+            ("5 us", "00:00:00.000005"),
+            ("1 hour 30 minutes", "01:30:00"),
+            ("-5 mons", "-5 mons"),
+        ];
+        for &(input, want) in cases {
+            let parsed = parse_interval_pg(input).unwrap_or_else(|| panic!("parse {input:?}"));
+            let (months, days, micros) = parsed;
+            assert_eq!(
+                format_interval_pg(months, days, micros),
+                want,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_interval_pg_rejects_garbage() {
+        for bad in ["", "   ", "nonsense", "1 fortnight", "ago", "abc def"] {
+            assert_eq!(parse_interval_pg(bad), None, "should reject {bad:?}");
+        }
+    }
 }

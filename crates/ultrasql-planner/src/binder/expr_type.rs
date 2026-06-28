@@ -62,6 +62,8 @@ pub(super) fn binary_result_type(
                 Ok(DataType::Int64)
             } else if let Some(money_type) = money_arithmetic_type(op, &lt, &rt) {
                 Ok(money_type)
+            } else if let Some(temporal_type) = temporal_sub_type(&lt, &rt) {
+                Ok(temporal_type)
             } else if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
@@ -232,6 +234,20 @@ pub(super) fn binary_result_type(
         | BinaryOp::JsonHasAnyKey
         | BinaryOp::JsonHasAllKeys
         | BinaryOp::TextSearchMatch => Ok(DataType::Bool),
+    }
+}
+
+/// Result type of PostgreSQL temporal subtraction whose result is not
+/// numeric: `timestamp - timestamp` / `timestamptz - timestamptz` yield
+/// `interval`, and `date - date` yields `int4` (a day count). Other operand
+/// pairs (including a NULL operand) return `None` so the generic handling
+/// proceeds.
+fn temporal_sub_type(lt: &DataType, rt: &DataType) -> Option<DataType> {
+    match (lt, rt) {
+        (DataType::Timestamp, DataType::Timestamp)
+        | (DataType::TimestampTz, DataType::TimestampTz) => Some(DataType::Interval),
+        (DataType::Date, DataType::Date) => Some(DataType::Int32),
+        _ => None,
     }
 }
 
@@ -456,6 +472,30 @@ mod tests {
                 DataType::Int32
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_result_type_covers_temporal_subtraction() {
+        // `timestamp - timestamp` / `timestamptz - timestamptz` -> interval.
+        assert_eq!(
+            binary_result_type(BinaryOp::Sub, DataType::Timestamp, DataType::Timestamp)
+                .expect("ts diff"),
+            DataType::Interval
+        );
+        assert_eq!(
+            binary_result_type(BinaryOp::Sub, DataType::TimestampTz, DataType::TimestampTz)
+                .expect("tstz diff"),
+            DataType::Interval
+        );
+        // `date - date` -> int4 (a day count, not an interval).
+        assert_eq!(
+            binary_result_type(BinaryOp::Sub, DataType::Date, DataType::Date).expect("date diff"),
+            DataType::Int32
+        );
+        // Addition stays unsupported for two timestamps (PG rejects it too).
+        assert!(
+            binary_result_type(BinaryOp::Add, DataType::Timestamp, DataType::Timestamp).is_err()
         );
     }
 

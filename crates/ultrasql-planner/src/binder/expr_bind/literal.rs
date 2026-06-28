@@ -133,12 +133,13 @@ pub(in crate::binder) fn common_array_element_type(
 ///
 /// Supported today:
 /// - `DATE 'YYYY-MM-DD'` → `Value::Date(days_since_2000_01_01)`.
-/// - `INTERVAL 'n' YEAR|MONTH|DAY|HOUR|MINUTE|SECOND` →
+/// - `INTERVAL 'n' YEAR|MONTH|DAY|HOUR|MINUTE|SECOND` and the bare
+///   `INTERVAL '<full pg interval string>'` form (e.g. `INTERVAL '1 day'`,
+///   `INTERVAL '2 mons 3 days 04:05:06'`) →
 ///   `Value::Interval { months, days, microseconds }`.
 ///
-/// Unsupported variants (TIME, TIMESTAMP, TIMESTAMPTZ, complex
-/// interval syntaxes) bind to NULL today so the binder does not reject
-/// queries upstream of the executor.
+/// Text that does not parse for a given typed literal binds to a typed NULL
+/// so the binder does not reject queries upstream of the executor.
 pub(in crate::binder) fn bind_typed_literal(
     type_name: &str,
     value: &str,
@@ -372,8 +373,16 @@ pub(in crate::binder) fn parse_interval_literal(
     text: &str,
     unit: Option<&str>,
 ) -> Option<(i32, i32, i64)> {
+    // Bare `INTERVAL '1 day'` (the full PostgreSQL interval string with the
+    // unit inside the literal) carries no trailing SQL unit keyword; parse it
+    // as a complete PG interval string. The `INTERVAL '1' DAY` form (a bare
+    // magnitude plus a separate SQL unit) keeps the field-qualified parse,
+    // where a unitless `'1'` would otherwise mean one second.
+    let Some(unit) = unit else {
+        return parse_interval_pg(text.trim());
+    };
     let magnitude = text.trim();
-    let unit = unit?.to_ascii_lowercase();
+    let unit = unit.to_ascii_lowercase();
     match unit.as_str() {
         "year" | "years" => {
             let years: i32 = magnitude.parse().ok()?;

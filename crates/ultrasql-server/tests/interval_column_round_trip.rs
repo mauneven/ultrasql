@@ -7,24 +7,13 @@
 //! `DataType::Interval` arm.
 //!
 //! Interval now projects as a TEXT (Utf8) column mirroring the streaming
-//! row-codec column builder (`Value::Interval{..}.to_string()`), while the
-//! schema field keeps `DataType::Interval` so the wire type OID stays `1186`
-//! (interval).
+//! row-codec column builder, but materialized in PostgreSQL-canonical text
+//! (`format_interval_pg`, e.g. `1 day`) rather than UltraSQL's internal debug
+//! form, while the schema field keeps `DataType::Interval` so the wire type
+//! OID stays `1186` (interval).
 //!
 //! Driven through the real PostgreSQL wire protocol. `simple_query` is used
 //! so the assertions read the exact text the server places on the wire.
-//!
-//! Scope note: the end-to-end "interval table column in a join/sort" and
-//! "timestamp - timestamp / age value" scenarios from the bug report are
-//! blocked *upstream* of the executor by separate planner/binder gaps that
-//! are out of scope for this fix:
-//!   - `CREATE TABLE (c INTERVAL)` is rejected ("column type not implemented").
-//!   - `timestamp - timestamp` / `date - date` are rejected by the planner
-//!     type checker ("arithmetic operator - on incompatible types").
-//!   - the bare `interval '1 day'` text literal binds to NULL because the
-//!     literal binder only parses the `INTERVAL '<n>' <unit>` value+unit form.
-//! The executor-level materialisation that #26 covers is exercised by the
-//! `build_batch` / `batch_to_rows` unit tests in `ultrasql-executor`.
 
 pub mod support;
 
@@ -54,15 +43,15 @@ async fn select_interval_literal_projects_text() {
     let value = scalar_text(client, "SELECT INTERVAL '1' DAY").await;
     assert_eq!(
         value.as_deref(),
-        Some("0mon 1d 0us"),
-        "interval projects its materialised text form (mirrors the streaming path)"
+        Some("1 day"),
+        "interval projects PostgreSQL-canonical text"
     );
 
-    // A different unit projects too (months / microseconds components).
+    // A different unit projects too (months / time components).
     let months = scalar_text(client, "SELECT INTERVAL '2' MONTH").await;
-    assert_eq!(months.as_deref(), Some("2mon 0d 0us"));
+    assert_eq!(months.as_deref(), Some("2 mons"));
     let hours = scalar_text(client, "SELECT INTERVAL '3' HOUR").await;
-    assert_eq!(hours.as_deref(), Some("0mon 0d 10800000000us"));
+    assert_eq!(hours.as_deref(), Some("03:00:00"));
 
     shutdown(running).await;
 }
@@ -144,10 +133,7 @@ async fn interval_projection_over_scan_pipeline() {
         .collect();
     assert_eq!(
         cells,
-        vec![
-            Some("0mon 5d 0us".to_owned()),
-            Some("0mon 5d 0us".to_owned())
-        ],
+        vec![Some("5 days".to_owned()), Some("5 days".to_owned())],
         "interval projects for each scanned row through the pipeline"
     );
 

@@ -224,6 +224,7 @@ pub(in crate::binder) fn bind_runtime_cast(
             "__ultrasql_cast_timestamptz"
         }
         DataType::TimeTz if actual_type.is_textlike() => "__ultrasql_cast_timetz",
+        DataType::Interval if actual_type.is_textlike() => "__ultrasql_cast_interval",
         // `inet` accepts text plus `cidr` (cidr -> inet is an implicit cast);
         // set-op supertype resolution unifies inet/cidr to inet.
         DataType::Inet if actual_type.is_textlike() || matches!(actual_type, DataType::Cidr) => {

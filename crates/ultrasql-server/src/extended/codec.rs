@@ -6,8 +6,8 @@
 use ultrasql_core::{
     BitString, DataType, Lsn, NetworkValue, Oid, Value, decode_pg_money_binary,
     decode_pg_numeric_binary, encode_pg_money_binary, encode_pg_numeric_binary, parse_decimal_text,
-    parse_money_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
-    parse_timetz_text, unpack_timetz,
+    parse_interval_pg, parse_money_text, parse_time_text, parse_timestamp_text,
+    parse_timestamptz_text, parse_timetz_text, unpack_timetz,
 };
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::{BackendMessage, FieldDescription};
@@ -441,6 +441,19 @@ pub(super) fn encode_binary_value_typed(
             .text_value(row)
             .and_then(Value::parse_uuid)
             .map(|uuid| uuid.to_vec()),
+        // Interval columns store PostgreSQL-canonical text; PG binary interval
+        // is the 16-byte `int64 microseconds || int32 days || int32 months`
+        // struct in network byte order (`interval_send`). Parse the text and
+        // emit those bytes so a typed libpq client reads OID 1186 correctly
+        // instead of misparsing raw text in binary mode.
+        (DataType::Interval, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
+            let (months, days, microseconds) = parse_interval_pg(col.text_value(row)?)?;
+            let mut out = Vec::with_capacity(16);
+            out.extend_from_slice(&microseconds.to_be_bytes());
+            out.extend_from_slice(&days.to_be_bytes());
+            out.extend_from_slice(&months.to_be_bytes());
+            Some(out)
+        }
         _ => encode_binary_value(col, row),
     }
 }

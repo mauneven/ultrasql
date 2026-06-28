@@ -67,10 +67,11 @@ pub use types::{
 };
 pub use value::{
     BoundingBox, Datum, GeometryValue, MICROS_PER_DAY, RangeValue, SparseVector,
-    TimestampTzDisplay, Value, date_parts_from_days, format_date_days, format_time_micros,
-    format_timestamp_micros, format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc,
-    format_timetz, format_timezone_offset_seconds, pack_timetz, parse_date_text, parse_time_text,
-    parse_timestamp_text, parse_timestamptz_text, parse_timetz_text, timestamp_micros_at_timezone,
+    TimestampTzDisplay, Value, date_parts_from_days, format_date_days, format_interval_pg,
+    format_time_micros, format_timestamp_micros, format_timestamptz_micros_in_timezone,
+    format_timestamptz_micros_utc, format_timetz, format_timezone_offset_seconds, pack_timetz,
+    parse_date_text, parse_interval_pg, parse_time_text, parse_timestamp_text,
+    parse_timestamptz_text, parse_timetz_text, timestamp_micros_at_timezone,
     timestamp_parts_from_micros, timestamptz_display_in_timezone, timetz_at_timezone,
     timetz_utc_micros, unpack_timetz, xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments, xml_xpath_element_fragments_with_namespaces,

@@ -6,7 +6,8 @@
 //! interpreter can apply the predicate per row.
 
 use ultrasql_core::{
-    DataType, GeometryValue, Oid, RangeValue, Schema, Value, parse_decimal_text, unpack_timetz,
+    DataType, GeometryValue, Oid, RangeValue, Schema, Value, parse_decimal_text, parse_interval_pg,
+    unpack_timetz,
 };
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
@@ -492,21 +493,25 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                 }
             }
             (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Interval) => {
-                // Interval columns materialise as text in the batch (see
-                // `build_batch`). Re-parse the `Value::Interval` display form
-                // (`"{months}mon {days}d {microseconds}us"`) so joins/sorts
+                // Interval columns materialise as PostgreSQL-canonical text in
+                // the batch (see `build_batch`). Re-parse it so joins/sorts
                 // that re-decode the column see a real `Value::Interval`
                 // downstream rather than an opaque text string.
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     match col.text_value(row_idx) {
                         Some(v) => {
-                            let interval = parse_interval_display_text(v).ok_or_else(|| {
-                                ExecError::TypeMismatch(format!(
-                                    "column {col_idx} ({name}): invalid interval text {v:?}",
-                                    name = field.name,
-                                ))
-                            })?;
-                            row.push(interval);
+                            let (months, days, microseconds) =
+                                parse_interval_pg(v).ok_or_else(|| {
+                                    ExecError::TypeMismatch(format!(
+                                        "column {col_idx} ({name}): invalid interval text {v:?}",
+                                        name = field.name,
+                                    ))
+                                })?;
+                            row.push(Value::Interval {
+                                months,
+                                days,
+                                microseconds,
+                            });
                         }
                         None => row.push(Value::Null),
                     }
@@ -523,28 +528,6 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
     }
 
     Ok(rows)
-}
-
-/// Parse the [`Value::Interval`] display form produced by `build_batch`.
-///
-/// The materialised text is exactly `"{months}mon {days}d {microseconds}us"`
-/// (see [`ultrasql_core::Value`]'s `Display` impl), so each component is a
-/// signed integer with a fixed suffix. Returns `None` if the text does not
-/// match that shape — the only producer is our own batch builder, so a
-/// mismatch indicates a corrupt or foreign column.
-fn parse_interval_display_text(text: &str) -> Option<Value> {
-    let mut parts = text.split_whitespace();
-    let months: i32 = parts.next()?.strip_suffix("mon")?.parse().ok()?;
-    let days: i32 = parts.next()?.strip_suffix('d')?.parse().ok()?;
-    let microseconds: i64 = parts.next()?.strip_suffix("us")?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(Value::Interval {
-        months,
-        days,
-        microseconds,
-    })
 }
 
 fn parse_bit_string_text_cell(

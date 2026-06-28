@@ -171,7 +171,11 @@ pub(crate) fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, 
         // Arithmetic
         // ------------------------------------------------------------------
         BinaryOp::Add => network_or_numeric_arith(lv, rv, ArithOp::Add),
-        BinaryOp::Sub => network_or_numeric_arith(lv, rv, ArithOp::Sub),
+        BinaryOp::Sub => match temporal_sub(&lv, &rv) {
+            // `timestamp - timestamp` -> interval, `date - date` -> int4.
+            Some(result) => result,
+            None => network_or_numeric_arith(lv, rv, ArithOp::Sub),
+        },
         BinaryOp::Mul => numeric_arith(lv, rv, ArithOp::Mul),
         BinaryOp::Div => numeric_arith(lv, rv, ArithOp::Div),
         BinaryOp::Mod => numeric_arith(lv, rv, ArithOp::Mod),

@@ -281,6 +281,7 @@ pub(in crate::binder) fn resolve_type_name(t: &TypeName) -> Result<DataType, Pla
         "timetz" | "time with time zone" => Ok(DataType::TimeTz),
         "timestamp" | "timestamp without time zone" => Ok(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
+        "interval" => Ok(DataType::Interval),
         "uuid" => Ok(DataType::Uuid),
         "int4range" => Ok(DataType::Range(RangeType::Int4)),
         "int8range" => Ok(DataType::Range(RangeType::Int8)),

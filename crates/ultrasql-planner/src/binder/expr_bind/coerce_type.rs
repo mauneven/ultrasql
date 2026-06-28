@@ -188,6 +188,16 @@ pub(in crate::binder) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &
                 *data_type = DataType::TimestampTz;
             }
         }
+        (DataType::Interval, Value::Text(text)) => {
+            if let Some((months, days, microseconds)) = parse_interval_pg(text) {
+                *value = Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                };
+                *data_type = DataType::Interval;
+            }
+        }
         (
             DataType::Float32,
             Value::Decimal {

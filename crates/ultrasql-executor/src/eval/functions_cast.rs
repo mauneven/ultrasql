@@ -437,7 +437,42 @@ pub(crate) fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
                 .map_or_else(|| oid.raw().to_string(), str::to_owned),
         ));
     }
+    // `interval -> text` uses PostgreSQL's canonical interval output, not the
+    // internal `Value` debug form (which the global `Display` keeps for error
+    // messages).
+    if let Value::Interval {
+        months,
+        days,
+        microseconds,
+    } = &args[0]
+    {
+        return Ok(Value::Text(format_interval_pg(*months, *days, *microseconds)));
+    }
     Ok(Value::Text(args[0].to_string()))
+}
+
+pub(crate) fn eval_cast_interval(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "interval cast: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    // `interval -> interval` is an identity pass-through (e.g. re-casts).
+    if let Value::Interval { .. } = &args[0] {
+        return Ok(args[0].clone());
+    }
+    let Some(text) = textlike_cast_arg("interval cast", args)? else {
+        return Ok(Value::Null);
+    };
+    let (months, days, microseconds) = parse_interval_pg(text).ok_or_else(|| {
+        EvalError::InvalidTextRepresentation(format!("interval cast: invalid syntax: {text}"))
+    })?;
+    Ok(Value::Interval {
+        months,
+        days,
+        microseconds,
+    })
 }
 
 pub(crate) fn eval_cast_inet(args: &[Value]) -> Result<Value, EvalError> {

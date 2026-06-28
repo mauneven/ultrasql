@@ -216,6 +216,57 @@ fn in_process_mode_runs_window_frames_shard() {
 }
 
 #[test]
+fn in_process_mode_runs_interval_pg_compat_shard() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/slt/ultrasql_specific/interval_pg_compat.slt")
+        .canonicalize()
+        .expect("interval-compat SLT shard exists");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The interval columns are read back through the typed wire client
+    // (binary 16-byte struct / canonical text), so a green run proves the
+    // OID 1186 wire format is libpq-decodable, not just the internal form.
+    assert!(stdout.contains("passed=18"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn ultrasql_specific_includes_interval_pg_compat_shard() {
+    let suite = repo_root().join("tests/slt/ultrasql_specific/interval_pg_compat.slt");
+    let text = fs::read_to_string(&suite).expect("curated interval-compat SLT shard exists");
+    assert!(
+        text.contains("UltraSQL-authored SQLLogicTest shard"),
+        "{} must document authored provenance",
+        suite.display()
+    );
+    assert!(
+        text.contains("PostgreSQL INTERVAL compatibility"),
+        "{} must name its reviewed scope",
+        suite.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (12..=40).contains(&case_count),
+        "{} must stay as a reviewed shard, got {case_count} cases",
+        suite.display()
+    );
+}
+
+#[test]
 fn portable_corpus_includes_window_frames_shard() {
     let suite = repo_root().join("tests/slt/portable/window_frames.slt");
     let text = fs::read_to_string(&suite).expect("curated window-frames SLT shard exists");

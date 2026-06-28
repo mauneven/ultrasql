@@ -48,6 +48,7 @@ pub(in crate::binder) fn resolve_cast_type(type_name: &str) -> Option<DataType> 
         "timetz" | "time with time zone" => Some(DataType::TimeTz),
         "timestamp" | "timestamp without time zone" => Some(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Some(DataType::TimestampTz),
+        "interval" => Some(DataType::Interval),
         "uuid" => Some(DataType::Uuid),
         "json" => Some(DataType::Json),
         "jsonb" => Some(DataType::Jsonb),

@@ -176,12 +176,12 @@ fn build_batch_covers_sql_storage_families_and_null_bitmaps() {
     assert_eq!(batch.columns()[34].text_value(0), Some("12.34"));
     assert_eq!(batch.columns()[35].text_value(0), Some("0.166667"));
     assert_eq!(batch.columns()[35].text_value(1), None);
-    // Interval columns materialise as text (last column), mirroring the
-    // streaming row-codec column builder; NULL stays NULL.
+    // Interval columns materialise as PostgreSQL-canonical text (last column),
+    // mirroring the streaming row-codec column builder; NULL stays NULL.
     let interval_col = batch.columns().len() - 1;
     assert_eq!(
         batch.columns()[interval_col].text_value(0),
-        Some("2mon 3d 14706000000us")
+        Some("2 mons 3 days 04:05:06")
     );
     assert_eq!(batch.columns()[interval_col].text_value(1), None);
 

@@ -52,12 +52,13 @@ pub(crate) use xml_validation::*;
 pub(crate) use xml_value::*;
 
 pub use datetime::{
-    date_parts_from_days, format_date_days, format_time_micros, format_timestamp_micros,
-    format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc,
+    date_parts_from_days, format_date_days, format_interval_pg, format_time_micros,
+    format_timestamp_micros, format_timestamptz_micros_in_timezone, format_timestamptz_micros_utc,
     format_timestamptz_micros_with_offset, format_timetz, format_timezone_offset_seconds,
-    pack_timetz, parse_date_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
-    parse_timetz_text, timestamp_micros_at_timezone, timestamp_parts_from_micros,
-    timestamptz_display_in_timezone, timetz_at_timezone, timetz_utc_micros, unpack_timetz,
+    pack_timetz, parse_date_text, parse_interval_pg, parse_time_text, parse_timestamp_text,
+    parse_timestamptz_text, parse_timetz_text, timestamp_micros_at_timezone,
+    timestamp_parts_from_micros, timestamptz_display_in_timezone, timetz_at_timezone,
+    timetz_utc_micros, unpack_timetz,
 };
 pub use geometry::{BoundingBox, GeometryValue, RangeValue, SparseVector, TimestampTzDisplay};
 pub use value_enum::Value;

@@ -1,0 +1,111 @@
+# UltraSQL-authored SQLLogicTest shard.
+#
+# PostgreSQL INTERVAL compatibility. PG-specific output, so this lives under
+# ultrasql_specific/ rather than the engine-agnostic portable corpus that is
+# run differentially against DuckDB/SQLite (which format intervals differently).
+#
+# Pins the INTERVAL fixes: canonical interval wire text (OID 1186) read by a
+# typed libpq client, the bare `interval '...'` literal, `timestamp -
+# timestamp` / `date - date`, `CREATE TABLE (c INTERVAL)` and
+# `CAST(... AS interval)`, and `age()`. Every expected value was verified
+# against PostgreSQL 14. Runs through the real wire protocol; the runner
+# decodes interval columns (binary 16-byte struct or canonical text).
+
+# --- Canonical interval wire text (OID 1186) ---------------------------------
+query T nosort
+SELECT INTERVAL '1' DAY
+----
+1 day
+
+# Bare `interval '<full string>'` literal (no trailing SQL unit keyword).
+query T nosort
+SELECT interval '1 day'
+----
+1 day
+
+query T nosort
+SELECT interval '2 mons 3 days 04:05:06'
+----
+2 mons 3 days 04:05:06
+
+query T nosort
+SELECT interval '-1 sec'
+----
+-00:00:01
+
+query T nosort
+SELECT interval '1.5 hours'
+----
+01:30:00
+
+query T nosort
+SELECT interval '-1 day +2 hours'
+----
+-1 days +02:00:00
+
+query T nosort
+SELECT interval '1 year 2 mons 3 days 04:05:06.789'
+----
+1 year 2 mons 3 days 04:05:06.789
+
+# --- timestamp - timestamp -> interval, date - date -> integer ---------------
+query T nosort
+SELECT TIMESTAMP '2000-01-02 00:00:00' - TIMESTAMP '2000-01-01 00:00:00'
+----
+1 day
+
+query T nosort
+SELECT TIMESTAMP '2000-01-01 00:00:00' - TIMESTAMP '2000-01-02 12:00:00'
+----
+-1 days -12:00:00
+
+query I nosort
+SELECT DATE '2000-01-05' - DATE '2000-01-01'
+----
+4
+
+# --- age() -------------------------------------------------------------------
+query T nosort
+SELECT age(TIMESTAMP '2001-04-10 00:00:00', TIMESTAMP '1957-06-13 00:00:00')
+----
+43 years 9 mons 27 days
+
+# --- CAST text <-> interval --------------------------------------------------
+query T nosort
+SELECT CAST('1 day 02:03:04' AS interval)
+----
+1 day 02:03:04
+
+query T nosort
+SELECT (interval '1 day 2 hours')::text
+----
+1 day 02:00:00
+
+# --- CREATE TABLE (c INTERVAL) storage round-trip + sort re-decode -----------
+statement ok
+CREATE TABLE slt_interval (id INT NOT NULL, span INTERVAL)
+
+statement ok
+INSERT INTO slt_interval VALUES (1, INTERVAL '1 day'), (2, interval '2 mons 3 days'), (3, NULL), (4, interval '-1 sec')
+
+query IT nosort
+SELECT id, span FROM slt_interval ORDER BY id
+----
+1
+1 day
+2
+2 mons 3 days
+3
+NULL
+4
+-00:00:01
+
+query T nosort
+SELECT span FROM slt_interval WHERE span IS NOT NULL ORDER BY span
+----
+-00:00:01
+1 day
+2 mons 3 days
+
+statement ok
+DROP TABLE slt_interval

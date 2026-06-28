@@ -30,10 +30,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{
-    DataType, Oid, SparseVector, Value, bpchar_semantic_text, parse_date_text, parse_decimal_text,
-    parse_money_text, parse_time_text, parse_timestamp_text, parse_timestamptz_text,
-    parse_timetz_text, timestamp_micros_at_timezone, timestamptz_display_in_timezone,
-    timetz_at_timezone, timetz_utc_micros, xml_content_is_well_formed, xml_document_is_well_formed,
+    DataType, Oid, SparseVector, Value, bpchar_semantic_text, format_interval_pg, parse_date_text,
+    parse_decimal_text, parse_interval_pg, parse_money_text, parse_time_text, parse_timestamp_text,
+    parse_timestamptz_text, parse_timetz_text, timestamp_micros_at_timezone,
+    timestamptz_display_in_timezone, timetz_at_timezone, timetz_utc_micros,
+    xml_content_is_well_formed, xml_document_is_well_formed,
     xml_xpath_element_fragments_with_namespaces,
 };
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp, catalog::builtin_type_oid};
@@ -455,6 +456,7 @@ fn eval_function_call(
         "__ultrasql_cast_timestamp" => eval_cast_timestamp(args),
         "__ultrasql_cast_timestamptz" => eval_cast_timestamptz(args),
         "__ultrasql_cast_timetz" => eval_cast_timetz(args),
+        "__ultrasql_cast_interval" => eval_cast_interval(args),
         "__ultrasql_cast_uuid" => eval_cast_uuid(args),
         "__ultrasql_cast_json" => eval_cast_json(args),
         "__ultrasql_cast_jsonb" => eval_cast_jsonb(args),

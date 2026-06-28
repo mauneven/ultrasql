@@ -7,7 +7,7 @@
 //! the binder lowers from a SELECT list — built-in function calls,
 //! CASE / COALESCE, arithmetic, etc.
 
-use ultrasql_core::{DataType, Schema, Value, pack_timetz};
+use ultrasql_core::{DataType, Schema, Value, format_interval_pg, pack_timetz};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
@@ -469,17 +469,21 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
             )
         }
         DataType::Interval => {
-            // Interval columns materialise as text so the full
-            // month/day/microsecond triple round-trips through the batch,
-            // mirroring the streaming row-codec column builder which stores
-            // `Value::Interval{..}.to_string()` into a Utf8 column. The
+            // Interval columns materialise as PostgreSQL-canonical text so the
+            // full month/day/microsecond triple round-trips through the batch
+            // and the result encoder emits libpq-readable interval text for
+            // OID 1186, mirroring the streaming row-codec column builder. The
             // schema field still reports `DataType::Interval`, so the wire
             // type OID (1186) is preserved by the result encoder.
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
                     Value::Null => strings.push(None),
-                    Value::Interval { .. } => strings.push(Some(v.to_string())),
+                    Value::Interval {
+                        months,
+                        days,
+                        microseconds,
+                    } => strings.push(Some(format_interval_pg(*months, *days, *microseconds))),
                     other => {
                         return Err(ExecError::TypeMismatch(format!(
                             "projection: expected Interval at row {i}, got {:?}",
@@ -785,7 +789,7 @@ mod tests {
                 ],
             )
             .expect("interval"),
-            &[Some("2mon 3d 14706000000us"), None],
+            &[Some("2 mons 3 days 04:05:06"), None],
         );
         assert_i32_values(
             build_column(&DataType::Null, vec![Value::Null, Value::Null]).expect("null"),

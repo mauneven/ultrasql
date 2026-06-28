@@ -6,7 +6,7 @@
 //! column builders. This function is kept for callers that still hold a
 //! `Vec<Vec<Value>>` and want a [`Batch`].
 
-use ultrasql_core::{DataType, Schema, Value, coerce_bpchar_text, pack_timetz};
+use ultrasql_core::{DataType, Schema, Value, coerce_bpchar_text, format_interval_pg, pack_timetz};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
@@ -443,16 +443,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 Column::Int64(col)
             }
             DataType::Interval => {
-                // Interval columns materialise as text so the full
-                // month/day/microsecond triple round-trips through the batch,
-                // mirroring the streaming row-codec column builder. The schema
-                // field carries the `DataType::Interval` tag so the wire OID
-                // (1186) is preserved and `batch_to_rows` re-parses the text
+                // Interval columns materialise as PostgreSQL-canonical text so
+                // the full month/day/microsecond triple round-trips through the
+                // batch, mirroring the streaming row-codec column builder. The
+                // schema field carries the `DataType::Interval` tag so the wire
+                // OID (1186) is preserved and `batch_to_rows` re-parses the text
                 // back into a `Value::Interval`.
                 let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
-                        Value::Interval { .. } => strings.push(Some(row[col_idx].to_string())),
+                        Value::Interval {
+                            months,
+                            days,
+                            microseconds,
+                        } => strings.push(Some(format_interval_pg(*months, *days, *microseconds))),
                         Value::Null => strings.push(None),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(

@@ -23,8 +23,8 @@
 pub(super) use num_traits::ToPrimitive;
 pub(super) use ultrasql_core::{
     BitString, DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, Oid, RangeType, RangeValue,
-    Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_money_text,
-    parse_time_text, parse_timestamptz_text, parse_timetz_text,
+    Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_interval_pg,
+    parse_money_text, parse_time_text, parse_timestamptz_text, parse_timetz_text,
 };
 pub(super) use ultrasql_parser::ast::{BinaryOp, Expr, Literal, ObjectName, UnaryOp};
 

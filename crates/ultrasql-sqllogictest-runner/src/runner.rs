@@ -6,7 +6,7 @@ use std::error::Error as StdError;
 use anyhow::{Result, bail};
 use tokio_postgres::types::{FromSql, Type};
 use tokio_postgres::{Client, Row};
-use ultrasql_core::{Value, decode_pg_numeric_binary};
+use ultrasql_core::{Value, decode_pg_numeric_binary, format_interval_pg, parse_interval_pg};
 
 use crate::model::{
     QueryExpectation, SkipFilters, SortMode, StatementExpectation, TestCase, TestKind,
@@ -270,6 +270,10 @@ fn format_cell(row: &Row, idx: usize, ty: &Type, declared: Option<char>) -> Resu
         let value: Option<PgNumeric> = row.try_get(idx)?;
         return Ok(value.map_or_else(|| "NULL".to_owned(), |n| n.format_for(declared)));
     }
+    if *ty == Type::INTERVAL {
+        let value: Option<PgInterval> = row.try_get(idx)?;
+        return Ok(value.map_or_else(|| "NULL".to_owned(), |v| v.0));
+    }
     bail!(
         "unsupported result type `{}` at column {}",
         ty.name(),
@@ -345,6 +349,33 @@ impl<'a> FromSql<'a> for PgNumeric {
 
     fn accepts(ty: &Type) -> bool {
         *ty == Type::NUMERIC
+    }
+}
+
+/// A decoded PostgreSQL `interval` (OID 1186), rendered as canonical interval
+/// text. The server advertises OID 1186 and `tokio_postgres` requests binary,
+/// so the wire payload is PG binary interval (`int64 microseconds || int32
+/// days || int32 months`, network byte order). The decoder also accepts the
+/// canonical text form as a fallback, then re-renders it through the shared
+/// formatter so the runner sees exactly what a typed libpq client decodes.
+struct PgInterval(String);
+
+impl<'a> FromSql<'a> for PgInterval {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+        if raw.len() == 16 {
+            let micros = i64::from_be_bytes(raw[0..8].try_into()?);
+            let days = i32::from_be_bytes(raw[8..12].try_into()?);
+            let months = i32::from_be_bytes(raw[12..16].try_into()?);
+            return Ok(Self(format_interval_pg(months, days, micros)));
+        }
+        let text = std::str::from_utf8(raw)?;
+        let (months, days, micros) =
+            parse_interval_pg(text).ok_or_else(|| format!("invalid interval text {text:?}"))?;
+        Ok(Self(format_interval_pg(months, days, micros)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::INTERVAL
     }
 }
 
