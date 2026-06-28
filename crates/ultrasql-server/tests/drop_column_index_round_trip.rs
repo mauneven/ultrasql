@@ -286,11 +286,9 @@ async fn drop_column_multi_column_index_shift_and_drop() {
 /// probe through it still resolves `b` correctly (the constraint and its index
 /// survive with their names intact).
 ///
-/// NOTE: this asserts the *metadata* re-pointing this fix is responsible for.
-/// Insert-time UNIQUE *enforcement* (the 23505 path) is independently lost
-/// across any `DROP COLUMN` on this engine — a pre-existing defect where the
-/// heap rewrite re-TIDs rows without rebuilding the unique B-tree maintainer —
-/// so it is deliberately not asserted here.
+/// This asserts the *metadata* re-pointing. Insert-time UNIQUE *enforcement*
+/// (the 23505 path) surviving the drop is asserted separately by
+/// `drop_column_unique_still_enforced_after_drop` and friends below.
 #[tokio::test]
 async fn drop_column_unique_constraint_repointed_and_survives() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
@@ -489,6 +487,122 @@ async fn drop_column_no_indexes_then_maintains_new_index() {
         .expect("seq scan (defeats index)");
     assert_eq!(via_seq.len(), 1);
     assert_eq!(via_seq[0].get::<_, i32>(0), 600);
+
+    shutdown(client, server_handle).await;
+}
+
+/// ENFORCEMENT — the repro this fix closes: a UNIQUE column keeps rejecting
+/// duplicates immediately after `DROP COLUMN`. The heap rewrite re-stamps every
+/// surviving row as a new tuple version, so the unique index's leaves point at
+/// the now-dead pre-images; without repopulating them the duplicate-key recheck
+/// reads a dead pre-image, sees a free slot, and lets the duplicate land (which
+/// then aborts the next restart's index rebuild and bricks the server). Matches
+/// PostgreSQL 14: the constraint stays enforced across the drop.
+#[tokio::test]
+async fn drop_column_unique_still_enforced_after_drop() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (a INT, b INT UNIQUE)")
+        .await
+        .expect("create with UNIQUE b");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10)")
+        .await
+        .expect("seed");
+
+    client
+        .batch_execute("ALTER TABLE t DROP COLUMN a")
+        .await
+        .expect("drop column a");
+
+    // The duplicate b=10 must still be rejected (23505) right after the drop.
+    let err = client
+        .batch_execute("INSERT INTO t VALUES (10)")
+        .await
+        .expect_err("duplicate b=10 must violate UNIQUE after DROP COLUMN");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23505");
+
+    // A distinct b still inserts through the repopulated index, and both rows
+    // are visible (the original survived the rewrite; the new one was added).
+    client
+        .batch_execute("INSERT INTO t VALUES (11)")
+        .await
+        .expect("distinct b inserts through the repopulated unique index");
+    let rows = client
+        .query("SELECT b FROM t ORDER BY b", &[])
+        .await
+        .expect("select");
+    let bs: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(bs, vec![10, 11]);
+
+    shutdown(client, server_handle).await;
+}
+
+/// ENFORCEMENT, position UNCHANGED: a UNIQUE on a column BEFORE the dropped one
+/// (its attnum does not shift) also keeps enforcing. This guards the case the
+/// column-shift bookkeeping skips entirely — the index needs repopulating
+/// because its leaves point at the rewritten rows' dead pre-images, not because
+/// its key position moved.
+#[tokio::test]
+async fn drop_column_unique_on_earlier_column_still_enforced() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (a INT UNIQUE, b INT)")
+        .await
+        .expect("create with UNIQUE a (attnum 0)");
+    client
+        .batch_execute("INSERT INTO t VALUES (10, 1)")
+        .await
+        .expect("seed");
+
+    // Drop b (attnum 1, AFTER a): a's position is unchanged at 0.
+    client
+        .batch_execute("ALTER TABLE t DROP COLUMN b")
+        .await
+        .expect("drop column b");
+
+    let err = client
+        .batch_execute("INSERT INTO t VALUES (10)")
+        .await
+        .expect_err("duplicate a=10 must violate UNIQUE even when its position did not shift");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23505");
+
+    client
+        .batch_execute("INSERT INTO t VALUES (20)")
+        .await
+        .expect("distinct a inserts through the repopulated unique index");
+
+    shutdown(client, server_handle).await;
+}
+
+/// ENFORCEMENT for PRIMARY KEY on a surviving column: the PK keeps rejecting
+/// duplicates after an earlier column is dropped (a PK is a UNIQUE index, so it
+/// rides the same repopulation path).
+#[tokio::test]
+async fn drop_column_primary_key_still_enforced_after_drop() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (a INT, b INT PRIMARY KEY)")
+        .await
+        .expect("create with PK b");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10)")
+        .await
+        .expect("seed");
+
+    client
+        .batch_execute("ALTER TABLE t DROP COLUMN a")
+        .await
+        .expect("drop column a");
+
+    let err = client
+        .batch_execute("INSERT INTO t VALUES (10)")
+        .await
+        .expect_err("duplicate PK b=10 must be rejected after DROP COLUMN");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23505");
 
     shutdown(client, server_handle).await;
 }

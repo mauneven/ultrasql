@@ -99,6 +99,70 @@ async fn alter_table_drop_column_index_adjustments_survive_restart() {
     shutdown(running).await;
 }
 
+/// BLAST RADIUS: before this fix, UNIQUE enforcement was silently lost after
+/// `DROP COLUMN` (the heap rewrite re-stamped every surviving row as a new
+/// tuple version without repopulating the unique index), so a duplicate slipped
+/// into the heap — and the NEXT restart's index rebuild aborted on it
+/// (`server init failed: ... duplicate key in index`), leaving the server
+/// unable to boot. With enforcement restored the duplicate is rejected up
+/// front, no duplicate ever lands, the restart boots cleanly, and UNIQUE is
+/// still enforced. Matches PostgreSQL 14.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alter_table_drop_column_keeps_unique_enforced_across_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "drop_column_unique_restart").await;
+    running
+        .client
+        .batch_execute("CREATE TABLE dcu (a INT, b INT UNIQUE)")
+        .await
+        .expect("create with UNIQUE b");
+    running
+        .client
+        .batch_execute("INSERT INTO dcu VALUES (1, 10)")
+        .await
+        .expect("seed");
+    running
+        .client
+        .batch_execute("ALTER TABLE dcu DROP COLUMN a")
+        .await
+        .expect("drop column a");
+
+    // Enforcement resumed immediately: the duplicate is rejected, so no
+    // duplicate row can reach the heap to poison the restart rebuild.
+    let err = running
+        .client
+        .batch_execute("INSERT INTO dcu VALUES (10)")
+        .await
+        .expect_err("duplicate b=10 must be rejected after DROP COLUMN");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23505");
+    running
+        .client
+        .batch_execute("INSERT INTO dcu VALUES (11)")
+        .await
+        .expect("distinct b inserts through the repopulated unique index");
+    shutdown(running).await;
+
+    // The server boots (the rebuild finds no duplicate) — `start_persistent_server`
+    // calls `Server::init`, which would PANIC here on the pre-fix duplicate-key
+    // rebuild abort — and UNIQUE is still enforced after restart.
+    let running = start_persistent_server(data_dir.path(), "drop_column_unique_restart").await;
+    let rows = running
+        .client
+        .query("SELECT b FROM dcu ORDER BY b", &[])
+        .await
+        .expect("select after restart");
+    let bs: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(bs, vec![10, 11]);
+    let err = running
+        .client
+        .batch_execute("INSERT INTO dcu VALUES (10)")
+        .await
+        .expect_err("UNIQUE still enforced after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23505");
+    shutdown(running).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alter_table_rename_column_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();

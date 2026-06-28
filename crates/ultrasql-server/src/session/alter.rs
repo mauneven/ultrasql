@@ -1516,6 +1516,15 @@ where
                     column_index,
                     &dependents,
                 );
+                // The heap rewrite re-stamped every surviving row as a new
+                // tuple version, orphaning the existing index leaves on the dead
+                // pre-images. Repopulate the survivors' btree/hash pages from the
+                // committed heap so UNIQUE / PRIMARY KEY enforcement resumes at
+                // once — otherwise the next duplicate INSERT slips past the 23505
+                // check and later aborts the restart's index rebuild, leaving the
+                // server unable to boot.
+                self.state
+                    .repopulate_table_btree_indexes_after_drop_column(&updated_entry);
                 if let Some((_, partition)) = self.state.time_partitions.remove(&table_key) {
                     let partition_column_index = if column_index < partition.partition_column_index
                     {

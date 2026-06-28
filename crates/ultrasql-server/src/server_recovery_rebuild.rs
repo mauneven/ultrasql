@@ -502,6 +502,78 @@ impl Server {
         )
     }
 
+    /// Repopulate the persistent btree/hash index pages of every surviving
+    /// plain-column index of `table` from the heap, after an `ALTER TABLE ...
+    /// DROP COLUMN` has rewritten that heap in place.
+    ///
+    /// DROP COLUMN re-encodes every visible tuple to the narrower row via a
+    /// direct `heap.update`, which re-stamps each surviving row as a new tuple
+    /// version (the pre-drop version is left dead). The existing index leaves
+    /// still point at those now-dead pre-images, so a UNIQUE / PRIMARY KEY index
+    /// silently stops enforcing 23505: the duplicate-key recheck fetches the
+    /// dead pre-image, classifies the slot as free, and lets a duplicate land.
+    /// That duplicate then aborts the next restart's index rebuild
+    /// (`restart rebuild <idx>: duplicate key in index`) and the server fails to
+    /// boot. Re-running exactly the startup btree rebuild here — but scoped to
+    /// this one table and its freshly committed heap — rebuilds every leaf to
+    /// point at the live tuple versions, so enforcement resumes immediately and
+    /// no duplicate can ever land. Must be called AFTER the rewrite has
+    /// committed and the in-memory catalog survivors have been re-pointed
+    /// ([`Self::rebuild_btree_index_pages`] reads the post-drop schema/columns).
+    ///
+    /// Expression / partial indexes are intentionally skipped: their runtime
+    /// key / predicate metadata still references the pre-drop column positions
+    /// (re-indexing that metadata is a separate concern), so evaluating them
+    /// against the rewritten rows here could key on the wrong slot. They are
+    /// rebuilt from re-bound metadata at the next restart.
+    pub(crate) fn repopulate_table_btree_indexes_after_drop_column(&self, table: &TableEntry) {
+        let snapshot = self.catalog_snapshot();
+        let Some(indexes) = snapshot.indexes_by_table.get(&table.oid) else {
+            return;
+        };
+        for index in indexes {
+            let method = logical_index_method_from_name(&index.access_method);
+            if !matches!(method, LogicalIndexMethod::Btree | LogicalIndexMethod::Hash) {
+                continue;
+            }
+            // Expression / partial index runtime metadata is not column-shifted
+            // by DROP COLUMN, so a rebuild here would evaluate stale positions;
+            // leave it to the restart rebuild, which re-binds against the schema.
+            let runtime = self
+                .table_constraints
+                .get(&table.oid)
+                .and_then(|constraints| constraints.indexes.get(&index.oid).cloned());
+            if runtime
+                .as_ref()
+                .is_some_and(|metadata| !metadata.key_exprs.is_empty() || metadata.predicate.is_some())
+            {
+                tracing::warn!(
+                    table = %table.name,
+                    index = %index.name,
+                    "ALTER TABLE DROP COLUMN: skipping in-place rebuild of expression/partial \
+                     index; it will be rebuilt at the next restart"
+                );
+                continue;
+            }
+            match self.rebuild_btree_index_pages(table, index, method) {
+                Ok(rows) => tracing::info!(
+                    table = %table.name,
+                    index = %index.name,
+                    rows,
+                    unique = index.is_unique,
+                    "ALTER TABLE DROP COLUMN: repopulated index from rewritten heap"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    table = %table.name,
+                    index = %index.name,
+                    "ALTER TABLE DROP COLUMN: repopulating index after column drop failed; \
+                     the heap is authoritative and a restart rebuilds it"
+                ),
+            }
+        }
+    }
+
     pub(crate) fn rebuild_brin_summary(
         &self,
         table: &TableEntry,
