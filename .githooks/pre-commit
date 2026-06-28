@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit: validate tests only. Nothing else.
+# Pre-commit: check formatting of staged files, then run the workspace tests.
 #
 # Wire once per clone:
 #   ln -sf ../../.githooks/pre-commit .git/hooks/pre-commit
@@ -13,6 +13,25 @@ if ! command -v cargo >/dev/null 2>&1; then
     if [ -f "$HOME/.cargo/env" ]; then
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
+    fi
+fi
+
+# Format gate. CI runs `cargo fmt --all -- --check`, but a direct push to main
+# bypasses that pre-merge gate, so unformatted code can land and turn the CI
+# rustfmt job red. Check the *staged* Rust files here — staged-only, so the
+# tree's pre-existing unformatted files never block an unrelated commit — and
+# refuse the commit if any need formatting. This is cheap (no build), so it
+# runs before the disk preflight. Bypass with `git commit --no-verify`.
+staged_rs="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' 2>/dev/null || true)"
+if [ -n "$staged_rs" ] && command -v rustfmt >/dev/null 2>&1; then
+    if ! printf '%s\n' "$staged_rs" | xargs rustfmt --edition 2024 --check >/dev/null 2>&1; then
+        printf '\n\033[1;31m== pre-commit: staged files are not rustfmt-clean ==\033[0m\n' >&2
+        printf 'Unformatted (per `cargo fmt --all -- --check`, the CI gate):\n' >&2
+        printf '%s\n' "$staged_rs" \
+            | xargs rustfmt --edition 2024 --check 2>/dev/null \
+            | grep -E '^Diff in ' | sed -E 's#^Diff in [^ ]*/(crates/[^:]+):.*#  \1#' | sort -u >&2
+        printf 'Fix: run `cargo fmt`, re-stage, and commit. Bypass once with --no-verify.\n' >&2
+        exit 1
     fi
 fi
 
