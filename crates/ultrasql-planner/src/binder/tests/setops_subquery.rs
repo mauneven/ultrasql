@@ -629,3 +629,154 @@ fn set_op_no_common_type_is_rejected() {
         "message must mirror PG, got {msg}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Set-operation precedence (INTERSECT binds tighter than UNION / EXCEPT)
+// -----------------------------------------------------------------------
+
+/// Render the SetOp plan tree as a fully-parenthesised string so a test can
+/// assert the exact operator grouping. Each non-SetOp child (a bound SELECT
+/// body) is rendered as `L`. Quantifiers are shown (`UNION ALL`) so
+/// multiplicity-preserving folds are visible too.
+fn setop_shape(plan: &LogicalPlan) -> String {
+    let LogicalPlan::SetOp {
+        op,
+        quantifier,
+        left,
+        right,
+        ..
+    } = plan
+    else {
+        return "L".to_string();
+    };
+    let op_s = match op {
+        LogicalSetOp::Union => "UNION",
+        LogicalSetOp::Intersect => "INTERSECT",
+        LogicalSetOp::Except => "EXCEPT",
+    };
+    let q_s = match quantifier {
+        LogicalSetQuantifier::All => " ALL",
+        LogicalSetQuantifier::Distinct => "",
+    };
+    format!(
+        "({} {op_s}{q_s} {})",
+        setop_shape(left),
+        setop_shape(right)
+    )
+}
+
+fn shape_of(sql: &str) -> String {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(sql, &cat).expect("bind ok");
+    setop_shape(&plan)
+}
+
+/// The canonical bug: `UNION` then `INTERSECT` must bind as
+/// `1 UNION (2 INTERSECT 2)`, never the naive left fold
+/// `(1 UNION 2) INTERSECT 2` (which yields the wrong result {2}).
+#[test]
+fn intersect_binds_tighter_than_trailing_union() {
+    assert_eq!(
+        shape_of("SELECT 1 UNION SELECT 2 INTERSECT SELECT 2"),
+        "(L UNION (L INTERSECT L))"
+    );
+}
+
+/// A leading `INTERSECT` run forms the first UNION operand:
+/// `1 INTERSECT 2 UNION 3` → `(1 INTERSECT 2) UNION 3`.
+#[test]
+fn leading_intersect_run_is_first_union_operand() {
+    assert_eq!(
+        shape_of("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3"),
+        "((L INTERSECT L) UNION L)"
+    );
+}
+
+/// UNION and EXCEPT share one (lower) precedence and associate left-to-right:
+/// `1 UNION 2 EXCEPT 3` → `(1 UNION 2) EXCEPT 3`.
+#[test]
+fn union_and_except_are_left_associative_at_equal_precedence() {
+    assert_eq!(
+        shape_of("SELECT 1 UNION SELECT 2 EXCEPT SELECT 3"),
+        "((L UNION L) EXCEPT L)"
+    );
+}
+
+/// EXCEPT also binds looser than INTERSECT:
+/// `1 EXCEPT 1 INTERSECT 2` → `1 EXCEPT (1 INTERSECT 2)`.
+#[test]
+fn intersect_binds_tighter_than_except() {
+    assert_eq!(
+        shape_of("SELECT 1 EXCEPT SELECT 1 INTERSECT SELECT 2"),
+        "(L EXCEPT (L INTERSECT L))"
+    );
+}
+
+/// INTERSECT itself is left-associative among its own chain:
+/// `1 INTERSECT 2 INTERSECT 3` → `(1 INTERSECT 2) INTERSECT 3`.
+#[test]
+fn intersect_chain_is_left_associative() {
+    assert_eq!(
+        shape_of("SELECT 1 INTERSECT SELECT 2 INTERSECT SELECT 3"),
+        "((L INTERSECT L) INTERSECT L)"
+    );
+}
+
+/// Mixed chain: each INTERSECT run is grouped, then the UNION/EXCEPT operators
+/// fold left-to-right. `1 INTERSECT 2 UNION 3 INTERSECT 4` →
+/// `(1 INTERSECT 2) UNION (3 INTERSECT 4)`.
+#[test]
+fn mixed_chain_groups_intersect_runs_then_folds_union_left() {
+    assert_eq!(
+        shape_of(
+            "SELECT 1 INTERSECT SELECT 2 UNION SELECT 3 INTERSECT SELECT 4"
+        ),
+        "((L INTERSECT L) UNION (L INTERSECT L))"
+    );
+}
+
+/// Interior INTERSECT run between two UNIONs:
+/// `1 UNION 2 INTERSECT 3 UNION 4` → `(1 UNION (2 INTERSECT 3)) UNION 4`.
+#[test]
+fn interior_intersect_run_is_grouped_inside_union_chain() {
+    assert_eq!(
+        shape_of(
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 UNION SELECT 4"
+        ),
+        "((L UNION (L INTERSECT L)) UNION L)"
+    );
+}
+
+/// Quantifiers ride along with their operator through precedence folding, so
+/// `UNION ALL` / `INTERSECT ALL` multiplicity is preserved in the right
+/// branch: `1 UNION ALL 1 INTERSECT ALL 1` →
+/// `1 UNION ALL (1 INTERSECT ALL 1)`.
+#[test]
+fn all_quantifier_is_preserved_through_precedence_fold() {
+    assert_eq!(
+        shape_of("SELECT 1 UNION ALL SELECT 1 INTERSECT ALL SELECT 1"),
+        "(L UNION ALL (L INTERSECT ALL L))"
+    );
+}
+
+/// A trailing ORDER BY / LIMIT still applies to the whole set-op result even
+/// though INTERSECT now nests: the top node is the Limit/Sort wrapper, and the
+/// set-op tree beneath it keeps the correct INTERSECT-tighter grouping.
+#[test]
+fn trailing_order_by_limit_wraps_the_whole_precedence_tree() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT 1 UNION SELECT 2 INTERSECT SELECT 2 ORDER BY 1 LIMIT 5",
+        &cat,
+    )
+    .expect("bind ok");
+    // LIMIT wraps SORT wraps the set-op tree.
+    let LogicalPlan::Limit { input, n, .. } = &plan else {
+        panic!("expected Limit at top, got {plan:?}");
+    };
+    assert_eq!(*n, 5);
+    let LogicalPlan::Sort { input, .. } = input.as_ref() else {
+        panic!("expected Sort under Limit, got {input:?}");
+    };
+    assert_eq!(setop_shape(input), "(L UNION (L INTERSECT L))");
+}

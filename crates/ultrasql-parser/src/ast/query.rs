@@ -43,9 +43,10 @@ pub struct SelectStmt {
     pub limit: Option<Expr>,
     /// `OFFSET n`.
     pub offset: Option<Expr>,
-    /// Chained UNION / INTERSECT / EXCEPT tails. In PostgreSQL, set ops bind
-    /// less tightly than ORDER BY / LIMIT. For v0.2 we represent the chain
-    /// here and leave precedence enforcement to the binder.
+    /// Chained UNION / INTERSECT / EXCEPT tails, stored as a flat left-to-right
+    /// list hanging off the leading SELECT body. PostgreSQL binds INTERSECT
+    /// tighter than UNION / EXCEPT; that precedence is applied by the binder
+    /// when it folds this flat chain into the plan tree, not by the parser.
     pub set_ops: Vec<SetOpTail>,
     /// Leading `WITH [RECURSIVE]` CTEs.
     pub ctes: Vec<Cte>,

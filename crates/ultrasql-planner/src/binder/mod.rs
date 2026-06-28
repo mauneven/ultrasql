@@ -737,7 +737,7 @@ fn select_without_set_tail_modifiers(select: &SelectStmt) -> SelectStmt {
 }
 
 fn bind_set_ops_and_modifiers(
-    mut plan: LogicalPlan,
+    plan: LogicalPlan,
     select: &SelectStmt,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
@@ -747,20 +747,70 @@ fn bind_set_ops_and_modifiers(
         return Ok(plan);
     }
 
-    let mut final_tail_order_by = Vec::new();
-    let mut final_tail_limit = None;
-    let mut final_tail_offset = None;
-    let tail_count = select.set_ops.len();
-    for (idx, tail) in select.set_ops.iter().enumerate() {
-        let mut right_select = (*tail.right).clone();
-        if idx + 1 == tail_count {
-            final_tail_order_by = std::mem::take(&mut right_select.order_by);
-            final_tail_limit = right_select.limit.take();
-            final_tail_offset = right_select.offset.take();
-        }
-        let right_plan = bind_select_with_ctes(&right_select, catalog, cte_catalog, scope)?;
-        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
+    // The parser stores the set-op chain as a flat, left-to-right list of
+    // tails hanging off the leading SELECT body (`b op0 r0 op1 r1 …`). This
+    // function is where that flat chain is folded into the actual plan tree,
+    // so this is where PostgreSQL set-op precedence is enforced: INTERSECT
+    // binds *tighter* than UNION / EXCEPT, while operators of equal
+    // precedence associate left-to-right. For example
+    // `1 UNION 2 INTERSECT 2` must bind as `1 UNION (2 INTERSECT 2)`, not the
+    // naive left fold `(1 UNION 2) INTERSECT 2`.
+    let tails = &select.set_ops;
+    let last = tails.len() - 1;
+
+    // The ORDER BY / LIMIT / OFFSET trailing the entire set-op chain are
+    // parsed onto the final SELECT body. Hoist them off a clone of that body
+    // so they apply to the whole combined result rather than just the last
+    // branch. (Independent of precedence: they always belong to the final
+    // tail's right, wherever that tail lands in the fold.)
+    let mut final_right = (*tails[last].right).clone();
+    let final_tail_order_by = std::mem::take(&mut final_right.order_by);
+    let final_tail_limit = final_right.limit.take();
+    let final_tail_offset = final_right.offset.take();
+
+    // Bind tail `idx`'s right-hand SELECT, substituting the modifier-stripped
+    // clone for the final tail.
+    let bind_right_at = |idx: usize, scope: &mut ScopeStack| -> Result<LogicalPlan, PlanError> {
+        let right_select: &SelectStmt = if idx == last {
+            &final_right
+        } else {
+            tails[idx].right.as_ref()
+        };
+        bind_select_with_ctes(right_select, catalog, cte_catalog, scope)
+    };
+
+    // Walk the flat chain once, gathering each maximal run of
+    // INTERSECT-connected terms into a single operand, then combining those
+    // operands left-to-right with the UNION / EXCEPT operators between them.
+    let mut left = plan;
+    let mut idx = 0;
+
+    // A leading INTERSECT run folds straight into the body, forming the first
+    // UNION / EXCEPT operand (e.g. `a INTERSECT b UNION c` → operand
+    // `a INTERSECT b`, then `UNION c`).
+    while idx <= last && matches!(tails[idx].op, SetOp::Intersect) {
+        let right = bind_right_at(idx, scope)?;
+        left = bind_set_op(left, tails[idx].op, tails[idx].quantifier, right)?;
+        idx += 1;
     }
+
+    // Each remaining UNION / EXCEPT joins the accumulated `left` to the next
+    // operand, which is the run of INTERSECT terms immediately following the
+    // operator (e.g. `a UNION b INTERSECT c` → `a UNION (b INTERSECT c)`).
+    while idx <= last {
+        let union_op = tails[idx].op;
+        let union_q = tails[idx].quantifier;
+        let mut right = bind_right_at(idx, scope)?;
+        idx += 1;
+        while idx <= last && matches!(tails[idx].op, SetOp::Intersect) {
+            let inner = bind_right_at(idx, scope)?;
+            right = bind_set_op(right, tails[idx].op, tails[idx].quantifier, inner)?;
+            idx += 1;
+        }
+        left = bind_set_op(left, union_op, union_q, right)?;
+    }
+
+    let plan = left;
 
     let order_by = if select.order_by.is_empty() {
         &final_tail_order_by

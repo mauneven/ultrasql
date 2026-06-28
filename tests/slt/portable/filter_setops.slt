@@ -105,6 +105,47 @@ delta
 3
 gamma
 
+# Set-operation precedence: INTERSECT binds tighter than UNION / EXCEPT
+# (PostgreSQL / SQL standard). Each expected result was confirmed in real
+# PostgreSQL and distinguishes the correct grouping from a naive left fold.
+
+# `1 UNION (2 INTERSECT 2)` = {1,2}; the wrong left fold `(1 UNION 2) INTERSECT 2`
+# would yield only {2}.
+query I rowsort
+SELECT 1 UNION SELECT 2 INTERSECT SELECT 2
+----
+1
+2
+
+# `(1 UNION (2 INTERSECT 2)) UNION 3` = {1,2,3}; the wrong left fold yields {2,3}.
+query I rowsort
+SELECT 1 UNION SELECT 2 INTERSECT SELECT 2 UNION SELECT 3
+----
+1
+2
+3
+
+# `1 EXCEPT (1 INTERSECT 2)` = {1}; the wrong left fold `(1 EXCEPT 1) INTERSECT 2`
+# would yield no rows.
+query I rowsort
+SELECT 1 EXCEPT SELECT 1 INTERSECT SELECT 2
+----
+1
+
+# `(1 INTERSECT 2) UNION 3` = {3} — leading INTERSECT run forms the first operand.
+query I rowsort
+SELECT 1 INTERSECT SELECT 2 UNION SELECT 3
+----
+3
+
+# Multiplicity: `1 UNION ALL (1 INTERSECT ALL 1)` keeps two rows; the wrong fold
+# `(1 UNION ALL 1) INTERSECT ALL 1` collapses to one.
+query I rowsort
+SELECT 1 UNION ALL SELECT 1 INTERSECT ALL SELECT 1
+----
+1
+1
+
 statement ok
 DROP TABLE slt_filter_blocklist
 

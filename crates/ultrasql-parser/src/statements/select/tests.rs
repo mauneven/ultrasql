@@ -549,6 +549,43 @@ fn except_all() {
     assert_eq!(s.set_ops[0].quantifier, SetQuantifier::All);
 }
 
+/// The parser stores a mixed set-op chain as a *flat* left-to-right list of
+/// tails hanging off the leading SELECT body; it does NOT pre-group INTERSECT.
+/// PostgreSQL's INTERSECT-over-UNION precedence is applied by the binder when
+/// it folds this chain into the plan tree (see the planner's
+/// `bind_set_ops_and_modifiers`). This test pins the flat representation so a
+/// regression in either layer is caught: here the order is exactly
+/// UNION, INTERSECT, EXCEPT as written.
+#[test]
+fn mixed_set_ops_are_stored_as_flat_chain_in_source_order() {
+    let stmt = parse(
+        "SELECT a FROM t1 \
+         UNION SELECT b FROM t2 \
+         INTERSECT SELECT c FROM t3 \
+         EXCEPT SELECT d FROM t4",
+    );
+    let Statement::Select(s) = stmt else { panic!() };
+    let ops: Vec<SetOp> = s.set_ops.iter().map(|t| t.op).collect();
+    assert_eq!(ops, vec![SetOp::Union, SetOp::Intersect, SetOp::Except]);
+    // Each tail's right is a single SELECT body with no nested set ops: the
+    // chain is genuinely flat, never pre-nested by the parser.
+    assert!(s.set_ops.iter().all(|t| t.right.set_ops.is_empty()));
+}
+
+/// A trailing ORDER BY / LIMIT after a set-op chain is parsed onto the final
+/// SELECT body (the binder later hoists it to apply to the whole result).
+#[test]
+fn trailing_order_by_limit_attaches_to_final_set_op_branch() {
+    let stmt = parse("SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY 1 LIMIT 3");
+    let Statement::Select(s) = stmt else { panic!() };
+    assert_eq!(s.set_ops.len(), 1);
+    assert!(s.order_by.is_empty(), "leading body carries no ORDER BY");
+    assert!(s.limit.is_none(), "leading body carries no LIMIT");
+    let last = s.set_ops.last().expect("one tail");
+    assert_eq!(last.right.order_by.len(), 1);
+    assert!(last.right.limit.is_some());
+}
+
 // -------- CTEs -------------------------------------------------------- //
 
 #[test]

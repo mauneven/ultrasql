@@ -136,9 +136,11 @@ impl Parser<'_> {
         }
 
         // Set-operation tails (UNION / INTERSECT / EXCEPT).
-        // Note on precedence: PostgreSQL resolves UNION < INTERSECT in a chain,
-        // but for v0.2 we parse them uniformly left-to-right and store the raw
-        // chain. The binder will enforce proper precedence.
+        // Precedence note: PostgreSQL binds INTERSECT tighter than UNION /
+        // EXCEPT. We deliberately parse the operators uniformly left-to-right
+        // and store the raw flat chain here; the binder folds that chain into
+        // the plan tree and is where the INTERSECT-over-UNION precedence is
+        // actually applied (see `bind_set_ops_and_modifiers`).
         let set_ops = self.parse_set_op_tails(recursive)?;
 
         // FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE
