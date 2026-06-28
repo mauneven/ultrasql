@@ -53,6 +53,25 @@ impl Batch {
         Ok(Self { columns, rows })
     }
 
+    /// Construct a batch with zero columns but an explicit logical row
+    /// count.
+    ///
+    /// [`Batch::new`] derives the row count from the first column, so a
+    /// column-less batch built that way is always zero rows. A few sources
+    /// need the opposite: logical rows that carry no columns of their own.
+    /// `INSERT ... DEFAULT VALUES` is the canonical case — one row whose
+    /// every target column is supplied downstream from its `DEFAULT`,
+    /// sequence `nextval`, identity, or generated expression. This is the
+    /// only constructor where row and column counts may disagree, and it is
+    /// deliberately restricted to the zero-column shape.
+    #[must_use]
+    pub fn row_markers(rows: usize) -> Self {
+        Self {
+            columns: SmallVec::new(),
+            rows,
+        }
+    }
+
     /// Borrow the columns slice.
     #[must_use]
     pub fn columns(&self) -> &[Column] {
@@ -116,5 +135,22 @@ mod tests {
         assert_eq!(batch.rows(), 0);
         assert_eq!(batch.width(), 0);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn row_markers_carry_rows_with_zero_columns() {
+        // Zero columns but a non-zero logical row count — the shape
+        // `INSERT ... DEFAULT VALUES` needs. `Batch::new` could never
+        // produce this, since it derives the row count from the first
+        // column.
+        let batch = Batch::row_markers(1);
+        assert_eq!(batch.rows(), 1);
+        assert_eq!(batch.width(), 0);
+        assert!(!batch.is_empty());
+
+        let none = Batch::row_markers(0);
+        assert_eq!(none.rows(), 0);
+        assert_eq!(none.width(), 0);
+        assert!(none.is_empty());
     }
 }

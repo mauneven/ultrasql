@@ -29,7 +29,9 @@ pub struct ValuesScan {
     schema: Schema,
     /// Start offset for the next non-empty output batch.
     next_row: usize,
-    /// Set after the single zero-row batch has been emitted.
+    /// Set after the single batch has been emitted for a source with no
+    /// output columns — either a zero-row batch (`rows` empty) or the
+    /// explicit row markers of `INSERT ... DEFAULT VALUES`.
     emitted_empty: bool,
 }
 
@@ -53,6 +55,20 @@ impl ValuesScan {
 
 impl Operator for ValuesScan {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        // Zero-column source (`INSERT ... DEFAULT VALUES` binds to a
+        // column-less `VALUES` whose single row carries no cells). The row
+        // count can't ride on any column, so emit explicit row markers:
+        // `self.rows` holds one empty cell-vector per logical row, and the
+        // consuming `ModifyTable` fills every column from its DEFAULT /
+        // sequence / identity / generated value (or NULL → NOT NULL).
+        if self.schema.is_empty() {
+            if self.emitted_empty {
+                return Ok(None);
+            }
+            self.emitted_empty = true;
+            return Ok(Some(Batch::row_markers(self.rows.len())));
+        }
+
         if self.rows.is_empty() {
             if self.emitted_empty {
                 return Ok(None);
@@ -196,5 +212,28 @@ mod tests {
         let scan = ValuesScan::new(vec![], schema_id_name());
         assert_eq!(scan.schema().len(), 2);
         assert_eq!(scan.schema().field_at(0).name, "id");
+    }
+
+    #[test]
+    fn values_scan_zero_column_row_reports_one_row() {
+        // `INSERT ... DEFAULT VALUES` binds to a zero-column VALUES whose
+        // single row carries no cells. A zero-column batch cannot derive its
+        // row count from a column, so the scan must emit an explicit one-row
+        // marker batch — otherwise the row vanishes and nothing is inserted.
+        let mut scan = ValuesScan::new(vec![vec![]], Schema::empty());
+        let batch = scan.next_batch().unwrap().unwrap();
+        assert_eq!(batch.rows(), 1, "one zero-column row must survive as 1 row");
+        assert_eq!(batch.width(), 0);
+        assert!(scan.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn values_scan_zero_column_zero_rows_reports_no_rows() {
+        // A column-less scan with no rows still emits exactly zero rows.
+        let mut scan = ValuesScan::new(vec![], Schema::empty());
+        let batch = scan.next_batch().unwrap().unwrap();
+        assert_eq!(batch.rows(), 0);
+        assert_eq!(batch.width(), 0);
+        assert!(scan.next_batch().unwrap().is_none());
     }
 }
