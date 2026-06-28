@@ -16,9 +16,29 @@ if ! command -v cargo >/dev/null 2>&1; then
     fi
 fi
 
+# Disk-space preflight. `cargo test --workspace --all-features` statically
+# links dozens of large test binaries; target/ can balloon to ~90GB. On a
+# near-full volume that build exhausts the disk (errno 28: "No space left on
+# device") mid-link, leaving a half-built tree and starving anything else
+# running on the machine. Refuse to start it without real headroom — free
+# space (`cargo clean`) and retry, or skip this commit's gate with
+# `git commit --no-verify` (CI runs the full suite on clean runners anyway).
+# Tune the floor with PRECOMMIT_MIN_FREE_GB; a missing/garbled `df` reads as
+# 0 and blocks (fail safe).
+min_free_gb="${PRECOMMIT_MIN_FREE_GB:-25}"
+free_gb="$(df -Pk . 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}')" || free_gb=0
+if [ "${free_gb:-0}" -lt "$min_free_gb" ]; then
+    printf '\n\033[1;31m== pre-commit: low disk — workspace test skipped ==\033[0m\n' >&2
+    printf 'Only %sGB free on the repo volume (need >= %sGB).\n' "${free_gb:-0}" "$min_free_gb" >&2
+    printf 'The full-workspace test would add tens of GB and exhaust the disk.\n' >&2
+    printf 'Fix: free space (e.g. `cargo clean`) and retry, or commit with --no-verify.\n' >&2
+    printf 'Override the floor with PRECOMMIT_MIN_FREE_GB=<n>.\n' >&2
+    exit 1
+fi
+
 export CARGO_BUILD_JOBS
 CARGO_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 export CARGO_INCREMENTAL=0
 
-printf "\n\033[1m== cargo test --workspace --all-features ==\033[0m\n"
+printf "\n\033[1m== cargo test --workspace --all-features (%sGB free) ==\033[0m\n" "$free_gb"
 cargo test --workspace --all-features
