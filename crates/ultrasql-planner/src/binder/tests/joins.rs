@@ -623,6 +623,105 @@ fn using_join_with_unique_columns_still_binds() {
     assert_eq!(plan.schema().len(), 3);
 }
 
+/// Two tables `t1(x, y)` and `t3(x, y)`: only `x` is a join column, but both
+/// sides also carry a non-join column named `y`. PostgreSQL 14 keeps both
+/// (output columns `x, t1.y, t3.y`, disambiguated by qualifier); this used to
+/// fail with a spurious "duplicate column name 'y'" schema error.
+fn two_xy_catalog() -> InMemoryCatalog {
+    let mut cat = InMemoryCatalog::new();
+    for name in ["t1", "t3"] {
+        let schema = Schema::new([
+            Field::required("x", DataType::Int32),
+            Field::required("y", DataType::Int32),
+        ])
+        .expect("schema ok");
+        cat.register(name, TableMeta::new(schema));
+    }
+    cat
+}
+
+#[test]
+fn using_join_keeps_shared_non_join_column_on_both_sides() {
+    // `SELECT * FROM t1 JOIN t3 USING (x)` with t1(x,y) and t3(x,y).
+    // PostgreSQL keeps both `y` columns (merged x, then t1.y, then t3.y).
+    let cat = two_xy_catalog();
+    let plan = parse_and_bind("SELECT * FROM t1 JOIN t3 USING (x)", &cat)
+        .expect("USING with shared non-join column must bind");
+
+    fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Join { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_join(input),
+            _ => None,
+        }
+    }
+    let join = find_join(&plan).expect("should contain a Join");
+    let LogicalPlan::Join {
+        condition, schema, ..
+    } = join
+    else {
+        panic!("expected Join");
+    };
+    assert!(
+        matches!(condition, LogicalJoinCondition::Using(pairs) if pairs.as_slice() == [(0, 0)]),
+        "expected USING(x) -> pair (0,0)"
+    );
+    // Join schema width: merged x + t1.y + t3.y = 3.
+    assert_eq!(schema.len(), 3, "USING(x) keeps both `y` columns");
+    // The output (post-project) is also 3 wide: x, y, y.
+    assert_eq!(plan.schema().len(), 3);
+    assert_eq!(plan.schema().field_at(0).name, "x");
+    assert_eq!(plan.schema().field_at(1).name, "y");
+    assert_eq!(plan.schema().field_at(2).name, "y");
+}
+
+#[test]
+fn using_join_shared_non_join_column_resolves_qualified() {
+    // Both `y` columns remain individually addressable via their qualifier.
+    let cat = two_xy_catalog();
+    let plan = parse_and_bind("SELECT t1.y, t3.y FROM t1 JOIN t3 USING (x)", &cat)
+        .expect("qualified refs to the duplicated column must resolve");
+    assert_eq!(plan.schema().len(), 2);
+}
+
+#[test]
+fn natural_join_merges_all_shared_columns() {
+    // NATURAL JOIN of t1(x,y) and t3(x,y): both x and y are common, so both
+    // merge -> width 2 (PostgreSQL: `x, y`).
+    let cat = two_xy_catalog();
+    let plan = parse_and_bind("SELECT * FROM t1 NATURAL JOIN t3", &cat)
+        .expect("NATURAL JOIN with all-shared columns must bind");
+
+    fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Join { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => find_join(input),
+            _ => None,
+        }
+    }
+    let join = find_join(&plan).expect("should contain a Join");
+    let LogicalPlan::Join {
+        condition, schema, ..
+    } = join
+    else {
+        panic!("expected Join");
+    };
+    assert!(
+        matches!(condition, LogicalJoinCondition::Using(pairs) if pairs.as_slice() == [(0, 0), (1, 1)]),
+        "NATURAL JOIN should pair both x and y"
+    );
+    assert_eq!(schema.len(), 2, "both shared columns merge");
+    assert_eq!(schema.field_at(0).name, "x");
+    assert_eq!(schema.field_at(1).name, "y");
+    assert_eq!(plan.schema().len(), 2);
+}
+
 #[test]
 fn binds_pivot_table_factor_schema_and_keys() {
     let cat = sales_pivot_catalog();

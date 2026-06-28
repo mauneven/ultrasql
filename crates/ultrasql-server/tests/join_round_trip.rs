@@ -480,3 +480,64 @@ async fn using_duplicate_common_column_reports_42702() {
 
     shutdown(client, server_handle).await;
 }
+
+/// A `USING` join where both sides also carry a *non-join* column of the same
+/// name (`t1(x, y)` and `t3(x, y)`, joined on `x`). PostgreSQL 14 keeps both
+/// `y` columns — output `x, t1.y, t3.y` — addressable by qualifier. UltraSQL
+/// previously rejected this with a spurious "duplicate column name 'y' in
+/// schema" error; this confirms it now binds and returns the three columns in
+/// PostgreSQL order.
+#[tokio::test]
+async fn using_join_keeps_shared_non_join_column() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE uy1 (x INT NOT NULL, y INT NOT NULL)")
+        .await
+        .expect("create uy1");
+    client
+        .batch_execute("CREATE TABLE uy3 (x INT NOT NULL, y INT NOT NULL)")
+        .await
+        .expect("create uy3");
+    client
+        .batch_execute("INSERT INTO uy1 VALUES (1, 100)")
+        .await
+        .expect("insert uy1");
+    client
+        .batch_execute("INSERT INTO uy3 VALUES (1, 300)")
+        .await
+        .expect("insert uy3");
+
+    let rows = client
+        .simple_query("SELECT * FROM uy1 JOIN uy3 USING (x)")
+        .await
+        .expect("USING (x) with a shared non-join column must bind");
+
+    let triples: Vec<(Option<i32>, Option<i32>, Option<i32>)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get(0).and_then(|s| s.parse::<i32>().ok()),
+                row.get(1).and_then(|s| s.parse::<i32>().ok()),
+                row.get(2).and_then(|s| s.parse::<i32>().ok()),
+            )),
+            _ => None,
+        })
+        .collect();
+    // Output columns: x (merged), t1.y, t3.y — three wide, in that order.
+    assert_eq!(triples, vec![(Some(1), Some(100), Some(300))]);
+
+    // The column labels match PostgreSQL: `x`, `y`, `y`.
+    let labels: Option<Vec<String>> = rows.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::RowDescription(cols) => {
+            Some(cols.iter().map(|c| c.name().to_owned()).collect())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        labels.as_deref(),
+        Some(["x".to_owned(), "y".to_owned(), "y".to_owned()].as_slice())
+    );
+
+    shutdown(client, server_handle).await;
+}

@@ -256,12 +256,22 @@ fn build_using_schema(
     let using_set: std::collections::HashSet<usize> = pairs.iter().map(|(l, _)| *l).collect();
     let right_using_set: std::collections::HashSet<usize> = pairs.iter().map(|(_, r)| *r).collect();
 
+    // The remaining left and right non-join columns can legitimately share a
+    // name (`t1 JOIN t3 USING (x)` with a `t1.y` and a `t3.y` — PostgreSQL
+    // keeps both, disambiguated by qualifier in scope). The plan schema is an
+    // internal relation schema and must stay collision-free, so disambiguate
+    // duplicate names the same way `concat_schemas_cross` does. Qualified
+    // binding later overwrites these with `qualifier.name` from the scope, and
+    // `SELECT *` labels come from the scope's true names, so this renaming is
+    // never visible on the wire.
+    let mut used_names = std::collections::HashSet::new();
     let mut out_fields: Vec<Field> = Vec::new();
     for &(left_idx, _) in pairs {
         let f = left.field_at(left_idx);
         let nullable = matches!(join_type, LogicalJoinType::FullOuter) || f.nullable;
+        let name = unique_join_field_name(&f.name, &mut used_names);
         out_fields.push(Field {
-            name: f.name.clone(),
+            name,
             data_type: f.data_type.clone(),
             nullable,
         });
@@ -274,8 +284,9 @@ fn build_using_schema(
             join_type,
             LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
         ) || f.nullable;
+        let name = unique_join_field_name(&f.name, &mut used_names);
         out_fields.push(Field {
-            name: f.name.clone(),
+            name,
             data_type: f.data_type.clone(),
             nullable,
         });
@@ -288,8 +299,9 @@ fn build_using_schema(
             join_type,
             LogicalJoinType::LeftOuter | LogicalJoinType::FullOuter
         ) || f.nullable;
+        let name = unique_join_field_name(&f.name, &mut used_names);
         out_fields.push(Field {
-            name: f.name.clone(),
+            name,
             data_type: f.data_type.clone(),
             nullable,
         });
