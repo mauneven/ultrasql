@@ -151,39 +151,113 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         let Some(epq) = &self.eval_plan_qual else {
             return Ok(rows);
         };
-        let relation_cols = self.codec.schema().len();
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let (tid, orig_row) = extract_tid_and_row(&row, self.relation)?;
-            match epq.lock_and_recheck(tid)? {
-                EpqDecision::Skip => {}
-                EpqDecision::Apply { tid, latest_row } => {
-                    if latest_row.len() != relation_cols {
-                        return Err(ExecError::TypeMismatch(format!(
-                            "EvalPlanQual latest row has {} columns, expected {}",
-                            latest_row.len(),
-                            relation_cols,
-                        )));
-                    }
-                    // Preserve extra (post-relation) eval columns the child
-                    // appended — only the relation-width prefix is replaced
-                    // with the latest committed image.
-                    let extra = orig_row.get(relation_cols..).unwrap_or(&[]).to_vec();
-                    let block = i32::try_from(tid.page.block.raw()).map_err(|_| {
-                        ExecError::TypeMismatch("EvalPlanQual TID block exceeds i32".to_owned())
-                    })?;
-                    let slot = i32::from(tid.slot);
-                    let mut rebuilt: Vec<Value> =
-                        Vec::with_capacity(2 + relation_cols + extra.len());
-                    rebuilt.push(Value::Int32(block));
-                    rebuilt.push(Value::Int32(slot));
-                    rebuilt.extend(latest_row);
-                    rebuilt.extend(extra);
-                    out.push(rebuilt);
-                }
+        for row in &rows {
+            if let Some(rebuilt) = self.epq_recheck_row(epq, row)? {
+                out.push(rebuilt);
             }
         }
         Ok(out)
+    }
+
+    /// Lock + EvalPlanQual latest-version re-check for one
+    /// `[tid_block, tid_slot, relation_cols..., extra...]` row.
+    ///
+    /// Returns the rebuilt row at the latest committed version —
+    /// `[latest_tid_block, latest_tid_slot, latest_relation_cols..., extra...]`,
+    /// preserving any post-relation `extra` columns the child appended (the
+    /// MERGE source columns) — or `None` when the row was concurrently
+    /// deleted, or its latest version no longer satisfies the WHERE under READ
+    /// COMMITTED. Aborts with 40001 under REPEATABLE READ / SERIALIZABLE on a
+    /// concurrent committed write. Shared by the general UPDATE / DELETE path
+    /// ([`Self::apply_eval_plan_qual`]) and the MERGE matched-action path
+    /// ([`Self::epq_recheck_merge_row`]).
+    fn epq_recheck_row(
+        &self,
+        epq: &super::eval_plan_qual::EvalPlanQual,
+        row: &[Value],
+    ) -> Result<Option<Vec<Value>>, ExecError> {
+        let relation_cols = self.codec.schema().len();
+        let (base_tid, orig_row) = extract_tid_and_row(row, self.relation)?;
+        match epq.lock_and_recheck(base_tid)? {
+            EpqDecision::Skip => Ok(None),
+            EpqDecision::Apply { tid, latest_row } => {
+                if latest_row.len() != relation_cols {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "EvalPlanQual latest row has {} columns, expected {}",
+                        latest_row.len(),
+                        relation_cols,
+                    )));
+                }
+                // Preserve extra (post-relation) eval columns the child
+                // appended — only the relation-width prefix is replaced
+                // with the latest committed image.
+                let extra = orig_row.get(relation_cols..).unwrap_or(&[]).to_vec();
+                let block = i32::try_from(tid.page.block.raw()).map_err(|_| {
+                    ExecError::TypeMismatch("EvalPlanQual TID block exceeds i32".to_owned())
+                })?;
+                let slot = i32::from(tid.slot);
+                let mut rebuilt: Vec<Value> = Vec::with_capacity(2 + relation_cols + extra.len());
+                rebuilt.push(Value::Int32(block));
+                rebuilt.push(Value::Int32(slot));
+                rebuilt.extend(latest_row);
+                rebuilt.extend(extra);
+                Ok(Some(rebuilt))
+            }
+        }
+    }
+
+    /// MERGE matched-action lock + EvalPlanQual re-check. Routes the matched
+    /// target row (`[tid_block, tid_slot, target_cols..., source_cols...]`)
+    /// through the **same** Exclusive tuple lock + latest-version re-check the
+    /// general UPDATE / DELETE path takes, so a concurrent UPDATE / DELETE /
+    /// `SELECT ... FOR UPDATE` of the matched row serializes and no update is
+    /// lost.
+    ///
+    /// Returns the row rebuilt at the latest committed target image (the WHEN
+    /// MATCHED UPDATE assignments / DELETE then apply to the latest version),
+    /// or `None` to skip the matched action when the row was concurrently
+    /// deleted. When no EvalPlanQual is wired, returns the row unchanged (the
+    /// legacy lock-free behavior used by in-process fixtures).
+    pub(crate) fn epq_recheck_merge_row(
+        &self,
+        tid_row: &[Value],
+    ) -> Result<Option<Vec<Value>>, ExecError> {
+        match &self.eval_plan_qual {
+            Some(epq) => self.epq_recheck_row(epq, tid_row),
+            None => Ok(Some(tid_row.to_vec())),
+        }
+    }
+
+    /// Lock + re-check the conflicting existing row for INSERT ... ON CONFLICT
+    /// DO UPDATE before mutating it (PostgreSQL locks the conflicting tuple).
+    ///
+    /// Acquires the Exclusive tuple lock on the conflicting `tid` (blocking,
+    /// deadlock-aware) so a concurrent UPDATE / DELETE / `SELECT ... FOR
+    /// UPDATE` of the row serializes with the DO UPDATE — preventing a lost
+    /// update — then resolves the row to mutate:
+    ///
+    /// - **READ COMMITTED**: the latest committed version, following the
+    ///   update chain (so `SET x = x + 1` adds to the latest value). Returns
+    ///   `None` when the conflicting row was concurrently deleted-and-committed
+    ///   — there is no live conflict, so the caller falls through to INSERT
+    ///   the new row.
+    /// - **REPEATABLE READ / SERIALIZABLE**: a concurrent committed update /
+    ///   delete of the conflicting row → 40001 (first-updater-wins).
+    ///
+    /// When no EvalPlanQual is wired (in-process fixtures), falls back to the
+    /// lock-free [`Self::fetch_conflict_current_row`] chain-follow.
+    pub(crate) fn lock_conflict_row(
+        &self,
+        tid: TupleId,
+    ) -> Result<Option<(TupleId, Vec<Value>)>, ExecError> {
+        match &self.eval_plan_qual {
+            Some(epq) => match epq.lock_and_recheck(tid)? {
+                EpqDecision::Apply { tid, latest_row } => Ok(Some((tid, latest_row))),
+                EpqDecision::Skip => Ok(None),
+            },
+            None => self.fetch_conflict_current_row(tid).map(Some),
+        }
     }
 
     pub(crate) fn compute_conflict_update_edit(

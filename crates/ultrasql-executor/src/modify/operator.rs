@@ -188,8 +188,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         let clause = &clauses[clause_idx];
                         match &clause.action {
                             MergeAction::Update { assignments } => {
+                                // Lock + re-check the matched target row against
+                                // its latest committed version before mutating
+                                // it, so a concurrent UPDATE / DELETE / FOR
+                                // UPDATE serializes and the assignments apply to
+                                // the latest image (no lost update). Skip the
+                                // action when the row was concurrently deleted.
+                                let Some(eval_row) =
+                                    self.epq_recheck_merge_row(merge_tid_row(row)?)?
+                                else {
+                                    continue;
+                                };
                                 let computed = self.compute_update_edit_with_evaluators(
-                                    merge_tid_row(row)?,
+                                    &eval_row,
                                     assignments,
                                     false,
                                 )?;
@@ -202,8 +213,16 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 all_update_edits.push((computed.tid, computed.payload));
                             }
                             MergeAction::Delete => {
-                                let deleted =
-                                    self.compute_delete_change_from_row(merge_tid_row(row)?)?;
+                                // Same lock + latest-version re-check as the
+                                // matched UPDATE: serialize on the row lock and
+                                // delete the latest committed version, or skip
+                                // when it was concurrently deleted.
+                                let Some(eval_row) =
+                                    self.epq_recheck_merge_row(merge_tid_row(row)?)?
+                                else {
+                                    continue;
+                                };
+                                let deleted = self.compute_delete_change_from_row(&eval_row)?;
                                 all_delete_tids.push(deleted.tid);
                                 if let Some(index_change) = deleted.index_change {
                                     all_delete_index_changes.push(index_change);
@@ -337,31 +356,51 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                                     .to_owned(),
                                             ));
                                         };
-                                        let (current_tid, old_row) =
-                                            self.fetch_conflict_current_row(tid)?;
-                                        if let Some(computed) = self.compute_conflict_update_edit(
-                                            current_tid,
-                                            &old_row,
-                                            target_row,
-                                            assignments,
-                                            predicate.as_ref(),
-                                            returning_active,
-                                        )? {
-                                            if let Some(index_change) = computed.index_change {
-                                                all_update_index_changes.push(index_change);
-                                            }
-                                            if let Some(index_change) = computed.vector_index_change
+                                        // Lock + re-check the conflicting existing
+                                        // row before mutating it (PostgreSQL locks
+                                        // the conflicting tuple): block on a
+                                        // concurrent writer, then resolve its
+                                        // latest committed version (READ
+                                        // COMMITTED) or abort 40001 (REPEATABLE
+                                        // READ / SERIALIZABLE). A concurrent
+                                        // committed DELETE of the row leaves no
+                                        // live conflict — fall through to INSERT
+                                        // the new row.
+                                        if let Some((current_tid, old_row)) =
+                                            self.lock_conflict_row(tid)?
+                                        {
+                                            if let Some(computed) = self
+                                                .compute_conflict_update_edit(
+                                                    current_tid,
+                                                    &old_row,
+                                                    target_row,
+                                                    assignments,
+                                                    predicate.as_ref(),
+                                                    returning_active,
+                                                )?
                                             {
-                                                all_update_vector_index_changes.push(index_change);
+                                                if let Some(index_change) = computed.index_change {
+                                                    all_update_index_changes.push(index_change);
+                                                }
+                                                if let Some(index_change) =
+                                                    computed.vector_index_change
+                                                {
+                                                    all_update_vector_index_changes
+                                                        .push(index_change);
+                                                }
+                                                if let Some(returning_row) = computed.returning_row {
+                                                    returning_rows.push(
+                                                        self.evaluate_returning_row(&returning_row)?,
+                                                    );
+                                                }
+                                                all_update_edits
+                                                    .push((computed.tid, computed.payload));
                                             }
-                                            if let Some(returning_row) = computed.returning_row {
-                                                returning_rows.push(
-                                                    self.evaluate_returning_row(&returning_row)?,
-                                                );
-                                            }
-                                            all_update_edits.push((computed.tid, computed.payload));
+                                            continue;
                                         }
-                                        continue;
+                                        // EvalPlanQual Skip: the conflicting row
+                                        // was concurrently deleted — fall through
+                                        // to INSERT the new row below.
                                     }
                                 }
                             }

@@ -77,6 +77,41 @@ pub(super) fn build_eval_plan_qual(
     input: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> EvalPlanQual {
+    // The UPDATE/DELETE WHERE predicate lives in the child `Filter`. Its
+    // column indices address the relation schema directly (the +2 TID shift
+    // is applied only to the *scan* child), so it can be evaluated against a
+    // decoded relation row as-is for the READ COMMITTED predicate re-check.
+    let predicate = match input {
+        LogicalPlan::Filter { predicate, .. } => Some(Eval::new(predicate.clone())),
+        _ => None,
+    };
+    build_eval_plan_qual_with_predicate(entry, predicate, ctx)
+}
+
+/// Build the per-row Exclusive tuple lock + EvalPlanQual latest-version
+/// re-check with **no** relation-row predicate.
+///
+/// Used by the MERGE matched-action path and INSERT ... ON CONFLICT DO
+/// UPDATE: neither has a relation-only WHERE whose re-evaluation against the
+/// latest row image alone decides a skip (MERGE's match is the ON / WHEN
+/// conditions over `[target, source]`; ON CONFLICT's optional DO UPDATE WHERE
+/// is evaluated separately against `[existing, excluded]`). The re-check still
+/// locks the targeted / conflicting row (blocking, deadlock-aware) and
+/// resolves its latest committed version under READ COMMITTED, or aborts with
+/// 40001 under REPEATABLE READ / SERIALIZABLE — so concurrent writers of the
+/// same row serialize and no update is lost.
+pub(super) fn build_eval_plan_qual_no_predicate(
+    entry: &TableEntry,
+    ctx: &LowerCtx<'_>,
+) -> EvalPlanQual {
+    build_eval_plan_qual_with_predicate(entry, None, ctx)
+}
+
+fn build_eval_plan_qual_with_predicate(
+    entry: &TableEntry,
+    predicate: Option<Eval>,
+    ctx: &LowerCtx<'_>,
+) -> EvalPlanQual {
     let lock_manager = Arc::clone(&ctx.oracle.lock_manager);
     // Lock under the TOP-LEVEL xid: the lock manager releases by xid only at
     // txn end, so a lock taken inside a savepoint that is later rolled back
@@ -101,15 +136,6 @@ pub(super) fn build_eval_plan_qual(
     let fetch = make_epq_fetch(Arc::clone(&ctx.heap));
 
     let oracle = Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>;
-
-    // The UPDATE/DELETE WHERE predicate lives in the child `Filter`. Its
-    // column indices address the relation schema directly (the +2 TID shift
-    // is applied only to the *scan* child), so it can be evaluated against a
-    // decoded relation row as-is for the READ COMMITTED predicate re-check.
-    let predicate = match input {
-        LogicalPlan::Filter { predicate, .. } => Some(Eval::new(predicate.clone())),
-        _ => None,
-    };
 
     let codec = RowCodec::new(entry.schema.clone());
 

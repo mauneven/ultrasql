@@ -24,6 +24,7 @@ use super::constraints::{
     build_exclusion_insert_checks, build_exclusion_update_checks, build_foreign_key_checks,
 };
 use super::indexes::{build_insert_index_maintainers, build_vector_index_maintainers};
+use super::lowering::build_eval_plan_qual_no_predicate;
 use super::referential::build_referenced_by_update_checks;
 
 pub(crate) fn lower_real_insert(
@@ -186,6 +187,17 @@ pub(crate) fn lower_real_insert(
     .with_update_vector_indexes(update_vector_indexes);
     let modify = if let Some(action) = conflict_action {
         modify.with_insert_conflict_action(action)
+    } else {
+        modify
+    };
+    // ON CONFLICT DO UPDATE mutates the conflicting existing row, so it needs
+    // the same general write-path locking discipline as UPDATE: lock the
+    // conflicting tuple (blocking, deadlock-aware) and re-check it against the
+    // latest committed version before applying the DO UPDATE, preventing lost
+    // updates and honoring a held SELECT ... FOR UPDATE on that row. DO NOTHING
+    // and plain INSERT never mutate an existing row, so they need no re-check.
+    let modify = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
+        modify.with_eval_plan_qual(build_eval_plan_qual_no_predicate(entry, ctx))
     } else {
         modify
     };

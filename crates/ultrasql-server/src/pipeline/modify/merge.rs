@@ -26,6 +26,7 @@ use super::indexes::{
     build_insert_index_maintainers, build_tid_seq_scan, build_vector_index_maintainers,
 };
 use super::insert::{build_rls_insert_checks, build_rls_update_checks, build_sequence_defaults};
+use super::lowering::build_eval_plan_qual_no_predicate;
 use super::referential::build_referenced_by_update_checks;
 
 #[derive(Debug)]
@@ -310,6 +311,11 @@ pub(crate) fn lower_real_merge(
         ctx.snapshot.clone(),
         Arc::clone(&ctx.oracle) as Arc<dyn ultrasql_mvcc::XidStatusOracle>,
     )
+    // General write-path locking discipline for WHEN MATCHED UPDATE / DELETE:
+    // every matched target row is Exclusive-locked and re-checked against the
+    // latest committed version before its new version is written, so a
+    // concurrent FOR UPDATE / UPDATE / DELETE serializes and no update is lost.
+    .with_eval_plan_qual(build_eval_plan_qual_no_predicate(entry, ctx))
     .with_update_extra_eval_columns()
     .with_insert_indexes(build_insert_index_maintainers(entry, ctx)?)
     .with_update_indexes(build_insert_index_maintainers(entry, ctx)?)
