@@ -694,11 +694,11 @@ where
                 }
             }
             ScalarExpr::ScalarSubquery { subplan, .. } | ScalarExpr::Exists { subplan, .. } => {
-                self.collect_plan(subplan, true);
+                self.collect_subquery(subplan);
             }
             ScalarExpr::InSubquery { expr, subplan, .. } => {
                 self.collect_expr(expr, sources, privilege);
-                self.collect_plan(subplan, true);
+                self.collect_subquery(subplan);
             }
             ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
         }
@@ -765,6 +765,23 @@ where
         self.mutation_targets
             .iter()
             .any(|target| target.eq_ignore_ascii_case(table))
+    }
+
+    /// Walk a subquery that appears inside an expression (a `WHERE`/`SET`/
+    /// `RETURNING` scalar, `EXISTS`, or `IN` subquery).
+    ///
+    /// Such a subquery is an independent read context: the mutation-target
+    /// SELECT exemption applies *only* to the result-relation scan of an
+    /// enclosing UPDATE/DELETE, never to a same-named scan reached through a
+    /// subquery. PostgreSQL denies `DELETE FROM t WHERE EXISTS (SELECT 1 FROM
+    /// t t2)` and `DELETE FROM t WHERE (SELECT count(*) FROM t) > 0` (42501)
+    /// for a role holding DELETE but not SELECT on `t`, because the subquery's
+    /// read of `t` needs SELECT. Suspend the markers while descending so a
+    /// nested `Scan{t}` registers its whole-table SELECT requirement again.
+    fn collect_subquery(&mut self, subplan: &LogicalPlan) {
+        let saved = std::mem::take(&mut self.mutation_targets);
+        self.collect_plan(subplan, true);
+        self.mutation_targets = saved;
     }
 }
 
@@ -1235,6 +1252,79 @@ mod tests {
     }
 
     #[test]
+    fn delete_with_same_named_subquery_denied_with_delete_only() {
+        use crate::auth::PrivilegeRequest;
+
+        // End-to-end: a role with DELETE but not SELECT on `secret` may run a
+        // bare `DELETE FROM secret`, but a WHERE subquery that reads `secret`
+        // independently needs SELECT and must be denied (PostgreSQL 14: 42501).
+        let server = Arc::new(crate::Server::with_sample_database());
+        server
+            .role_catalog
+            .create_role(crate::auth::RoleEntry {
+                oid: 30_003,
+                name: "delonly".to_owned(),
+                password: None,
+                is_superuser: false,
+                inherit: true,
+                create_role: false,
+                create_db: false,
+                can_login: true,
+                replication: false,
+                bypass_rls: false,
+                connection_limit: -1,
+                valid_until: None,
+            })
+            .expect("create role");
+        server.privilege_catalog.grant_many(
+            "ultrasql",
+            PrivilegeObjectKind::Table,
+            &["secret".to_owned()],
+            &["delonly".to_owned()],
+            &[PrivilegeRequest {
+                privilege: PrivilegeKind::Delete,
+                columns: Vec::new(),
+            }],
+            false,
+        );
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "delonly".to_owned();
+
+        // Bare DELETE FROM secret: DELETE is enough.
+        let bare_delete = LogicalPlan::Delete {
+            table: "secret".to_owned(),
+            input: Box::new(scan("secret")),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        session
+            .enforce_column_privileges(&bare_delete, &snapshot)
+            .expect("bare DELETE needs only the DELETE privilege");
+
+        // DELETE FROM secret WHERE EXISTS (SELECT 1 FROM secret): the subquery
+        // read needs SELECT, which the role lacks -> denied.
+        let delete_exists = LogicalPlan::Delete {
+            table: "secret".to_owned(),
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("secret")),
+                predicate: ScalarExpr::Exists {
+                    subplan: Box::new(count_star("secret")),
+                    negated: false,
+                    correlated: false,
+                },
+            }),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let err = session
+            .enforce_column_privileges(&delete_exists, &snapshot)
+            .expect_err("a same-named subquery read inside WHERE must require SELECT");
+        assert!(matches!(err, ServerError::InsufficientPrivilege(_)));
+    }
+
+    #[test]
     fn mutation_target_scan_does_not_require_select() {
         // #17 must not over-reach: a bare `DELETE FROM t` / `UPDATE t SET
         // c = <const>` reads no column from the target and needs only
@@ -1333,6 +1423,82 @@ mod tests {
                 .requirements
                 .contains(&req("id", PrivilegeKind::Select)),
             "DELETE ... WHERE id = 1 must require SELECT on the read column id"
+        );
+    }
+
+    #[test]
+    fn mutation_target_subquery_scan_still_requires_select() {
+        // A same-named subquery read inside the mutation's WHERE is NOT the
+        // result-relation scan: it independently reads the target and must
+        // still raise a whole-table SELECT requirement. PostgreSQL denies
+        // `DELETE FROM t WHERE EXISTS (SELECT 1 FROM t t2)` and
+        // `DELETE FROM t WHERE (SELECT count(*) FROM t) > 0` (42501) for a
+        // role with DELETE but not SELECT on t — the mutation-target SELECT
+        // exemption must not leak into the subquery.
+        let server = Arc::new(crate::Server::with_sample_database());
+        let snapshot = server.catalog_snapshot();
+        let (io, _peer) = duplex(64);
+        let mut session = Session::new(io, Arc::clone(&server), None);
+        session.current_user = "ultrasql".to_owned();
+
+        // DELETE FROM users WHERE EXISTS (SELECT 1 FROM users t2)
+        let delete_exists = LogicalPlan::Delete {
+            table: "users".to_owned(),
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("users")),
+                predicate: ScalarExpr::Exists {
+                    subplan: Box::new(count_star("users")),
+                    negated: false,
+                    correlated: false,
+                },
+            }),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut exists_collector = collector(&session, &snapshot);
+        exists_collector.collect_plan(&delete_exists, true);
+        assert!(
+            exists_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Delete)),
+            "DELETE must still require the DELETE privilege"
+        );
+        assert!(
+            exists_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Select)),
+            "a same-named EXISTS subquery read inside WHERE must require whole-table SELECT on the target"
+        );
+
+        // DELETE FROM users WHERE (SELECT count(*) FROM users) > 0
+        let delete_scalar = LogicalPlan::Delete {
+            table: "users".to_owned(),
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan("users")),
+                predicate: ScalarExpr::Binary {
+                    op: ultrasql_planner::BinaryOp::Gt,
+                    left: Box::new(ScalarExpr::ScalarSubquery {
+                        subplan: Box::new(count_star("users")),
+                        correlated: false,
+                        data_type: DataType::Int64,
+                    }),
+                    right: Box::new(ScalarExpr::Literal {
+                        value: Value::Int64(0),
+                        data_type: DataType::Int64,
+                    }),
+                    data_type: DataType::Bool,
+                },
+            }),
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        let mut scalar_collector = collector(&session, &snapshot);
+        scalar_collector.collect_plan(&delete_scalar, true);
+        assert!(
+            scalar_collector
+                .table_requirements
+                .contains(&tbl_req("users", PrivilegeKind::Select)),
+            "a same-named scalar subquery read inside WHERE must require whole-table SELECT on the target"
         );
     }
 
