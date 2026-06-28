@@ -1,6 +1,8 @@
 //! Plan-cache invalidation and row-level security predicate application.
 
-use ultrasql_planner::{LogicalAggregateExpr, LogicalJoinCondition, SortKey};
+use ultrasql_planner::{
+    LogicalAggregateExpr, LogicalJoinCondition, LogicalMergeAction, LogicalMergeClause, SortKey,
+};
 
 use super::*;
 
@@ -137,6 +139,52 @@ where
             }
             None => out.push((*column, expr.clone())),
         }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// Apply `rewrite_expr` to every subquery-bearing expression a `MERGE`'s
+/// `WHEN` clauses carry — the optional `AND` condition plus each action's
+/// expressions (UPDATE assignment RHS, INSERT `VALUES`) — returning a new list
+/// when any expression changed and `None` otherwise. (`DELETE` carries no
+/// expression.) Mirrors the per-position helpers above so an embedded subquery
+/// in any clause position has RLS applied to its subplan.
+fn rewrite_merge_clauses<F>(
+    clauses: &[LogicalMergeClause],
+    rewrite_expr: &mut F,
+) -> Result<Option<Vec<LogicalMergeClause>>, ServerError>
+where
+    F: FnMut(&ScalarExpr) -> Result<Option<ScalarExpr>, ServerError>,
+{
+    let mut changed = false;
+    let mut out = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let new_condition = rewrite_optional_expr(clause.condition.as_ref(), rewrite_expr)?;
+        let new_action = match &clause.action {
+            LogicalMergeAction::Update { assignments } => {
+                rewrite_assignments(assignments, rewrite_expr)?
+                    .map(|assignments| LogicalMergeAction::Update { assignments })
+            }
+            LogicalMergeAction::Insert { columns, values } => rewrite_expr_list(
+                values,
+                rewrite_expr,
+            )?
+            .map(|values| LogicalMergeAction::Insert {
+                columns: columns.clone(),
+                values,
+            }),
+            LogicalMergeAction::Delete => None,
+        };
+        if new_condition.is_none() && new_action.is_none() {
+            out.push(clause.clone());
+            continue;
+        }
+        changed = true;
+        out.push(LogicalMergeClause {
+            kind: clause.kind,
+            condition: new_condition.or_else(|| clause.condition.clone()),
+            action: new_action.unwrap_or_else(|| clause.action.clone()),
+        });
     }
     Ok(changed.then_some(out))
 }
@@ -774,19 +822,54 @@ where
                     }
                 }),
             ),
+            // `MERGE INTO target USING source`. Step 1 rewrites the `source`
+            // child subtree; the node's *own* expressions — the `ON`
+            // predicate, each `WHEN` clause's `AND` condition, and each
+            // action's expressions (UPDATE assignment RHS, INSERT `VALUES`) —
+            // can each embed a subquery scanning an RLS table. Those subplans
+            // are NOT decorrelated to a join, so without descending here their
+            // raw scans would reach the executor with no policy applied.
+            // Descend into every clause-side expression and apply RLS to each
+            // embedded subplan (same shape as the other node arms). The
+            // executor currently rejects any such embedded subquery
+            // fail-closed, so this is defense-in-depth that stays correct if
+            // MERGE later gains embedded-subquery execution.
+            LogicalPlan::Merge {
+                target,
+                target_alias,
+                target_schema,
+                source,
+                on,
+                clauses,
+                schema,
+            } => {
+                let new_on = rewrite_expr(on)?;
+                let new_clauses = rewrite_merge_clauses(clauses, &mut rewrite_expr)?;
+                if new_on.is_none() && new_clauses.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(LogicalPlan::Merge {
+                    target: target.clone(),
+                    target_alias: target_alias.clone(),
+                    target_schema: target_schema.clone(),
+                    source: source.clone(),
+                    on: new_on.unwrap_or_else(|| on.clone()),
+                    clauses: new_clauses.unwrap_or_else(|| clauses.clone()),
+                    schema: schema.clone(),
+                }))
+            }
             // Remaining shapes carry no expression position that can embed a
             // subquery plan reachable from here: leaves (`Scan`, `Values`,
             // `Empty`, `FunctionScan`, `Summarize`), pure pass-through unary
             // nodes whose only expressions are column references
             // (`Limit`, `LockRows`, `SingleRowAssert`, `Pivot`, `Unpivot`),
             // wrappers handled via their child plan (`SetOp`, `Cte`,
-            // `Explain`, `Copy`, `Merge` source), and control/DDL plans
-            // dispatched before the walker. The node-tree walker (step 1)
-            // already enumerates and fail-closes on unknown shapes, so
-            // returning `None` here is safe: any subquery plan they *did*
-            // carry would have to live under a child plan node, which step
-            // 1's recursion (back through the full `apply_row_security`)
-            // covers.
+            // `Explain`, `Copy`), and control/DDL plans dispatched before the
+            // walker. The node-tree walker (step 1) already enumerates and
+            // fail-closes on unknown shapes, so returning `None` here is safe:
+            // any subquery plan they *did* carry would have to live under a
+            // child plan node, which step 1's recursion (back through the full
+            // `apply_row_security`) covers.
             _ => Ok(None),
         }
     }
@@ -1040,8 +1123,10 @@ mod fail_closed_tests {
     use std::sync::Arc;
 
     use tokio::io::{DuplexStream, duplex};
-    use ultrasql_core::Schema;
-    use ultrasql_planner::LogicalPlan;
+    use ultrasql_core::{DataType, Schema, Value};
+    use ultrasql_planner::{
+        LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalPlan, ScalarExpr,
+    };
 
     use crate::session::Session;
     use crate::{RuntimeRlsCommand, Server};
@@ -1105,6 +1190,166 @@ mod fail_closed_tests {
                 .expect("Values is a table-free leaf")
                 .is_none(),
             "Values must need no RLS rewrite"
+        );
+    }
+
+    // ── MERGE clause-expression subplan descent ──────────────────────────────
+    //
+    // A subquery embedded in a MERGE `ON` predicate, a `WHEN` clause condition,
+    // an UPDATE assignment RHS, or a NOT-MATCHED INSERT `VALUES` expression is
+    // NOT decorrelated to a join, so its raw subplan would otherwise reach the
+    // executor with no row-level security applied. `apply_row_security` must
+    // descend into every such position and recurse through the embedded
+    // subplan.
+    //
+    // Today MERGE's executor rejects any embedded subquery fail-closed (the
+    // backstop in `eval/mod.rs`), so this descent is defense-in-depth: it keeps
+    // RLS sound if MERGE later gains embedded-subquery execution. These tests
+    // pin the descent by embedding an *unenumerated* subplan
+    // (`LogicalPlan::Commit`, a stand-in for "a shape the RLS node walker does
+    // not enumerate") in each position: if the walker descends, the fail-closed
+    // default fires and `apply_row_security` errors; if a future change drops a
+    // MERGE arm and stops descending, it returns `Ok(None)` and the test fails,
+    // flagging the reopened bypass.
+
+    /// A boolean subquery whose subplan is an unenumerated shape: descending
+    /// into it must trip `apply_row_security`'s fail-closed default.
+    fn fail_closed_bool_subquery() -> ScalarExpr {
+        ScalarExpr::Exists {
+            subplan: Box::new(LogicalPlan::Commit {
+                schema: Schema::empty(),
+            }),
+            negated: false,
+            correlated: false,
+        }
+    }
+
+    /// A scalar subquery whose subplan is an unenumerated shape (value
+    /// position: UPDATE assignment RHS / INSERT `VALUES`).
+    fn fail_closed_scalar_subquery() -> ScalarExpr {
+        ScalarExpr::ScalarSubquery {
+            subplan: Box::new(LogicalPlan::Commit {
+                schema: Schema::empty(),
+            }),
+            correlated: false,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn bool_true() -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Bool(true),
+            data_type: DataType::Bool,
+        }
+    }
+
+    /// Build a MERGE plan with a table-free source so any fail-closed error
+    /// must come from descending into the clause expressions under test.
+    fn merge_plan(on: ScalarExpr, clauses: Vec<LogicalMergeClause>) -> LogicalPlan {
+        LogicalPlan::Merge {
+            target: "merge_target".to_owned(),
+            target_alias: None,
+            target_schema: Schema::empty(),
+            source: Box::new(LogicalPlan::Values {
+                rows: Vec::new(),
+                schema: Schema::empty(),
+            }),
+            on,
+            clauses,
+            schema: Schema::empty(),
+        }
+    }
+
+    fn assert_merge_descent_fails_closed(plan: &LogicalPlan, position: &str) {
+        let session = test_session();
+        let snapshot = session.state.catalog_snapshot();
+        // If the walker descends into the clause expression, it reaches the
+        // unenumerated embedded subplan and `apply_row_security` returns the
+        // fail-closed `Err`. If it does NOT descend (a dropped MERGE arm), it
+        // returns `Ok(None)` and this assertion fails — flagging the regression.
+        let result = session.apply_row_security(plan, &snapshot, RuntimeRlsCommand::Select);
+        assert!(
+            result.is_err(),
+            "MERGE {position} subquery descent must reach the embedded subplan and trip the \
+             fail-closed default"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("row-level security cannot be verified"),
+            "MERGE {position} descent should surface the fail-closed error: {message}"
+        );
+    }
+
+    #[test]
+    fn apply_row_security_descends_into_merge_on_subquery() {
+        let plan = merge_plan(fail_closed_bool_subquery(), Vec::new());
+        assert_merge_descent_fails_closed(&plan, "ON");
+    }
+
+    #[test]
+    fn apply_row_security_descends_into_merge_when_condition_subquery() {
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: Some(fail_closed_bool_subquery()),
+                action: LogicalMergeAction::Delete,
+            }],
+        );
+        assert_merge_descent_fails_closed(&plan, "WHEN condition");
+    }
+
+    #[test]
+    fn apply_row_security_descends_into_merge_update_assignment_subquery() {
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: None,
+                action: LogicalMergeAction::Update {
+                    assignments: vec![(0, fail_closed_scalar_subquery())],
+                },
+            }],
+        );
+        assert_merge_descent_fails_closed(&plan, "UPDATE assignment");
+    }
+
+    #[test]
+    fn apply_row_security_descends_into_merge_insert_values_subquery() {
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::NotMatched,
+                condition: None,
+                action: LogicalMergeAction::Insert {
+                    columns: vec![0],
+                    values: vec![fail_closed_scalar_subquery()],
+                },
+            }],
+        );
+        assert_merge_descent_fails_closed(&plan, "INSERT VALUES");
+    }
+
+    /// A MERGE whose clause expressions embed no subquery needs no RLS rewrite
+    /// and must NOT error — the descent arm must not over-trigger.
+    #[test]
+    fn apply_row_security_merge_without_subqueries_is_noop() {
+        let session = test_session();
+        let snapshot = session.state.catalog_snapshot();
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: None,
+                action: LogicalMergeAction::Delete,
+            }],
+        );
+        assert!(
+            session
+                .apply_row_security(&plan, &snapshot, RuntimeRlsCommand::Select)
+                .expect("subquery-free MERGE must not error")
+                .is_none(),
+            "subquery-free MERGE over a table-free source needs no RLS rewrite"
         );
     }
 }

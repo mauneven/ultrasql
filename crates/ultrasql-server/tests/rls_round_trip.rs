@@ -1790,3 +1790,68 @@ async fn non_rls_embedded_subqueries_unaffected() {
 
     shutdown(client, server_handle).await;
 }
+
+/// Defense-in-depth: a subquery embedded in a MERGE clause expression (here
+/// the `ON` predicate) that probes an RLS-protected table must fail closed.
+///
+/// Unlike a SELECT/Filter position, a subquery in a MERGE `ON` / `WHEN`
+/// condition / INSERT `VALUES` is NOT decorrelated to a join, so it survives
+/// to the executor, which rejects it via the eval backstop rather than
+/// evaluating it with RLS bypassed. The RLS and SSI walkers do descend into
+/// these clause positions (so any embedded subplan is policy-rewritten and
+/// takes a predicate lock), but the masking guarantee today is the executor's
+/// fail-closed refusal. This test pins that guarantee: if a future change
+/// gives MERGE embedded-subquery *execution* and this MERGE starts to succeed,
+/// the test trips — forcing a conscious check that RLS is enforced on the
+/// executed subquery instead of silently reopening the bypass.
+#[tokio::test]
+async fn rls_merge_embedded_subquery_fails_closed() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    for sql in [
+        "CREATE TABLE merge_target (id INT PRIMARY KEY, v INT NOT NULL)",
+        "CREATE TABLE merge_source (id INT NOT NULL, v INT NOT NULL)",
+        "INSERT INTO merge_target VALUES (1, 10)",
+        "INSERT INTO merge_source VALUES (1, 100)",
+        // RLS-protected table the MERGE clause subquery probes.
+        "CREATE TABLE secret (tenant_id TEXT NOT NULL, val INT NOT NULL)",
+        "INSERT INTO secret VALUES ('tenant-a', 10), ('tenant-b', 20)",
+        "CREATE POLICY secret_isolation ON secret \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE secret ENABLE ROW LEVEL SECURITY",
+        // A tenant that owns no `secret` row, so a leak would be observable.
+        "SET ultrasql.tenant_id = 'nobody'",
+    ] {
+        client.batch_execute(sql).await.expect(sql);
+    }
+
+    let err = client
+        .batch_execute(
+            "MERGE INTO merge_target AS t \
+             USING merge_source AS s \
+             ON t.id = s.id AND EXISTS (SELECT 1 FROM secret) \
+             WHEN MATCHED THEN UPDATE SET v = s.v",
+        )
+        .await
+        .expect_err("MERGE with an embedded subquery must fail closed, not leak RLS-hidden rows");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("subquery")),
+        "expected the executor's subquery backstop to refuse the MERGE: {err}"
+    );
+
+    // Fail-closed means no partial effect: the target row is untouched.
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT v FROM merge_target WHERE id = 1")
+            .await
+            .expect("read merge_target after fail-closed MERGE"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["10".to_owned()]],
+        "fail-closed MERGE must not have applied any update"
+    );
+
+    shutdown(client, server_handle).await;
+}

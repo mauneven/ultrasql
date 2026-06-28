@@ -6,7 +6,7 @@
 
 use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::{DataType, RelationId};
-use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalMergeAction, LogicalPlan, ScalarExpr};
 use ultrasql_txn::{IsolationLevel, PredicateLockTag, Transaction, TransactionManager};
 
 use crate::pipeline;
@@ -192,6 +192,35 @@ fn collect_node_expr_subplan_read_locks(
         LogicalPlan::Insert { returning, .. } | LogicalPlan::Delete { returning, .. } => {
             for (expr, _) in returning {
                 expr.for_each_subplan(&mut visit);
+            }
+        }
+        // MERGE's `source` child is descended by the main match; here we cover
+        // the node's own expressions — the `ON` predicate, each `WHEN` clause's
+        // `AND` condition, and each action's expressions (UPDATE assignment
+        // RHS, INSERT `VALUES`). A subquery embedded in any of these is NOT
+        // decorrelated to a join, so without descending here a SERIALIZABLE
+        // reader probing a relation only through such a subquery would take no
+        // predicate lock and miss a read-write conflict (the SSI mirror of the
+        // RLS-bypass hole).
+        LogicalPlan::Merge { on, clauses, .. } => {
+            on.for_each_subplan(&mut visit);
+            for clause in clauses {
+                if let Some(condition) = &clause.condition {
+                    condition.for_each_subplan(&mut visit);
+                }
+                match &clause.action {
+                    LogicalMergeAction::Update { assignments } => {
+                        for (_, expr) in assignments {
+                            expr.for_each_subplan(&mut visit);
+                        }
+                    }
+                    LogicalMergeAction::Insert { values, .. } => {
+                        for expr in values {
+                            expr.for_each_subplan(&mut visit);
+                        }
+                    }
+                    LogicalMergeAction::Delete => {}
+                }
             }
         }
         // Other shapes carry no expression position that can embed a subquery
@@ -583,7 +612,10 @@ mod tests {
 
     use ultrasql_catalog::CatalogSnapshot;
     use ultrasql_core::{Field, Oid, Schema, Value};
-    use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
+    use ultrasql_planner::{
+        BinaryOp, LogicalMergeAction, LogicalMergeClause, LogicalMergeMatchKind, LogicalPlan,
+        ScalarExpr,
+    };
     use ultrasql_txn::PredicateLockTag;
 
     use super::*;
@@ -1443,6 +1475,156 @@ mod tests {
             }],
             "Int32 column vs Int64 literal shares the INT unit-class and \
              must stay tight (width-crossing allowed)"
+        );
+    }
+
+    // ── MERGE clause-expression subplan read locks ───────────────────────────
+    //
+    // A relation scanned only through a subquery embedded in a MERGE `ON`
+    // predicate, a `WHEN` clause condition, an UPDATE assignment RHS, or a
+    // NOT-MATCHED INSERT `VALUES` expression is reachable by neither the main
+    // match's child-plan recursion nor a decorrelated join. A SERIALIZABLE
+    // reader probing such a relation must still take a predicate read-lock, or
+    // a concurrent writer's read-write conflict is silently missed. These tests
+    // pin that `collect_serializable_read_locks` descends into every MERGE
+    // clause-expression position.
+
+    /// `EXISTS (SELECT … FROM t)` — boolean subquery scanning `t` (oid 42),
+    /// for the `ON` / `WHEN` condition positions.
+    fn exists_scan_t() -> ScalarExpr {
+        ScalarExpr::Exists {
+            subplan: Box::new(scan()),
+            negated: false,
+            correlated: false,
+        }
+    }
+
+    /// `(SELECT a FROM t)` — scalar subquery scanning `t` (oid 42), for the
+    /// value positions (UPDATE assignment RHS / INSERT `VALUES`).
+    fn scalar_scan_t() -> ScalarExpr {
+        ScalarExpr::ScalarSubquery {
+            subplan: Box::new(scan()),
+            correlated: false,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn bool_true() -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Bool(true),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn t_relation_tag() -> PredicateLockTag {
+        PredicateLockTag::Relation(RelationId(Oid::new(42)))
+    }
+
+    /// Build a MERGE plan with a table-free source so any collected read-lock
+    /// must come from descending into the clause expressions under test.
+    fn merge_plan(on: ScalarExpr, clauses: Vec<LogicalMergeClause>) -> LogicalPlan {
+        LogicalPlan::Merge {
+            target: "merge_target".to_owned(),
+            target_alias: None,
+            target_schema: test_schema(),
+            source: Box::new(LogicalPlan::Values {
+                rows: Vec::new(),
+                schema: Schema::empty(),
+            }),
+            on,
+            clauses,
+            schema: Schema::empty(),
+        }
+    }
+
+    #[test]
+    fn serializable_read_locks_descend_into_merge_on_subquery() {
+        let snapshot = test_snapshot();
+        let plan = merge_plan(exists_scan_t(), Vec::new());
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![t_relation_tag()],
+            "a relation scanned only through a MERGE ON subquery must take a read lock"
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_descend_into_merge_when_condition_subquery() {
+        let snapshot = test_snapshot();
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: Some(exists_scan_t()),
+                action: LogicalMergeAction::Delete,
+            }],
+        );
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![t_relation_tag()],
+            "a relation scanned only through a MERGE WHEN condition subquery must take a read lock"
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_descend_into_merge_update_assignment_subquery() {
+        let snapshot = test_snapshot();
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: None,
+                action: LogicalMergeAction::Update {
+                    assignments: vec![(0, scalar_scan_t())],
+                },
+            }],
+        );
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![t_relation_tag()],
+            "a relation scanned only through a MERGE UPDATE assignment subquery must take a \
+             read lock"
+        );
+    }
+
+    #[test]
+    fn serializable_read_locks_descend_into_merge_insert_values_subquery() {
+        let snapshot = test_snapshot();
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::NotMatched,
+                condition: None,
+                action: LogicalMergeAction::Insert {
+                    columns: vec![0],
+                    values: vec![scalar_scan_t()],
+                },
+            }],
+        );
+        assert_eq!(
+            read_locks(&plan, &snapshot),
+            vec![t_relation_tag()],
+            "a relation scanned only through a MERGE INSERT VALUES subquery must take a read lock"
+        );
+    }
+
+    /// A MERGE whose clause expressions embed no subquery and whose source is
+    /// table-free must collect no read locks — the descent arm must not
+    /// over-collect.
+    #[test]
+    fn serializable_read_locks_merge_without_subqueries_is_empty() {
+        let snapshot = test_snapshot();
+        let plan = merge_plan(
+            bool_true(),
+            vec![LogicalMergeClause {
+                kind: LogicalMergeMatchKind::Matched,
+                condition: None,
+                action: LogicalMergeAction::Delete,
+            }],
+        );
+        assert!(
+            read_locks(&plan, &snapshot).is_empty(),
+            "subquery-free MERGE over a table-free source needs no predicate lock"
         );
     }
 }
