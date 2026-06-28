@@ -447,8 +447,14 @@ pub(in crate::binder) fn bind_expr_with_ctes(
                 .map(|&i| bound_args[i].clone())
                 .collect();
             let result_type = common_scalar_return_type("case", &result_args)?;
+            // Coerce each result branch to the common output type, inserting a
+            // runtime cast for non-literal branches (e.g. a column) — the same
+            // reconciliation COALESCE/greatest/least use. The executor returns
+            // the taken branch's value verbatim, so a `THEN int_col` branch
+            // against a declared `Float64` would otherwise reach the projection
+            // layer as `Int32` and be rejected.
             for &i in &result_indices {
-                coerce_literal_to_type(&mut bound_args[i], &result_type);
+                coerce_arg_to_common_type(&mut bound_args[i], &result_type);
             }
             Ok(ScalarExpr::FunctionCall {
                 name: case_kind.to_owned(),

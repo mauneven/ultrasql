@@ -97,21 +97,29 @@ pub(in crate::binder) fn common_scalar_pair_type(
 
 pub(in crate::binder) fn coerce_args_to_common_type(args: &mut [ScalarExpr], target: &DataType) {
     for arg in args {
-        coerce_literal_to_type(arg, target);
-        // Literal coercion only rewrites `Literal` nodes; a column (or other
-        // non-literal expression) keeps its original type. For functions like
-        // `greatest`/`least`/`coalesce` whose declared result type is the
-        // common type of the arguments, the executor must receive values of
-        // that type, otherwise the projection layer rejects the row (e.g.
-        // `greatest(int, float8)` would yield an `Int32` against a declared
-        // `Float64`). Insert a runtime cast so the value type matches.
-        let actual = arg.data_type();
-        if matches!(actual, DataType::Null) || cast_result_matches(target, &actual) {
-            continue;
-        }
-        if let Some(cast) = bind_runtime_cast(arg.clone(), target, &actual) {
-            *arg = cast;
-        }
+        coerce_arg_to_common_type(arg, target);
+    }
+}
+
+/// Coerce a single argument to the common `target` type, inserting a runtime
+/// cast when literal coercion alone is insufficient.
+///
+/// `coerce_literal_to_type` only rewrites `Literal` nodes; a column (or other
+/// non-literal expression) keeps its original type. For constructs whose
+/// declared result type is the common type of their argument branches —
+/// `greatest`/`least`/`coalesce` and the result branches of `CASE` — the
+/// executor must receive values of that type, otherwise the projection layer
+/// rejects the row (e.g. `greatest(int, float8)`, or `CASE … THEN int ELSE
+/// float8 END`, would yield an `Int32` against a declared `Float64`). Insert a
+/// runtime cast so the value type matches the declared type.
+pub(in crate::binder) fn coerce_arg_to_common_type(arg: &mut ScalarExpr, target: &DataType) {
+    coerce_literal_to_type(arg, target);
+    let actual = arg.data_type();
+    if matches!(actual, DataType::Null) || cast_result_matches(target, &actual) {
+        return;
+    }
+    if let Some(cast) = bind_runtime_cast(arg.clone(), target, &actual) {
+        *arg = cast;
     }
 }
 
