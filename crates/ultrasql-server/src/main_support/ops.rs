@@ -284,6 +284,15 @@ pub(crate) fn metrics_body(state: &Server) -> String {
         env!("CARGO_PKG_VERSION")
     ));
     body.push_str(
+        "# HELP ultrasql_connections_active Currently-open client connections.\n\
+         # TYPE ultrasql_connections_active gauge\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_connections_active",
+        usize_to_u64_saturated(state.workload_recorder.active_session_count()),
+    );
+    body.push_str(
         "# HELP ultrasql_buffer_pool_hits_total Buffer-pool page hits.\n\
          # TYPE ultrasql_buffer_pool_hits_total counter\n",
     );

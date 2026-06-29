@@ -442,6 +442,15 @@ impl WorkloadRecorder {
         self.latency_histogram.lock().snapshot()
     }
 
+    /// Number of currently-registered client sessions (live connections).
+    ///
+    /// Sourced from the same `active_sessions` map that backs
+    /// `pg_stat_activity`, so it counts exactly the connections that have
+    /// completed startup and not yet disconnected.
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.lock().len()
+    }
+
     /// Start or replace one active VACUUM progress row.
     pub fn begin_vacuum(&self, pid: u32, relid: u32, heap_blks_total: u32) {
         self.vacuum_progress.lock().insert(

@@ -61,6 +61,8 @@ async fn ops_endpoint_paths_return_expected_http_shapes() {
     assert!(metrics.starts_with("HTTP/1.1 200 OK"));
     assert!(metrics.contains("content-type: text/plain; version=0.0.4"));
     assert!(metrics.contains("ultrasql_up 1"));
+    // Core DB-health gauge: active client connections (none in this probe).
+    assert!(metrics.contains("ultrasql_connections_active 0"));
 
     let not_found = request_ops_path("/nope", missing_pg, state).await;
     assert!(not_found.starts_with("HTTP/1.1 404 Not Found"));
