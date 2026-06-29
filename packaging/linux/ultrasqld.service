@@ -9,7 +9,10 @@ Type=simple
 User=ultrasql
 Group=ultrasql
 EnvironmentFile=-/etc/ultrasql/ultrasqld.env
-ExecStart=/usr/bin/ultrasqld --listen ${ULTRASQL_LISTEN} --data-dir ${ULTRASQL_DATA_DIR}
+# All flags are taken from the environment file (ultrasqld reads ULTRASQL_LISTEN,
+# ULTRASQL_DATA_DIR, ULTRASQL_AUTH_*, ULTRASQL_HBA_FILE, ULTRASQL_TLS_*, etc.).
+# The default bind is loopback-only; exposing it requires configuring auth.
+ExecStart=/usr/bin/ultrasqld
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true

@@ -36,7 +36,13 @@ use ultrasql_server::LogStatementMode;
 )]
 pub(crate) struct Cli {
     /// Address to bind the PostgreSQL-wire listener on.
-    #[arg(long, default_value = "127.0.0.1:5433")]
+    ///
+    /// Defaults to loopback so an out-of-the-box start is never publicly
+    /// exposed. Settable via `ULTRASQL_LISTEN` so service managers and
+    /// containers can configure the bind declaratively (an explicit CLI value
+    /// still wins). Listening on a non-loopback address with no authentication
+    /// is refused (see `--auth-user` / `--hba-file` / `--insecure-no-auth`).
+    #[arg(long, env = "ULTRASQL_LISTEN", default_value = "127.0.0.1:5433")]
     pub(crate) listen: SocketAddr,
 
     /// Permit trust-auth PostgreSQL-wire listener on non-loopback addresses.
