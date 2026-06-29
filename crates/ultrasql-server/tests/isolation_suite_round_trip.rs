@@ -331,6 +331,99 @@ async fn hermitage_g2_serializable_write_skew_aborts_one_wire() {
     shutdown(running).await;
 }
 
+/// SSI correctness guard for the int32-pair shape: a SERIALIZABLE write-skew
+/// over a two-`INT` table (`SELECT a, b FROM pair_shift` is exactly the
+/// column-cache fast-path projection) must still abort exactly one transaction.
+///
+/// The fast path returns a pre-encoded projection without descending into the
+/// executor and, in `run_plan_in_txn`, used to short-circuit *above*
+/// `record_serializable_predicate_locks` — a latent SIREAD-lock-dropping hole
+/// now closed by skipping the fast path under SERIALIZABLE. In practice the
+/// column-cache coherence gate already declines to serve the fast path while a
+/// conflicting writer is in flight, but the guard makes the invariant explicit
+/// and local so a future coherence-gate relaxation cannot silently reopen it.
+/// An autocommit read first warms the shared column cache.
+#[tokio::test]
+async fn serializable_int32_pair_fast_path_records_read_lock_wire() {
+    let running = start_sample_server("serializable_int32_pair_fast_path").await;
+    let (peer, peer_handle) =
+        connect_peer(running.bound, "serializable_int32_pair_fast_path_peer").await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE pair_shift (a INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create pair table");
+    running
+        .client
+        .batch_execute("INSERT INTO pair_shift VALUES (1, 100), (2, 200)")
+        .await
+        .expect("seed pair table");
+
+    // Warm the shared int32-pair column cache so the in-transaction reads below
+    // are served by the fast path (the path this regression guards).
+    running
+        .client
+        .query("SELECT a, b FROM pair_shift", &[])
+        .await
+        .expect("warm column cache");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // Each transaction reads the whole table via the fast path, then writes a
+    // disjoint row — the classic write-skew shape. With the read lock recorded
+    // the two rw-antidependencies form a dangerous cycle and one tx must abort.
+    let a_rows = running
+        .client
+        .query("SELECT a, b FROM pair_shift", &[])
+        .await
+        .expect("read a");
+    assert_eq!(a_rows.len(), 2);
+    let b_rows = peer
+        .query("SELECT a, b FROM pair_shift", &[])
+        .await
+        .expect("read b");
+    assert_eq!(b_rows.len(), 2);
+
+    running
+        .client
+        .batch_execute("UPDATE pair_shift SET b = 0 WHERE a = 1")
+        .await
+        .expect("update a");
+    peer.batch_execute("UPDATE pair_shift SET b = 0 WHERE a = 2")
+        .await
+        .expect("update b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "one serializable tx must commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "one serializable tx must fail with 40001 (fast-path read lock recorded): a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn serializable_indexed_disjoint_row_updates_both_commit_wire() {
     let running = start_sample_server("serializable_disjoint_indexed_rows").await;

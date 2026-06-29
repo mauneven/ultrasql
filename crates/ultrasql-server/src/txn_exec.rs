@@ -139,14 +139,26 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         allow_streaming,
         streaming_commit_txn,
     } = args;
-    if let Some(result) = try_run_cached_int32_pair_select(
-        plan,
-        &catalog_snapshot,
-        heap.as_ref(),
-        &txn.snapshot,
-        oracle.as_ref(),
-        stream_buf,
-    ) {
+    // The int32-pair fast path serves the shared column-cache projection
+    // without descending into the executor, so it must NOT short-circuit a
+    // SERIALIZABLE read: returning here would skip the
+    // `record_serializable_predicate_locks` call below and drop the SIREAD
+    // predicate lock for this read, missing a read-write conflict (an SSI
+    // serialization hole). Under SERIALIZABLE we fall through to the locking
+    // path — correctness over the fast path. READ COMMITTED / REPEATABLE READ
+    // record no predicate locks, so the fast path is safe there. Mirrors the
+    // `ReadCommitted`-only guard in
+    // `can_use_cached_scalar_aggregate_in_explicit_txn`.
+    if txn.isolation != ultrasql_txn::IsolationLevel::Serializable
+        && let Some(result) = try_run_cached_int32_pair_select(
+            plan,
+            &catalog_snapshot,
+            heap.as_ref(),
+            &txn.snapshot,
+            oracle.as_ref(),
+            stream_buf,
+        )
+    {
         return Ok(result);
     }
     let text_options =
