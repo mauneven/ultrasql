@@ -60,8 +60,10 @@ close before v1.0 or production use.
 - Parser, binder, optimizer, vectorized executor, MVCC heap, WAL, indexes, COPY,
   JSON/JSONB, text search, vector types, HNSW/IVFFlat, and external scan
   surfaces.
-- Driver certification for common application drivers, ORMs, CLI tools, GUI
-  tools, and migration tools.
+- A driver-certification harness that exercises common application drivers,
+  ORMs, CLI tools, GUI tools, and migration tools (current pass status is
+  tracked in [docs/driver-certification.md](docs/driver-certification.md), not
+  a blanket "certified" guarantee).
 - Reproducible benchmark scripts for measured engines including DuckDB,
   ClickHouse, SQLite, PostgreSQL, local Firebolt Core, TPC-H, TPC-B, TPC-C,
   Sysbench-style OLTP, ClickBench, ANN/vector, and chaos recovery.

@@ -10,23 +10,18 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use ultrasql_server::LogStatementMode;
 
-/// `ultrasqld` v0.5: SQL server with an
-/// in-memory sample database.
+/// `ultrasqld`: a PostgreSQL-wire-compatible SQL database server.
 ///
-/// On startup the server registers a single table:
-///
-/// ```text
-///     users(id INT, name TEXT, score DOUBLE PRECISION)
-/// ```
-///
-/// pre-populated with three rows (Ada, Grace, Linus). Connect with
-/// any PostgreSQL v3 client and run:
+/// With `--data-dir` it boots WAL-backed durable storage. Without one it serves
+/// an in-memory sample database for quick local experiments — a single
+/// pre-populated table:
 ///
 /// ```text
-///     SELECT id FROM users;
-///     SELECT id FROM users WHERE id = 2;
-///     SELECT id FROM users LIMIT 1;
+///     users(id INT, name TEXT, score DOUBLE PRECISION)  -- 3 rows: Ada/Grace/Linus
 /// ```
+///
+/// Connect with any PostgreSQL v3 client (`psql`, libpq, language drivers) and
+/// run ordinary SQL.
 #[derive(Debug, Parser)]
 #[command(
     name = "ultrasqld",
@@ -236,24 +231,20 @@ impl From<CliLogStatementMode> for LogStatementMode {
 
 /// Long description shown by `--help`. Kept as a separate constant so
 /// rustfmt does not split it across lines that mangle the indentation.
-const LONG_ABOUT: &str = "UltraSQL database server (v0.5).
+const LONG_ABOUT: &str = "UltraSQL database server.
 
-Speaks the PostgreSQL wire protocol v3. Without --data-dir it serves an
-in-memory sample database pre-populated with:
+Speaks the PostgreSQL wire protocol v3. With --data-dir it boots WAL-backed
+durable storage; without one it serves an in-memory sample database for quick
+local experiments:
 
     users(id INT, name TEXT, score DOUBLE PRECISION)
     -- 3 rows: Ada/Grace/Linus
 
-Connect with any libpq-style client. Example session:
+Connect with any libpq-style client and run ordinary SQL. Example session:
 
-    psql -h 127.0.0.1 -p 5433 -d ultrasql -c 'SELECT id FROM users;'
+    psql -h 127.0.0.1 -p 5433 -d ultrasql -c 'SELECT id, name FROM users;'
 
-Supported query shapes in v0.5:
-  - SELECT col [, col]* FROM users
-  - SELECT col FROM users WHERE int_col = literal
-  - ... LIMIT n
-
-Production-oriented v0.9 flags:
+Production-oriented flags:
   - --data-dir DIR      boot WAL-backed storage
   - --insecure-no-auth  explicitly permit trust-auth listener outside loopback
                         (alias: --allow-insecure-listen)
