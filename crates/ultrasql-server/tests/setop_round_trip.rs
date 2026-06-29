@@ -732,16 +732,32 @@ async fn string_char_union_text_dedups_equal() {
 async fn string_varchar_intersect_text_matches() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
 
+    // Cross-type string INTERSECT: a varchar(8) value and a text value holding
+    // the same characters compare equal across the type boundary, so a matching
+    // row survives and a non-matching one does not.
+    //
+    // INTERSECT binds more tightly than UNION in standard SQL (and in this
+    // engine), so the earlier `… UNION ALL … INTERSECT …` form actually parsed
+    // as `'x' UNION ALL ('y' INTERSECT 'y')` and PG-faithfully returned the
+    // extra UNION-ALL row. Test the cross-type match directly instead.
     let rows = client
-        .simple_query(
-            "SELECT 'x'::varchar(8) UNION ALL SELECT 'y'::varchar(8) \
-             INTERSECT \
-             SELECT 'y'::text",
-        )
+        .simple_query("SELECT 'y'::varchar(8) INTERSECT SELECT 'y'::text")
         .await
         .expect("varchar/text INTERSECT succeeds");
-    let vals = rows_to_text_col(&rows, 0);
-    assert_eq!(vals, vec!["y".to_owned()], "matching string must survive");
+    assert_eq!(
+        rows_to_text_col(&rows, 0),
+        vec!["y".to_owned()],
+        "matching string must survive cross-type INTERSECT"
+    );
+
+    let miss = client
+        .simple_query("SELECT 'x'::varchar(8) INTERSECT SELECT 'y'::text")
+        .await
+        .expect("varchar/text INTERSECT succeeds");
+    assert!(
+        rows_to_text_col(&miss, 0).is_empty(),
+        "non-matching string must not survive INTERSECT"
+    );
 
     shutdown(client, server_handle).await;
 }
