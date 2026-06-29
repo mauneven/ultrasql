@@ -450,8 +450,11 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          provenance: false
-          sbom: false
+          # Supply-chain: attach a full SLSA provenance attestation and an SBOM
+          # to the published image so consumers can verify how it was built and
+          # what it contains.
+          provenance: mode=max
+          sbom: true
           tags: ghcr.io/${{ github.repository_owner }}/ultrasql:${{ env.RELEASE_TAG }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -463,6 +466,10 @@ jobs:
     needs: [build, docker]
     permissions:
       contents: write
+      # Keyless cosign signing + build-provenance attestation both authenticate
+      # via the workflow's OIDC token.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -470,6 +477,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - uses: sigstore/cosign-installer@v3
       - uses: actions/download-artifact@v8
         with:
           pattern: ultrasql-${{ env.RELEASE_TAG }}-*
@@ -517,6 +525,21 @@ jobs:
             release/driver_compatibility_status.json \
             release/RELEASE_NOTES.md
           ls -la release
+      - name: sign checksum manifest (keyless cosign)
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+        run: |
+          # The checksum manifest is the integrity root for every release
+          # asset; a Sigstore signature over it lets consumers verify the whole
+          # set. The bundle ships alongside the manifest in the release assets.
+          cosign sign-blob \
+            --bundle release/SHASUMS256.txt.cosign.bundle \
+            release/SHASUMS256.txt
+      - name: attest build provenance for the checksum manifest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/SHASUMS256.txt
       - name: publish github release
         uses: softprops/action-gh-release@v3
         with:
