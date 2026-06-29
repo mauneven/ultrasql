@@ -461,22 +461,43 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "cargo build --locked --profile release-ship",
         "USER 10001:10001",
         "ENTRYPOINT",
-        "--listen",
-        "0.0.0.0:5432",
-        "--data-dir",
-        "/var/lib/ultrasql",
+        "docker-entrypoint.sh",
+        "HEALTHCHECK",
     ] {
         assert!(dockerfile.contains(needle), "Dockerfile missing {needle}");
     }
     assert!(dockerignore.contains("target/"));
     assert!(dockerignore.contains("benchmarks/results/"));
 
+    // The wire-listener bind, data dir, and the secure-by-default auth contract
+    // now live in the container entrypoint (it requires a password or an
+    // explicit trust opt-in before exposing a public listener) rather than the
+    // Dockerfile CMD.
+    let docker_entrypoint = repo_file("packaging/docker/docker-entrypoint.sh");
+    for needle in [
+        "--listen",
+        "0.0.0.0:5432",
+        "--data-dir",
+        "/var/lib/ultrasql",
+        "ULTRASQL_PASSWORD",
+        "--auth-user",
+        "ULTRASQL_HOST_AUTH_METHOD",
+        "--insecure-no-auth",
+    ] {
+        assert!(
+            docker_entrypoint.contains(needle),
+            "docker entrypoint missing {needle}"
+        );
+    }
+
     for needle in [
         "docker/build-push-action",
         "ghcr.io/${{ github.repository_owner }}/ultrasql",
         "platforms: linux/amd64",
-        "provenance: false",
-        "sbom: false",
+        "provenance: mode=max",
+        "sbom: true",
+        "cosign sign-blob",
+        "attest-build-provenance",
         "makensis",
         "setup.exe",
         "*.exe",
