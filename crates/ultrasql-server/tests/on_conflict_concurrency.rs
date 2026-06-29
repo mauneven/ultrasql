@@ -270,7 +270,9 @@ async fn on_conflict_cross_row_deadlock_40p01() {
     match victim {
         Victim::A => {
             drop(a_fut);
-            a.batch_execute("ROLLBACK").await.expect("victim A rollback");
+            a.batch_execute("ROLLBACK")
+                .await
+                .expect("victim A rollback");
             tokio::time::timeout(Duration::from_secs(5), &mut b_fut)
                 .await
                 .expect("survivor B unblocks")
@@ -280,7 +282,9 @@ async fn on_conflict_cross_row_deadlock_40p01() {
         }
         Victim::B => {
             drop(b_fut);
-            b.batch_execute("ROLLBACK").await.expect("victim B rollback");
+            b.batch_execute("ROLLBACK")
+                .await
+                .expect("victim B rollback");
             tokio::time::timeout(Duration::from_secs(5), &mut a_fut)
                 .await
                 .expect("survivor A unblocks")

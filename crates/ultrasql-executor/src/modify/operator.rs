@@ -388,9 +388,12 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                                     all_update_vector_index_changes
                                                         .push(index_change);
                                                 }
-                                                if let Some(returning_row) = computed.returning_row {
+                                                if let Some(returning_row) = computed.returning_row
+                                                {
                                                     returning_rows.push(
-                                                        self.evaluate_returning_row(&returning_row)?,
+                                                        self.evaluate_returning_row(
+                                                            &returning_row,
+                                                        )?,
                                                     );
                                                 }
                                                 all_update_edits
