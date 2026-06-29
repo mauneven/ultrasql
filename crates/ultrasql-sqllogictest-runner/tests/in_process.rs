@@ -245,6 +245,64 @@ fn in_process_mode_runs_interval_pg_compat_shard() {
 }
 
 #[test]
+fn in_process_mode_runs_scalar_short_circuit_shard() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/slt/ultrasql_specific/scalar_short_circuit.slt")
+        .canonicalize()
+        .expect("scalar short-circuit SLT shard exists");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // PostgreSQL integer-division short-circuit: a non-taken `1 / 0` branch
+    // returns a value instead of raising. Not portable to DuckDB/SQLite (they do
+    // float division / no error), so it is exercised here, UltraSQL-only.
+    assert!(stdout.contains("passed=10"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn in_process_mode_runs_setop_precedence_shard() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/slt/ultrasql_specific/setop_precedence.slt")
+        .canonicalize()
+        .expect("set-op precedence SLT shard exists");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // INTERSECT binds tighter than UNION / EXCEPT (PostgreSQL / SQL standard);
+    // SQLite folds compound set operators left-to-right, so this is not portable
+    // and is exercised here, UltraSQL-only.
+    assert!(stdout.contains("passed=5"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn ultrasql_specific_includes_interval_pg_compat_shard() {
     let suite = repo_root().join("tests/slt/ultrasql_specific/interval_pg_compat.slt");
     let text = fs::read_to_string(&suite).expect("curated interval-compat SLT shard exists");
