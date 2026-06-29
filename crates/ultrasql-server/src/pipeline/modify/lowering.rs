@@ -88,8 +88,9 @@ pub(super) fn build_eval_plan_qual(
     // release on `owner`). When no savepoint is open the two are equal.
     let lock_xid = ctx.lock_xid;
     let lock_owner = ctx.xid;
-    let lock =
-        Arc::new(move |tid| acquire_eval_plan_qual_row_lock(&lock_manager, lock_xid, lock_owner, tid));
+    let lock = Arc::new(move |tid| {
+        acquire_eval_plan_qual_row_lock(&lock_manager, lock_xid, lock_owner, tid)
+    });
 
     let oracle_for_snapshot = Arc::clone(&ctx.oracle);
     let snapshot_xid = ctx.xid;

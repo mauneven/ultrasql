@@ -446,7 +446,11 @@ pub(crate) fn eval_cast_text(args: &[Value]) -> Result<Value, EvalError> {
         microseconds,
     } = &args[0]
     {
-        return Ok(Value::Text(format_interval_pg(*months, *days, *microseconds)));
+        return Ok(Value::Text(format_interval_pg(
+            *months,
+            *days,
+            *microseconds,
+        )));
     }
     Ok(Value::Text(args[0].to_string()))
 }

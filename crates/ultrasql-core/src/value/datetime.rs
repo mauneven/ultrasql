@@ -554,7 +554,9 @@ pub fn parse_interval_pg(text: &str) -> Option<(i32, i32, i64)> {
 }
 
 fn is_interval_unit(word: &str) -> bool {
-    IntervalAccumulator::default().apply_unit(word, 0, 0.0).is_some()
+    IntervalAccumulator::default()
+        .apply_unit(word, 0, 0.0)
+        .is_some()
 }
 
 /// Split a numeric interval field into `(integer_part, fractional_part)`,
@@ -975,7 +977,12 @@ mod interval_tests {
         (0, 0, 1_500_000, "00:00:01.5"),
         (0, 0, 1_234_560, "00:00:01.23456"),
         (0, 0, 90_000_000, "00:01:30"),
-        (-14, -3, -3_845_000_000, "-1 years -2 mons -3 days -01:04:05"),
+        (
+            -14,
+            -3,
+            -3_845_000_000,
+            "-1 years -2 mons -3 days -01:04:05",
+        ),
         (0, 0, 500_000, "00:00:00.5"),
         (0, 0, -500_000, "-00:00:00.5"),
         (1, 0, 500_000, "1 mon 00:00:00.5"),
@@ -1013,7 +1020,10 @@ mod interval_tests {
         let cases: &[(&str, &str)] = &[
             ("1 day", "1 day"),
             ("1 day 2 hours", "1 day 02:00:00"),
-            ("1 year 2 months 3 days 04:05:06", "1 year 2 mons 3 days 04:05:06"),
+            (
+                "1 year 2 months 3 days 04:05:06",
+                "1 year 2 mons 3 days 04:05:06",
+            ),
             ("-00:00:01", "-00:00:01"),
             ("1.5 hours", "01:30:00"),
             ("2 weeks", "14 days"),

@@ -1318,8 +1318,9 @@ mod tests {
         // `a/c + b` into a Project would divide by zero for those rows, turning
         // an empty/valid result into a runtime error. It must NOT be hoisted.
         let shared = add(div(col("a", 0), col("c", 1)), col("b", 2)); // 5 nodes, fallible
-        let case_with_then =
-            |then: ScalarExpr| case_searched(vec![ne(col("c", 1), lit_i32(0)), then, shared.clone()]);
+        let case_with_then = |then: ScalarExpr| {
+            case_searched(vec![ne(col("c", 1), lit_i32(0)), then, shared.clone()])
+        };
         let plan = LogicalPlan::Project {
             input: Box::new(three_col_scan()),
             exprs: vec![

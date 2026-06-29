@@ -658,11 +658,7 @@ fn setop_shape(plan: &LogicalPlan) -> String {
         LogicalSetQuantifier::All => " ALL",
         LogicalSetQuantifier::Distinct => "",
     };
-    format!(
-        "({} {op_s}{q_s} {})",
-        setop_shape(left),
-        setop_shape(right)
-    )
+    format!("({} {op_s}{q_s} {})", setop_shape(left), setop_shape(right))
 }
 
 fn shape_of(sql: &str) -> String {
@@ -728,9 +724,7 @@ fn intersect_chain_is_left_associative() {
 #[test]
 fn mixed_chain_groups_intersect_runs_then_folds_union_left() {
     assert_eq!(
-        shape_of(
-            "SELECT 1 INTERSECT SELECT 2 UNION SELECT 3 INTERSECT SELECT 4"
-        ),
+        shape_of("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3 INTERSECT SELECT 4"),
         "((L INTERSECT L) UNION (L INTERSECT L))"
     );
 }
@@ -740,9 +734,7 @@ fn mixed_chain_groups_intersect_runs_then_folds_union_left() {
 #[test]
 fn interior_intersect_run_is_grouped_inside_union_chain() {
     assert_eq!(
-        shape_of(
-            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 UNION SELECT 4"
-        ),
+        shape_of("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 UNION SELECT 4"),
         "((L UNION (L INTERSECT L)) UNION L)"
     );
 }
