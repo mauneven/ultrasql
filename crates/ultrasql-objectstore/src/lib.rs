@@ -1438,8 +1438,18 @@ mod tests {
 
     fn objectstore_env_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+        // Poison-tolerant, mirroring the production `lock_unpoisoned` helper.
+        // This lock only serializes process-global S3-endpoint/env mutation, so
+        // its data (`()`) carries no invariant a poison could corrupt. Using
+        // `.expect()` here made the whole S3 suite fragile under parallel
+        // `cargo test`: if one test panicked while holding the guard (e.g. a
+        // failed assertion, or the intentional poison in
+        // `s3_endpoint_override_recovers_from_poisoned_guard_lock`), the lock
+        // poisoned and every subsequent S3 test died on `.expect()` — turning a
+        // single race into a multi-test, multi-platform failure. Recover the
+        // guard instead so a lone failure stays contained.
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("objectstore env test lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
