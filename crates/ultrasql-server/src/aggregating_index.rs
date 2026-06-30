@@ -186,6 +186,9 @@ pub(crate) fn build_aggregating_index_rows(
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            // Deliberate fault-injection panic, gated on `debug_assertions` and a
+            // one-shot atomic — compiled out of release builds and used only to
+            // exercise rebuild-failure recovery in tests; not a reachable panic.
             #[allow(clippy::panic)]
             {
                 panic!("ultrasql test panic (debug-only, during aggregating-index rebuild)");

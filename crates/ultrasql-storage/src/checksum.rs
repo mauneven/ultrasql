@@ -23,7 +23,7 @@ pub const CHECKSUM_OFFSET: usize = 8;
 /// checksum field is set, zeroed, or stale. Callers can write the
 /// returned value back into the field unconditionally.
 #[must_use]
-pub fn compute_page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
+pub(crate) fn compute_page_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
     let mut hasher_input = [0_u8; PAGE_SIZE];
     hasher_input.copy_from_slice(page);
     hasher_input[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);

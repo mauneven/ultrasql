@@ -1148,19 +1148,20 @@ fn csv_schema(header: &[String]) -> Result<Schema, ServerError> {
 }
 
 fn validate_header(header: &[String], path: &std::path::Path) -> Result<(), ServerError> {
-    if header.is_empty() || header.iter().any(String::is_empty) {
-        return Err(ServerError::CopyFormat(format!(
-            "read_csv header contains an empty column name: {}",
-            path.display()
-        )));
-    }
-    Ok(())
+    check_header_column_names(header, &path.display().to_string())
 }
 
 fn validate_object_header(header: &[String], display: &str) -> Result<(), ServerError> {
+    check_header_column_names(header, display)
+}
+
+/// Reject a CSV header with no columns or any empty column name. Shared by the
+/// filesystem ([`validate_header`]) and object-store ([`validate_object_header`])
+/// scan paths so the rule and its error message live in one place.
+fn check_header_column_names(header: &[String], location: &str) -> Result<(), ServerError> {
     if header.is_empty() || header.iter().any(String::is_empty) {
         return Err(ServerError::CopyFormat(format!(
-            "read_csv header contains an empty column name: {display}"
+            "read_csv header contains an empty column name: {location}"
         )));
     }
     Ok(())

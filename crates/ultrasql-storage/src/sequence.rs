@@ -135,8 +135,9 @@ struct SequenceState {
     cycle: bool,
     /// Cache size as configured.
     ///
-    /// TODO(sequence-persistent): use this to batch WAL writes when the
-    /// session cache is refilled from the heap page.
+    /// TODO(sequence-cache-batching): use this to batch WAL writes when the
+    /// session cache is refilled from the heap page (distinct from the
+    /// core persistence work tracked by `TODO(sequence-persistent)` above).
     cache_size: u32,
 }
 

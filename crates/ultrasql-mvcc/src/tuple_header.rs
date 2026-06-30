@@ -149,8 +149,10 @@ pub struct TupleHeader {
     /// Lifecycle flag bits.
     pub infomask: InfoMask,
     /// Number of attributes the tuple physically stores. The catalog
-    /// may declare more; missing trailing attributes default per
-    /// `pg_attribute.attmissingval` (TODO).
+    /// may declare more; filling missing trailing attributes from
+    /// `pg_attribute.attmissingval` is not yet implemented — a tuple
+    /// shorter than the declared schema is currently rejected as
+    /// truncated rather than defaulted.
     pub n_atts: u16,
     /// Byte offset of the first attribute relative to the header
     /// start. 0 means "use natural alignment + bitmap presence";

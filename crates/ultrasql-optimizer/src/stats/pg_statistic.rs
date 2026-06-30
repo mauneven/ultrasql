@@ -44,6 +44,9 @@ fn catalog_float4(value: f64) -> f32 {
 /// three are intentionally absent and will be added when the corresponding
 /// statistics kinds (correlation slot, distinct-list slot, etc.) are
 /// implemented.
+// Field names deliberately mirror PostgreSQL's `pg_statistic` catalog columns
+// (stakind*, stanumbers*, etc.) for a 1:1 persistent-adapter mapping, so the
+// repeated `sta`/`kind` stems are intentional rather than a naming smell.
 #[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PgStatisticRow {
