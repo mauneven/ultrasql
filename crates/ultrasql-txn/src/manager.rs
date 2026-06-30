@@ -322,6 +322,13 @@ pub struct TransactionManager {
     /// Owned here so commit/abort can release all locks held by the
     /// terminating transaction.
     pub lock_manager: Arc<LockManager>,
+    /// Lifetime counters for committed / rolled-back top-level transactions
+    /// (a `pg_stat_database` `xact_commit` / `xact_rollback` analog),
+    /// incremented exactly once per terminal transition in
+    /// [`Self::terminate_with_subxids`]. Surfaced on the `/metrics` endpoint;
+    /// not consulted for visibility or recovery.
+    xact_commit: AtomicU64,
+    xact_rollback: AtomicU64,
 }
 
 impl Default for TransactionManager {
@@ -346,6 +353,8 @@ impl TransactionManager {
             subxid_parent: DashMap::new(),
             ssi: None,
             lock_manager: Arc::new(LockManager::new()),
+            xact_commit: AtomicU64::new(0),
+            xact_rollback: AtomicU64::new(0),
         }
     }
 
@@ -364,7 +373,23 @@ impl TransactionManager {
             subxid_parent: DashMap::new(),
             ssi: Some(ssi),
             lock_manager: Arc::new(LockManager::new()),
+            xact_commit: AtomicU64::new(0),
+            xact_rollback: AtomicU64::new(0),
         }
+    }
+
+    /// Total top-level transactions that have committed since startup
+    /// (`pg_stat_database.xact_commit` analog). Monotonic; for `/metrics`.
+    #[must_use]
+    pub fn xact_commit_total(&self) -> u64 {
+        self.xact_commit.load(Ordering::Relaxed)
+    }
+
+    /// Total top-level transactions that have rolled back / aborted since
+    /// startup (`pg_stat_database.xact_rollback` analog). Monotonic.
+    #[must_use]
+    pub fn xact_rollback_total(&self) -> u64 {
+        self.xact_rollback.load(Ordering::Relaxed)
     }
 
     /// Begin a new transaction with the given isolation level.
@@ -818,6 +843,20 @@ impl TransactionManager {
             }
         }
         active.remove(&parent);
+
+        // Count this terminal transition exactly once (the parent flip above
+        // succeeds at most once per txn). Drives the xact_commit / xact_rollback
+        // /metrics counters; recovery replays status via `clog.insert` and so is
+        // deliberately not counted here.
+        match new_status {
+            XidStatus::Committed => {
+                self.xact_commit.fetch_add(1, Ordering::Relaxed);
+            }
+            XidStatus::Aborted => {
+                self.xact_rollback.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
 
         // Fold each subxid. In the single-phase path (`force_family == false`)
         // only a still-`InProgress` subxid is upgraded — a subxid already
@@ -1863,6 +1902,29 @@ mod tests {
         // T3 has no conflict-in so it commits cleanly.
         mgr.commit(t3).unwrap();
         assert_eq!(mgr.status(t3_xid), XidStatus::Committed);
+    }
+
+    #[test]
+    fn xact_counters_track_commit_and_abort() {
+        let mgr = TransactionManager::new();
+        assert_eq!(mgr.xact_commit_total(), 0);
+        assert_eq!(mgr.xact_rollback_total(), 0);
+
+        let t1 = mgr.begin(IsolationLevel::ReadCommitted);
+        mgr.commit(t1).unwrap();
+        assert_eq!(mgr.xact_commit_total(), 1);
+        assert_eq!(mgr.xact_rollback_total(), 0);
+
+        let t2 = mgr.begin(IsolationLevel::ReadCommitted);
+        mgr.abort(t2).unwrap();
+        assert_eq!(mgr.xact_commit_total(), 1);
+        assert_eq!(mgr.xact_rollback_total(), 1);
+
+        // A second commit advances only the commit counter.
+        let t3 = mgr.begin(IsolationLevel::ReadCommitted);
+        mgr.commit(t3).unwrap();
+        assert_eq!(mgr.xact_commit_total(), 2);
+        assert_eq!(mgr.xact_rollback_total(), 1);
     }
 
     #[test]

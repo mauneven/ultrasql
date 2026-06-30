@@ -293,6 +293,24 @@ pub(crate) fn metrics_body(state: &Server) -> String {
         usize_to_u64_saturated(state.workload_recorder.active_session_count()),
     );
     body.push_str(
+        "# HELP ultrasql_transactions_committed_total Top-level transactions committed.\n\
+         # TYPE ultrasql_transactions_committed_total counter\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_transactions_committed_total",
+        state.txn_manager.xact_commit_total(),
+    );
+    body.push_str(
+        "# HELP ultrasql_transactions_rolled_back_total Top-level transactions rolled back.\n\
+         # TYPE ultrasql_transactions_rolled_back_total counter\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_transactions_rolled_back_total",
+        state.txn_manager.xact_rollback_total(),
+    );
+    body.push_str(
         "# HELP ultrasql_buffer_pool_hits_total Buffer-pool page hits.\n\
          # TYPE ultrasql_buffer_pool_hits_total counter\n",
     );
