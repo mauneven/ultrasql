@@ -1095,6 +1095,24 @@ impl<L: PageLoader> HeapAccess<L> {
                         continue;
                     }
 
+                    // Write-write conflict: the row is visible to us but a
+                    // concurrent in-flight transaction has already stamped xmax
+                    // (an unresolved delete/update). Stamping over it would lose
+                    // that writer's mark (a lost delete). The fused DELETE path
+                    // does not wait+recheck, so surface a retryable serialization
+                    // failure (SQLSTATE 40001), mirroring the fused UPDATE path.
+                    // An aborted xmax is not in progress, so a delete over a
+                    // rolled-back deleter still proceeds.
+                    let prior_xmax = Xid::new(xmax_raw);
+                    if !prior_xmax.is_invalid()
+                        && prior_xmax != xid
+                        && oracle.is_in_progress(prior_xmax)
+                    {
+                        return Err(HeapError::WriteConflict(
+                            "in-place tuple has an unresolved writer",
+                        ));
+                    }
+
                     if wal.is_some() {
                         wal_scratch.push(src_slot)?;
                     }
@@ -1597,6 +1615,20 @@ impl<L: PageLoader> HeapAccess<L> {
                         continue;
                     }
 
+                    // Write-write conflict (see delete_int32_pair_inplace): a
+                    // visible row whose xmax names a foreign in-flight writer
+                    // must not be stamped over (lost delete); raise a retryable
+                    // 40001 instead of waiting/recheck.
+                    let prior_xmax = Xid::new(xmax_raw);
+                    if !prior_xmax.is_invalid()
+                        && prior_xmax != xid
+                        && oracle.is_in_progress(prior_xmax)
+                    {
+                        return Err(HeapError::WriteConflict(
+                            "in-place tuple has an unresolved writer",
+                        ));
+                    }
+
                     wal_scratch.push(src_slot)?;
                     let offset_u16 = u16::try_from(offset)
                         .map_err(|_| HeapError::MalformedHeader("tuple offset overflow"))?;
@@ -1765,6 +1797,20 @@ impl<L: PageLoader> HeapAccess<L> {
                     predicate,
                 )? {
                     continue;
+                }
+
+                // Write-write conflict (see delete_int32_pair_inplace): a
+                // visible row whose xmax names a foreign in-flight writer must
+                // not be stamped over (lost delete); raise a retryable 40001
+                // instead of waiting/recheck.
+                let prior_xmax = Xid::new(xmax_raw);
+                if !prior_xmax.is_invalid()
+                    && prior_xmax != xid
+                    && oracle.is_in_progress(prior_xmax)
+                {
+                    return Err(HeapError::WriteConflict(
+                        "in-place tuple has an unresolved writer",
+                    ));
                 }
 
                 src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);

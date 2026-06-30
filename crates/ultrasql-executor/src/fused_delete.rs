@@ -26,7 +26,8 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{
-    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, Int32PairCmp, Int32PairPredicate,
+    DeleteInt32PairScan, DeleteInt32PairStamp, HeapAccess, HeapError, Int32PairCmp,
+    Int32PairPredicate,
 };
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
@@ -186,7 +187,15 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             self.heap
                 .delete_int32_pair_inplace_parallel_no_wal(scan, stamp, self.vm.as_deref())
         }
-        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        .map_err(|e| match e {
+            // A concurrent transaction holds an unresolved in-place write on a
+            // row this DELETE matched. Relabel it as a retryable serialization
+            // failure (SQLSTATE 40001) instead of the generic catch-all,
+            // mirroring the fused UPDATE path, so retry-aware clients classify
+            // it rather than silently losing the delete (double-stamped xmax).
+            HeapError::WriteConflict(reason) => ExecError::SerializationFailure(reason.to_owned()),
+            other => ExecError::TypeMismatch(other.to_string()),
+        })?;
 
         Ok(Some(affected_rows_batch(n, "fused DELETE")?))
     }
