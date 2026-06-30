@@ -806,6 +806,17 @@ pub(crate) fn open_segment_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// Open an *existing* segment file for appending (no create), used when a
+/// standby resumes landing into its last partially-filled segment. Fails if the
+/// file does not exist. `O_NOFOLLOW` guards against a swapped-in symlink.
+pub(crate) fn open_segment_file_append(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.append(true).read(false);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path)
+}
+
 fn sync_segment_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());

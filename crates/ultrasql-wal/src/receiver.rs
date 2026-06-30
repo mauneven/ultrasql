@@ -25,8 +25,10 @@ use ultrasql_core::Lsn;
 use ultrasql_core::fsync::full_fsync;
 
 use crate::record::{MAX_RECORD_BYTES, RECORD_HEADER_SIZE_U32, WalRecordError};
-use crate::segment::segment_path;
-use crate::writer::{WalWriterError, open_segment_file, peek_record_length};
+use crate::segment::{list_segments, segment_path};
+use crate::writer::{
+    WalWriterError, open_segment_file, open_segment_file_append, peek_record_length,
+};
 
 /// Writes received WAL into a standby's local segment directory.
 ///
@@ -75,6 +77,56 @@ impl WalReceiver {
             current_size: 0,
             written_lsn: 0,
             flushed_lsn: 0,
+            pending: Vec::new(),
+        })
+    }
+
+    /// Resume landing into an *existing* standby WAL directory, continuing to
+    /// append to the last segment so the stream stays byte-identical to the
+    /// primary's across a reconnect/restart. The resume position
+    /// ([`Self::received_lsn`]) is the total of the present segments' lengths —
+    /// segments are contiguous from LSN 0 with no padding — which is the LSN to
+    /// pass as the `START_REPLICATION` start.
+    ///
+    /// Assumes a graceful prior shutdown (the last segment ends on a complete,
+    /// fsynced record); recovering a crash-torn tail before resuming is a
+    /// follow-up. An empty/absent directory resumes as a fresh receiver.
+    ///
+    /// # Errors
+    /// [`WalWriterError::Io`] on a directory/segment read or open failure;
+    /// [`WalWriterError::CounterOverflow`] if the summed length overflows.
+    pub fn resume(
+        dir: impl Into<PathBuf>,
+        segment_size_bytes: u64,
+    ) -> Result<Self, WalWriterError> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let segments = list_segments(&dir)?;
+        let Some((last_index, last_path)) = segments.last().cloned() else {
+            // Nothing landed yet — behaves exactly like a fresh receiver.
+            return Self::create(dir, segment_size_bytes);
+        };
+        // Total bytes already landed = the resume LSN (contiguous, unpadded).
+        let mut written_lsn: u64 = 0;
+        for (_index, path) in &segments {
+            let len = std::fs::metadata(path)?.len();
+            written_lsn = written_lsn
+                .checked_add(len)
+                .ok_or(WalWriterError::CounterOverflow {
+                    counter: "receiver resume lsn",
+                })?;
+        }
+        let current_size = std::fs::metadata(&last_path)?.len();
+        let current_file = open_segment_file_append(&last_path)?;
+        Ok(Self {
+            dir,
+            segment_size_bytes,
+            current_index: last_index,
+            current_file: Some(current_file),
+            current_size,
+            written_lsn,
+            // Prior landed records were fsynced before the graceful shutdown.
+            flushed_lsn: written_lsn,
             pending: Vec::new(),
         })
     }
@@ -423,6 +475,58 @@ mod tests {
             receiver.flushed_lsn(),
             receiver.written_lsn(),
             "flush makes the written position durable"
+        );
+    }
+
+    #[test]
+    fn resume_continues_landing_byte_identically() {
+        const SEG: u64 = 256;
+        let written: Vec<WalRecord> = (0..16).map(rec).collect();
+        let (primary_dir, durable) = write_primary(&written, SEG);
+        let stream = read_wal_range(primary_dir.path(), Lsn::ZERO, durable).expect("read");
+        assert_eq!(stream.records.len(), written.len());
+
+        // Split the record stream at a record boundary (after the first 8).
+        let split = 8;
+        let first_half: Vec<u8> = stream.records[..split]
+            .iter()
+            .flat_map(|r| r.bytes.clone())
+            .collect();
+        let second_half: Vec<u8> = stream.records[split..]
+            .iter()
+            .flat_map(|r| r.bytes.clone())
+            .collect();
+        let split_lsn = stream.records[split].lsn;
+        assert_eq!(split_lsn.raw(), first_half.len() as u64);
+
+        let standby_dir = TempDir::new().unwrap();
+        // Land the first half, flush, and drop (a graceful shutdown).
+        {
+            let mut first = WalReceiver::create(standby_dir.path(), SEG).unwrap();
+            first.land(Lsn::ZERO, &first_half).unwrap();
+            first.flush().unwrap();
+            assert_eq!(first.written_lsn(), split_lsn);
+        }
+        // Resume and land the rest.
+        let mut resumed = WalReceiver::resume(standby_dir.path(), SEG).unwrap();
+        assert_eq!(
+            resumed.received_lsn(),
+            split_lsn,
+            "resumes at prior position"
+        );
+        assert_eq!(resumed.flushed_lsn(), split_lsn);
+        resumed.land(split_lsn, &second_half).unwrap();
+        resumed.flush().unwrap();
+        assert_eq!(resumed.written_lsn(), durable);
+
+        // The resumed standby's segments are byte-identical to the primary's —
+        // resume continued the same segment layout across the restart.
+        let primary_segs = read_all_segment_bytes(primary_dir.path());
+        let standby_segs = read_all_segment_bytes(standby_dir.path());
+        assert!(primary_segs.len() > 1, "test spans several segments");
+        assert_eq!(
+            standby_segs, primary_segs,
+            "resumed landing is byte-identical to the primary"
         );
     }
 }
