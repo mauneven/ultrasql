@@ -67,7 +67,7 @@ Query recall and p50 latency, swept across each engine's recall knob:
   versus 1–4 s for the others, because its HNSW build scans every live node per
   insert (O(N²)). This is why the suite runs at 50k rather than SIFT1M, and it is
   the honest gap. The fix — graph-search-based candidate selection at insert — is
-  tracked in [TODO.md](../TODO.md) with a measurable exit condition
+  tracked in [TODO.md](https://github.com/mauneven/ultrasql/blob/main/TODO.md) with a measurable exit condition
   (SIFT1M build in minutes, recall@10 ≥ 0.95 at ef ≤ 128). Query recall/latency
   is already competitive; the gap is build, not search.
 

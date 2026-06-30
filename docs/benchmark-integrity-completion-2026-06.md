@@ -38,7 +38,7 @@ and 1 `not_available`.
 ## Part 2 / Part 3 — winnable rows and honest losses
 
 Each non-leading row was profiled (see
-[`operator-reports/2026-06-benchmark-row-analysis.md`](../operator-reports/2026-06-benchmark-row-analysis.md)).
+[`operator-reports/2026-06-benchmark-row-analysis.md`](https://github.com/mauneven/ultrasql/blob/main/operator-reports/2026-06-benchmark-row-analysis.md)).
 
 - `select_scan_100k` (→ ClickHouse, ~6 %): confirmed a real loss, not noise
   (four fresh-server runs, 6580–6650 µs vs ClickHouse 6202). Root cause is the

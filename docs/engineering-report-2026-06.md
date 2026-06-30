@@ -4,7 +4,7 @@ Two missions ran back to back: (A) benchmark integrity and engine hardening,
 and (B) the first slice of the AI-native operational-database wedge. This
 report records, per part, what shipped, the measured numbers, which acceptance
 gates passed, and what honestly remains (with measurable exit conditions in
-[TODO.md](../TODO.md)). No number here was hand-edited; every figure comes
+[TODO.md](https://github.com/mauneven/ultrasql/blob/main/TODO.md)). No number here was hand-edited; every figure comes
 from running committed code on an Apple M4 host.
 
 ## Mission A — Benchmark integrity & hardening
