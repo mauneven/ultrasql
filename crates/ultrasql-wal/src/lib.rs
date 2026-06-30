@@ -26,6 +26,7 @@ pub mod buffer;
 pub mod manifest;
 pub mod payload;
 pub mod reader;
+pub mod receiver;
 pub mod record;
 pub mod recovery;
 pub(crate) mod segment;

@@ -762,7 +762,7 @@ fn checked_writer_usize_add(
 /// record without otherwise validating the record. Used to advance
 /// cursor by exact record-byte counts and to perform record-aligned
 /// segment rotation. Returns the length in bytes.
-fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
+pub(crate) fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
     if bytes.len() < 4 {
         return Err(WalWriterError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -792,7 +792,7 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
 /// open call fails without following the link.
 ///
 /// On non-Unix targets the flag is unavailable and the open is plain.
-fn open_segment_file(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_segment_file(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.create_new(true).write(true).read(false);
     #[cfg(unix)]
