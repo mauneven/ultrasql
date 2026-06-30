@@ -135,6 +135,66 @@ async fn concurrent_fused_delete_disjoint_rows_both_commit() {
     shutdown(running).await;
 }
 
+/// The general (indexed, non-fused) delete path takes a blocking EvalPlanQual
+/// row lock, so a concurrent deleter of the same row WAITS for the holder
+/// instead of double-stamping. After the holder commits, the waiter re-reads,
+/// finds the row already deleted, and deletes nothing without error
+/// (PostgreSQL READ COMMITTED wait+re-read; no lost delete).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_indexed_delete_waits_then_sees_committed_delete() {
+    let running = start_sample_server("delete_indexed_wait_test").await;
+    let client_a = &running.client;
+    // An index forces the general ModifyTable + EvalPlanQual path (not fused).
+    client_a
+        .batch_execute(
+            "CREATE TABLE del_indexed (id INT NOT NULL, v INT NOT NULL);
+             INSERT INTO del_indexed VALUES (1, 10), (2, 20);
+             CREATE INDEX del_indexed_id_idx ON del_indexed(id);",
+        )
+        .await
+        .expect("setup indexed rows");
+    let (client_b, peer_handle) = connect_peer(&running, "delete_indexed_wait_b").await;
+
+    client_a
+        .batch_execute("BEGIN; DELETE FROM del_indexed WHERE id = 1;")
+        .await
+        .expect("client a holds delete");
+
+    // B's delete of the same row must block on A's EvalPlanQual lock.
+    let b_task = tokio::spawn(async move {
+        let r = client_b
+            .batch_execute("DELETE FROM del_indexed WHERE id = 1;")
+            .await;
+        (client_b, r)
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !b_task.is_finished(),
+        "general-path delete must BLOCK on the holder's row lock, not double-stamp"
+    );
+
+    // A commits -> B unblocks, re-reads, finds the row already deleted -> Ok.
+    client_a.batch_execute("COMMIT;").await.expect("a commit");
+    let (client_b, b_result) = tokio::time::timeout(Duration::from_secs(5), b_task)
+        .await
+        .expect("b did not hang after a committed")
+        .expect("b task joins");
+    b_result.expect("b's delete succeeds (row already gone, no lost delete)");
+
+    let ids: Vec<i32> = client_a
+        .query("SELECT id FROM del_indexed ORDER BY id", &[])
+        .await
+        .expect("read remaining rows")
+        .iter()
+        .map(|r| r.get::<_, i32>(0))
+        .collect();
+    assert_eq!(ids, vec![2], "row 1 deleted exactly once; row 2 remains");
+
+    drop(client_b);
+    peer_handle.abort();
+    shutdown(running).await;
+}
+
 /// No spurious conflict over a ROLLED-BACK deleter: a delete whose xmax names
 /// an *aborted* transaction is not "in progress", so a later DELETE proceeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
