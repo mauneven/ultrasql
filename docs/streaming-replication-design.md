@@ -130,6 +130,16 @@ as the primary store."
   `primary_conninfo`, runs `START_REPLICATION`, writes received WAL to local
   segments durably, and sends standby status replies. Gate: a two-node
   in-process test streams WAL primary→standby and asserts byte-identical WAL.
+  - **Status — Phase 2a + 2b-i landed.** 2a: `ultrasql_wal::receiver::WalReceiver`
+    lands received WAL byte-identically (partial-record reassembly + the
+    primary's rotation rule; write/flush position tracking). 2b-i:
+    `ultrasql_server::walreceiver::WalReceiverClient` connects to a primary,
+    drives `START_REPLICATION`, parses `XLogData`/keepalive frames, lands via
+    `WalReceiver`, and sends standby status replies — gated by the two-node
+    byte-identical test (slot-less and named-slot, the latter asserting the
+    primary's slot `restart_lsn` advances from the standby's flush ack). **2b-ii**
+    (auto-launch the walreceiver from `primary_conninfo` in standby mode + a
+    continuous reconnect loop) is next, then Phase 3 (continuous apply).
 - **Phase 3 — continuous hot-standby apply.** Resumable apply loop replays
   received WAL via `replay_into`; expose receive/flush/replay LSNs and a
   `pg_stat_replication` view + `ultrasql_replication_lag_*` metrics (the

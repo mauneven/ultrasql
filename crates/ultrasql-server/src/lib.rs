@@ -97,6 +97,7 @@ pub mod tls;
 mod tpch_cache;
 mod txn_exec;
 pub mod wal_sink;
+pub mod walreceiver;
 pub mod wire_writer;
 pub mod workload;
 

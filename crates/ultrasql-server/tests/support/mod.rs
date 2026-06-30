@@ -33,6 +33,23 @@ pub async fn start_persistent_server(data_dir: &Path, application_name: &str) ->
     .await
 }
 
+/// Like [`start_persistent_server`] but with a custom WAL segment size, so a
+/// test can force several segment rotations without writing 16 MiB of WAL.
+pub async fn start_persistent_server_with_segment_size(
+    data_dir: &Path,
+    application_name: &str,
+    segment_size_bytes: u64,
+) -> RunningServer {
+    start_server(
+        Arc::new(
+            Server::init_with_wal_segment_size(data_dir, segment_size_bytes)
+                .expect("persistent server init"),
+        ),
+        application_name,
+    )
+    .await
+}
+
 pub async fn start_sample_server(application_name: &str) -> RunningServer {
     start_server(Arc::new(Server::with_sample_database()), application_name).await
 }

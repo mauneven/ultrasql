@@ -120,6 +120,15 @@ impl WalReceiver {
                 ),
             )));
         }
+        // Defense-in-depth: a single landed chunk larger than the maximum record
+        // is invalid (a real walsender chunks well below this), so refuse it
+        // before it can enlarge the pending buffer — keeping the bound on
+        // `pending` independent of any caller or upstream framing limit.
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(WalWriterError::Encode(WalRecordError::Malformed(
+                "received WAL chunk exceeds the maximum record size",
+            )));
+        }
         self.pending.extend_from_slice(bytes);
         self.drain_complete_records()?;
         // After draining, only a single incomplete record may remain, which is
