@@ -152,6 +152,19 @@ where
                 );
         }
 
+        // A `replication` startup parameter routes this connection to the
+        // physical-replication walsender command loop instead of the SQL
+        // engine (see [`Session::run_replication`]). PostgreSQL treats
+        // `true`/`on`/`yes`/`1`/`database` as replication mode and
+        // `false`/`off`/`no`/`0` (or absent) as a normal connection.
+        self.is_replication = params.iter().any(|(key, value)| {
+            key == "replication"
+                && !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "" | "false" | "off" | "no" | "0"
+                )
+        });
+
         // Authentication. The default `Trust` policy short-circuits to
         // `AuthenticationOk`. The `Md5` policy runs the standard
         // PostgreSQL MD5 challenge: send `AuthenticationMD5Password`

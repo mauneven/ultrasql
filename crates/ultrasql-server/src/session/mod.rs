@@ -41,6 +41,7 @@ mod parquet_copy;
 mod privilege;
 mod privilege_enforce;
 mod privilege_sources;
+mod replication;
 mod role;
 pub(crate) use role::role_is_superuser;
 mod run;
@@ -192,6 +193,11 @@ pub(crate) struct Session<RW> {
     /// its background-ish maintenance hook should run after the reply
     /// bytes are already on the wire.
     pub(super) pending_post_commit_maintenance: bool,
+    /// `true` when the startup packet set the `replication` parameter to a
+    /// truthy value. Such a connection is routed to the physical-replication
+    /// walsender command loop ([`Session::run_replication`]) instead of the
+    /// SQL [`run`](Session::run) loop. Set during [`Session::startup`].
+    pub(super) is_replication: bool,
 }
 
 impl<RW> Session<RW>
@@ -246,6 +252,7 @@ where
             sequence_state: crate::SequenceSessionState::default(),
             advisory_state: crate::AdvisorySessionState::new(pid),
             pending_post_commit_maintenance: false,
+            is_replication: false,
         }
     }
 

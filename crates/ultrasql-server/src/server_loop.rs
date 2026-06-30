@@ -313,5 +313,11 @@ where
             return Ok(());
         }
     }
-    session.run().await
+    // A connection opened with the `replication` startup parameter speaks the
+    // physical-replication command protocol (walsender), not SQL.
+    if session.is_replication {
+        session.run_replication().await
+    } else {
+        session.run().await
+    }
 }

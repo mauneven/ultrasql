@@ -874,12 +874,65 @@ impl ReplicationSlotStore {
         Ok(slots)
     }
 
+    /// Remove a persisted slot. Returns `false` if it did not exist.
+    pub fn drop_slot(&self, name: &str) -> Result<bool, ServerError> {
+        validate_replication_slot_name(name)?;
+        let path = self.slot_path(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                // Persist the directory-entry removal so a crash right after a
+                // successful DROP cannot resurrect the slot on recovery (a
+                // resurrected slot would keep pinning WAL forever). Mirrors the
+                // dir fsync `save` performs on create via write_regular_text_file.
+                sync_metadata_parent(&path)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(ServerError::Io(err)),
+        }
+    }
+
     fn slot_path(&self, name: &str) -> PathBuf {
         self.root.join(format!("{name}.slot"))
     }
 }
 
-fn validate_replication_slot_name(name: &str) -> Result<(), ServerError> {
+/// Format an LSN as PostgreSQL `pg_lsn` text (`%X/%X`: the high and low 32-bit
+/// halves in hex). This is the on-the-wire form for `IDENTIFY_SYSTEM` /
+/// `START_REPLICATION` and the form physical slots persist `restart_lsn` in.
+#[must_use]
+pub(crate) fn format_pg_lsn(lsn: ultrasql_core::Lsn) -> String {
+    let raw = lsn.raw();
+    format!("{:X}/{:X}", raw >> 32, raw & 0xFFFF_FFFF)
+}
+
+/// Parse PostgreSQL `pg_lsn` text (`%X/%X`) back to an [`ultrasql_core::Lsn`].
+///
+/// Returns `None` when the text is not in `hi/lo` hex form — notably the
+/// archive WAL *filenames* the offline [`WalSender`] stores in a slot's
+/// `restart_lsn` (no `/`), so the recycle-floor clamp transparently ignores
+/// those and only pins WAL for live physical-streaming slots.
+#[must_use]
+pub(crate) fn parse_pg_lsn(text: &str) -> Option<ultrasql_core::Lsn> {
+    let (hi, lo) = text.split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    Some(ultrasql_core::Lsn::new((hi << 32) | lo))
+}
+
+/// The minimum `restart_lsn` across `slots` that parses as a `pg_lsn`, or
+/// `None` if none do. This is the WAL the recycle floor must not advance past
+/// (a held physical slot pins WAL a lagging standby still needs). Slots whose
+/// `restart_lsn` is absent or a non-LSN archive filename are skipped.
+#[must_use]
+pub(crate) fn min_parseable_restart_lsn(slots: &[ReplicationSlot]) -> Option<ultrasql_core::Lsn> {
+    slots
+        .iter()
+        .filter_map(|slot| slot.restart_lsn.as_deref().and_then(parse_pg_lsn))
+        .min_by_key(|lsn| lsn.raw())
+}
+
+pub(crate) fn validate_replication_slot_name(name: &str) -> Result<(), ServerError> {
     let valid = !name.is_empty()
         && name.len() <= 63
         && name
@@ -1869,5 +1922,62 @@ mod tests {
                 .expect("second cascade receive"),
             0
         );
+    }
+
+    #[test]
+    fn pg_lsn_text_round_trips() {
+        for raw in [0_u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x1A2B_3C4D_5E6F_7080] {
+            let lsn = ultrasql_core::Lsn::new(raw);
+            let text = format_pg_lsn(lsn);
+            assert!(text.contains('/'), "pg_lsn text has a slash: {text}");
+            assert_eq!(parse_pg_lsn(&text), Some(lsn), "round-trip {raw:#x}");
+        }
+    }
+
+    #[test]
+    fn parse_pg_lsn_rejects_archive_filenames_and_garbage() {
+        // The offline WalSender stores WAL *filenames* (no slash) in
+        // restart_lsn; the recycle-floor clamp must ignore those rather than
+        // mis-parse them as live physical-streaming LSNs.
+        assert_eq!(parse_pg_lsn("000000010000000000000002"), None);
+        assert_eq!(parse_pg_lsn("segment_0000000001"), None);
+        assert_eq!(parse_pg_lsn(""), None);
+        assert_eq!(parse_pg_lsn("/"), None);
+        assert_eq!(parse_pg_lsn("zz/1"), None);
+    }
+
+    #[test]
+    fn min_parseable_restart_lsn_picks_min_and_skips_non_lsn() {
+        let mut low = ReplicationSlot::new("low");
+        low.restart_lsn = Some(format_pg_lsn(ultrasql_core::Lsn::new(200)));
+        let mut high = ReplicationSlot::new("high");
+        high.restart_lsn = Some(format_pg_lsn(ultrasql_core::Lsn::new(5000)));
+        let mut archive = ReplicationSlot::new("archive");
+        archive.restart_lsn = Some("000000010000000000000009".to_owned()); // filename → skipped
+        let unset = ReplicationSlot::new("unset"); // restart_lsn None → skipped
+
+        let slots = vec![high, low, archive, unset];
+        assert_eq!(
+            min_parseable_restart_lsn(&slots),
+            Some(ultrasql_core::Lsn::new(200))
+        );
+        assert_eq!(min_parseable_restart_lsn(&[]), None);
+        assert_eq!(
+            min_parseable_restart_lsn(&[ReplicationSlot::new("none")]),
+            None
+        );
+    }
+
+    #[test]
+    fn slot_store_drop_removes_slot_and_reports_absence() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = ReplicationSlotStore::open(dir.path().join("pg_replslot")).expect("store");
+        let mut slot = ReplicationSlot::new("phys");
+        slot.restart_lsn = Some(format_pg_lsn(ultrasql_core::Lsn::new(42)));
+        store.save(&slot).expect("save");
+        assert!(store.list().expect("list").iter().any(|s| s.name == "phys"));
+        assert!(store.drop_slot("phys").expect("drop existing returns true"));
+        assert!(store.list().expect("list").iter().all(|s| s.name != "phys"));
+        assert!(!store.drop_slot("phys").expect("drop missing returns false"));
     }
 }

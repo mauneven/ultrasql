@@ -113,6 +113,14 @@ as the primary store."
   receives WAL bytes) and a slot-retention test (a held slot prevents WAL
   recycling below `restart_lsn`). Requires a new incremental WAL **reader** API
   in `ultrasql-wal`.
+  - **Status — Phase 1a (control plane) landed.** The incremental WAL `reader`
+    (`ultrasql_wal::reader::read_wal_range`), `replication`-parameter routing,
+    `IDENTIFY_SYSTEM`, `CREATE`/`DROP_REPLICATION_SLOT … PHYSICAL` with durable
+    on-disk persistence, and the `restart_lsn` recycle-floor clamp in
+    `maybe_recycle_wal` are implemented and tested (raw-wire protocol round-trip
+    + slot-retention floor logic). **Phase 1b** — `START_REPLICATION` streaming
+    `XLogData` over `CopyBoth` + keepalives — is next; until then
+    `START_REPLICATION` returns a defined `0A000` (feature_not_supported) error.
 - **Phase 2 — walreceiver + WAL landing.** Standby connects via
   `primary_conninfo`, runs `START_REPLICATION`, writes received WAL to local
   segments durably, and sends standby status replies. Gate: a two-node

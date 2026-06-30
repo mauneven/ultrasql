@@ -470,6 +470,17 @@ impl Server {
     /// durable. An index with no logged mutation (snapshot LSN `ZERO`) has no WAL
     /// records of its own and imposes no floor — `fold_min_nonzero_lsn` excludes
     /// it, so its `None` bound here simply does not constrain the floor.
+    /// Minimum `restart_lsn` across all persisted physical replication slots,
+    /// or `None` when there are none with a parseable LSN (in-memory mode, no
+    /// slots, or only archive-filename slots). Used to floor WAL recycling so a
+    /// held slot prevents losing WAL a standby still needs.
+    pub(crate) fn min_physical_slot_restart_lsn(&self) -> Option<Lsn> {
+        let dir = self.data_dir.as_ref()?.join("pg_replslot");
+        let store = crate::replication::ReplicationSlotStore::open(dir).ok()?;
+        let slots = store.list().ok()?;
+        crate::replication::min_parseable_restart_lsn(&slots)
+    }
+
     pub(crate) fn maybe_recycle_wal(
         &self,
         redo_from: Lsn,
@@ -496,6 +507,13 @@ impl Server {
         }
         if let Some(ivfflat_lsn) = min_ivfflat_snapshot_lsn {
             floor = floor.min(ivfflat_lsn.raw());
+        }
+        // A held physical replication slot pins WAL: never recycle below the
+        // minimum `restart_lsn` across all slots, or a lagging standby would
+        // silently lose segments it still needs to catch up. See
+        // `session/replication.rs` and `docs/streaming-replication-design.md`.
+        if let Some(slot_floor) = self.min_physical_slot_restart_lsn() {
+            floor = floor.min(slot_floor.raw());
         }
         match ultrasql_wal::truncate_below(wal_dir, Lsn::new(floor)) {
             Ok(outcome) if !outcome.is_noop() => tracing::info!(
