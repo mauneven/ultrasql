@@ -6,7 +6,7 @@
 //! negligible at our error-detection budget (false-positive 1 in 2³²).
 //!
 //! The checksum *field itself* must be zeroed during computation so the
-//! check is self-consistent. Callers should use [`compute_page_checksum`],
+//! check is self-consistent. Callers should use `compute_page_checksum`,
 //! which handles the zero-field convention.
 
 use xxhash_rust::xxh3::xxh3_64;
