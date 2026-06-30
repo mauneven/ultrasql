@@ -297,6 +297,21 @@ pub fn encode_backend(msg: &BackendMessage, buf: &mut BytesMut) {
                 }
             });
         }
+        BackendMessage::CopyBothResponse {
+            overall_format,
+            column_formats,
+        } => {
+            // Spec §55.7: CopyBothResponse (B), Byte1('W'),
+            // Int32 len, Int8 overall_format, Int16 ncols,
+            // Int16[ncols] column_formats. Used to start physical replication.
+            write_tagged(buf, b'W', |payload| {
+                payload.put_u8(*overall_format);
+                payload.put_i16(i16_from_usize(column_formats.len()));
+                for code in column_formats {
+                    payload.put_u16(*code);
+                }
+            });
+        }
         BackendMessage::CopyData(data) => {
             // Spec §55.7: CopyData (F&B), Byte1('d'),
             // Int32 len, Byte[n] data.

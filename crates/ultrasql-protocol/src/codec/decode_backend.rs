@@ -195,6 +195,22 @@ fn decode_backend_payload(
                 column_formats,
             }
         }
+        b'W' => {
+            // Spec §55.7: CopyBothResponse (B) — physical replication.
+            // Int8 overall_format, Int16 ncols, Int16[ncols] col_formats.
+            let overall_format = p.read_u8()?;
+            let ncols = p.read_i16()?;
+            let ncols = nonneg_usize(ncols, "copy-both column count")?;
+            let mut column_formats = Vec::with_capacity(ncols.min(64));
+            for _ in 0..ncols {
+                column_formats.push(p.read_u16()?);
+            }
+            p.ensure_drained()?;
+            BackendMessage::CopyBothResponse {
+                overall_format,
+                column_formats,
+            }
+        }
         b'd' => {
             // Spec §55.7: CopyData (F&B). All remaining payload bytes.
             let data = p.read_remaining();

@@ -432,6 +432,18 @@ pub enum BackendMessage {
         column_formats: Vec<u16>,
     },
 
+    /// `CopyBothResponse` (`'W'`): the server is initiating a bidirectional
+    /// COPY stream. Used by physical streaming replication: after
+    /// `START_REPLICATION` the server sends this, then a sequence of
+    /// [`Self::CopyData`] frames carrying `XLogData`/keepalive messages while
+    /// the client sends standby status updates on the same connection.
+    CopyBothResponse {
+        /// Overall copy format: `0` = text, `1` = binary.
+        overall_format: u8,
+        /// Per-column format codes (`0` = text, `1` = binary).
+        column_formats: Vec<u16>,
+    },
+
     /// `CopyData` (`'d'`): a block of data in a COPY stream from the
     /// server to the client. Follows a [`Self::CopyOutResponse`]; ends
     /// with a [`Self::CopyDone`] or [`Self::ErrorResponse`].
