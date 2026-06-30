@@ -55,7 +55,19 @@ where
             //   dropped read future.
             // - `mpsc::UnboundedReceiver::poll_recv` only consumes a
             //   record when it returns `Poll::Ready(Some(_))`.
-            let idle_timeout_ms = self.state.idle_session_timeout_ms();
+            // Idle-read timeout. Matching PostgreSQL, the two idle timeouts are
+            // mutually exclusive by transaction state: inside an open
+            // transaction `idle_in_transaction_session_timeout` applies (an
+            // abandoned txn holds its row/relation locks and pins vacuum, so on
+            // expiry we roll it back and disconnect with SQLSTATE 25P03);
+            // outside a transaction the server-level `idle_session_timeout`
+            // applies (just close). Either being 0 means no bound.
+            let (idle_timeout_ms, terminate_idle_in_txn) =
+                if matches!(self.txn_state, TxnState::Idle) {
+                    (self.state.idle_session_timeout_ms(), false)
+                } else {
+                    (self.idle_in_transaction_session_timeout_ms, true)
+                };
             let read_outcome = if idle_timeout_ms == 0 {
                 self.read_frontend_or_notify().await?
             } else {
@@ -67,12 +79,37 @@ where
                 {
                     Ok(outcome) => outcome?,
                     Err(_) => {
-                        debug!(
-                            target: "ultrasqld",
-                            pid = self.pid,
-                            idle_timeout_ms,
-                            "idle session timeout; closing connection"
-                        );
+                        if terminate_idle_in_txn {
+                            debug!(
+                                target: "ultrasqld",
+                                pid = self.pid,
+                                idle_timeout_ms,
+                                "idle-in-transaction timeout; rolling back and closing connection"
+                            );
+                            // Roll back the abandoned transaction so its locks
+                            // are released, then tell the client why.
+                            let _ = self.execute_rollback();
+                            self.send(&BackendMessage::ErrorResponse {
+                                fields: vec![
+                                    (b'S', "FATAL".to_owned()),
+                                    (b'V', "FATAL".to_owned()),
+                                    (b'C', "25P03".to_owned()),
+                                    (
+                                        b'M',
+                                        "terminating connection due to idle-in-transaction timeout"
+                                            .to_owned(),
+                                    ),
+                                ],
+                            })
+                            .await?;
+                        } else {
+                            debug!(
+                                target: "ultrasqld",
+                                pid = self.pid,
+                                idle_timeout_ms,
+                                "idle session timeout; closing connection"
+                            );
+                        }
                         return Ok(());
                     }
                 }

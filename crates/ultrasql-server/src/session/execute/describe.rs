@@ -184,6 +184,12 @@ where
                 self.session_settings.remove("statement_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "idle_in_transaction_session_timeout" => {
+                self.idle_in_transaction_session_timeout_ms = 0;
+                self.session_settings
+                    .remove("idle_in_transaction_session_timeout");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "work_mem" => {
                 // Drop the override; the lowering path falls back to
                 // DEFAULT_WORK_MEM_BYTES when the key is absent.
@@ -258,6 +264,15 @@ where
                 self.statement_timeout_ms = parsed;
                 self.session_settings
                     .insert("statement_timeout".to_owned(), parsed.to_string());
+                Ok(())
+            }
+            "idle_in_transaction_session_timeout" => {
+                let parsed = parse_statement_timeout_ms(value)?;
+                self.idle_in_transaction_session_timeout_ms = parsed;
+                self.session_settings.insert(
+                    "idle_in_transaction_session_timeout".to_owned(),
+                    parsed.to_string(),
+                );
                 Ok(())
             }
             // Per-statement work-memory budget. Stored canonically as a byte
@@ -386,6 +401,9 @@ where
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
             "statement_timeout" => self.statement_timeout_ms.to_string(),
+            "idle_in_transaction_session_timeout" => {
+                self.idle_in_transaction_session_timeout_ms.to_string()
+            }
             "work_mem" => self
                 .session_settings
                 .get("work_mem")

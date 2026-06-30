@@ -152,6 +152,12 @@ pub(crate) struct Session<RW> {
     pub(super) jit_above_rows: usize,
     /// Session-local `statement_timeout` in milliseconds; `0` disables it.
     pub(super) statement_timeout_ms: u64,
+    /// Session-local `idle_in_transaction_session_timeout` in milliseconds;
+    /// `0` disables it. When set, a session left idle inside an open
+    /// transaction longer than this is rolled back and disconnected (SQLSTATE
+    /// 25P03), releasing the row/relation locks it held so other backends are
+    /// not blocked indefinitely by an abandoned transaction.
+    pub(super) idle_in_transaction_session_timeout_ms: u64,
     /// Session-local custom GUCs used by row-level security policies.
     pub(super) session_settings: std::collections::HashMap<String, String>,
     /// Receiver half of the per-connection notification channel.
@@ -226,6 +232,7 @@ where
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             statement_timeout_ms: 0,
+            idle_in_transaction_session_timeout_ms: 0,
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
