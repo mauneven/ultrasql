@@ -84,6 +84,29 @@ pub enum AccessMethodError {
     NotImplemented(&'static str),
 }
 
+/// Validate a vector against an index's declared dimensionality and reject
+/// non-finite (NaN / ±∞) elements. `index_label` names the index kind in the
+/// error message. Shared by the HNSW and IVFFlat backends (both the in-memory
+/// and page-backed variants) so the rule and its messages live in one place.
+pub(crate) fn validate_vector_dims_finite(
+    vector: &[f32],
+    dims: usize,
+    index_label: &str,
+) -> Result<(), AccessMethodError> {
+    if vector.len() != dims {
+        return Err(AccessMethodError::Storage(format!(
+            "{index_label} vector dimension mismatch: expected {dims}, got {}",
+            vector.len()
+        )));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(AccessMethodError::Storage(format!(
+            "{index_label} vector elements must be finite"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------

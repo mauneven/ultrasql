@@ -353,19 +353,7 @@ impl PageBackedHnswIndex {
     }
 
     pub(crate) fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
-        if vector.len() != self.dims {
-            return Err(AccessMethodError::Storage(format!(
-                "page-backed hnsw vector dimension mismatch: expected {}, got {}",
-                self.dims,
-                vector.len()
-            )));
-        }
-        if vector.iter().any(|value| !value.is_finite()) {
-            return Err(AccessMethodError::Storage(
-                "page-backed hnsw vector elements must be finite".to_owned(),
-            ));
-        }
-        Ok(())
+        crate::access_method::validate_vector_dims_finite(vector, self.dims, "page-backed hnsw")
     }
 
     pub(crate) fn emit_hnsw_wal(

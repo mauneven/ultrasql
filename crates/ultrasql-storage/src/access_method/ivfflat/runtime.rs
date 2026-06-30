@@ -275,19 +275,7 @@ impl IvfFlatIndex {
     }
 
     pub(crate) fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
-        if vector.len() != self.dims {
-            return Err(AccessMethodError::Storage(format!(
-                "ivfflat vector dimension mismatch: expected {}, got {}",
-                self.dims,
-                vector.len()
-            )));
-        }
-        if vector.iter().any(|v| !v.is_finite()) {
-            return Err(AccessMethodError::Storage(
-                "ivfflat vector elements must be finite".to_owned(),
-            ));
-        }
-        Ok(())
+        crate::access_method::validate_vector_dims_finite(vector, self.dims, "ivfflat")
     }
 
     pub(crate) fn train_centroids(
