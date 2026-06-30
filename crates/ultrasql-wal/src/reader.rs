@@ -1,7 +1,7 @@
 //! Incremental, read-from-LSN reader over WAL segment files.
 //!
 //! The streaming-replication walsender (see
-//! [`docs/streaming-replication-design.md`], Phase 1) needs to read WAL records
+//! `docs/streaming-replication-design.md`, Phase 1) needs to read WAL records
 //! starting at an arbitrary LSN and frame them for a standby. [`read_wal_range`]
 //! returns the records whose `[lsn, end_lsn)` falls in a bounded half-open LSN
 //! range `[from_lsn, to_lsn)`.
