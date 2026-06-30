@@ -54,7 +54,9 @@ The top items by criticality and blast radius. These are the things that block a
    [`docs/evalplanqual-design.md`](docs/evalplanqual-design.md) (high).
 4. **Continuous networked + synchronous physical replication** — replication is offline WAL-file
    copying only; no walsender/walreceiver wire protocol, no streaming hot-standby apply, no sync
-   commit, no failover/promotion. Blocks HA/DR (critical).
+   commit, no failover/promotion. Blocks HA/DR (critical). Phased plan designed in
+   [`docs/streaming-replication-design.md`](docs/streaming-replication-design.md) (Phase 0 landed;
+   walsender handshake + physical-slot retention is the first implementation increment).
 5. **CLOG persistence + transactional DDL** — in-memory DashMap commit log and DDL hard-rejected
    inside explicit transaction blocks; both are atomicity/durability correctness gaps and block
    ORM/migration certification beyond autocommit. **Increment B landed**: the DDL-in-transaction
