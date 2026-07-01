@@ -464,6 +464,12 @@ pub struct Server {
     /// reject writes before planning so a standby can safely serve analytical
     /// queries while WAL shipping/replay catches up.
     pub standby_mode: std::sync::atomic::AtomicBool,
+    /// Hot-standby WAL-apply cursor: the next LSN not yet applied by continuous
+    /// replay. Seeded at startup to the recovered LSN and advanced by
+    /// [`Server::apply_landed_wal`] as streamed WAL is replayed into this
+    /// standby's heap and commit-status oracle. Left at the recovered LSN on a
+    /// primary, which never calls `apply_landed_wal`.
+    pub(crate) standby_apply_lsn: std::sync::atomic::AtomicU64,
     /// Background WAL writer owned by WAL-backed server instances.
     ///
     /// `None` means in-memory sample mode. `Some` means `Server::init`

@@ -659,25 +659,7 @@ pub(crate) fn rebuild_commit_status_from_wal(
     let mut observed_xids = std::collections::BTreeSet::new();
     ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
         observed_xids.insert(record.header.xid);
-        txn_manager.recover_observed_xid(record.header.xid);
-        match record.header.record_type {
-            RecordType::Commit => {
-                txn_manager.recover_committed(record.header.xid);
-                // The parent's single Commit record carries the subxids
-                // that committed atomically with it (released + implicitly
-                // released-at-commit savepoints). Mark each one Committed so
-                // the post-replay default-abort sweep below does NOT abort
-                // them — otherwise a row inserted under a released savepoint
-                // would have an aborted xmin and vanish on restart.
-                if let Ok(payload) = CommitPayload::decode(&record.payload) {
-                    for subxid in payload.committed_subxids {
-                        txn_manager.recover_committed(subxid);
-                    }
-                }
-            }
-            RecordType::Abort => txn_manager.recover_aborted(record.header.xid),
-            _ => {}
-        }
+        update_commit_status_for_record(txn_manager, record);
         Ok(())
     })
     .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))?;
@@ -685,4 +667,160 @@ pub(crate) fn rebuild_commit_status_from_wal(
         txn_manager.recover_uncommitted_as_aborted(xid);
     }
     Ok(())
+}
+
+/// Apply one WAL record's effect on the commit-status oracle: mark the record's
+/// XID observed (advancing the allocator floor), and on a terminal
+/// Commit/Abort record flip the XID — and, for a commit, every subxid released
+/// atomically with it — to its final status.
+///
+/// This is the per-record half of commit-status recovery, shared by the
+/// full-WAL crash rebuild ([`rebuild_commit_status_from_wal`]) and incremental
+/// hot-standby apply ([`apply_wal_range_with_commit_status`]) so the two paths
+/// cannot drift.
+///
+/// It deliberately performs **no** default-abort sweep. An XID observed but not
+/// yet terminal stays [`ultrasql_mvcc::XidStatus::InProgress`]. The crash
+/// rebuild adds the sweep after a *complete* scan (every XID's fate is known);
+/// incremental standby apply must not, because a commit for an in-progress XID
+/// may still arrive in a later WAL record that has not been applied yet —
+/// aborting it now would permanently hide rows it will legitimately commit.
+fn update_commit_status_for_record(txn_manager: &TransactionManager, record: &WalRecord) {
+    txn_manager.recover_observed_xid(record.header.xid);
+    match record.header.record_type {
+        RecordType::Commit => {
+            txn_manager.recover_committed(record.header.xid);
+            // The parent's single Commit record carries the subxids that
+            // committed atomically with it (released + implicitly
+            // released-at-commit savepoints). Mark each Committed so a row
+            // inserted under a released savepoint keeps a committed xmin.
+            if let Ok(payload) = CommitPayload::decode(&record.payload) {
+                for subxid in payload.committed_subxids {
+                    txn_manager.recover_committed(subxid);
+                }
+            }
+        }
+        RecordType::Abort => txn_manager.recover_aborted(record.header.xid),
+        _ => {}
+    }
+}
+
+/// Incrementally apply a bounded WAL range `[from_lsn, to_lsn)` on a hot
+/// standby: replay heap and sequence changes into `heap_target` and advance
+/// transaction commit status in `txn_manager`, in a single pass. Returns the
+/// next unapplied LSN (the cursor to resume from on the next call).
+///
+/// Unlike crash recovery this performs **no** default-abort sweep (see
+/// [`update_commit_status_for_record`]); commit status converges as later
+/// ranges are applied. Heap replay is idempotent under the page-LSN rule and
+/// commit-status restoration is idempotent, so re-applying an already-applied
+/// prefix is harmless.
+pub(crate) fn apply_wal_range_with_commit_status(
+    txn_manager: &TransactionManager,
+    heap_target: &dyn HeapTarget,
+    wal_dir: &Path,
+    from_lsn: Lsn,
+    to_lsn: Lsn,
+) -> Result<Lsn, ServerError> {
+    let stream = ultrasql_wal::reader::read_wal_range(wal_dir, from_lsn, to_lsn)
+        .map_err(|e| ServerError::ddl(format!("standby apply: read WAL range: {e}")))?;
+    for record in &stream.records {
+        let (decoded, _used) = WalRecord::decode(&record.bytes)
+            .map_err(|e| ServerError::ddl(format!("standby apply: decode record: {e}")))?;
+        ultrasql_wal::dispatch_record_at_lsn(heap_target, &decoded, record.lsn)
+            .map_err(|e| ServerError::ddl(format!("standby apply: dispatch record: {e}")))?;
+        update_commit_status_for_record(txn_manager, &decoded);
+    }
+    Ok(stream.next_lsn)
+}
+
+impl Server {
+    /// Apply landed-but-unapplied WAL up to `up_to` on a hot standby, replaying
+    /// heap/sequence changes and transaction commit status so this standby's
+    /// snapshots observe freshly-streamed commits, and advancing the apply
+    /// cursor. Returns the new cursor (the next unapplied LSN).
+    ///
+    /// A no-op when `up_to` is at or behind the cursor. Idempotent under the
+    /// WAL page-LSN and commit-status recovery rules, so a redundant call over
+    /// an already-applied range is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the server has no persistent WAL directory
+    /// (an in-memory instance) or if reading/replaying the WAL range fails.
+    pub fn apply_landed_wal(&self, up_to: Lsn) -> Result<Lsn, ServerError> {
+        let wal_dir = self.wal_dir.as_ref().ok_or_else(|| {
+            ServerError::ddl("apply_landed_wal requires a persistent WAL directory")
+        })?;
+        let from_lsn = Lsn::new(
+            self.standby_apply_lsn
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        if up_to.raw() <= from_lsn.raw() {
+            return Ok(from_lsn);
+        }
+        let target = ServerRecoveryTarget {
+            heap: Arc::clone(&self.heap),
+            sequences: Arc::clone(&self.sequences),
+        };
+        let next_lsn = apply_wal_range_with_commit_status(
+            self.txn_manager.as_ref(),
+            &target,
+            wal_dir,
+            from_lsn,
+            up_to,
+        )?;
+        self.standby_apply_lsn
+            .store(next_lsn.raw(), std::sync::atomic::Ordering::Release);
+        Ok(next_lsn)
+    }
+}
+
+#[cfg(test)]
+mod standby_apply_tests {
+    use super::*;
+    use ultrasql_mvcc::{XidStatus, XidStatusOracle};
+
+    /// Incremental commit-status apply marks commits (and their released
+    /// subxids) terminal, but leaves an observed-yet-uncommitted XID
+    /// `InProgress` — the crash-recovery default-abort sweep must NOT run
+    /// incrementally, or a commit arriving in a later range would be lost.
+    #[test]
+    fn incremental_apply_marks_commits_without_aborting_open_xids() {
+        let txn_manager = TransactionManager::new();
+
+        // An INSERT by xid 10 whose Commit record has not been applied yet.
+        let insert = WalRecord::new(
+            RecordType::HeapInsert,
+            Xid::new(10),
+            Lsn::ZERO,
+            0,
+            Vec::new(),
+        )
+        .expect("build insert record");
+        update_commit_status_for_record(&txn_manager, &insert);
+
+        // A committed transaction (xid 11) that released a subxid (12).
+        let commit_payload = CommitPayload {
+            commit_lsn: Lsn::new(64),
+            commit_timestamp_micros: 0,
+            committed_subxids: vec![Xid::new(12)],
+        }
+        .encode()
+        .expect("encode commit payload");
+        let commit = WalRecord::new(
+            RecordType::Commit,
+            Xid::new(11),
+            Lsn::ZERO,
+            0,
+            commit_payload,
+        )
+        .expect("build commit record");
+        update_commit_status_for_record(&txn_manager, &commit);
+
+        assert_eq!(txn_manager.status(Xid::new(11)), XidStatus::Committed);
+        assert_eq!(txn_manager.status(Xid::new(12)), XidStatus::Committed);
+        // The open xid is still resolvable by a later commit — not aborted.
+        assert_eq!(txn_manager.status(Xid::new(10)), XidStatus::InProgress);
+    }
 }

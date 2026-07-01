@@ -227,6 +227,7 @@ impl Server {
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
+            standby_apply_lsn: std::sync::atomic::AtomicU64::new(0),
             checkpointer: None,
             wal_writer: None,
             wal_buffer_sink: None,
