@@ -729,15 +729,17 @@ where
         // the per-window loop never moves it.
         let mut commit_txn = handle.take_commit_txn();
 
-        // Unwind guard for the autocommit XID. This drive loop runs the
-        // panic-prone synchronous `encode_window` (executor-grade operator pull
-        // over user data) OUTSIDE the per-statement `catch_unwind`, so a panic
-        // here unwinds the connection future and drops `commit_txn` without
-        // abort — leaking its row locks exactly like the buffered path did.
-        // The guard aborts the XID on any unwind; it is disarmed before every
-        // normal `commit_txn.take()` (each of which itself commits or aborts the
-        // handle). `None` `commit_txn` is an explicit-txn streaming SELECT whose
-        // handle lives in `txn_state` — no autocommit XID to guard.
+        // Unwind guard for the autocommit XID. The panic-prone synchronous
+        // `encode_window` pull now runs under a local `catch_unwind` in the loop
+        // below — a mid-drain panic is converted to `ServerError::Internal` and
+        // reported inline (which aborts the txn), so the connection survives with
+        // a clean error instead of unwinding the future and dropping the socket.
+        // This guard remains as a backstop for any unwind that escapes elsewhere
+        // in the loop (e.g. the async write path), aborting the XID so its row
+        // locks are never leaked — the buffered path's old failure mode. It is
+        // disarmed before every normal `commit_txn.take()` (each of which itself
+        // commits or aborts the handle). `None` `commit_txn` is an explicit-txn
+        // streaming SELECT whose handle lives in `txn_state` — no autocommit XID.
         let mut abort_guard = commit_txn
             .as_ref()
             .map(|txn| AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid));
@@ -769,11 +771,35 @@ where
 
         loop {
             buf.clear();
-            match crate::result_encoder::encode_window(
-                &mut handle,
-                &mut buf,
-                crate::result_encoder::STREAM_WINDOW_HIGH_WATER_BYTES,
-            ) {
+            // Catch a panic in the synchronous operator pull (executor-grade
+            // code over user data) and route it into the same inline mid-stream
+            // error path an operator `Err` uses, so a mid-drain panic yields a
+            // clean ErrorResponse + ReadyForQuery and the connection survives.
+            // Only the sync pull is wrapped — `catch_unwind` cannot span the
+            // `write_all().await`. `encode_window` borrows only `handle`+`buf`,
+            // so `self` stays out of the closure.
+            let window = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::result_encoder::encode_window(
+                    &mut handle,
+                    &mut buf,
+                    crate::result_encoder::STREAM_WINDOW_HIGH_WATER_BYTES,
+                )
+            })) {
+                Ok(result) => result,
+                Err(payload) => {
+                    // Log full detail server-side; the client gets a generic
+                    // XX000 (panic strings never reach the wire). The `Err` arm
+                    // below performs the txn abort via report_streaming_error_inline.
+                    tracing::error!(
+                        target: "ultrasqld",
+                        pid = self.pid,
+                        panic = %panic_payload_message(&payload),
+                        "streaming SELECT drain panicked mid-drive; reporting inline"
+                    );
+                    Err(ServerError::Internal)
+                }
+            };
+            match window {
                 Ok(more) => {
                     if !more {
                         // Final window: append trailer (notifications +

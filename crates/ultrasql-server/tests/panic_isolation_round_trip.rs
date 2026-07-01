@@ -411,9 +411,29 @@ async fn panicking_streaming_select_aborts_its_txn() {
     // gets a mid-stream error or a dropped result; either way the server must
     // not have leaked the autocommit txn.
     let (a, _a_conn) = connect(bound).await;
-    let _ = a
+    // With the drive-loop `catch_unwind`, a mid-drain panic now surfaces as a
+    // clean ErrorResponse (XX000) rather than a dropped socket, and the
+    // connection survives its own mid-drain panic and stays usable. `db_error`
+    // asserts an ErrorResponse was received (not a connection drop).
+    let err = a
         .simple_query("SELECT id, payload FROM stream_panic_probe ORDER BY id")
-        .await;
+        .await
+        .expect_err("mid-stream panic must surface an ErrorResponse, not a dropped result");
+    let (code, _msg) = db_error(&err);
+    assert_eq!(
+        code, "XX000",
+        "mid-drain panic maps to internal_error XX000"
+    );
+    let after = a
+        .simple_query("SELECT 1")
+        .await
+        .expect("connection A survives its own mid-drain panic and stays usable");
+    assert!(
+        after
+            .iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))),
+        "SELECT 1 returns a row on the recovered connection"
+    );
 
     // The server survived and no txn/lock leaked: a fresh connection writes the
     // sentinel row (taking its Exclusive lock) and reads back, promptly.
