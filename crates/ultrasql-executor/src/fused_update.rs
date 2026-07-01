@@ -50,7 +50,7 @@ use ultrasql_vec::Batch;
 use crate::affected_rows::affected_rows_batch;
 use crate::{ExecError, Operator};
 
-type TargetTidLock = dyn Fn(TupleId) -> Result<bool, String> + Send + Sync;
+type TargetTidLock = dyn Fn(TupleId) -> Result<bool, ExecError> + Send + Sync;
 
 /// Predicate descriptor for the optional `WHERE col_j cmp literal`
 /// clause. Both `col_index` and `literal` are typed at construction
@@ -236,7 +236,7 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
     #[must_use]
     pub fn with_target_tid_lock<F>(mut self, lock: F, refresh_snapshot_after_lock: bool) -> Self
     where
-        F: Fn(TupleId) -> Result<bool, String> + Send + Sync + 'static,
+        F: Fn(TupleId) -> Result<bool, ExecError> + Send + Sync + 'static,
     {
         self.target_tid_lock = Some(Arc::new(lock));
         self.refresh_snapshot_after_lock = refresh_snapshot_after_lock;
@@ -295,7 +295,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             for tid in target_tids {
                 let mut refreshed_after_lock = false;
                 if let Some(lock) = &self.target_tid_lock {
-                    let waited = lock(*tid).map_err(ExecError::TypeMismatch)?;
+                    let waited = lock(*tid)?;
                     if waited && self.refresh_snapshot_after_lock {
                         update_snapshot = self.oracle.statement_snapshot(self.xid, self.command_id);
                         refreshed_after_lock = true;

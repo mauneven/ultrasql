@@ -471,6 +471,11 @@ impl ServerError {
             // general write path's Exclusive row lock (EvalPlanQual). Mirrors
             // the FOR UPDATE `Self::DeadlockDetected` 40P01 path.
             Self::Execute(ultrasql_executor::ExecError::DeadlockDetected(_)) => "40P01",
+            // lock_not_available — an UPDATE/DELETE/MERGE row-lock wait
+            // exceeded the session's `lock_timeout`. Mirrors the FOR UPDATE
+            // `Self::LockNotAvailable` 55P03 path so both surfaces classify
+            // a lock timeout identically.
+            Self::Execute(ultrasql_executor::ExecError::LockNotAvailable(_)) => "55P03",
             // cardinality_violation — a scalar subquery used as an
             // expression returned more than one row. Raised by the
             // `SingleRowAssert` guard the decorrelation rule inserts.
@@ -685,6 +690,22 @@ mod tests {
         );
         assert!(err.is_query_scoped());
         assert_eq!(err.sqlstate(), "2200H");
+    }
+
+    #[test]
+    fn lock_timeout_maps_to_lock_not_available() {
+        // PG: 55P03 lock_not_available — both the FOR UPDATE (server-side)
+        // and UPDATE/DELETE (executor-side) lock-timeout surfaces.
+        let err =
+            ServerError::LockNotAvailable("canceling statement due to lock timeout".to_owned());
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "55P03");
+
+        let err = ServerError::Execute(ultrasql_executor::ExecError::LockNotAvailable(
+            "canceling statement due to lock timeout".to_owned(),
+        ));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "55P03");
     }
 
     #[test]

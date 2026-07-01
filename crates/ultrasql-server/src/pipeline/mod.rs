@@ -368,6 +368,19 @@ pub struct LowerCtx<'a> {
     pub allow_server_files: bool,
 }
 
+impl LowerCtx<'_> {
+    /// Build the statement's blocking-lock wait options from the session
+    /// GUC snapshot (`lock_timeout` → 55P03 on expiry) and the statement
+    /// cancel flag (statement_timeout / client cancel → 57014). Used by
+    /// every write-side row-lock closure this lowering constructs.
+    pub(crate) fn lock_wait(&self) -> ultrasql_txn::LockWait {
+        crate::txn_exec::lock_wait_options_from_settings(
+            self.session_settings.as_ref(),
+            self.cancel_flag.as_ref(),
+        )
+    }
+}
+
 /// Materialised non-recursive CTE binding.
 ///
 /// Owns the batches produced by running the CTE's definition plan to

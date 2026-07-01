@@ -186,6 +186,12 @@ where
                 self.session_settings.remove("statement_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "lock_timeout" => {
+                // The default is 0 (disabled), matching PostgreSQL.
+                self.lock_timeout_ms = 0;
+                self.session_settings.remove("lock_timeout");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "idle_in_transaction_session_timeout" => {
                 self.idle_in_transaction_session_timeout_ms = 0;
                 self.session_settings
@@ -279,6 +285,18 @@ where
                 self.statement_timeout_ms = parsed;
                 self.session_settings
                     .insert("statement_timeout".to_owned(), parsed.to_string());
+                Ok(())
+            }
+            // Lock-wait bound in milliseconds; 0 disables (PostgreSQL
+            // default). Stored canonically as a millisecond count in
+            // `session_settings` so the `run_plan_in_txn` lock pass (which
+            // sees only the settings snapshot) reads the same value the
+            // session field carries.
+            "lock_timeout" => {
+                let parsed = parse_ms_guc(value, "invalid lock_timeout")?;
+                self.lock_timeout_ms = parsed;
+                self.session_settings
+                    .insert("lock_timeout".to_owned(), parsed.to_string());
                 Ok(())
             }
             "idle_in_transaction_session_timeout" => {
@@ -435,6 +453,7 @@ where
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
             "statement_timeout" => self.statement_timeout_ms.to_string(),
+            "lock_timeout" => self.lock_timeout_ms.to_string(),
             "idle_in_transaction_session_timeout" => {
                 self.idle_in_transaction_session_timeout_ms.to_string()
             }

@@ -349,6 +349,14 @@ pub enum ExecError {
     #[error("deadlock detected: {0}")]
     DeadlockDetected(String),
 
+    /// A row-lock wait exceeded the session's `lock_timeout` while an
+    /// UPDATE / DELETE / MERGE was acquiring its Exclusive tuple lock.
+    /// The server maps this to PostgreSQL SQLSTATE `55P03`
+    /// (`lock_not_available`), matching PostgreSQL's "canceling statement
+    /// due to lock timeout" semantics. Query-scoped and retryable.
+    #[error("{0}")]
+    LockNotAvailable(String),
+
     /// A scalar subquery used as an expression returned more than one
     /// row. SQL requires exactly one row from such a subquery; the
     /// [`SingleRowAssert`] operator raises this the moment it observes a

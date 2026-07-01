@@ -951,7 +951,12 @@ fn rewrite_catalog_scalar_expr(
                     ctx.xid,
                 )?
             } else {
-                state.evaluate_function(name, &values, &ctx.oracle.lock_manager)?
+                state.evaluate_function(
+                    name,
+                    &values,
+                    &ctx.oracle.lock_manager,
+                    &ctx.lock_wait(),
+                )?
             };
             Ok(ScalarExpr::Literal {
                 value,

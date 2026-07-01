@@ -671,6 +671,7 @@ where
                         self.state.heap.as_ref(),
                         self.state.txn_manager.as_ref(),
                         &txn,
+                        &self.lock_wait(),
                     ) {
                         Ok(rewritten) => {
                             restore_plan = self.swap_portal_plan(portal, rewritten);
@@ -816,6 +817,7 @@ where
                         self.state.heap.as_ref(),
                         self.state.txn_manager.as_ref(),
                         &txn,
+                        &self.lock_wait(),
                     ) {
                         Ok(rewritten) => {
                             restore_plan = self.swap_portal_plan(portal, rewritten);

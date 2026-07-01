@@ -61,7 +61,9 @@ pub mod savepoint;
 pub mod ssi;
 pub mod two_phase;
 
-pub use lock::{LockError, LockManager, LockMode, LockRequest, LockTableSnapshot, LockTag};
+pub use lock::{
+    LockError, LockManager, LockMode, LockRequest, LockTableSnapshot, LockTag, LockWait,
+};
 pub use manager::{IsolationLevel, Transaction, TransactionManager, TxnError};
 pub use row_lock::{RowLockExt, RowLockMode, RowLockRequest};
 pub use savepoint::{SavepointError, Subtxn, SubtxnManager};

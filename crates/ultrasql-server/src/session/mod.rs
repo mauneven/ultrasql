@@ -154,6 +154,13 @@ pub(crate) struct Session<RW> {
     pub(super) jit_above_rows: usize,
     /// Session-local `statement_timeout` in milliseconds; `0` disables it.
     pub(super) statement_timeout_ms: u64,
+    /// Session-local `lock_timeout` in milliseconds; `0` (the default,
+    /// matching PostgreSQL) disables it. When set, any statement that
+    /// blocks on a heap row / relation / advisory lock longer than this
+    /// aborts with SQLSTATE `55P03` (`lock_not_available`) instead of
+    /// waiting indefinitely; the timed-out waiter is removed from the
+    /// lock manager's wait queue.
+    pub(super) lock_timeout_ms: u64,
     /// Session-local `idle_in_transaction_session_timeout` in milliseconds;
     /// `0` disables it. When set, a session left idle inside an open
     /// transaction longer than this is rolled back and disconnected (SQLSTATE
@@ -259,6 +266,7 @@ where
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             statement_timeout_ms,
+            lock_timeout_ms: 0,
             idle_in_transaction_session_timeout_ms: 0,
             log_statement: logging_defaults.log_statement,
             log_min_duration_statement_ms: logging_defaults.log_min_duration_statement_ms,
@@ -299,6 +307,16 @@ where
     pub(super) fn work_mem_budget(&self) -> Arc<ultrasql_executor::work_mem::WorkMemBudget> {
         crate::session::execute::work_mem_budget_from_settings(&self.session_settings)
     }
+
+    /// Build the per-statement blocking-lock wait options for this session.
+    ///
+    /// Carries the session's `lock_timeout` (55P03 on expiry) and a clone
+    /// of the statement [`CancelFlag`](ultrasql_executor::CancelFlag) so a
+    /// `statement_timeout` deadline or a client `CancelRequest` interrupts
+    /// a lock wait with 57014 instead of blocking until the lock frees.
+    pub(super) fn lock_wait(&self) -> ultrasql_txn::LockWait {
+        crate::lock_wait_options(self.lock_timeout_ms, Some(&self.cancel_flag))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +331,28 @@ impl<RW> Drop for Session<RW> {
     /// cancel registry on drop so the per-pid sender is released and any
     /// orphaned subscriptions are removed.
     fn drop(&mut self) {
+        // A client that disconnects (EOF / Terminate / error) with an
+        // explicit transaction still open must not leave that transaction
+        // in-progress forever: its row/relation locks would never release
+        // and any peer blocked on them would hang indefinitely, and its
+        // xid would pin vacuum. Abort it here — a disconnect is a
+        // rollback, matching PostgreSQL.
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
+                if let Err(e) = self.state.abort_transaction(
+                    txn,
+                    false,
+                    "session disconnect with open transaction",
+                ) {
+                    tracing::warn!(
+                        pid = self.pid,
+                        error = %e,
+                        "failed to abort open transaction on session drop"
+                    );
+                }
+            }
+            TxnState::Idle => {}
+        }
         // A client that disconnects mid-transaction after an in-txn
         // CREATE TABLE (no COMMIT/ROLLBACK) must not leave the staged,
         // non-MVCC global side maps (runtime constraints / RLS / privileges)

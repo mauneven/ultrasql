@@ -33,6 +33,62 @@ pub(crate) fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
     }
 }
 
+/// PostgreSQL's `lock_timeout` error text (SQLSTATE `55P03`).
+pub(crate) const LOCK_TIMEOUT_MESSAGE: &str = "canceling statement due to lock timeout";
+
+/// Build the per-statement blocking-lock wait options.
+///
+/// - `lock_timeout_ms` > 0 arms the wait deadline whose expiry surfaces as
+///   SQLSTATE `55P03` ([`LockError::Timeout`] → [`ServerError::LockNotAvailable`]
+///   or [`ExecError::LockNotAvailable`]).
+/// - `cancel_flag` (when present) is polled while blocked so a
+///   `statement_timeout` deadline or client `CancelRequest` interrupts the
+///   wait with SQLSTATE `57014` ([`LockError::Cancelled`] →
+///   [`ExecError::Cancelled`]).
+///
+/// Cost: one closure `Arc` per statement on the *blocking* path only; the
+/// lock manager's uncontended fast path never touches these options.
+pub(crate) fn lock_wait_options(
+    lock_timeout_ms: u64,
+    cancel_flag: Option<&ultrasql_executor::CancelFlag>,
+) -> ultrasql_txn::LockWait {
+    ultrasql_txn::LockWait {
+        timeout: (lock_timeout_ms > 0).then(|| std::time::Duration::from_millis(lock_timeout_ms)),
+        cancelled: cancel_flag.map(|flag| {
+            let flag = flag.clone();
+            std::sync::Arc::new(move || flag.is_set())
+                as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
+        }),
+    }
+}
+
+/// [`lock_wait_options`] fed from a session-settings snapshot (the
+/// `run_plan_in_txn` path, which does not see the `Session` fields). Reads
+/// the canonical millisecond string the `SET lock_timeout` handler stores.
+pub(crate) fn lock_wait_options_from_settings(
+    session_settings: &std::collections::HashMap<String, String>,
+    cancel_flag: Option<&ultrasql_executor::CancelFlag>,
+) -> ultrasql_txn::LockWait {
+    let lock_timeout_ms = session_settings
+        .get("lock_timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    lock_wait_options(lock_timeout_ms, cancel_flag)
+}
+
+/// Classify a [`LockError`] from a blocking row-lock wait into the
+/// query-scoped [`ServerError`] carrying the right SQLSTATE:
+/// deadlock victim → `40P01`, `lock_timeout` expiry → `55P03`,
+/// statement-timeout / client cancel → `57014`, anything else → `40001`.
+fn classify_row_lock_wait_error(e: LockError) -> ServerError {
+    match e {
+        LockError::Deadlock { .. } => deadlock_error(),
+        LockError::Timeout => ServerError::LockNotAvailable(LOCK_TIMEOUT_MESSAGE.to_owned()),
+        LockError::Cancelled => ServerError::Execute(ExecError::Cancelled),
+        other => ServerError::Execute(ExecError::SerializationFailure(other.to_string())),
+    }
+}
+
 pub(crate) struct RunPlanInTxnArgs<'a> {
     pub(crate) plan: &'a LogicalPlan,
     pub(crate) txn: &'a Transaction,
@@ -164,7 +220,11 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
     // Acquire the real row locks demanded by a SELECT ... FOR UPDATE /
     // SHARE clause. For SKIP LOCKED this returns a rewritten plan that
     // yields only the rows this txn actually grabbed; otherwise the
-    // original plan is executed unchanged.
+    // original plan is executed unchanged. Blocking waits observe the
+    // session's `lock_timeout` (55P03) and the statement cancel flag
+    // (statement_timeout / client cancel → 57014).
+    let lock_wait =
+        lock_wait_options_from_settings(session_settings.as_ref(), cancel_flag.as_ref());
     let rewritten_lock_plan = acquire_simple_lock_rows(
         plan,
         &catalog_snapshot,
@@ -172,6 +232,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         heap.as_ref(),
         oracle.as_ref(),
         txn,
+        &lock_wait,
     )?;
     let plan: &LogicalPlan = rewritten_lock_plan.as_ref().unwrap_or(plan);
 
@@ -377,6 +438,7 @@ pub(crate) fn acquire_simple_lock_rows(
     heap: &HeapAccess<BlankPageLoader>,
     oracle: &TransactionManager,
     txn: &Transaction,
+    lock_wait: &ultrasql_txn::LockWait,
 ) -> Result<Option<LogicalPlan>, ServerError> {
     let LogicalPlan::LockRows {
         input,
@@ -424,7 +486,7 @@ pub(crate) fn acquire_simple_lock_rows(
             oracle,
             txn,
         )?;
-        acquire_row_locks(&tids, oracle, txn, mode, *wait_policy)?;
+        acquire_row_locks(&tids, oracle, txn, mode, *wait_policy, lock_wait)?;
     }
 
     Ok(None)
@@ -834,6 +896,7 @@ fn acquire_row_locks(
     txn: &Transaction,
     mode: RowLockMode,
     wait_policy: LockWaitPolicy,
+    lock_wait: &ultrasql_txn::LockWait,
 ) -> Result<(), ServerError> {
     let xid = txn.xid;
     let owner = txn.current_xid();
@@ -852,7 +915,7 @@ fn acquire_row_locks(
                 // (re-locking the same row inside the same txn is a no-op).
                 match lock_manager.try_acquire_for_owner(req, owner) {
                     Ok(true) => {}
-                    Ok(false) => block_on_lock(lock_manager, req, owner)?,
+                    Ok(false) => block_on_lock(lock_manager, req, owner, lock_wait)?,
                     Err(LockError::Deadlock { .. }) => {
                         return Err(deadlock_error());
                     }
@@ -902,8 +965,9 @@ fn block_on_lock(
     lock_manager: &LockManager,
     req: LockRequest,
     owner: Xid,
+    lock_wait: &ultrasql_txn::LockWait,
 ) -> Result<(), ServerError> {
-    let acquire = || lock_manager.acquire_for_owner(req, owner);
+    let acquire = || lock_manager.acquire_for_owner_with_wait(req, owner, lock_wait);
     let result = if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)
@@ -912,13 +976,7 @@ fn block_on_lock(
     } else {
         acquire()
     };
-    match result {
-        Ok(()) => Ok(()),
-        Err(LockError::Deadlock { .. }) => Err(deadlock_error()),
-        Err(e) => Err(ServerError::Execute(ExecError::SerializationFailure(
-            e.to_string(),
-        ))),
-    }
+    result.map_err(classify_row_lock_wait_error)
 }
 
 /// Construct the `40P01 deadlock_detected` error for a row-lock victim.

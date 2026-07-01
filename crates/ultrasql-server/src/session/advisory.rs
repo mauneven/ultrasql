@@ -33,6 +33,7 @@ where
             &name,
             &values,
             &self.state.txn_manager.lock_manager,
+            &self.lock_wait(),
         )?;
         let result = match name.as_str() {
             "pg_advisory_lock" | "pg_advisory_unlock_all" => void_select_result(output_name),

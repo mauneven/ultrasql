@@ -25,7 +25,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
@@ -162,15 +162,80 @@ pub enum LockError {
         /// The XID chosen as victim.
         victim: Xid,
     },
-    /// The lock could not be acquired within the configured timeout.
+    /// The lock could not be acquired within the caller-supplied
+    /// [`LockWait::timeout`] (the SQL `lock_timeout`). The waiter has
+    /// already been removed from the wait queue when this is returned.
     #[error("lock acquisition timed out")]
     Timeout,
     /// `try_acquire` found a conflicting grant; the lock was not taken.
     #[error("lock held by another transaction")]
     Conflict,
+    /// The blocking wait was interrupted by the caller-supplied
+    /// [`LockWait::cancelled`] observer (statement timeout or client
+    /// cancel). The waiter has already been removed from the wait queue
+    /// when this is returned.
+    #[error("lock wait cancelled")]
+    Cancelled,
     /// A fastpath relation-lock reference count overflowed.
     #[error("fastpath lock reference count overflow")]
     FastpathOverflow,
+}
+
+/// Deadline / cancellation options for a blocking lock wait.
+///
+/// The default (`LockWait::default()`) waits forever with no
+/// cancellation observer — exactly the historical [`LockManager::acquire`]
+/// behaviour, using an unbounded condvar `wait` with no periodic wakeups.
+/// When either field is set, the waiter sleeps in bounded slices
+/// ([`LockWait::POLL_INTERVAL`], or less when the timeout deadline is
+/// nearer) so it can observe cancellation and enforce the timeout even if
+/// no grant/release notification ever arrives.
+///
+/// Priority on wake: a grantable lock always wins over an expired
+/// timeout or a cancellation observed on the same wakeup, matching
+/// PostgreSQL (the lock was available before the error was raised).
+#[derive(Clone, Default)]
+pub struct LockWait {
+    /// Relative timeout measured from the start of the blocking wait;
+    /// `None` waits forever. Expiry returns [`LockError::Timeout`]
+    /// (SQL `lock_timeout` → SQLSTATE `55P03`).
+    pub timeout: Option<Duration>,
+    /// Cancellation observer polled on every wakeup (statement timeout /
+    /// client cancel). Returning `true` aborts the wait with
+    /// [`LockError::Cancelled`] (→ SQLSTATE `57014`). The closure must be
+    /// cheap: it is polled at least every [`LockWait::POLL_INTERVAL`].
+    pub cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LockWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockWait")
+            .field("timeout", &self.timeout)
+            .field("has_cancel_observer", &self.cancelled.is_some())
+            .finish()
+    }
+}
+
+impl LockWait {
+    /// Upper bound between cancellation polls while blocked on a lock.
+    ///
+    /// 10 ms keeps a cancelled/timed-out statement's exit latency well
+    /// under human-visible thresholds without measurable idle cost (the
+    /// waiter is parked; each wakeup is two atomic loads + a clock read).
+    pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    /// Whether this wait is a plain unbounded wait (no timeout, no
+    /// cancellation observer).
+    #[must_use]
+    pub fn is_unbounded(&self) -> bool {
+        self.timeout.is_none() && self.cancelled.is_none()
+    }
+
+    /// Poll the cancellation observer.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.as_ref().is_some_and(|f| f())
+    }
 }
 
 /// A point-in-time snapshot of who holds and waits on a particular
@@ -468,7 +533,17 @@ impl LockManager {
     ///    - Otherwise check again whether the lock can be granted; if so,
     ///      move from waiters to grants and return `Ok(())`.
     pub fn acquire(&self, req: LockRequest) -> Result<(), LockError> {
-        self.acquire_with_owner(req, req.xid)
+        self.acquire_with_owner(req, req.xid, &LockWait::default())
+    }
+
+    /// Like [`Self::acquire`] but bounded by `wait`: an expired
+    /// [`LockWait::timeout`] returns [`LockError::Timeout`] and a firing
+    /// [`LockWait::cancelled`] observer returns [`LockError::Cancelled`].
+    /// On either early exit the waiter is removed from the wait queue
+    /// under the entry mutex — a timed-out waiter can never linger and
+    /// block or confuse later acquirers.
+    pub fn acquire_with_wait(&self, req: LockRequest, wait: &LockWait) -> Result<(), LockError> {
+        self.acquire_with_owner(req, req.xid, wait)
     }
 
     /// Like [`Self::acquire`] but records `owner` (the acquiring
@@ -478,11 +553,27 @@ impl LockManager {
     /// a row lock taken inside a savepoint). Pass `owner == req.xid` when no
     /// savepoint is open.
     pub fn acquire_for_owner(&self, req: LockRequest, owner: Xid) -> Result<(), LockError> {
-        self.acquire_with_owner(req, owner)
+        self.acquire_with_owner(req, owner, &LockWait::default())
+    }
+
+    /// [`Self::acquire_for_owner`] bounded by `wait` — see
+    /// [`Self::acquire_with_wait`] for the timeout / cancellation contract.
+    pub fn acquire_for_owner_with_wait(
+        &self,
+        req: LockRequest,
+        owner: Xid,
+        wait: &LockWait,
+    ) -> Result<(), LockError> {
+        self.acquire_with_owner(req, owner, wait)
     }
 
     #[allow(clippy::significant_drop_tightening)] // `state` is intentionally held across `wait`
-    fn acquire_with_owner(&self, req: LockRequest, owner: Xid) -> Result<(), LockError> {
+    fn acquire_with_owner(
+        &self,
+        req: LockRequest,
+        owner: Xid,
+        wait: &LockWait,
+    ) -> Result<(), LockError> {
         // Register the XID's deadlock state if not already present.
         self.ensure_xid_state(req.xid);
 
@@ -507,6 +598,13 @@ impl LockManager {
             return Ok(());
         }
 
+        // A statement already cancelled must not enqueue at all.
+        if wait.is_cancelled() {
+            return Err(LockError::Cancelled);
+        }
+        // The timeout deadline starts when the blocking wait starts.
+        let deadline = wait.timeout.map(|t| Instant::now() + t);
+
         // Slow path: enqueue and wait.
         state.waiters.push_back((req.xid, req.mode));
 
@@ -520,8 +618,19 @@ impl LockManager {
                 return Err(LockError::Deadlock { victim: req.xid });
             }
 
-            // `wait` atomically releases the mutex and parks the thread.
-            entry.waiters_changed.wait(&mut state);
+            if wait.is_unbounded() {
+                // `wait` atomically releases the mutex and parks the thread.
+                entry.waiters_changed.wait(&mut state);
+            } else {
+                // Bounded sleep: wake at the next cancellation poll tick or
+                // at the timeout deadline, whichever comes first, so both
+                // are observed even if no notification ever arrives.
+                let mut wake_at = Instant::now() + LockWait::POLL_INTERVAL;
+                if let Some(deadline) = deadline {
+                    wake_at = wake_at.min(deadline);
+                }
+                let _ = entry.waiters_changed.wait_until(&mut state, wake_at);
+            }
 
             // Re-check victim flag after waking.
             if self.is_victim(req.xid) {
@@ -529,6 +638,9 @@ impl LockManager {
                 return Err(LockError::Deadlock { victim: req.xid });
             }
 
+            // A grantable lock wins over a timeout/cancel observed on the
+            // same wakeup: the lock was available before the error would
+            // have been raised (PostgreSQL behaves the same way).
             if !has_conflict(&state.grants, req.xid, req.mode) {
                 remove_waiter(&mut state.waiters, req.xid, req.mode);
                 state.grants.push(Grant {
@@ -540,6 +652,21 @@ impl LockManager {
                 // detection run that resolved itself by the time we woke).
                 self.clear_victim(req.xid);
                 return Ok(());
+            }
+
+            // CRITICAL: both early exits remove this waiter under the entry
+            // mutex, exactly like the deadlock-victim path above — a waiter
+            // is never leaked in the queue. Nothing else needs waking:
+            // grant eligibility is computed from `grants` alone (FIFO order
+            // never gates a grant), so removing a waiter cannot unblock or
+            // starve another waiter.
+            if wait.is_cancelled() {
+                remove_waiter(&mut state.waiters, req.xid, req.mode);
+                return Err(LockError::Cancelled);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                remove_waiter(&mut state.waiters, req.xid, req.mode);
+                return Err(LockError::Timeout);
             }
         }
     }
@@ -1499,6 +1626,181 @@ mod tests {
             mgr.inspect(tag).is_none(),
             "empty entry should be pruned after release"
         );
+    }
+
+    // ── deadline-aware waits: lock_timeout / cancellation ─────────────────
+
+    /// A bounded wait on a held conflicting lock returns `Timeout` once the
+    /// `LockWait::timeout` elapses — and, critically, removes the waiter
+    /// from the queue so nothing leaks: the holder can release and a fresh
+    /// transaction acquires immediately.
+    #[test]
+    fn acquire_with_wait_times_out_and_leaves_no_waiter() {
+        let mgr = LockManager::new();
+        let tag = tup(600, 0, 0);
+
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+
+        let started = std::time::Instant::now();
+        let wait = LockWait {
+            timeout: Some(Duration::from_millis(50)),
+            cancelled: None,
+        };
+        let err = mgr
+            .acquire_with_wait(req(2, tag, LockMode::Exclusive), &wait)
+            .expect_err("conflicting bounded wait must time out");
+        assert!(matches!(err, LockError::Timeout), "got {err:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "must not time out early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must time out promptly: {elapsed:?}"
+        );
+
+        // No waiter leak: the queue is empty again.
+        let snap = mgr.inspect(tag).expect("entry still held by xid 1");
+        assert!(
+            snap.waiters.is_empty(),
+            "timed-out waiter must be removed from the queue: {snap:?}"
+        );
+
+        // The holder releases; a fresh transaction acquires immediately.
+        mgr.release(xid(1), tag, LockMode::Exclusive);
+        let wait = LockWait {
+            timeout: Some(Duration::from_millis(50)),
+            cancelled: None,
+        };
+        mgr.acquire_with_wait(req(3, tag, LockMode::Exclusive), &wait)
+            .expect("free lock must be granted immediately after release");
+    }
+
+    /// A cancellation observer flipping mid-wait aborts the wait with
+    /// `Cancelled` (the statement-timeout / client-cancel path) and removes
+    /// the waiter from the queue.
+    #[test]
+    fn acquire_with_wait_observes_cancellation() {
+        let mgr = LockManager::new();
+        let tag = tup(601, 0, 0);
+
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = Arc::clone(&cancelled);
+        let wait = LockWait {
+            timeout: None,
+            cancelled: Some(Arc::new(move || {
+                observer.load(std::sync::atomic::Ordering::Relaxed)
+            })),
+        };
+        // Flip the flag shortly after the wait starts.
+        let flipper = Arc::clone(&cancelled);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flipper.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let started = std::time::Instant::now();
+        let err = mgr
+            .acquire_with_wait(req(2, tag, LockMode::Exclusive), &wait)
+            .expect_err("cancelled wait must abort");
+        assert!(matches!(err, LockError::Cancelled), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation must interrupt the wait promptly"
+        );
+        handle.join().expect("flipper thread");
+
+        let snap = mgr.inspect(tag).expect("entry still held by xid 1");
+        assert!(
+            snap.waiters.is_empty(),
+            "cancelled waiter must be removed from the queue: {snap:?}"
+        );
+    }
+
+    /// An already-cancelled statement never enqueues at all.
+    #[test]
+    fn acquire_with_wait_pre_cancelled_does_not_enqueue() {
+        let mgr = LockManager::new();
+        let tag = tup(602, 0, 0);
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+
+        let wait = LockWait {
+            timeout: None,
+            cancelled: Some(Arc::new(|| true)),
+        };
+        let err = mgr
+            .acquire_with_wait(req(2, tag, LockMode::Exclusive), &wait)
+            .expect_err("pre-cancelled wait must abort");
+        assert!(matches!(err, LockError::Cancelled));
+        let snap = mgr.inspect(tag).expect("entry still held by xid 1");
+        assert!(snap.waiters.is_empty(), "must not have enqueued: {snap:?}");
+    }
+
+    /// A bounded wait whose lock becomes free before the deadline is
+    /// granted, not timed out — a grantable lock wins over the deadline.
+    #[test]
+    fn acquire_with_wait_grants_when_released_before_deadline() {
+        let mgr = Arc::new(LockManager::new());
+        let tag = tup(603, 0, 0);
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+
+        let releaser = Arc::clone(&mgr);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            releaser.release(xid(1), tag, LockMode::Exclusive);
+        });
+
+        let wait = LockWait {
+            timeout: Some(Duration::from_secs(5)),
+            cancelled: None,
+        };
+        mgr.acquire_with_wait(req(2, tag, LockMode::Exclusive), &wait)
+            .expect("wait must be granted once the holder releases");
+        handle.join().expect("releaser thread");
+
+        let snap = mgr.inspect(tag).expect("entry must exist");
+        assert_eq!(snap.grants.len(), 1);
+        assert_eq!(snap.grants[0].0, xid(2));
+        assert!(snap.waiters.is_empty());
+    }
+
+    /// A timeout on one waiter must not disturb a second waiter on the same
+    /// tag: the survivor still gets the grant when the holder releases.
+    #[test]
+    fn timed_out_waiter_does_not_disturb_surviving_waiter() {
+        let mgr = Arc::new(LockManager::new());
+        let tag = tup(604, 0, 0);
+        mgr.acquire(req(1, tag, LockMode::Exclusive)).unwrap();
+
+        // Waiter A: short timeout — will expire.
+        let mgr_a = Arc::clone(&mgr);
+        let a = std::thread::spawn(move || {
+            let wait = LockWait {
+                timeout: Some(Duration::from_millis(40)),
+                cancelled: None,
+            };
+            mgr_a.acquire_with_wait(req(2, tag, LockMode::Exclusive), &wait)
+        });
+        // Waiter B: unbounded — must eventually be granted.
+        let mgr_b = Arc::clone(&mgr);
+        let b = std::thread::spawn(move || mgr_b.acquire(req(3, tag, LockMode::Exclusive)));
+
+        // Let A time out while the holder still holds the lock.
+        std::thread::sleep(Duration::from_millis(120));
+        let a_result = a.join().expect("waiter A thread");
+        assert!(matches!(a_result, Err(LockError::Timeout)), "{a_result:?}");
+
+        // Release: B must be granted.
+        mgr.release(xid(1), tag, LockMode::Exclusive);
+        b.join().expect("waiter B thread").expect("B granted");
+
+        let snap = mgr.inspect(tag).expect("entry must exist");
+        assert_eq!(snap.grants.len(), 1);
+        assert_eq!(snap.grants[0].0, xid(3));
+        assert!(snap.waiters.is_empty());
     }
 
     /// Deterministic prune/acquire race regression.

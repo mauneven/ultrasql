@@ -587,7 +587,12 @@ fn runtime_state_helpers_cover_sequences_advisory_and_validation() {
     let advisory = AdvisorySessionState::new(77);
     assert_eq!(
         advisory
-            .evaluate_function("pg_try_advisory_lock", &[Value::Int64(42)], &locks)
+            .evaluate_function(
+                "pg_try_advisory_lock",
+                &[Value::Int64(42)],
+                &locks,
+                &ultrasql_txn::LockWait::default(),
+            )
             .expect("try lock"),
         Value::Bool(true)
     );
@@ -596,25 +601,41 @@ fn runtime_state_helpers_cover_sequences_advisory_and_validation() {
             .evaluate_function(
                 "pg_advisory_unlock",
                 &[Value::Int32(0), Value::Int32(42)],
-                &locks
+                &locks,
+                &ultrasql_txn::LockWait::default(),
             )
             .expect("unlock"),
         Value::Bool(true)
     );
     assert_eq!(
         advisory
-            .evaluate_function("pg_advisory_unlock", &[Value::Int64(42)], &locks)
+            .evaluate_function(
+                "pg_advisory_unlock",
+                &[Value::Int64(42)],
+                &locks,
+                &ultrasql_txn::LockWait::default(),
+            )
             .expect("unlock missing"),
         Value::Bool(false)
     );
     assert!(
         advisory
-            .evaluate_function("pg_advisory_lock", &[Value::Text("x".to_owned())], &locks)
+            .evaluate_function(
+                "pg_advisory_lock",
+                &[Value::Text("x".to_owned())],
+                &locks,
+                &ultrasql_txn::LockWait::default(),
+            )
             .is_err()
     );
     assert!(
         advisory
-            .evaluate_function("pg_advisory_unlock_all", &[Value::Int32(1)], &locks)
+            .evaluate_function(
+                "pg_advisory_unlock_all",
+                &[Value::Int32(1)],
+                &locks,
+                &ultrasql_txn::LockWait::default(),
+            )
             .is_err()
     );
     assert_eq!(

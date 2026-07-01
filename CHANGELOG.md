@@ -39,6 +39,18 @@ and must document the break here.
   values, and `pg_settings` reports the session value with PostgreSQL's
   `superuser` context. Both remain configurable at startup via the existing
   CLI flags.
+- `lock_timeout` session GUC (`SET` / `SHOW` / `RESET`, milliseconds, default
+  `0` = disabled, PostgreSQL-faithful): a statement blocked waiting on a heap
+  row lock (`SELECT ... FOR UPDATE/SHARE`, `UPDATE`, `DELETE`, `MERGE`) or a
+  blocking advisory lock now fails with SQLSTATE `55P03`
+  ("canceling statement due to lock timeout") once the timeout elapses,
+  instead of waiting indefinitely. Blocking lock waits are now
+  deadline-aware end to end: a `statement_timeout` deadline or client
+  `CancelRequest` also interrupts a lock wait (SQLSTATE `57014`), and a
+  timed-out / cancelled waiter is always removed from the lock manager's
+  wait queue (no waiter leak). Additionally, a session that disconnects with
+  an explicit transaction still open now has that transaction aborted at
+  teardown, so its row locks release instead of blocking peers forever.
 - Read-only transactions: `BEGIN` and `SET TRANSACTION` now parse and honor
   `READ ONLY` / `READ WRITE` (and accept `[NOT] DEFERRABLE`, currently inert).
   A data-modifying statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE` /

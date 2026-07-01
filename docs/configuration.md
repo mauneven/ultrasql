@@ -18,7 +18,19 @@ stored per connection.
   value — including `0` to disable — and `RESET statement_timeout` restores
   the server default. Cancellation surfaces as SQLSTATE `57014`. Note this
   differs from PostgreSQL's shipped default of `0`; long-running analytical
-  or bulk-load sessions should raise or disable it explicitly.
+  or bulk-load sessions should raise or disable it explicitly. A
+  `statement_timeout` deadline (like a client `CancelRequest`) also
+  interrupts a statement blocked waiting on a row / relation / advisory
+  lock, again with `57014`.
+- `lock_timeout` (milliseconds, `SET lock_timeout = <ms>`) bounds how long a
+  statement may block waiting for a heap row lock (`SELECT ... FOR
+  UPDATE/SHARE`, `UPDATE`, `DELETE`, `MERGE`) or a blocking advisory lock
+  (`pg_advisory_lock`). Default `0` = disabled, matching PostgreSQL. On
+  expiry the statement fails with SQLSTATE `55P03` (`lock_not_available`,
+  "canceling statement due to lock timeout") and the timed-out waiter is
+  removed from the lock manager's wait queue; inside an explicit transaction
+  the block is aborted like any other statement error. The value is a plain
+  integer millisecond count (unit suffixes are not parsed yet).
 
 ## Memory
 

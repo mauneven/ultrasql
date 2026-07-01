@@ -91,18 +91,24 @@ impl AdvisorySessionState {
     }
 
     /// Evaluate a PostgreSQL advisory-lock function against this session.
+    ///
+    /// `lock_wait` bounds the blocking `pg_advisory_lock` wait: the
+    /// session's `lock_timeout` expiry surfaces as SQLSTATE `55P03` and a
+    /// statement-timeout / client cancel as `57014`, matching PostgreSQL
+    /// (`lock_timeout` applies to advisory locks too).
     pub fn evaluate_function(
         &self,
         name: &str,
         args: &[Value],
         lock_manager: &LockManager,
+        lock_wait: &ultrasql_txn::LockWait,
     ) -> Result<Value, ServerError> {
         match name {
             "pg_advisory_lock" => {
                 let Some(tag) = advisory_tag_from_values(name, args)? else {
                     return Ok(Value::Null);
                 };
-                self.lock(tag, lock_manager, name)?;
+                self.lock(tag, lock_manager, name, lock_wait)?;
                 Ok(Value::Null)
             }
             "pg_try_advisory_lock" => {
@@ -177,6 +183,7 @@ impl AdvisorySessionState {
         tag: LockTag,
         lock_manager: &LockManager,
         name: &str,
+        lock_wait: &ultrasql_txn::LockWait,
     ) -> Result<(), ServerError> {
         {
             let mut held = self.held.lock();
@@ -186,12 +193,23 @@ impl AdvisorySessionState {
             }
         }
         lock_manager
-            .acquire(LockRequest {
-                xid: self.owner,
-                tag,
-                mode: LockMode::Exclusive,
-            })
-            .map_err(|err| advisory_type_error(format!("{name}: {err}")))?;
+            .acquire_with_wait(
+                LockRequest {
+                    xid: self.owner,
+                    tag,
+                    mode: LockMode::Exclusive,
+                },
+                lock_wait,
+            )
+            .map_err(|err| match err {
+                ultrasql_txn::LockError::Timeout => {
+                    ServerError::LockNotAvailable(crate::txn_exec::LOCK_TIMEOUT_MESSAGE.to_owned())
+                }
+                ultrasql_txn::LockError::Cancelled => {
+                    ServerError::Execute(ultrasql_executor::ExecError::Cancelled)
+                }
+                other => advisory_type_error(format!("{name}: {other}")),
+            })?;
         self.held.lock().insert(tag, 1);
         Ok(())
     }

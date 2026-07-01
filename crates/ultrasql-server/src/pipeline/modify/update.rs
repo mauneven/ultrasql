@@ -209,10 +209,16 @@ fn try_build_fused_update(
             // frees it. When no savepoint is open these are equal.
             let lock_xid = ctx.lock_xid;
             let owner = ctx.xid;
+            let lock_wait = ctx.lock_wait();
             op.with_target_tids(target_tids).with_target_tid_lock(
                 move |tid| {
-                    let acquired =
-                        acquire_indexed_update_row_lock(&lock_manager, lock_xid, owner, tid)?;
+                    let acquired = acquire_indexed_update_row_lock(
+                        &lock_manager,
+                        lock_xid,
+                        owner,
+                        tid,
+                        &lock_wait,
+                    )?;
                     // Debug-only panic AFTER the per-tuple Exclusive lock is held,
                     // for the lock-leak isolation test. Keyed off the sentinel
                     // delta so it fires only for `SET col = col + <SENTINEL>`;
@@ -310,7 +316,8 @@ pub(super) fn acquire_indexed_update_row_lock(
     xid: Xid,
     owner: Xid,
     tid: TupleId,
-) -> Result<bool, String> {
+    lock_wait: &ultrasql_txn::LockWait,
+) -> Result<bool, ultrasql_executor::ExecError> {
     let req = ultrasql_txn::LockRequest {
         xid,
         tag: ultrasql_txn::LockTag::Tuple(tid),
@@ -319,12 +326,12 @@ pub(super) fn acquire_indexed_update_row_lock(
     match lock_manager.try_acquire_for_owner(req, owner) {
         Ok(true) => return Ok(false),
         Ok(false) => {}
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(classify_row_lock_wait_exec_error(e)),
     }
     let acquire = || {
         lock_manager
-            .acquire_for_owner(req, owner)
-            .map_err(|e| e.to_string())
+            .acquire_for_owner_with_wait(req, owner, lock_wait)
+            .map_err(classify_row_lock_wait_exec_error)
     };
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
@@ -337,40 +344,58 @@ pub(super) fn acquire_indexed_update_row_lock(
     Ok(true)
 }
 
+/// Classify a [`ultrasql_txn::LockError`] from a blocking row-lock wait
+/// into the executor error carrying the right SQLSTATE: deadlock victim →
+/// `40P01`, `lock_timeout` expiry → `55P03`, statement-timeout / client
+/// cancel → `57014`, anything else → `40001`. Shared by the fused indexed
+/// UPDATE path and the general EvalPlanQual path so all write-side lock
+/// waits classify identically.
+pub(super) fn classify_row_lock_wait_exec_error(
+    e: ultrasql_txn::LockError,
+) -> ultrasql_executor::ExecError {
+    use ultrasql_executor::ExecError;
+    use ultrasql_txn::LockError;
+    match e {
+        LockError::Deadlock { .. } => ExecError::DeadlockDetected(e.to_string()),
+        LockError::Timeout => {
+            ExecError::LockNotAvailable(crate::txn_exec::LOCK_TIMEOUT_MESSAGE.to_owned())
+        }
+        LockError::Cancelled => ExecError::Cancelled,
+        other => ExecError::SerializationFailure(other.to_string()),
+    }
+}
+
 /// Acquire the blocking, deadlock-aware Exclusive tuple lock for the general
 /// UPDATE / DELETE EvalPlanQual path, classifying the outcome so the server
-/// surfaces the right SQLSTATE: a lock-wait cycle victim becomes
-/// [`ExecError::DeadlockDetected`] (→ 40P01) and every other lock-manager
-/// failure becomes [`ExecError::SerializationFailure`] (→ 40001). Reuses the
-/// same `LockManager` `try_acquire` / blocking `acquire` path the fused fast
-/// path and `SELECT ... FOR UPDATE` use, so all three serialize on the same
-/// `LockTag::Tuple` grants.
+/// surfaces the right SQLSTATE (see [`classify_row_lock_wait_exec_error`]):
+/// a lock-wait cycle victim → 40P01, a `lock_timeout` expiry → 55P03, a
+/// statement-timeout / client cancel → 57014, and every other lock-manager
+/// failure → 40001. Reuses the same `LockManager` `try_acquire` / blocking
+/// `acquire` path the fused fast path and `SELECT ... FOR UPDATE` use, so all
+/// three serialize on the same `LockTag::Tuple` grants; the blocking wait is
+/// bounded by the statement's [`ultrasql_txn::LockWait`] options.
 pub(super) fn acquire_eval_plan_qual_row_lock(
     lock_manager: &ultrasql_txn::LockManager,
     xid: Xid,
     owner: Xid,
     tid: TupleId,
+    lock_wait: &ultrasql_txn::LockWait,
 ) -> Result<bool, ultrasql_executor::ExecError> {
-    use ultrasql_executor::ExecError;
-    use ultrasql_txn::LockError;
-
     let req = ultrasql_txn::LockRequest {
         xid,
         tag: ultrasql_txn::LockTag::Tuple(tid),
         mode: ultrasql_txn::LockMode::Exclusive,
     };
-    let classify = |e: LockError| -> ExecError {
-        match e {
-            LockError::Deadlock { .. } => ExecError::DeadlockDetected(e.to_string()),
-            other => ExecError::SerializationFailure(other.to_string()),
-        }
-    };
     match lock_manager.try_acquire_for_owner(req, owner) {
         Ok(true) => return Ok(false),
         Ok(false) => {}
-        Err(e) => return Err(classify(e)),
+        Err(e) => return Err(classify_row_lock_wait_exec_error(e)),
     }
-    let acquire = || lock_manager.acquire_for_owner(req, owner).map_err(classify);
+    let acquire = || {
+        lock_manager
+            .acquire_for_owner_with_wait(req, owner, lock_wait)
+            .map_err(classify_row_lock_wait_exec_error)
+    };
     if matches!(
         tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
         Ok(tokio::runtime::RuntimeFlavor::MultiThread)

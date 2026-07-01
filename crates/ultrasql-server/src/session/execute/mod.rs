@@ -303,15 +303,21 @@ fn parse_work_mem_bytes(value: &str) -> Result<u64, ServerError> {
 }
 
 fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
+    parse_ms_guc(value, "invalid statement_timeout")
+}
+
+/// Parse a non-negative millisecond GUC value (`statement_timeout`,
+/// `lock_timeout`); `0` means disabled.
+fn parse_ms_guc(value: &str, invalid: &'static str) -> Result<u64, ServerError> {
     let trimmed = value.trim();
     if let Some(stripped) = trimmed.strip_prefix('-') {
         if !stripped.is_empty() {
-            return Err(ServerError::Unsupported("invalid statement_timeout"));
+            return Err(ServerError::Unsupported(invalid));
         }
     }
     trimmed
         .parse::<u64>()
-        .map_err(|_| ServerError::Unsupported("invalid statement_timeout"))
+        .map_err(|_| ServerError::Unsupported(invalid))
 }
 
 /// Parse a `SET log_statement` value: the four PostgreSQL statement
