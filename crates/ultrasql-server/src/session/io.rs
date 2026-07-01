@@ -7,10 +7,11 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ultrasql_protocol::{
     BackendMessage, FrontendMessage, decode_frontend, decode_frontend_raw, encode_backend,
+    error_fields,
 };
 
 use super::Session;
-use crate::error::ServerError;
+use crate::error::{ServerError, split_message_hint};
 
 impl<RW> Session<RW>
 where
@@ -55,20 +56,17 @@ where
         Ok(())
     }
 
-    /// Send a wire `ErrorResponse`. The fields are
-    /// the minimal set every libpq client expects: severity, code,
-    /// message.
+    /// Send a wire `ErrorResponse` with the structured field set
+    /// (`S`, `V`, `C`, `M`, and `H` when the message carries a jammed
+    /// `HINT:` line — see [`split_message_hint`]).
     pub(crate) async fn send_error(
         &mut self,
         message: &str,
         sqlstate: &str,
     ) -> Result<(), ServerError> {
+        let (primary, hint) = split_message_hint(message);
         let msg = BackendMessage::ErrorResponse {
-            fields: vec![
-                (b'S', "ERROR".to_string()),
-                (b'C', sqlstate.to_string()),
-                (b'M', message.to_string()),
-            ],
+            fields: error_fields("ERROR", sqlstate, primary, None, hint),
         };
         self.send(&msg).await
     }

@@ -199,11 +199,14 @@ async fn parse_error_reports_error_response() {
         .expect("error response present");
     match err {
         BackendMessage::ErrorResponse { fields } => {
-            // Severity, code, and message fields are populated.
+            // Severity (localized and non-localized), code, and message
+            // fields are populated, in PostgreSQL's canonical order.
             let codes: Vec<u8> = fields.iter().map(|(c, _)| *c).collect();
-            assert!(codes.contains(&b'S'));
-            assert!(codes.contains(&b'C'));
-            assert!(codes.contains(&b'M'));
+            assert_eq!(
+                codes.iter().take(4).copied().collect::<Vec<_>>(),
+                vec![b'S', b'V', b'C', b'M'],
+                "canonical S,V,C,M prefix"
+            );
         }
         _ => unreachable!(),
     }

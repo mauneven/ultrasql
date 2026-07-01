@@ -470,3 +470,35 @@ pub enum BackendMessage {
         payload: String,
     },
 }
+
+/// Build the canonical `ErrorResponse` / `NoticeResponse` field list in
+/// PostgreSQL's transmission order: `S` (localized severity), `V`
+/// (non-localized severity, protocol 3.0 §"Error and Notice Message
+/// Fields"), `C` (SQLSTATE), `M` (primary message), then the optional
+/// `D` (detail) and `H` (hint) fields.
+///
+/// UltraSQL never localizes severities, so `V` always carries the same
+/// text as `S` — but both are emitted because drivers built against
+/// PostgreSQL ≥ 9.6 read `V` preferentially.
+#[must_use]
+pub fn error_fields(
+    severity: &str,
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+) -> Vec<(u8, String)> {
+    let mut fields = vec![
+        (b'S', severity.to_owned()),
+        (b'V', severity.to_owned()),
+        (b'C', code.to_owned()),
+        (b'M', message.to_owned()),
+    ];
+    if let Some(detail) = detail {
+        fields.push((b'D', detail.to_owned()));
+    }
+    if let Some(hint) = hint {
+        fields.push((b'H', hint.to_owned()));
+    }
+    fields
+}

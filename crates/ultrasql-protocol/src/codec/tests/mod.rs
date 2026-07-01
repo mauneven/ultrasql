@@ -438,6 +438,54 @@ fn error_response_round_trip() {
 }
 
 #[test]
+fn error_fields_builder_round_trip_with_detail_and_hint() {
+    let msg = BackendMessage::ErrorResponse {
+        fields: crate::messages::error_fields(
+            "ERROR",
+            "0A000",
+            "cursor WITH HOLD is not supported",
+            Some("holdable cursors outlive their transaction"),
+            Some("declare the cursor WITHOUT HOLD"),
+        ),
+    };
+    assert_eq!(round_trip_backend(&msg), msg);
+}
+
+/// Byte-level golden test for the structured `ErrorResponse` encoding:
+/// the fields appear in PostgreSQL's canonical order (`S`, `V`, `C`,
+/// `M`, then optional `D`, `H`), each value is NUL-terminated, and the
+/// field list itself is terminated by a single zero byte.
+#[test]
+fn error_response_field_order_and_nul_termination() {
+    let msg = BackendMessage::ErrorResponse {
+        fields: crate::messages::error_fields("ERROR", "0A000", "msg", Some("det"), Some("hnt")),
+    };
+    let mut buf = BytesMut::new();
+    encode_backend(&msg, &mut buf);
+
+    assert_eq!(buf[0], b'E', "ErrorResponse tag");
+    let payload = &buf[5..];
+    let expected: &[u8] = b"SERROR\0VERROR\0C0A000\0Mmsg\0Ddet\0Hhnt\0\0";
+    assert_eq!(payload, expected, "canonical S,V,C,M,D,H layout");
+    // Framed length covers the length word + payload.
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    assert_eq!(len, 4 + expected.len());
+}
+
+/// Without detail/hint the optional `D`/`H` fields are omitted
+/// entirely rather than sent empty.
+#[test]
+fn error_response_omits_absent_detail_and_hint() {
+    let msg = BackendMessage::ErrorResponse {
+        fields: crate::messages::error_fields("FATAL", "28P01", "no", None, None),
+    };
+    let mut buf = BytesMut::new();
+    encode_backend(&msg, &mut buf);
+    let payload = &buf[5..];
+    assert_eq!(payload, b"SFATAL\0VFATAL\0C28P01\0Mno\0\0".as_slice());
+}
+
+#[test]
 fn empty_query_round_trip() {
     assert_eq!(
         round_trip_backend(&BackendMessage::EmptyQueryResponse),

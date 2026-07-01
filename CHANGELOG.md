@@ -8,6 +8,15 @@ and must document the break here.
 
 ### Added
 
+- Structured wire `ErrorResponse` fields: every server error now carries the
+  non-localized severity (`V`) alongside `S`/`C`/`M`, in PostgreSQL's canonical
+  field order, and advice that used to be jammed into the message text as a
+  `\nHINT:` line (most visibly the `0A000` transactional-DDL rejection) now
+  travels in the dedicated `H` (hint) field. psql renders it as its own
+  `HINT:` line and drivers surface it via their `hint()` accessors; the
+  primary message (`M`) contains only the primary text. The encoder also
+  supports an optional `D` (detail) field; no details or hints are invented
+  for errors that never had them.
 - Read-only transactions: `BEGIN` and `SET TRANSACTION` now parse and honor
   `READ ONLY` / `READ WRITE` (and accept `[NOT] DEFERRABLE`, currently inert).
   A data-modifying statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE` /

@@ -6,11 +6,20 @@
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info};
-use ultrasql_protocol::{BackendMessage, FrontendMessage};
+use ultrasql_protocol::{BackendMessage, FrontendMessage, error_fields};
 
 use super::Session;
 use crate::auth::pg_authid::AuthCatalog;
 use crate::error::ServerError;
+
+/// Build a `FATAL` `ErrorResponse` for the startup/authentication phase
+/// with the structured `S`/`V`/`C`/`M` field set. Startup failures never
+/// carry a detail or hint; the connection closes right after the reply.
+fn fatal_error(code: &str, message: &str) -> BackendMessage {
+    BackendMessage::ErrorResponse {
+        fields: error_fields("FATAL", code, message, None, None),
+    }
+}
 
 impl<RW> Session<RW>
 where
@@ -111,18 +120,10 @@ where
             // error. The reply is best-effort — if it fails we still
             // propagate the original UnsupportedProtocol error.
             let _ = self
-                .send(&BackendMessage::ErrorResponse {
-                    fields: vec![
-                        (b'S', "FATAL".to_string()),
-                        (b'C', "08P01".to_string()),
-                        (
-                            b'M',
-                            format!(
-                                "unsupported frontend protocol {major}.{minor}; server supports 3.0"
-                            ),
-                        ),
-                    ],
-                })
+                .send(&fatal_error(
+                    "08P01",
+                    &format!("unsupported frontend protocol {major}.{minor}; server supports 3.0"),
+                ))
                 .await;
             return Err(ServerError::UnsupportedProtocol { major, minor });
         }
@@ -181,13 +182,7 @@ where
                     .unwrap_or("");
                 if presented_user != username {
                     let _ = self
-                        .send(&BackendMessage::ErrorResponse {
-                            fields: vec![
-                                (b'S', "FATAL".to_string()),
-                                (b'C', "28P01".to_string()),
-                                (b'M', "password authentication failed".to_string()),
-                            ],
-                        })
+                        .send(&fatal_error("28P01", "password authentication failed"))
                         .await;
                     return Err(ServerError::AuthFailed);
                 }
@@ -200,13 +195,7 @@ where
                     other => {
                         debug!(target: "ultrasqld", ?other, "expected Password message");
                         let _ = self
-                            .send(&BackendMessage::ErrorResponse {
-                                fields: vec![
-                                    (b'S', "FATAL".to_string()),
-                                    (b'C', "08P01".to_string()),
-                                    (b'M', "expected Password message".to_string()),
-                                ],
-                            })
+                            .send(&fatal_error("08P01", "expected Password message"))
                             .await;
                         return Err(ServerError::AuthFailed);
                     }
@@ -214,13 +203,7 @@ where
                 let expected = crate::auth::md5::compute_md5_response(password, username, &salt);
                 if !crate::auth::md5::verify_md5_response(&expected, &supplied) {
                     let _ = self
-                        .send(&BackendMessage::ErrorResponse {
-                            fields: vec![
-                                (b'S', "FATAL".to_string()),
-                                (b'C', "28P01".to_string()),
-                                (b'M', "password authentication failed".to_string()),
-                            ],
-                        })
+                        .send(&fatal_error("28P01", "password authentication failed"))
                         .await;
                     return Err(ServerError::AuthFailed);
                 }
@@ -238,13 +221,7 @@ where
                     presented_user == username && self.authenticate_scram(verifier).await?;
                 if !authenticated {
                     let _ = self
-                        .send(&BackendMessage::ErrorResponse {
-                            fields: vec![
-                                (b'S', "FATAL".to_string()),
-                                (b'C', "28P01".to_string()),
-                                (b'M', "password authentication failed".to_string()),
-                            ],
-                        })
+                        .send(&fatal_error("28P01", "password authentication failed"))
                         .await;
                     return Err(ServerError::AuthFailed);
                 }
@@ -259,13 +236,7 @@ where
                     .to_owned();
                 if !self.authenticate_hba(hba, &database).await? {
                     let _ = self
-                        .send(&BackendMessage::ErrorResponse {
-                            fields: vec![
-                                (b'S', "FATAL".to_string()),
-                                (b'C', "28P01".to_string()),
-                                (b'M', "authentication failed".to_string()),
-                            ],
-                        })
+                        .send(&fatal_error("28P01", "authentication failed"))
                         .await;
                     return Err(ServerError::AuthFailed);
                 }
@@ -288,36 +259,24 @@ where
                 .is_none()
         {
             let _ = self
-                .send(&BackendMessage::ErrorResponse {
-                    fields: vec![
-                        (b'S', "FATAL".to_string()),
-                        (b'C', "42939".to_string()),
-                        (
-                            b'M',
-                            format!(
-                                "role name \"{}\" is reserved; the \"{}\" prefix is for system roles",
-                                self.auth_user,
-                                crate::auth::RESERVED_ROLE_PREFIX
-                            ),
-                        ),
-                    ],
-                })
+                .send(&fatal_error(
+                    "42939",
+                    &format!(
+                        "role name \"{}\" is reserved; the \"{}\" prefix is for system roles",
+                        self.auth_user,
+                        crate::auth::RESERVED_ROLE_PREFIX
+                    ),
+                ))
                 .await;
             return Err(ServerError::AuthFailed);
         }
         if let Some(role) = self.state.role_catalog.lookup_role(&self.auth_user) {
             if !role.can_login {
                 let _ = self
-                    .send(&BackendMessage::ErrorResponse {
-                        fields: vec![
-                            (b'S', "FATAL".to_string()),
-                            (b'C', "28000".to_string()),
-                            (
-                                b'M',
-                                format!("role {} is not permitted to log in", self.auth_user),
-                            ),
-                        ],
-                    })
+                    .send(&fatal_error(
+                        "28000",
+                        &format!("role {} is not permitted to log in", self.auth_user),
+                    ))
                     .await;
                 return Err(ServerError::AuthFailed);
             }
@@ -326,16 +285,10 @@ where
                 .is_some_and(|valid_until| valid_until <= chrono::Utc::now().timestamp_micros())
             {
                 let _ = self
-                    .send(&BackendMessage::ErrorResponse {
-                        fields: vec![
-                            (b'S', "FATAL".to_string()),
-                            (b'C', "28000".to_string()),
-                            (
-                                b'M',
-                                format!("role {} password has expired", self.auth_user),
-                            ),
-                        ],
-                    })
+                    .send(&fatal_error(
+                        "28000",
+                        &format!("role {} password has expired", self.auth_user),
+                    ))
                     .await;
                 return Err(ServerError::AuthFailed);
             }
@@ -345,19 +298,13 @@ where
                 .try_acquire(&role.name, role.connection_limit)
             {
                 let _ = self
-                    .send(&BackendMessage::ErrorResponse {
-                        fields: vec![
-                            (b'S', "FATAL".to_string()),
-                            (b'C', "53300".to_string()),
-                            (
-                                b'M',
-                                format!(
-                                    "role {} connection limit {} exceeded; {} sessions already active",
-                                    err.role, err.limit, err.active
-                                ),
-                            ),
-                        ],
-                    })
+                    .send(&fatal_error(
+                        "53300",
+                        &format!(
+                            "role {} connection limit {} exceeded; {} sessions already active",
+                            err.role, err.limit, err.active
+                        ),
+                    ))
                     .await;
                 return Err(ServerError::AuthFailed);
             }

@@ -264,6 +264,34 @@ impl ServerError {
     }
 }
 
+/// Split a rendered error message into its primary text and an
+/// optional PostgreSQL-style hint.
+///
+/// Several [`ServerError`] variants (and dynamic messages built by DDL
+/// gates) carry advice as a `\nHINT:` line jammed into the display
+/// text. On the wire that advice belongs in the dedicated `H` field of
+/// `ErrorResponse` — psql then renders it as its own `HINT:` line and
+/// drivers expose it via their `hint()` accessors — while the `M`
+/// field carries only the primary message. Every server error-send
+/// path routes through this splitter so existing jammed hints migrate
+/// without touching each construction site.
+///
+/// Messages without a `\nHINT:` line pass through unchanged.
+#[must_use]
+pub fn split_message_hint(message: &str) -> (&str, Option<&str>) {
+    match message.split_once("\nHINT:") {
+        Some((primary, hint)) => {
+            let hint = hint.trim();
+            if hint.is_empty() {
+                (primary.trim_end(), None)
+            } else {
+                (primary.trim_end(), Some(hint))
+            }
+        }
+        None => (message, None),
+    }
+}
+
 impl ServerError {
     /// `true` if this error should be reported to the client as a
     /// query-scoped `ErrorResponse` and the session continued.
@@ -557,6 +585,36 @@ mod tests {
             msg.contains("HINT:") && msg.contains("autocommit"),
             "message carries an autocommit hint: {msg}"
         );
+    }
+
+    #[test]
+    fn split_message_hint_extracts_jammed_hint() {
+        // The DDL-in-txn error is the canonical jammed-hint carrier: the
+        // wire path must place the advice in the H field, leaving M with
+        // only the primary message.
+        let rendered = ServerError::DdlInTransaction.to_string();
+        let (message, hint) = split_message_hint(&rendered);
+        assert_eq!(
+            message,
+            "DDL inside an explicit transaction block is not yet supported"
+        );
+        let hint = hint.expect("DDL-in-txn carries a hint");
+        assert!(
+            hint.contains("autocommit") && !hint.contains("HINT"),
+            "hint text is the advice itself, without the HINT: prefix: {hint}"
+        );
+    }
+
+    #[test]
+    fn split_message_hint_passes_plain_messages_through() {
+        let (message, hint) = split_message_hint("current transaction is aborted");
+        assert_eq!(message, "current transaction is aborted");
+        assert!(hint.is_none());
+
+        // A trailing HINT: with no advice is dropped, not sent empty.
+        let (message, hint) = split_message_hint("boom\nHINT:   ");
+        assert_eq!(message, "boom");
+        assert!(hint.is_none());
     }
 
     #[test]

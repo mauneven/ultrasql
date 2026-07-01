@@ -1477,21 +1477,18 @@ async fn ddl_in_explicit_transaction_is_feature_not_supported_with_hint() {
         "DDL-in-transaction must report feature_not_supported: {err}"
     );
 
-    // The failure is honest: it names the construct and carries a HINT
-    // pointing at autocommit. The server reports errors through a uniform
-    // (message, sqlstate) path with no separate wire HINT field, so the
-    // hint travels in the message text; assert both halves are present.
-    let message = err
-        .as_db_error()
-        .map(tokio_postgres::error::DbError::message)
-        .unwrap_or("");
+    // The failure is honest: it names the construct in the primary
+    // message and carries the autocommit advice in the dedicated wire
+    // HINT (`H`) field, exactly as psql renders PostgreSQL errors.
+    let db = err.as_db_error().expect("wire error carries DbError");
     assert!(
-        message.contains("DDL inside an explicit transaction block is not yet supported"),
+        db.message()
+            .contains("DDL inside an explicit transaction block is not yet supported"),
         "message names the rejected construct: {err}"
     );
     assert!(
-        message.contains("HINT:") && message.contains("autocommit"),
-        "rejection carries an autocommit hint: message={message:?}, err={err}"
+        db.hint().is_some_and(|hint| hint.contains("autocommit")),
+        "rejection carries an autocommit hint in the H field: err={err}"
     );
 
     // Per PostgreSQL semantics the block is now Failed: subsequent

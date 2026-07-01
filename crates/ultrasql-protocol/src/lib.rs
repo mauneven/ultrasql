@@ -59,4 +59,4 @@ pub use codec::{
     decode_backend, decode_frontend, decode_frontend_raw, encode_backend, encode_frontend,
 };
 pub use error::ProtocolError;
-pub use messages::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage};
+pub use messages::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage, error_fields};

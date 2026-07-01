@@ -12,14 +12,14 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 use ultrasql_parser::Parser;
-use ultrasql_protocol::{BackendMessage, FrontendMessage, encode_backend};
+use ultrasql_protocol::{BackendMessage, FrontendMessage, encode_backend, error_fields};
 
 use super::AutocommitAbortGuard;
 use super::Session;
 use super::notify::ReadOrNotify;
 use super::timeout::StatementTimeoutGuard;
 use crate::TxnState;
-use crate::error::ServerError;
+use crate::error::{ServerError, split_message_hint};
 use crate::result_encoder::SelectResult;
 use crate::workload::WorkloadQueryRecordRef;
 
@@ -90,16 +90,13 @@ where
                             // are released, then tell the client why.
                             let _ = self.execute_rollback();
                             self.send(&BackendMessage::ErrorResponse {
-                                fields: vec![
-                                    (b'S', "FATAL".to_owned()),
-                                    (b'V', "FATAL".to_owned()),
-                                    (b'C', "25P03".to_owned()),
-                                    (
-                                        b'M',
-                                        "terminating connection due to idle-in-transaction timeout"
-                                            .to_owned(),
-                                    ),
-                                ],
+                                fields: error_fields(
+                                    "FATAL",
+                                    "25P03",
+                                    "terminating connection due to idle-in-transaction timeout",
+                                    None,
+                                    None,
+                                ),
                             })
                             .await?;
                         } else {
@@ -551,13 +548,10 @@ where
     }
 
     fn encode_error_response(scratch: &mut BytesMut, message: &str, sqlstate: &str) {
+        let (primary, hint) = split_message_hint(message);
         encode_backend(
             &BackendMessage::ErrorResponse {
-                fields: vec![
-                    (b'S', "ERROR".to_string()),
-                    (b'C', sqlstate.to_string()),
-                    (b'M', message.to_string()),
-                ],
+                fields: error_fields("ERROR", sqlstate, primary, None, hint),
             },
             scratch,
         );
@@ -953,12 +947,9 @@ where
         message: &str,
         sqlstate: &str,
     ) -> Result<(), ServerError> {
+        let (primary, hint) = split_message_hint(message);
         let err = BackendMessage::ErrorResponse {
-            fields: vec![
-                (b'S', "ERROR".to_string()),
-                (b'C', sqlstate.to_string()),
-                (b'M', message.to_string()),
-            ],
+            fields: error_fields("ERROR", sqlstate, primary, None, hint),
         };
         let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),

@@ -29,11 +29,7 @@ use super::*;
 /// drivers see the same behaviour they expect from PostgreSQL.
 pub(crate) fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
     BackendMessage::NoticeResponse {
-        fields: vec![
-            (b'S', "WARNING".to_string()),
-            (b'C', sqlstate.to_string()),
-            (b'M', message.to_string()),
-        ],
+        fields: ultrasql_protocol::error_fields("WARNING", sqlstate, message, None, None),
     }
 }
 
