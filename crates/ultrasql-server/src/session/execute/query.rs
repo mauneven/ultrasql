@@ -75,7 +75,12 @@ where
             return self.execute_backup_function(function_name);
         }
         if self.state.is_standby_mode() && !Self::hot_standby_allows(trimmed) {
-            return Err(ServerError::Unsupported("hot standby is read-only"));
+            // A standby is read-only: reject writes with SQLSTATE 25006 so libpq
+            // clients and pools recognize it as read-only rather than a generic
+            // failure (PostgreSQL hot-standby behavior).
+            return Err(ServerError::ReadOnlyTransaction(
+                Self::standby_write_command(trimmed),
+            ));
         }
         if let Some(table) = self.try_parse_analyze_target(trimmed) {
             return self.execute_analyze(table.as_deref());

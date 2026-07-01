@@ -611,6 +611,23 @@ where
             .portals
             .get(portal)
             .and_then(|p| p.plan.clone());
+        // Hot-standby read-only enforcement (SQLSTATE 25006) for the
+        // extended-query path. Simple queries are caught by the text-level gate
+        // in `execute_query`, but Bind/Execute bypasses it, so a standby must
+        // reject data-modifying portals here too. Cheap on a primary: a single
+        // relaxed atomic load that short-circuits to false before touching the
+        // plan (and read plans return `None`, so reads always pass).
+        if self.state.is_standby_mode()
+            && let Some(plan) = portal_plan.as_ref()
+            && let Some(command) = Self::read_only_violation_command(plan)
+        {
+            if let TxnState::InTransaction(txn) =
+                std::mem::replace(&mut self.txn_state, TxnState::Idle)
+            {
+                self.txn_state = TxnState::Failed(txn);
+            }
+            return Err(ServerError::ReadOnlyTransaction(command));
+        }
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
                 if let Some(plan) = portal_plan.as_ref() {

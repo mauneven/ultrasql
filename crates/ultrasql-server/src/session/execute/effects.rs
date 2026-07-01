@@ -413,4 +413,30 @@ where
             || upper.starts_with("VALUES")
             || (upper.starts_with("COPY") && upper.contains(" TO "))
     }
+
+    /// Best-effort command label for a statement rejected on a hot standby, used
+    /// in the SQLSTATE 25006 (`read_only_sql_transaction`) error message. Returns
+    /// the leading keyword when recognized, otherwise a generic fallback.
+    pub(crate) fn standby_write_command(trimmed_sql: &str) -> &'static str {
+        let verb = trimmed_sql
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        match verb.as_str() {
+            "INSERT" => "INSERT",
+            "UPDATE" => "UPDATE",
+            "DELETE" => "DELETE",
+            "MERGE" => "MERGE",
+            "CREATE" => "CREATE",
+            "DROP" => "DROP",
+            "ALTER" => "ALTER",
+            "TRUNCATE" => "TRUNCATE",
+            "COPY" => "COPY",
+            "GRANT" => "GRANT",
+            "REVOKE" => "REVOKE",
+            "REINDEX" => "REINDEX",
+            _ => "this statement",
+        }
+    }
 }
