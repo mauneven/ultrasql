@@ -275,6 +275,41 @@ fn duplicate_insert_returns_duplicate_key_error() {
 }
 
 #[test]
+fn lookup_all_point_probe_reads_one_descent_not_the_whole_leaf_chain() {
+    // Regression: `lookup_all` used to enter at the LEFTMOST leaf and walk
+    // every right-link, so a point probe on an N-leaf index cost O(N) page
+    // reads. It must descend by key: O(depth) reads for a unique key.
+    let pool = Arc::new(BufferPool::new(4096, MapLoader::new()));
+    let mut tree = BTree::create(Arc::clone(&pool), RelationId::new(42)).expect("create btree");
+    // 4096 distinct keys → hundreds of leaves at the current leaf fanout.
+    for key in 0_i64..4096 {
+        let block = u32::try_from(key).expect("block fits u32");
+        tree.insert::<i64>(key, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+
+    let before = pool.stats().gets;
+    let found = tree.lookup_all::<i64>(2048).unwrap();
+    let gets = pool.stats().gets - before;
+
+    assert_eq!(found, vec![tid(2048, 0)]);
+    assert!(
+        gets <= 8,
+        "point lookup_all must be O(tree depth) page reads, used {gets} \
+         (a leaf-chain scan reads hundreds of pages here)"
+    );
+
+    // An absent key is just as cheap and returns nothing.
+    let before = pool.stats().gets;
+    assert!(tree.lookup_all::<i64>(1_000_000).unwrap().is_empty());
+    let gets = pool.stats().gets - before;
+    assert!(
+        gets <= 8,
+        "absent-key probe must also be O(depth), used {gets}"
+    );
+}
+
+#[test]
 fn non_unique_insert_allows_duplicate_keys_and_lookup_all_returns_every_tid() {
     let mut tree = make_tree();
     for block in 1_u32..=40 {

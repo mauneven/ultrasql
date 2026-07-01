@@ -18,7 +18,7 @@ use crate::buffer_pool::PageLoader;
 use crate::wal_sink::WalSink;
 
 use super::node::{DescendStep, LeafProbe, NodeMeta, probe_leaf, read_leaf_entries, step_descend};
-use super::{BTree, BTreeError, Key, NO_SIBLING};
+use super::{BTree, BTreeError, Key};
 
 impl<L: PageLoader> BTree<L> {
     /// Point lookup. Returns `None` if the key is absent.
@@ -41,9 +41,11 @@ impl<L: PageLoader> BTree<L> {
     ///
     /// Non-unique indexes store duplicate keys as adjacent leaf entries, but
     /// duplicate groups may cross leaf splits because internal separators only
-    /// carry the logical key. To keep duplicate probes correct, this method
-    /// walks the leaf chain from the leftmost leaf and collects every matching
-    /// key.
+    /// carry the logical key. This descends to the leftmost leaf that can
+    /// contain `key`, then follows right-links only while the equal-key run
+    /// can continue (`key >= high_key`), so a point probe costs
+    /// O(depth + run-leaves) page reads instead of scanning the whole leaf
+    /// chain.
     pub fn lookup_all<K: Key>(&self, key: K) -> Result<Vec<TupleId>, BTreeError> {
         let op_latch = Arc::clone(&self.op_latch);
         let _op_guard = op_latch.read();
@@ -54,15 +56,23 @@ impl<L: PageLoader> BTree<L> {
         key.encode(&mut buf);
         let raw_key = read_i64_le(&buf).map_err(|_| BTreeError::MalformedNode("key encode"))?;
 
+        // Descend to the leftmost leaf that can hold `raw_key` (a duplicate
+        // run can start on the left side of a same-key split), then walk
+        // right-links only while the run can continue (Lehman-Yao chase:
+        // `key >= high_key`). O(depth + run-leaves) page reads — a point
+        // lookup touches one root-to-leaf path, never the whole leaf chain.
         let root = *self.root_block.lock();
-        let mut current = Some(leftmost_leaf(self, root)?);
+        let mut current = self.descend_to_leftmost_leaf_for_key(root, raw_key)?;
         let mut out = Vec::new();
-        while let Some(leaf) = current {
-            let guard = self.pool.get_page_relieved(self.page_id(leaf))?;
-            let (entries, right_link) = {
+        loop {
+            let guard = self.pool.get_page_relieved(self.page_id(current))?;
+            let (entries, chase) = {
                 let r = guard.read();
                 let meta = NodeMeta::read_from(&r)?;
-                (read_leaf_entries(&r, meta.n_keys)?, meta.right_link)
+                (
+                    read_leaf_entries(&r, meta.n_keys)?,
+                    super::node::should_chase_right(meta, raw_key),
+                )
             };
             drop(guard);
             for entry in entries {
@@ -70,11 +80,10 @@ impl<L: PageLoader> BTree<L> {
                     out.push(entry.value);
                 }
             }
-            current = if right_link == NO_SIBLING {
-                None
-            } else {
-                Some(BlockNumber::new(right_link))
-            };
+            match chase {
+                Some(next) => current = BlockNumber::new(next),
+                None => break,
+            }
         }
         Ok(out)
     }
