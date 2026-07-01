@@ -199,6 +199,14 @@ pub struct BufferPoolRelationStats {
 pub struct BufferPool<L: PageLoader> {
     frames: Vec<CachePadded<Frame>>,
     page_table: DashMap<PageId, usize>,
+    /// Monotone per-relation high-water mark of every block number that has
+    /// ever been resident. Maintained with one `fetch_max` on the page-table
+    /// install path (misses only) so [`BufferPool::max_resident_block`] is
+    /// O(1) instead of an O(resident) scan; never lowered on eviction — its
+    /// only consumer is a block-allocation floor, where a monotone
+    /// over-approximation is strictly safer (it can only leave gaps, never
+    /// collide).
+    max_resident_blocks: DashMap<RelationId, AtomicU32>,
     loader: L,
     clock_hand: AtomicUsize,
     /// Serializes miss installation so one `PageId` cannot be loaded
@@ -321,6 +329,7 @@ impl<L: PageLoader> BufferPool<L> {
         Self {
             frames,
             page_table: DashMap::with_capacity(capacity),
+            max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
             miss_lock: Mutex::new(()),
@@ -360,6 +369,7 @@ impl<L: PageLoader> BufferPool<L> {
         Self {
             frames,
             page_table: DashMap::with_capacity(capacity),
+            max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
             miss_lock: Mutex::new(()),
@@ -421,13 +431,9 @@ impl<L: PageLoader> BufferPool<L> {
     /// wired into the B-tree layer.
     #[must_use]
     pub fn max_resident_block(&self, rel: RelationId) -> Option<BlockNumber> {
-        self.page_table
-            .iter()
-            .filter_map(|entry| {
-                let page_id = *entry.key();
-                (page_id.relation == rel).then_some(page_id.block)
-            })
-            .max()
+        self.max_resident_blocks
+            .get(&rel)
+            .map(|max| BlockNumber::new(max.load(Ordering::Acquire)))
     }
 
     /// Return the shared operation latch for one B-tree relation.
@@ -689,6 +695,12 @@ impl<L: PageLoader> BufferPool<L> {
             frame.pin_count.fetch_add(1, Ordering::AcqRel);
         }
         self.page_table.insert(page_id, frame_idx);
+        // Monotone per-relation block high-water mark (see field docs). Runs
+        // on the miss/install path only, never on the resident-hit path.
+        self.max_resident_blocks
+            .entry(page_id.relation)
+            .or_insert_with(|| AtomicU32::new(page_id.block.raw()))
+            .fetch_max(page_id.block.raw(), Ordering::AcqRel);
         Ok(PageGuard {
             pool: Arc::clone(self),
             frame_idx,
@@ -1227,6 +1239,26 @@ mod tests {
             w.set_lsn(42);
         }
         assert_eq!(g.read().header().lsn, 42);
+    }
+
+    #[test]
+    fn max_resident_block_tracks_high_water_mark_and_survives_eviction() {
+        let pool = Arc::new(BufferPool::new(2, BlankLoader));
+        let rel = RelationId::new(1);
+        assert!(pool.max_resident_block(rel).is_none());
+
+        // Touch blocks 0..8 through a 2-frame pool: most get evicted, but
+        // the allocation-floor high-water mark must keep the maximum ever
+        // resident (a monotone over-approximation can only leave gaps; a
+        // lowered floor could hand out an existing block number).
+        for block in 0_u32..8 {
+            drop(pool.get_page(pid(block)).unwrap());
+        }
+        assert_eq!(pool.max_resident_block(rel), Some(BlockNumber::new(7)));
+
+        // Another relation's residency is tracked independently.
+        let other = RelationId::new(2);
+        assert!(pool.max_resident_block(other).is_none());
     }
 
     #[test]
