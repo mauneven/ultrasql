@@ -273,6 +273,11 @@ struct Counters {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    /// Live count of dirty frames, maintained on every clean<->dirty
+    /// transition (`swap`-guarded so racing writers count each transition
+    /// exactly once). Keeps the per-statement buffer-pool pressure precheck
+    /// O(1) instead of an O(frames) sweep.
+    dirty: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -429,6 +434,18 @@ impl<L: PageLoader> BufferPool<L> {
     /// allocation above the resident maximum prevents reopened handles
     /// from reusing an existing index page before the segment allocator is
     /// wired into the B-tree layer.
+    /// Live count of dirty frames — O(1) from the maintained counter.
+    #[must_use]
+    pub fn dirty_pages(&self) -> usize {
+        self.counters.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Currently resident pages — O(shards) page-table length.
+    #[must_use]
+    pub fn resident_pages(&self) -> usize {
+        self.page_table.len()
+    }
+
     #[must_use]
     pub fn max_resident_block(&self, rel: RelationId) -> Option<BlockNumber> {
         self.max_resident_blocks
@@ -565,7 +582,9 @@ impl<L: PageLoader> BufferPool<L> {
             }
 
             // Clear the dirty bit only after a successful write.
-            frame.dirty.store(false, Ordering::Release);
+            if frame.dirty.swap(false, Ordering::Release) {
+                self.counters.dirty.fetch_sub(1, Ordering::Relaxed);
+            }
             flushed += 1;
         }
 
@@ -691,7 +710,9 @@ impl<L: PageLoader> BufferPool<L> {
             *frame.page.write() = Some(new_page);
             *frame.page_id.lock() = Some(page_id);
             frame.clock_ref.store(true, Ordering::Release);
-            frame.dirty.store(false, Ordering::Release);
+            if frame.dirty.swap(false, Ordering::Release) {
+                self.counters.dirty.fetch_sub(1, Ordering::Relaxed);
+            }
             frame.pin_count.fetch_add(1, Ordering::AcqRel);
         }
         self.page_table.insert(page_id, frame_idx);
@@ -782,11 +803,7 @@ impl<L: PageLoader> BufferPool<L> {
             .iter()
             .filter(|f| f.pin_count.load(Ordering::Acquire) > 0)
             .count();
-        let dirty = self
-            .frames
-            .iter()
-            .filter(|f| f.dirty.load(Ordering::Acquire))
-            .count();
+        let dirty = self.counters.dirty.load(Ordering::Relaxed);
         BufferPoolStats {
             gets: self.counters.gets.load(Ordering::Relaxed),
             hits: self.counters.hits.load(Ordering::Relaxed),
@@ -995,8 +1012,8 @@ impl<L: PageLoader> BufferPool<L> {
 
     fn unpin(&self, frame_idx: usize, dirty: bool) {
         let frame = &self.frames[frame_idx];
-        if dirty {
-            frame.dirty.store(true, Ordering::Release);
+        if dirty && !frame.dirty.swap(true, Ordering::Release) {
+            self.counters.dirty.fetch_add(1, Ordering::Relaxed);
         }
         // Drop the pin count last so concurrent readers see dirty
         // before unpin.
@@ -1048,6 +1065,7 @@ impl<L: PageLoader> PageGuard<L> {
         let frame: &Frame = &self.pool.frames[self.frame_idx];
         PageWrite {
             frame,
+            dirty_count: &self.pool.counters.dirty,
             inner: frame.page.write(),
         }
     }
@@ -1088,6 +1106,9 @@ impl std::ops::Deref for PageRead<'_> {
 /// dirty on drop.
 pub struct PageWrite<'a> {
     frame: &'a Frame,
+    /// Pool-wide live dirty-frame count; bumped when this guard's drop
+    /// transitions the frame clean -> dirty.
+    dirty_count: &'a AtomicUsize,
     inner: parking_lot::lock_api::RwLockWriteGuard<'a, parking_lot::RawRwLock, Option<Page>>,
 }
 
@@ -1124,7 +1145,9 @@ impl std::ops::DerefMut for PageWrite<'_> {
 
 impl Drop for PageWrite<'_> {
     fn drop(&mut self) {
-        self.frame.dirty.store(true, Ordering::Release);
+        if !self.frame.dirty.swap(true, Ordering::Release) {
+            self.dirty_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

@@ -881,19 +881,21 @@ impl Server {
     /// the eviction invariant while avoiding O(pool_frames × batches) work.
     pub fn flush_dirty_heap_pages_if_needed(&self) -> Result<Option<usize>, ServerError> {
         let pool = self.heap.buffer_pool();
-        let before = pool.stats();
         let capacity = pool.capacity();
         let resident_threshold = capacity.saturating_mul(3) / 4;
         let dirty_threshold = capacity.saturating_mul(1) / 8;
 
-        if capacity == 0
-            || before.dirty == 0
-            || before.resident < resident_threshold
-            || before.dirty < dirty_threshold
-        {
+        // Cheap precheck: this runs after EVERY row-producing INSERT
+        // statement, so it must not sweep the frame array. The O(1)
+        // dirty counter + page-table length decide "no pressure" without
+        // touching the full stats() sweep.
+        let dirty = pool.dirty_pages();
+        let resident = pool.resident_pages();
+        if capacity == 0 || dirty == 0 || resident < resident_threshold || dirty < dirty_threshold {
             return Ok(None);
         }
 
+        let before = pool.stats();
         let flushed = self.flush_dirty_heap_pages()?;
         let after = pool.stats();
         info!(
