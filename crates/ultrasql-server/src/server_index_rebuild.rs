@@ -178,6 +178,18 @@ impl Server {
         self.default_statement_timeout_ms = timeout_ms;
     }
 
+    /// Return the resolved process-wide memory-admission ceiling in bytes.
+    #[must_use]
+    pub fn memory_ceiling_bytes(&self) -> u64 {
+        self.memory_admission.ceiling_bytes()
+    }
+
+    /// Replace the memory-admission ceiling before the listener starts;
+    /// `0` auto-sizes to 75 % of detected physical RAM.
+    pub fn set_memory_ceiling_bytes(&mut self, ceiling_bytes: u64) {
+        self.memory_admission.set_ceiling_bytes(ceiling_bytes);
+    }
+
     /// Return runtime WAL archive settings.
     #[must_use]
     pub fn wal_archive_config(&self) -> WalArchiveConfig {

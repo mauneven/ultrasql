@@ -64,6 +64,7 @@ pub mod embedded;
 pub mod error;
 pub mod extended;
 pub mod index_key;
+pub mod memory_admission;
 mod metadata_io;
 mod metadata_scalar;
 mod metadata_tokens;
@@ -109,6 +110,7 @@ pub mod workload;
 pub(crate) use cached_select::*;
 pub(crate) use combined_catalog::*;
 pub use config::*;
+pub use memory_admission::MemoryAdmission;
 pub(crate) use metadata_io::*;
 pub(crate) use metadata_scalar::*;
 pub(crate) use metadata_tokens::*;
@@ -426,6 +428,15 @@ pub struct Server {
     /// default keeps one runaway query from occupying a connection forever
     /// on a public beta deployment.
     pub default_statement_timeout_ms: u64,
+    /// Process-wide memory-admission ceiling for per-statement `work_mem`
+    /// budgets. At statement start the effective budget is
+    /// `min(session work_mem, ceiling / max(1, live sessions))`, so N
+    /// connections × `work_mem` can no longer exceed the ceiling in
+    /// aggregate — over-budget statements spill to disk instead.
+    /// Configured with `--memory-ceiling-bytes` /
+    /// `ULTRASQL_MEMORY_CEILING_BYTES`; `0` (default) auto-sizes to 75 %
+    /// of detected physical RAM.
+    pub memory_admission: MemoryAdmission,
     /// Runtime WAL archive command exposed through `pg_settings`.
     pub wal_archive_config: WalArchiveConfig,
     /// Two-phase commit coordinator. Owns the on-disk state directory

@@ -51,6 +51,16 @@ and must document the break here.
   wait queue (no waiter leak). Additionally, a session that disconnects with
   an explicit transaction still open now has that transaction aborted at
   teardown, so its row locks release instead of blocking peers forever.
+- Process-wide memory-admission ceiling: `ultrasqld --memory-ceiling-bytes`
+  (env `ULTRASQL_MEMORY_CEILING_BYTES`, default `0` = auto = 75% of physical
+  RAM detected at startup) caps the *aggregate* of per-statement `work_mem`
+  budgets. Each statement's effective budget is now
+  `min(session work_mem, ceiling / live connections)` (floored at 64 KiB),
+  so many concurrent sessions can no longer multiply `work_mem` into an
+  unbounded heap — over-budget statements engage the existing disk-spill
+  paths instead. `SHOW effective_work_mem` reports the admitted budget. The
+  divisor is live connections (not executing statements), a deliberately
+  coarse first cut.
 - Read-only transactions: `BEGIN` and `SET TRANSACTION` now parse and honor
   `READ ONLY` / `READ WRITE` (and accept `[NOT] DEFERRABLE`, currently inert).
   A data-modifying statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE` /

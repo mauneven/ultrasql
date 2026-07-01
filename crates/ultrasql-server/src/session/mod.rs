@@ -240,6 +240,10 @@ where
         // listening; the receiver just buffers.
         let notify_rx = state.notify_hub.register_connection(pid);
         state.workload_recorder.register_session(pid, "tester");
+        // Count this session toward the process-wide memory-admission
+        // divisor (effective work_mem = min(session work_mem,
+        // ceiling / live sessions)). One relaxed atomic add.
+        state.memory_admission.register_session();
         // Sessions start at the server-wide default statement timeout; a
         // client may `SET statement_timeout` to any value (including 0).
         let statement_timeout_ms = state.default_statement_timeout_ms;
@@ -298,14 +302,19 @@ where
     /// Build the per-statement `work_mem` budget for this session.
     ///
     /// Reads the session-local `work_mem` GUC (stored canonically as a byte
-    /// count in `session_settings` by the SET handler) and falls back to
-    /// [`crate::session::execute::DEFAULT_WORK_MEM_BYTES`] when unset. The
+    /// count in `session_settings` by the SET handler), falls back to
+    /// [`crate::session::execute::DEFAULT_WORK_MEM_BYTES`] when unset, and
+    /// caps the result by the process-wide memory-admission share
+    /// (`ceiling / live sessions` — see [`crate::MemoryAdmission`]). The
     /// returned budget is shared by reference across every memory-heavy
     /// operator in the statement's plan, so once a query's working set
     /// crosses the budget the executor's spill paths engage instead of
     /// growing the heap without bound.
     pub(super) fn work_mem_budget(&self) -> Arc<ultrasql_executor::work_mem::WorkMemBudget> {
-        crate::session::execute::work_mem_budget_from_settings(&self.session_settings)
+        crate::session::execute::work_mem_budget_from_settings(
+            &self.session_settings,
+            self.state.memory_admission.per_statement_cap_bytes(),
+        )
     }
 
     /// Build the per-statement blocking-lock wait options for this session.
@@ -369,5 +378,6 @@ impl<RW> Drop for Session<RW> {
             self.state.role_connection_limiter.release(&role);
         }
         self.state.workload_recorder.deregister_session(self.pid);
+        self.state.memory_admission.deregister_session();
     }
 }

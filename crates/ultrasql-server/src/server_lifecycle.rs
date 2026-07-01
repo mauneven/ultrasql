@@ -83,10 +83,14 @@ impl Server {
             },
             cancel_flag: None,
             // Embedded `ultrasql-local` has no session GUCs; arm the default
-            // 64 MiB budget so large sorts / GROUP BY / hash-joins spill to
-            // disk rather than growing the heap without bound.
+            // 64 MiB budget (capped by the process-wide memory-admission
+            // share) so large sorts / GROUP BY / hash-joins spill to disk
+            // rather than growing the heap without bound.
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
-                crate::session::DEFAULT_WORK_MEM_BYTES,
+                crate::memory_admission::effective_work_mem_bytes(
+                    crate::session::DEFAULT_WORK_MEM_BYTES,
+                    self.memory_admission.per_statement_cap_bytes(),
+                ),
             )),
             profile_operators: false,
             // Embedded `ultrasql-local` runs as the bootstrap superuser
@@ -217,6 +221,7 @@ impl Server {
             logging_config: LoggingConfig::default(),
             idle_session_timeout_ms: 0,
             default_statement_timeout_ms: crate::DEFAULT_STATEMENT_TIMEOUT_MS,
+            memory_admission: crate::MemoryAdmission::from_env_or_auto(),
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,

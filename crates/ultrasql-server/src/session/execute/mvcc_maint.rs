@@ -507,6 +507,7 @@ where
             oracle: Arc::clone(&self.state.txn_manager),
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
+            work_mem_cap_bytes: self.state.memory_admission.per_statement_cap_bytes(),
             stream_buf: &mut self.write_buf,
             // Materialized-view maintenance INSERT reads only the row
             // count and needs a complete body; never stream.

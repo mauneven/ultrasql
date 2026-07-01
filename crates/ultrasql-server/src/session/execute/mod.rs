@@ -242,23 +242,40 @@ fn shown_transaction_isolation(txn_state: &TxnState) -> &'static str {
 pub(crate) const DEFAULT_WORK_MEM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Build a per-statement [`WorkMemBudget`](ultrasql_executor::work_mem::WorkMemBudget)
-/// from a session-settings map.
+/// from a session-settings map, capped by the process-wide memory
+/// admission share.
 ///
 /// Reads the canonical byte-count string the `SET work_mem` handler stores
-/// under the `work_mem` key and falls back to [`DEFAULT_WORK_MEM_BYTES`] when
-/// the key is absent or unparsable. Shared by [`Session::work_mem_budget`]
+/// under the `work_mem` key, falls back to [`DEFAULT_WORK_MEM_BYTES`] when
+/// the key is absent or unparsable, and takes the minimum with
+/// `per_statement_cap_bytes` (the caller-supplied
+/// [`MemoryAdmission::per_statement_cap_bytes`](crate::MemoryAdmission::per_statement_cap_bytes)
+/// share, `ceiling / live sessions`). Shared by [`Session::work_mem_budget`]
 /// and the `run_plan_in_txn` hot path so both arm the same budget; without
 /// this a large sort / GROUP BY / hash-join would grow the heap unbounded
-/// (OOM DoS) instead of spilling to disk.
+/// (OOM DoS) instead of spilling to disk — and without the cap, N
+/// connections × `work_mem` would still be unbounded in aggregate.
 pub(crate) fn work_mem_budget_from_settings(
     session_settings: &std::collections::HashMap<String, String>,
+    per_statement_cap_bytes: u64,
 ) -> Arc<ultrasql_executor::work_mem::WorkMemBudget> {
-    let bytes = session_settings
+    let bytes = crate::memory_admission::effective_work_mem_bytes(
+        requested_work_mem_bytes(session_settings),
+        per_statement_cap_bytes,
+    );
+    Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(bytes))
+}
+
+/// The session's requested `work_mem` in bytes (the `SET work_mem` value,
+/// or [`DEFAULT_WORK_MEM_BYTES`] when unset), before memory admission.
+pub(crate) fn requested_work_mem_bytes(
+    session_settings: &std::collections::HashMap<String, String>,
+) -> u64 {
+    session_settings
         .get("work_mem")
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&b| b > 0)
-        .unwrap_or(DEFAULT_WORK_MEM_BYTES);
-    Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(bytes))
+        .unwrap_or(DEFAULT_WORK_MEM_BYTES)
 }
 
 /// Parse a `work_mem` value into bytes.

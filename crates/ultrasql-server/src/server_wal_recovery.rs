@@ -562,6 +562,7 @@ impl Server {
             logging_config: LoggingConfig::default(),
             idle_session_timeout_ms: 0,
             default_statement_timeout_ms: crate::DEFAULT_STATEMENT_TIMEOUT_MS,
+            memory_admission: crate::MemoryAdmission::from_env_or_auto(),
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,

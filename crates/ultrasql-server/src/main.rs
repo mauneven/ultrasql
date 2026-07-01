@@ -166,6 +166,7 @@ fn main() -> std::process::ExitCode {
                     server.set_logging_config(logging_config);
                     server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
                     server.set_default_statement_timeout_ms(cli.statement_timeout_ms);
+                    server.set_memory_ceiling_bytes(cli.memory_ceiling_bytes);
                     server.set_wal_archive_config(wal_archive_config.clone());
                     server = apply_auth_config(server, &auth_config);
                     server = apply_tls_config(server, &tls_config);
@@ -183,6 +184,7 @@ fn main() -> std::process::ExitCode {
             server.set_logging_config(logging_config);
             server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
             server.set_default_statement_timeout_ms(cli.statement_timeout_ms);
+            server.set_memory_ceiling_bytes(cli.memory_ceiling_bytes);
             server.set_wal_archive_config(wal_archive_config);
             server = apply_auth_config(server, &auth_config);
             server = apply_tls_config(server, &tls_config);

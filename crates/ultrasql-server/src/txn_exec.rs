@@ -123,6 +123,11 @@ pub(crate) struct RunPlanInTxnArgs<'a> {
     pub(crate) oracle: Arc<TransactionManager>,
     pub(crate) jit: ultrasql_vec::jit::JitConfig,
     pub(crate) cancel_flag: Option<ultrasql_executor::CancelFlag>,
+    /// Process-wide memory-admission share for this statement
+    /// (`MemoryAdmission::per_statement_cap_bytes()` at statement start):
+    /// the effective `work_mem` budget is the session's requested value
+    /// capped by this. Pass `u64::MAX` from fixtures that opt out.
+    pub(crate) work_mem_cap_bytes: u64,
     pub(crate) stream_buf: &'a mut bytes::BytesMut,
     /// When `true`, a large SELECT (body past
     /// [`crate::result_encoder::STREAM_WINDOW_HIGH_WATER_BYTES`]) returns
@@ -187,6 +192,7 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
         oracle,
         jit,
         cancel_flag,
+        work_mem_cap_bytes,
         stream_buf,
         allow_streaming,
         streaming_commit_txn,
@@ -247,7 +253,10 @@ pub(crate) fn run_plan_in_txn(args: RunPlanInTxnArgs<'_>) -> Result<SelectResult
     // `LowerCtx`. Once a sort / GROUP BY / hash-join working set crosses this
     // budget the executor spills to disk instead of growing the heap without
     // bound (OOM DoS).
-    let work_mem = crate::session::work_mem_budget_from_settings(session_settings.as_ref());
+    let work_mem = crate::session::work_mem_budget_from_settings(
+        session_settings.as_ref(),
+        work_mem_cap_bytes,
+    );
     let ctx = LowerCtx {
         tables,
         catalog_snapshot,

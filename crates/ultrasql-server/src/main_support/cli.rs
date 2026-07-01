@@ -137,6 +137,14 @@ pub(crate) struct Cli {
     )]
     pub(crate) statement_timeout_ms: u64,
 
+    /// Process-wide ceiling in bytes over the sum of per-statement
+    /// `work_mem` budgets; 0 = auto = 75% of physical RAM detected at
+    /// startup. Each statement's effective budget is
+    /// `min(session work_mem, ceiling / live connections)`; over-budget
+    /// statements spill to disk instead of growing the heap.
+    #[arg(long, env = "ULTRASQL_MEMORY_CEILING_BYTES", default_value_t = 0)]
+    pub(crate) memory_ceiling_bytes: u64,
+
     /// On SIGTERM/SIGINT, stop accepting and drain in-flight sessions for
     /// this many milliseconds before aborting the rest. A second signal
     /// forces an immediate shutdown.

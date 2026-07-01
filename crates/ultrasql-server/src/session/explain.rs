@@ -189,6 +189,7 @@ where
             oracle: Arc::clone(&self.state.txn_manager),
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
+            work_mem_cap_bytes: self.state.memory_admission.per_statement_cap_bytes(),
             stream_buf: &mut stream_buf,
             // EXPLAIN ANALYZE only reads `result.rows`; never stream.
             allow_streaming: false,

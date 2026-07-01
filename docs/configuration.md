@@ -35,8 +35,23 @@ stored per connection.
 ## Memory
 
 - `work_mem` appears through `pg_catalog.pg_settings` for client tooling.
-- Per-query memory enforcement and spill behavior are tracked separately under
-  the release hardening backlog.
+  `SET work_mem` arms the per-statement budget (default 64 MiB); sorts,
+  GROUP BY, and hash joins spill to disk once a statement's working set
+  crosses it.
+- `ultrasqld --memory-ceiling-bytes` (env `ULTRASQL_MEMORY_CEILING_BYTES`,
+  default `0` = auto = 75% of the physical RAM detected at startup; a
+  conservative 6 GiB is used if RAM cannot be detected) is a coarse
+  process-wide ceiling over the sum of per-statement `work_mem` budgets.
+  At statement start the effective budget becomes
+  `min(session work_mem, ceiling / live connections)`, floored at 64 KiB,
+  so N connections × `work_mem` can no longer exceed the ceiling in
+  aggregate — over-budget statements spill instead of growing the heap
+  toward an OOM kill. `SHOW effective_work_mem` (an UltraSQL extension)
+  reports the budget the next statement will actually be armed with.
+  Known coarseness: the divisor counts live connections (not concurrently
+  executing statements), so mostly-idle connection pools get smaller
+  per-statement budgets than strictly necessary — raise the ceiling or
+  `work_mem` if a pooled deployment spills more than expected.
 - `ULTRASQL_TPCH_POOL_FRAMES` tunes the TPC-H benchmark buffer-pool frame count
   used by benchmark harnesses.
 - `ULTRASQL_PAGE_SPILL_BACKING` selects the page-spill backing path used by

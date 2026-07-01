@@ -464,6 +464,15 @@ where
                 .get("work_mem")
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_WORK_MEM_BYTES.to_string()),
+            // UltraSQL extension: the budget the *next* statement will
+            // actually be armed with — the session's requested work_mem
+            // capped by the process-wide memory-admission share
+            // (ceiling / live sessions). Read-only observability surface.
+            "effective_work_mem" => crate::memory_admission::effective_work_mem_bytes(
+                crate::session::execute::requested_work_mem_bytes(&self.session_settings),
+                self.state.memory_admission.per_statement_cap_bytes(),
+            )
+            .to_string(),
             "hnsw.ef_search" => self
                 .session_settings
                 .get("hnsw.ef_search")

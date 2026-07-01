@@ -125,6 +125,7 @@ fn autovacuum_config_from_cli_converts_scale_factors() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     let config = autovacuum_config_from_cli(&cli).expect("valid autovacuum config");
@@ -172,6 +173,7 @@ fn autovacuum_config_from_cli_rejects_invalid_scale_factor() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     assert!(autovacuum_config_from_cli(&cli).is_err());
@@ -214,6 +216,7 @@ fn logging_config_from_cli_rejects_invalid_duration() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     assert!(logging_config_from_cli(&cli).is_err());
@@ -256,6 +259,7 @@ fn logging_config_from_cli_accepts_duration_and_statement_mode() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     let config = logging_config_from_cli(&cli).expect("valid logging config");
@@ -302,6 +306,7 @@ fn listen_security_from_cli_rejects_wildcard_without_override() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     let err = listen_security_from_cli(&cli).expect_err("wildcard trust must be rejected");
@@ -432,6 +437,7 @@ fn md5_auth_from_cli_reads_password_file_and_secures_wildcard_listener() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     let auth = auth_config_from_cli(&cli).expect("password file auth config");
@@ -551,6 +557,7 @@ fn md5_auth_from_cli_rejects_partial_or_dirty_password_config() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     let err = auth_config_from_cli(&cli).expect_err("partial auth config rejected");
@@ -675,6 +682,7 @@ fn cli_with_auth_password_file(password_file: PathBuf) -> Cli {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     }
 }
 
@@ -715,6 +723,7 @@ fn ops_token_from_cli_rejects_weak_tokens() {
         wal_sync_method: "fsync".to_owned(),
         primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
+        memory_ceiling_bytes: 0,
     };
 
     assert!(
