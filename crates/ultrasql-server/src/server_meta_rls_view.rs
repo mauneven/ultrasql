@@ -112,6 +112,17 @@ impl Server {
             })
             .collect::<Vec<_>>();
         entries.sort_by_key(|(oid, _, _)| oid.raw());
+        // A trust-auth session user with no catalog role can own a table (the
+        // owner is recorded below); materialize such names as implicit roles
+        // before the sidecar write so the boot loader can resolve them.
+        self.ensure_metadata_roles_durable(entries.iter().flat_map(|(_, _, runtime)| {
+            std::iter::once(runtime.owner_role.as_str()).chain(
+                runtime
+                    .policies
+                    .iter()
+                    .flat_map(|policy| policy.roles.iter().map(String::as_str)),
+            )
+        }))?;
 
         let mut out = String::from("# ultrasql row security v2\n");
         for (oid, table_name, runtime) in entries {
@@ -157,7 +168,8 @@ impl Server {
             std::collections::HashMap::new();
         let mut seen_table_oids = std::collections::HashSet::new();
         let mut seen_policy_keys = std::collections::HashSet::new();
-        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut recovered_roles = false;
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -189,13 +201,17 @@ impl Server {
                     } else {
                         String::new()
                     };
-                    if !owner_role.is_empty() && !known_roles.contains(&owner_role) {
-                        return Err(ServerError::Ddl(format!(
-                            "unknown RLS table metadata owner '{}' on line {}",
-                            owner_role,
-                            line_no + 1
-                        )));
-                    }
+                    // An owner with no catalog entry was recorded by a
+                    // previously-accepted trust-auth session (or predates the
+                    // write-side implicit-role protection). Refusing to boot
+                    // over it would brick the data directory; recover instead.
+                    recovered_roles |= self.recover_unknown_metadata_role(
+                        &mut known_roles,
+                        &owner_role,
+                        "pg_row_security.meta",
+                        "table owner",
+                        line_no,
+                    );
                     let entry = rows
                         .entry(oid)
                         .or_insert_with(|| (String::new(), TableRowSecurity::default()));
@@ -223,7 +239,16 @@ impl Server {
                     } else {
                         Vec::new()
                     };
-                    validate_rls_metadata_policy_roles(&known_roles, &mut roles, line_no)?;
+                    for role in &mut roles {
+                        *role = role.to_ascii_lowercase();
+                        recovered_roles |= self.recover_unknown_metadata_role(
+                            &mut known_roles,
+                            role,
+                            "pg_row_security.meta",
+                            "policy role",
+                            line_no,
+                        );
+                    }
                     let using = parse_rls_expr(parts[5], parts[6], parts[7])?;
                     let with_check = parse_rls_expr(parts[8], parts[9], parts[10])?;
                     if let Some(table) = snapshot.tables_by_oid.get(&oid) {
@@ -272,6 +297,9 @@ impl Server {
                 )));
             }
             self.row_security.insert(oid, Arc::new(runtime));
+        }
+        if recovered_roles {
+            self.persist_role_metadata()?;
         }
         Ok(())
     }

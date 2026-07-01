@@ -1164,3 +1164,92 @@ fn wait_for_txn_data_wal_durable_flushes_the_txns_last_data_record() {
         last_data_lsn.raw()
     );
 }
+
+#[test]
+fn server_init_recovers_unknown_metadata_owner_role_instead_of_failing_boot() {
+    use super::super::auth::AuthCatalog;
+
+    // A trust-auth session user with no catalog role can end up recorded as
+    // an object owner in a metadata sidecar (older data dirs predate the
+    // write-side implicit-role protection). Boot must never refuse to start
+    // over such an owner: it recovers by registering an implicit login role
+    // and healing pg_auth.meta.
+    let data_dir = tempfile::TempDir::new().unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+    fs::write(
+        data_dir.path().join("pg_schema_runtime.meta"),
+        "# ultrasql schemas v1\nschema\torphaned_schema\tmissing_owner\n",
+    )
+    .unwrap();
+
+    let server = Server::init(data_dir.path()).expect("boot recovers the unknown schema owner");
+    let role = server
+        .role_catalog
+        .lookup_role("missing_owner")
+        .expect("recovered owner is registered as a role");
+    assert!(!role.is_superuser, "implicit role must not be a superuser");
+    assert!(
+        role.can_login,
+        "implicit role must keep trust logins working"
+    );
+    assert!(
+        !role.create_role && !role.create_db && !role.bypass_rls,
+        "implicit role must not gain privileged attributes"
+    );
+    let schema_owner = server
+        .schemas
+        .get("orphaned_schema")
+        .expect("schema metadata still loads")
+        .owner_role
+        .clone();
+    assert_eq!(schema_owner, "missing_owner");
+    let auth_meta = fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+        .expect("recovery persists pg_auth.meta");
+    assert!(
+        auth_meta.contains("missing_owner"),
+        "recovered role must be durable: {auth_meta}"
+    );
+    drop(server);
+
+    // The healed pg_auth.meta resolves the owner on the next boot.
+    Server::init(data_dir.path()).expect("second boot resolves the recovered role");
+}
+
+#[test]
+fn implicit_metadata_role_registration_skips_known_public_and_empty_names() {
+    use super::super::auth::AuthCatalog;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert!(
+        !server.register_implicit_metadata_role("public"),
+        "PUBLIC is a pseudo-role, never a catalog entry"
+    );
+    assert!(
+        !server.register_implicit_metadata_role("  "),
+        "blank names are ignored"
+    );
+    assert!(
+        !server.register_implicit_metadata_role("ultrasql"),
+        "existing roles are left untouched"
+    );
+    assert!(server.register_implicit_metadata_role("SomeUser"));
+    assert!(
+        !server.register_implicit_metadata_role("someuser"),
+        "registration is idempotent and case-insensitive"
+    );
+    let role = server.role_catalog.lookup_role("someuser").unwrap();
+    assert!(!role.is_superuser && role.can_login);
+
+    // The durable path skips the legacy trust-mode `tester` name (the boot
+    // loaders already treat it as known) but persists genuinely new names.
+    server
+        .ensure_metadata_roles_durable(["tester", "otheruser"])
+        .unwrap();
+    assert!(server.role_catalog.lookup_role("tester").is_none());
+    let auth_meta = fs::read_to_string(data_dir.path().join("pg_auth.meta")).unwrap();
+    assert!(auth_meta.contains("otheruser"), "{auth_meta}");
+    assert!(!auth_meta.contains("tester"), "{auth_meta}");
+}

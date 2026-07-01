@@ -45,7 +45,7 @@ fn privilege_metadata_rejects_duplicate_default_grant_keys_on_rebuild() {
 }
 
 #[test]
-fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
+fn privilege_metadata_recovers_unknown_role_refs_on_rebuild() {
     let cases = [
         (
             "grant grantee",
@@ -74,6 +74,9 @@ fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
         ),
     ];
 
+    // A role recorded by a previously-accepted trust-auth session (the
+    // grantor of a table it owned, a default-privilege owner, ...) must
+    // never brick the data dir: boot recovers it as an implicit role.
     for (case, row, role) in cases {
         let data_dir = tempfile::TempDir::new().expect("temp data dir");
         support::make_data_dir_private(data_dir.path());
@@ -83,17 +86,18 @@ fn privilege_metadata_rejects_unknown_role_refs_on_rebuild() {
         )
         .expect("write privilege metadata with unknown role");
 
-        let err = match Server::init(data_dir.path()) {
-            Ok(_) => panic!("{case} should reject unknown role refs"),
-            Err(err) => err,
+        let server = match Server::init(data_dir.path()) {
+            Ok(server) => server,
+            Err(err) => panic!("{case} should recover unknown role refs, got {err}"),
         };
-        let message = err.to_string();
+        drop(server);
+        let auth_meta = std::fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+            .expect("recovery persists pg_auth.meta");
         assert!(
-            message.contains("unknown privilege metadata role")
-                && message.contains(role)
-                && message.contains("line 2"),
-            "{case} expected unknown role rejection for {role}, got {message}"
+            auth_meta.contains(role),
+            "{case} expected {role} to be recovered durably: {auth_meta}"
         );
+        Server::init(data_dir.path()).expect("second boot resolves the recovered role");
     }
 }
 

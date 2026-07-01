@@ -38,9 +38,9 @@ pub const RESERVED_ROLE_PREFIX: &str = "ultrasql_";
 /// and DDL both lower-case role names before use. A name in this namespace
 /// that is not a persisted role must never be allowed to authenticate or
 /// own objects: it would be waved through by the `Trust` policy yet never
-/// recorded in the role catalog, and once it owns a table/schema/sequence
-/// the catalog and RLS sidecar replay on the next restart rejects the
-/// unknown owner and the database refuses to start — total data loss.
+/// created via role DDL, and once it owns a table/schema/sequence the
+/// metadata persistence materializes it as an implicit login role —
+/// squatting a system name that a future release may need.
 #[must_use]
 pub fn is_reserved_role_name(name: &str) -> bool {
     // Compare bytes (not `&str` slices) so a multi-byte UTF-8 name cannot

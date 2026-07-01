@@ -193,7 +193,7 @@ async fn sequence_owner_survives_restart_in_catalog_views() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequence_owner_metadata_rejects_unknown_owner_on_rebuild() {
+async fn sequence_owner_metadata_recovers_unknown_owner_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
 
     let running = start_persistent_server(data_dir.path(), "sequence_owner_orphan_setup").await;
@@ -213,11 +213,28 @@ async fn sequence_owner_metadata_rejects_unknown_owner_on_rebuild() {
     )
     .expect("write orphaned sequence owner metadata");
 
-    let err = Server::init(data_dir.path()).expect_err("orphaned sequence owner rejected");
+    // An owner recorded by a previously-accepted trust-auth session must
+    // never brick the data dir: boot recovers it as an implicit role.
+    let running = start_persistent_server(data_dir.path(), "sequence_owner_orphan_verify").await;
+    let owner = running
+        .client
+        .query_one(
+            "SELECT sequenceowner \
+             FROM pg_catalog.pg_sequences \
+             WHERE sequencename = 'orphan_owner_sequence'",
+            &[],
+        )
+        .await
+        .expect("query recovered sequence owner")
+        .get::<_, String>(0);
+    assert_eq!(owner, "missing_owner");
+    graceful_shutdown(running).await;
+
+    let auth_meta = std::fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+        .expect("recovery persists pg_auth.meta");
     assert!(
-        err.to_string()
-            .contains("unknown sequence owner metadata role 'missing_owner'"),
-        "expected unknown sequence owner rejection, got {err}"
+        auth_meta.contains("missing_owner"),
+        "recovered owner must be durable: {auth_meta}"
     );
 }
 

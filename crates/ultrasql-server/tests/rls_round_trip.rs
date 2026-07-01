@@ -622,7 +622,7 @@ async fn rls_metadata_rejects_unknown_table_rows_on_rebuild() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rls_metadata_rejects_unknown_table_owner_on_rebuild() {
+async fn rls_metadata_recovers_unknown_table_owner_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
     support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
@@ -654,15 +654,32 @@ async fn rls_metadata_rejects_unknown_table_owner_on_rebuild() {
     assert!(changed, "RLS metadata should include table row: {metadata}");
     std::fs::write(&metadata_path, format!("{tampered}\n")).expect("unknown RLS owner metadata");
 
-    let err = Server::init(data_dir.path()).expect_err("unknown RLS table owner rejected");
+    // An owner recorded by a previously-accepted trust-auth session must
+    // never brick the data dir: boot recovers it as an implicit role.
+    let server = Server::init(data_dir.path()).expect("unknown RLS table owner recovered at boot");
+    drop(server);
+    let auth_meta = std::fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+        .expect("recovery persists pg_auth.meta");
     assert!(
-        err.to_string().contains("unknown RLS table metadata owner"),
-        "expected unknown RLS table owner rejection, got {err}"
+        auth_meta.contains("missing_owner"),
+        "recovered owner must be durable: {auth_meta}"
     );
+
+    let running = start_persistent_server(data_dir.path(), "rls_unknown_owner_verify").await;
+    let rows = running
+        .client
+        .query(
+            "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname = 'missing_owner'",
+            &[],
+        )
+        .await
+        .expect("query recovered owner role");
+    assert_eq!(rows.len(), 1, "recovered owner is visible in pg_roles");
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rls_metadata_rejects_unknown_policy_roles_on_rebuild() {
+async fn rls_metadata_recovers_unknown_policy_roles_on_rebuild() {
     let data_dir = tempfile::TempDir::new().unwrap();
     support::make_data_dir_private(data_dir.path());
     let metadata_path = data_dir.path().join("pg_row_security.meta");
@@ -692,14 +709,18 @@ async fn rls_metadata_rejects_unknown_policy_roles_on_rebuild() {
     )
     .expect("unknown RLS role metadata");
 
-    let err = match Server::init(data_dir.path()) {
-        Ok(_) => panic!("unknown RLS policy role should be rejected"),
-        Err(err) => err,
-    };
+    // A policy role missing from the role catalog must never brick the data
+    // dir: boot recovers it as an implicit role and keeps the policy scoped
+    // to exactly the recorded name.
+    let server = Server::init(data_dir.path()).expect("unknown RLS policy role recovered at boot");
+    drop(server);
+    let auth_meta = std::fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+        .expect("recovery persists pg_auth.meta");
     assert!(
-        err.to_string().contains("unknown RLS policy role"),
-        "expected unknown RLS policy role rejection, got {err}"
+        auth_meta.contains("missing_role"),
+        "recovered policy role must be durable: {auth_meta}"
     );
+    Server::init(data_dir.path()).expect("second boot resolves the recovered role");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -245,12 +245,12 @@ where
         // Reserve the `ultrasql_` role namespace for the system (mirrors
         // PostgreSQL's `pg_` reservation). A login under this prefix that is
         // not a persisted role would be accepted by the `Trust` policy yet
-        // never recorded in the role catalog; once it owns objects, the
-        // catalog/RLS/sequence/schema sidecar replay on the next restart
-        // rejects the unknown owner and the database refuses to start —
-        // total data loss. Refuse the login instead. The bootstrap role
-        // `ultrasql` has no trailing underscore, so it is unaffected, and a
-        // role that was explicitly created (hence persisted) still logs in.
+        // never created via role DDL; once it owns objects, the metadata
+        // persistence materializes it as an implicit login role — squatting
+        // a system name that a future release may need. Refuse the login
+        // instead. The bootstrap role `ultrasql` has no trailing underscore,
+        // so it is unaffected, and a role that was explicitly created (hence
+        // persisted) still logs in.
         if crate::auth::is_reserved_role_name(&self.auth_user)
             && self
                 .state

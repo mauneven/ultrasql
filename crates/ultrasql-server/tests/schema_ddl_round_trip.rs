@@ -88,7 +88,7 @@ async fn create_drop_schema_survives_restart_and_blocks_owner_drop() {
 }
 
 #[test]
-fn schema_metadata_rejects_unknown_owner_on_rebuild() {
+fn schema_metadata_recovers_unknown_owner_on_rebuild() {
     let data_dir = tempfile::TempDir::new().expect("temp data dir");
     support::make_data_dir_private(data_dir.path());
     std::fs::write(
@@ -100,12 +100,25 @@ fn schema_metadata_rejects_unknown_owner_on_rebuild() {
     )
     .expect("write orphaned schema metadata");
 
-    let err = Server::init(data_dir.path()).expect_err("orphaned schema owner rejected");
+    // An owner recorded by a previously-accepted trust-auth session must
+    // never brick the data dir: boot recovers it as an implicit role.
+    let server = Server::init(data_dir.path()).expect("orphaned schema owner recovered at boot");
+    let schema_owner = server
+        .schemas
+        .get("orphaned_schema")
+        .expect("schema metadata still loads")
+        .owner_role
+        .clone();
+    assert_eq!(schema_owner, "missing_owner");
+    drop(server);
+
+    let auth_meta = std::fs::read_to_string(data_dir.path().join("pg_auth.meta"))
+        .expect("recovery persists pg_auth.meta");
     assert!(
-        err.to_string()
-            .contains("unknown schema metadata owner 'missing_owner'"),
-        "expected unknown schema owner rejection, got {err}"
+        auth_meta.contains("missing_owner"),
+        "recovered owner must be durable: {auth_meta}"
     );
+    Server::init(data_dir.path()).expect("second boot resolves the recovered role");
 }
 
 #[cfg(unix)]

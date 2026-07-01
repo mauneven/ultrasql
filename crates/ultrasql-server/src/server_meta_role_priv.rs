@@ -460,6 +460,118 @@ impl Server {
         self.data_dir.as_ref().map(|dir| dir.join("pg_auth.meta"))
     }
 
+    /// Register an implicit, non-privileged login role for a name that is
+    /// recorded (or about to be recorded) in a runtime metadata sidecar but
+    /// has no role catalog entry.
+    ///
+    /// Trust-style authentication accepts usernames that were never created
+    /// with `CREATE ROLE`; such a session can own tables, schemas, and
+    /// sequences and appear as a privilege grantor. The implicit role keeps
+    /// the recorded name resolvable without granting anything the session did
+    /// not already have: it is not a superuser, holds no memberships, and
+    /// carries no CREATEROLE/CREATEDB/BYPASSRLS attributes.
+    ///
+    /// Returns `true` when a role was created, `false` when the name is
+    /// empty, `public`, or already cataloged (including a concurrent create).
+    pub(crate) fn register_implicit_metadata_role(&self, name: &str) -> bool {
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.is_empty() || normalized == "public" {
+            return false;
+        }
+        if auth::AuthCatalog::lookup_role(self.role_catalog.as_ref(), &normalized).is_some() {
+            return false;
+        }
+        let entry = auth::RoleEntry {
+            oid: 0,
+            name: normalized,
+            password: None,
+            is_superuser: false,
+            inherit: true,
+            create_role: false,
+            create_db: false,
+            can_login: true,
+            replication: false,
+            bypass_rls: false,
+            connection_limit: -1,
+            valid_until: None,
+        };
+        // A concurrent session may have created the role between the lookup
+        // and the insert; `already exists` is success for this purpose.
+        self.role_catalog.create_role(entry).is_ok()
+    }
+
+    /// Durably ensure every role name that is about to be written into a
+    /// runtime metadata sidecar has a persisted role catalog entry.
+    ///
+    /// This is the write-side half of the unknown-owner protection: the boot
+    /// loaders resolve recorded owners/grantors against `pg_auth.meta`, so a
+    /// sidecar row naming an uncataloged trust-auth user must first
+    /// materialize that user as an implicit role — otherwise a clean restart
+    /// of the data directory would find an unknown owner. Names the loaders
+    /// already accept (cataloged roles, `public`, the legacy `tester`
+    /// trust-mode name) are left untouched.
+    pub(crate) fn ensure_metadata_roles_durable<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ServerError> {
+        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut created = false;
+        for name in names {
+            let normalized = name.trim().to_ascii_lowercase();
+            if normalized.is_empty() || known_roles.contains(&normalized) {
+                continue;
+            }
+            if self.register_implicit_metadata_role(&normalized) {
+                warn!(
+                    target: "ultrasqld",
+                    role = %normalized,
+                    "runtime metadata records a role with no catalog entry; \
+                     registering an implicit login role so restart can resolve it"
+                );
+                created = true;
+            }
+        }
+        if created {
+            self.persist_role_metadata()?;
+        }
+        Ok(())
+    }
+
+    /// Boot-time recovery for a role name found in a runtime metadata sidecar
+    /// with no role catalog entry.
+    ///
+    /// Older data directories could record an uncataloged trust-auth user as
+    /// an object owner (or privilege grantor) without a matching role entry;
+    /// refusing to boot over that bricks the data directory. Recover by
+    /// registering an implicit login role and continuing, and report whether
+    /// a recovery happened so the caller can re-persist `pg_auth.meta`.
+    /// Empty names and `public` are ignored (nothing to register).
+    pub(crate) fn recover_unknown_metadata_role(
+        &self,
+        known_roles: &mut std::collections::HashSet<String>,
+        name: &str,
+        file: &str,
+        field: &str,
+        line_no: usize,
+    ) -> bool {
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.is_empty() || normalized == "public" || known_roles.contains(&normalized) {
+            return false;
+        }
+        warn!(
+            target: "ultrasqld",
+            role = %normalized,
+            file,
+            field,
+            line = line_no + 1,
+            "runtime metadata references a role with no catalog entry; \
+             recovering by registering an implicit login role"
+        );
+        let created = self.register_implicit_metadata_role(&normalized);
+        known_roles.insert(normalized);
+        created
+    }
+
     pub(crate) fn persist_role_metadata(&self) -> Result<(), ServerError> {
         let Some(path) = self.role_metadata_path() else {
             return Ok(());

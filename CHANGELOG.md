@@ -189,6 +189,13 @@ and must document the break here.
 
 ### Fixed
 
+- A restart no longer refuses to boot (`unknown RLS table metadata owner`)
+  when an object owner was recorded by a trust-authenticated username that
+  has no catalog role. Taking ownership (or granting) now durably registers
+  the name as an implicit non-privileged login role in `pg_auth.meta`, and
+  the boot-time metadata loaders recover an unknown recorded role by
+  registering it with a warning instead of failing — data directories
+  already affected by the old behavior boot cleanly and are healed.
 - B-tree deletion of a non-unique key whose duplicate group spans a same-key
   leaf split no longer silently fails for entries on the left side of the
   split. Previously `DELETE`/`UPDATE` index maintenance on a low-cardinality

@@ -175,6 +175,21 @@ impl Server {
                     privilege_kind_name(left.privilege).cmp(privilege_kind_name(right.privilege))
                 })
         });
+        // Grantors (and default-privilege owners) can be trust-auth session
+        // users with no catalog role; materialize them as implicit roles
+        // before the sidecar write so the boot loader can resolve them.
+        self.ensure_metadata_roles_durable(
+            grants
+                .iter()
+                .flat_map(|grant| [grant.grantee.as_str(), grant.grantor.as_str()])
+                .chain(default_grants.iter().flat_map(|grant| {
+                    [
+                        grant.owner_role.as_str(),
+                        grant.grantee.as_str(),
+                        grant.grantor.as_str(),
+                    ]
+                })),
+        )?;
 
         let mut out = String::from("# ultrasql privilege runtime v1\n");
         for grant in grants {
@@ -216,7 +231,8 @@ impl Server {
         let mut default_grants = Vec::new();
         let mut seen_grant_keys = std::collections::HashSet::new();
         let mut seen_default_grant_keys = std::collections::HashSet::new();
-        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut recovered_roles = false;
         let snapshot = self.catalog_snapshot();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -251,13 +267,19 @@ impl Server {
                             line_no + 1
                         )));
                     }
-                    validate_privilege_metadata_grantee(&known_roles, &grant.grantee, line_no)?;
-                    validate_privilege_metadata_role(
-                        &known_roles,
-                        &grant.grantor,
-                        line_no,
-                        "grantor",
-                    )?;
+                    // Grantees are validated at GRANT time, but the grantor
+                    // can be a trust-auth session user with no catalog role;
+                    // recover unknown names instead of refusing to boot.
+                    for (field, role) in [("grantee", &grant.grantee), ("grantor", &grant.grantor)]
+                    {
+                        recovered_roles |= self.recover_unknown_metadata_role(
+                            &mut known_roles,
+                            role,
+                            "pg_privileges.meta",
+                            field,
+                            line_no,
+                        );
+                    }
                     validate_privilege_metadata_column(&snapshot, &self.catalog, &grant, line_no)?;
                     grants.push(grant);
                 }
@@ -288,19 +310,22 @@ impl Server {
                             line_no + 1
                         )));
                     }
-                    validate_privilege_metadata_role(
-                        &known_roles,
-                        &grant.owner_role,
-                        line_no,
-                        "owner",
-                    )?;
-                    validate_privilege_metadata_grantee(&known_roles, &grant.grantee, line_no)?;
-                    validate_privilege_metadata_role(
-                        &known_roles,
-                        &grant.grantor,
-                        line_no,
-                        "grantor",
-                    )?;
+                    // Default-privilege owners/grantors can be trust-auth
+                    // session users with no catalog role; recover unknown
+                    // names instead of refusing to boot.
+                    for (field, role) in [
+                        ("owner", &grant.owner_role),
+                        ("grantee", &grant.grantee),
+                        ("grantor", &grant.grantor),
+                    ] {
+                        recovered_roles |= self.recover_unknown_metadata_role(
+                            &mut known_roles,
+                            role,
+                            "pg_privileges.meta",
+                            field,
+                            line_no,
+                        );
+                    }
                     default_grants.push(grant);
                 }
                 _ => {
@@ -313,6 +338,9 @@ impl Server {
         }
         self.privilege_catalog
             .install_snapshot(grants, default_grants);
+        if recovered_roles {
+            self.persist_role_metadata()?;
+        }
         Ok(())
     }
 
@@ -345,6 +373,15 @@ impl Server {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         owners.sort_by(|left, right| left.0.cmp(&right.0));
+        // Sequence owners can be trust-auth session users with no catalog
+        // role; materialize them as implicit roles before the sidecar write
+        // so the boot loader can resolve them.
+        self.ensure_metadata_roles_durable(
+            owners
+                .iter()
+                .filter(|(sequence_name, _)| self.sequences.contains_key(sequence_name))
+                .map(|(_, owner_role)| owner_role.as_str()),
+        )?;
 
         let mut out = String::from("# ultrasql sequence owners v2\n");
         for (sequence_name, owner_role) in owners {
@@ -374,7 +411,8 @@ impl Server {
 
         let mut owners = Vec::new();
         let mut seen_sequences = std::collections::HashSet::new();
-        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut recovered_roles = false;
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -420,13 +458,16 @@ impl Server {
                     sequence_name
                 )));
             }
-            if !known_roles.contains(&owner_role) {
-                return Err(ServerError::ddl(format!(
-                    "unknown sequence owner metadata role '{}' on line {}",
-                    owner_role,
-                    line_no + 1
-                )));
-            }
+            // A previously-accepted trust-auth session can be the recorded
+            // owner without a catalog role; recover instead of refusing to
+            // boot (which would brick the data directory).
+            recovered_roles |= self.recover_unknown_metadata_role(
+                &mut known_roles,
+                &owner_role,
+                "pg_sequence_owner.meta",
+                "sequence owner",
+                line_no,
+            );
             owners.push((sequence_name, owner_role, namespace));
         }
         self.sequence_owners.clear();
@@ -435,6 +476,9 @@ impl Server {
             self.sequence_owners
                 .insert(sequence_name.clone(), owner_role);
             self.sequence_namespaces.insert(sequence_name, namespace);
+        }
+        if recovered_roles {
+            self.persist_role_metadata()?;
         }
         Ok(())
     }
@@ -455,6 +499,12 @@ impl Server {
             .map(|entry| (entry.key().clone(), entry.value().as_ref().clone()))
             .collect::<Vec<_>>();
         schemas.sort_by(|left, right| left.0.cmp(&right.0));
+        // Schema owners can be trust-auth session users with no catalog role;
+        // materialize them as implicit roles before the sidecar write so the
+        // boot loader can resolve them.
+        self.ensure_metadata_roles_durable(
+            schemas.iter().map(|(_, schema)| schema.owner_role.as_str()),
+        )?;
 
         let mut out = String::from("# ultrasql schemas v1\n");
         for (_, schema) in schemas {
@@ -477,7 +527,8 @@ impl Server {
 
         let mut schemas = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut known_roles = runtime_metadata_known_role_names(&self.role_catalog);
+        let mut recovered_roles = false;
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -511,18 +562,24 @@ impl Server {
                     line_no + 1
                 )));
             }
-            if !known_roles.contains(&owner_role) {
-                return Err(ServerError::ddl(format!(
-                    "unknown schema metadata owner '{}' on line {}",
-                    owner_role,
-                    line_no + 1
-                )));
-            }
+            // A previously-accepted trust-auth session can be the recorded
+            // owner without a catalog role; recover instead of refusing to
+            // boot (which would brick the data directory).
+            recovered_roles |= self.recover_unknown_metadata_role(
+                &mut known_roles,
+                &owner_role,
+                "pg_schema_runtime.meta",
+                "schema owner",
+                line_no,
+            );
             schemas.push(RuntimeSchema { name, owner_role });
         }
         self.schemas.clear();
         for schema in schemas {
             self.schemas.insert(schema.name.clone(), Arc::new(schema));
+        }
+        if recovered_roles {
+            self.persist_role_metadata()?;
         }
         Ok(())
     }

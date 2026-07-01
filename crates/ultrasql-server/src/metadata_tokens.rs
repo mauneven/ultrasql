@@ -296,32 +296,6 @@ pub(crate) fn parse_privilege_kind(
     }
 }
 
-pub(crate) fn validate_privilege_metadata_role(
-    known_roles: &std::collections::HashSet<String>,
-    role: &str,
-    line_no: usize,
-    field: &str,
-) -> Result<(), ServerError> {
-    if known_roles.contains(&role.to_ascii_lowercase()) {
-        return Ok(());
-    }
-    Err(ServerError::ddl(format!(
-        "unknown privilege metadata role '{role}' in {field} on line {}",
-        line_no + 1
-    )))
-}
-
-pub(crate) fn validate_privilege_metadata_grantee(
-    known_roles: &std::collections::HashSet<String>,
-    grantee: &str,
-    line_no: usize,
-) -> Result<(), ServerError> {
-    if grantee.eq_ignore_ascii_case("public") {
-        return Ok(());
-    }
-    validate_privilege_metadata_role(known_roles, grantee, line_no, "grantee")
-}
-
 pub(crate) fn runtime_metadata_known_role_names(
     role_catalog: &auth::InMemoryAuthCatalog,
 ) -> std::collections::HashSet<String> {
@@ -413,24 +387,6 @@ pub(crate) fn parse_rls_command(value: &str) -> Result<RuntimeRlsCommand, Server
         "delete" => Ok(RuntimeRlsCommand::Delete),
         other => Err(ServerError::Ddl(format!("unknown RLS command {other}"))),
     }
-}
-
-pub(crate) fn validate_rls_metadata_policy_roles(
-    known_roles: &std::collections::HashSet<String>,
-    roles: &mut [String],
-    line_no: usize,
-) -> Result<(), ServerError> {
-    for role in roles {
-        *role = role.to_ascii_lowercase();
-        if role == "public" || known_roles.contains(role.as_str()) {
-            continue;
-        }
-        return Err(ServerError::Ddl(format!(
-            "unknown RLS policy role '{role}' on line {}",
-            line_no + 1
-        )));
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_rls_metadata_expr(
