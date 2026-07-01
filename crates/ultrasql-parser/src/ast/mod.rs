@@ -166,6 +166,13 @@ pub enum Statement {
     RollbackToSavepoint(RollbackToSavepointStmt),
     /// `RELEASE [SAVEPOINT] name`.
     ReleaseSavepoint(ReleaseSavepointStmt),
+    /// `DECLARE name [BINARY] [[NO] SCROLL] CURSOR [{WITH|WITHOUT} HOLD]
+    /// FOR select`.
+    DeclareCursor(Box<DeclareCursorStmt>),
+    /// `FETCH [direction] [FROM|IN] cursor` / `MOVE …`.
+    Fetch(FetchStmt),
+    /// `CLOSE { name | ALL }`.
+    Close(CloseStmt),
     /// `EXPLAIN [ANALYZE] [VERBOSE] [(FORMAT …)] stmt`.
     Explain(Box<ExplainStmt>),
     /// `PREPARE name [(types)] AS stmt`.
@@ -292,6 +299,9 @@ impl Statement {
             Self::Savepoint(s) => s.span,
             Self::RollbackToSavepoint(s) => s.span,
             Self::ReleaseSavepoint(s) => s.span,
+            Self::DeclareCursor(s) => s.span,
+            Self::Fetch(s) => s.span,
+            Self::Close(s) => s.span,
             Self::Explain(s) => s.span,
             Self::Prepare(s) => s.span,
             Self::Execute(s) => s.span,

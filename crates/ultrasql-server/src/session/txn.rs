@@ -116,6 +116,9 @@ where
         &mut self,
         gid: &str,
     ) -> Result<SelectResult, ServerError> {
+        // PREPARE TRANSACTION detaches the transaction from the session,
+        // so its WITHOUT HOLD cursors cannot survive it either.
+        self.close_all_cursors();
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => Ok(SelectResult {
                 messages: vec![
@@ -525,6 +528,9 @@ where
         // a new one. If an error below re-enters a Failed/InTransaction state,
         // the dispatch helper re-pins it defensively.
         self.txn_start_micros = None;
+        // Every cursor is WITHOUT HOLD: the end of the block closes them
+        // all, whether the commit below succeeds or rolls back on error.
+        self.close_all_cursors();
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => Ok(SelectResult {
                 messages: vec![
@@ -676,6 +682,8 @@ where
         // The block is ending; drop its transaction-start clock (see
         // `execute_commit`).
         self.txn_start_micros = None;
+        // Every cursor is WITHOUT HOLD: ROLLBACK closes them all.
+        self.close_all_cursors();
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => Ok(SelectResult {
                 messages: vec![

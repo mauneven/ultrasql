@@ -91,6 +91,21 @@ completed evidence.
   aborts one transaction with SQLSTATE `40001`, but broader isolation schedules
   (the upstream `src/test/isolation` schedules) and fully predicate-precise
   (PostgreSQL-style physical SIREAD tuple/page) locking remain open.
+- Server-side cursors (`DECLARE` / `FETCH` / `CLOSE`) are forward-only and
+  `WITHOUT HOLD` only, and the cursor's `SELECT` is **materialized at
+  `DECLARE` time** (the full result is buffered in session memory and `FETCH`
+  windows over it) rather than executed incrementally, so a cursor over a huge
+  result set costs memory proportional to the result, not to the fetch window.
+  `DECLARE` requires an explicit transaction block (`25P01` outside one, as in
+  PostgreSQL); `COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION` close every open
+  cursor. `WITH HOLD`, `SCROLL` (and every backward/absolute `FETCH`
+  direction), `MOVE`, and `BINARY` cursors parse but are rejected with
+  SQLSTATE `0A000` and a hint. Cursor statements are simple-query-protocol
+  surfaces: sending `DECLARE` / `FETCH` through an extended-protocol prepared
+  statement is rejected at bind time. Cursors also ignore `ROLLBACK TO
+  SAVEPOINT`: PostgreSQL closes a cursor that was opened inside the
+  rolled-back savepoint's scope, while UltraSQL keeps it open until the
+  transaction ends.
 - `SAVEPOINT` / subtransaction *visibility* is implemented for DML: a
   transaction sees its own writes made under an active `SAVEPOINT`, `ROLLBACK
   TO` hides a savepoint's inserts and restores its deletes / in-place-update

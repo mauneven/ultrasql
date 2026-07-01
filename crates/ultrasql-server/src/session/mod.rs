@@ -24,6 +24,7 @@ mod alter;
 mod alter_in_txn;
 mod catalog_overlay;
 mod copy;
+mod cursor;
 mod ddl;
 mod drop_in_txn;
 mod embedded;
@@ -197,6 +198,12 @@ pub(crate) struct Session<RW> {
     pub(super) sequence_state: crate::SequenceSessionState,
     /// Per-session PostgreSQL advisory locks.
     pub(super) advisory_state: crate::AdvisorySessionState,
+    /// Open server-side cursors, keyed by case-folded cursor name.
+    /// Every cursor is `WITHOUT HOLD` and forward-only: `DECLARE`
+    /// requires an open transaction block, materializes the SELECT, and
+    /// `COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION` drops the whole
+    /// registry (see [`cursor`]).
+    pub(super) cursors: std::collections::HashMap<String, cursor::SessionCursor>,
     /// `true` when an autocommit statement committed successfully and
     /// its background-ish maintenance hook should run after the reply
     /// bytes are already on the wire.
@@ -267,6 +274,7 @@ where
             pending_materialized_view_rows: Vec::new(),
             sequence_state: crate::SequenceSessionState::default(),
             advisory_state: crate::AdvisorySessionState::new(pid),
+            cursors: std::collections::HashMap::new(),
             pending_post_commit_maintenance: false,
             is_replication: false,
         }

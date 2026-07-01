@@ -182,6 +182,15 @@ where
         {
             return Ok(result);
         }
+        // DECLARE / FETCH / MOVE / CLOSE manipulate the per-session
+        // cursor registry (see `session/cursor.rs`). Dispatched here for
+        // the same reason as PREPARE/EXECUTE: the binder rejects these
+        // AST variants.
+        if let Some(result) =
+            self.try_dispatch_cursor_statement(&stmt, trimmed, &catalog_snapshot)?
+        {
+            return Ok(result);
+        }
         if let Some(result) = self.try_dispatch_advisory_lock_select(&stmt)? {
             return Ok(result);
         }

@@ -16,6 +16,7 @@ pub(crate) mod create_sequence;
 pub(crate) mod create_table;
 pub(crate) mod create_type;
 pub(crate) mod create_view;
+pub(crate) mod cursor;
 pub(crate) mod delete;
 pub(crate) mod describe;
 pub(crate) mod drop_index;

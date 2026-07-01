@@ -174,12 +174,25 @@ pub enum ServerError {
     #[error("{0}")]
     SequenceLimitExceeded(String),
 
-    /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` was issued
-    /// outside a transaction block. Maps to PostgreSQL SQLSTATE
-    /// `25P01` (`no_active_sql_transaction`). The string names the
-    /// failing construct.
+    /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` /
+    /// `SET TRANSACTION` / `DECLARE CURSOR` was issued outside a
+    /// transaction block. Maps to PostgreSQL SQLSTATE `25P01`
+    /// (`no_active_sql_transaction`). The string names the failing
+    /// construct.
     #[error("{0}")]
     Savepoint(&'static str),
+
+    /// `FETCH` / `MOVE` / `CLOSE` named a cursor that does not exist in
+    /// this session (never declared, already closed, or closed by the
+    /// end of its transaction — every cursor is `WITHOUT HOLD`). Maps
+    /// to PostgreSQL SQLSTATE `34000` (`invalid_cursor_name`).
+    #[error("cursor \"{0}\" does not exist")]
+    InvalidCursorName(String),
+
+    /// `DECLARE` named a cursor that already exists in this session.
+    /// Maps to PostgreSQL SQLSTATE `42P03` (`duplicate_cursor`).
+    #[error("cursor \"{0}\" already exists")]
+    DuplicateCursor(String),
 
     /// `RELEASE` / `ROLLBACK TO SAVEPOINT` named an unknown savepoint.
     /// Maps to PostgreSQL SQLSTATE `3B001`
@@ -324,6 +337,8 @@ impl ServerError {
                 | Self::SequenceLimitExceeded(_)
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
+                | Self::InvalidCursorName(_)
+                | Self::DuplicateCursor(_)
                 | Self::ReadOnlyTransaction(_)
                 | Self::CopyFormat(_)
                 | Self::CopyAborted(_)
@@ -405,6 +420,8 @@ impl ServerError {
             Self::TransactionAborted => "25P02", // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",       // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001", // invalid_savepoint_specification
+            Self::InvalidCursorName(_) => "34000", // invalid_cursor_name
+            Self::DuplicateCursor(_) => "42P03", // duplicate_cursor
             Self::ReadOnlyTransaction(_) => "25006", // read_only_sql_transaction
             Self::InsufficientPrivilege(_) => "42501", // insufficient_privilege
             // NOT-NULL constraint violation surfaced by `ModifyTable`
@@ -689,6 +706,21 @@ mod tests {
         assert!(err.is_query_scoped());
         assert_eq!(err.sqlstate(), "XX000");
         assert_eq!(err.to_string(), "internal error");
+    }
+
+    #[test]
+    fn cursor_errors_map_to_postgres_cursor_sqlstates() {
+        // PG: 34000 invalid_cursor_name for FETCH/CLOSE on a missing
+        // cursor; 42P03 duplicate_cursor for a second DECLARE.
+        let err = ServerError::InvalidCursorName("c".to_owned());
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "34000");
+        assert_eq!(err.to_string(), "cursor \"c\" does not exist");
+
+        let err = ServerError::DuplicateCursor("c".to_owned());
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "42P03");
+        assert_eq!(err.to_string(), "cursor \"c\" already exists");
     }
 
     #[test]

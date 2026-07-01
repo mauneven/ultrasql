@@ -17,6 +17,19 @@ and must document the break here.
   primary message (`M`) contains only the primary text. The encoder also
   supports an optional `D` (detail) field; no details or hints are invented
   for errors that never had them.
+- Server-side cursors: `DECLARE name [BINARY] [[NO] SCROLL] CURSOR
+  [{WITH|WITHOUT} HOLD] FOR select`, `FETCH [count | NEXT | FORWARD count |
+  ALL] [FROM|IN] name`, and `CLOSE {name | ALL}` over the simple-query
+  protocol, inside an explicit transaction block. Cursors are forward-only and
+  `WITHOUT HOLD`; the `SELECT` is materialized at `DECLARE` time and `FETCH`
+  windows over the buffered rows with the SELECT's row description and a
+  `FETCH n` command tag. `DECLARE` outside a transaction block is rejected
+  with SQLSTATE `25P01`; a duplicate `DECLARE` is `42P03`
+  (`duplicate_cursor`); `FETCH`/`CLOSE` on an unknown cursor is `34000`
+  (`invalid_cursor_name`); `COMMIT`/`ROLLBACK`/`PREPARE TRANSACTION` close all
+  cursors. `WITH HOLD`, `SCROLL`, backward/absolute fetch directions, `MOVE`,
+  and `BINARY` cursors parse but are rejected with `0A000` plus a hint (see
+  `docs/known-limitations.md` for the materialization trade-off).
 - Runtime-settable statement-logging GUCs: `log_statement`
   (`none` | `ddl` | `mod` | `all`) and `log_min_duration_statement`
   (milliseconds; `-1` disables, `0` logs everything) now support per-session

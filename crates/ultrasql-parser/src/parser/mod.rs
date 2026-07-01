@@ -316,6 +316,14 @@ impl<'src> Parser<'src> {
                     self.parse_set_stmt().map(Statement::SetVar)
                 }
             }
+            // ---- Cursors ----------------------------------------------------
+            // `FETCH` is a lexer keyword; `DECLARE` / `CLOSE` / `MOVE` are
+            // dispatched on identifier text below (like MERGE / CHECKPOINT)
+            // so they stay usable as ordinary identifiers.
+            TokenKind::KwFetch => {
+                let tok = self.advance()?;
+                self.parse_fetch(tok.span.start, false)
+            }
             // ---- Savepoints -------------------------------------------------
             TokenKind::KwSavepoint => {
                 let tok = self.advance()?;
@@ -372,6 +380,30 @@ impl<'src> Parser<'src> {
                     .is_some_and(|text| text.eq_ignore_ascii_case("merge")) =>
             {
                 self.parse_merge().map(|s| Statement::Merge(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("declare")) =>
+            {
+                let tok = self.advance()?;
+                self.parse_declare_cursor(tok.span.start)
+            }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("close")) =>
+            {
+                let tok = self.advance()?;
+                self.parse_close_cursor(tok.span.start)
+            }
+            TokenKind::Identifier
+                if head
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("move")) =>
+            {
+                let tok = self.advance()?;
+                self.parse_fetch(tok.span.start, true)
             }
             TokenKind::Identifier
                 if head
