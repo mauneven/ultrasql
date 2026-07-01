@@ -454,6 +454,16 @@ pub(super) fn encode_binary_value_typed(
             out.extend_from_slice(&months.to_be_bytes());
             Some(out)
         }
+        // A BYTEA column is physically stored as `\xHEX` text; PostgreSQL's
+        // binary format is the raw bytes with no header, so decode the hex text
+        // to those bytes. Without this arm the fallback returns the literal
+        // `\xdeadbeef` ASCII while the wire says format_code=1, which typed
+        // binary-requesting drivers misread. This makes binary ENCODE symmetric
+        // with the already-correct binary DECODE path; the text-format branch
+        // still returns the `\xHEX` ASCII.
+        (DataType::Bytea, Column::Utf8(_) | Column::DictionaryUtf8(_)) => {
+            col.text_value(row).and_then(Value::parse_bytea)
+        }
         _ => encode_binary_value(col, row),
     }
 }
@@ -831,6 +841,23 @@ mod tests {
         assert_eq!(
             encode_binary_value_typed(&column, 0, &DataType::Bit { len: Some(4) }).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn binary_bytea_result_encodes_raw_bytes() {
+        // `\xHEX` stored text must emit the raw bytes in binary format, not the
+        // ASCII `\xdeadbeef` string.
+        let column = Column::Utf8(StringColumn::from_data(["\\xdeadbeef".to_owned()]));
+        assert_eq!(
+            encode_binary_value_typed(&column, 0, &DataType::Bytea).unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        // Empty bytea -> zero-length binary payload, not the 2-byte "\x" text.
+        let empty = Column::Utf8(StringColumn::from_data(["\\x".to_owned()]));
+        assert_eq!(
+            encode_binary_value_typed(&empty, 0, &DataType::Bytea).unwrap(),
+            Vec::<u8>::new()
         );
     }
 
