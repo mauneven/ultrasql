@@ -67,7 +67,11 @@ async fn set_variable_to_reuses_existing_validation_and_reset() {
         .query_one("SHOW statement_timeout", &[])
         .await
         .expect("SHOW statement_timeout after reset");
-    assert_eq!(row.get::<_, String>(0), "0");
+    assert_eq!(
+        row.get::<_, String>(0),
+        ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS.to_string(),
+        "DEFAULT restores the server-wide statement_timeout default"
+    );
 
     shutdown(running).await;
 }

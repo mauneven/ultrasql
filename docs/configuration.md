@@ -11,6 +11,15 @@ Session-local runtime parameters use PostgreSQL-style `SET`, `SHOW`, and
 existing validation, and dotted custom settings such as `ultrasql.tenant` are
 stored per connection.
 
+- `statement_timeout` defaults to the server-wide value configured with
+  `ultrasqld --statement-timeout-ms` (env `ULTRASQL_STATEMENT_TIMEOUT_MS`,
+  default 30000 = 30 s) so a runaway query cannot occupy a connection forever
+  on a shared deployment. Any session may `SET statement_timeout` to another
+  value — including `0` to disable — and `RESET statement_timeout` restores
+  the server default. Cancellation surfaces as SQLSTATE `57014`. Note this
+  differs from PostgreSQL's shipped default of `0`; long-running analytical
+  or bulk-load sessions should raise or disable it explicitly.
+
 ## Memory
 
 - `work_mem` appears through `pg_catalog.pg_settings` for client tooling.

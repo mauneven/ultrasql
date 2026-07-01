@@ -385,12 +385,35 @@ pub fn eval_error_to_exec_error(error: EvalError) -> ExecError {
 /// over [`CancelFlag::is_set`] inside its `next_batch` and returns
 /// [`ExecError::Cancelled`] as soon as the flag fires.
 ///
-/// `Clone` is `Arc::clone` — every clone observes the same atomic.
+/// Besides the explicit cancel bit (client `CancelRequest`), the flag
+/// carries an optional *statement deadline* so `statement_timeout`
+/// needs no per-statement timer thread: the session arms the deadline
+/// when a statement starts ([`CancelFlag::arm_deadline_in_ms`]) and the
+/// regular [`CancelFlag::is_set`] polls observe expiry. The disabled
+/// fast path costs two relaxed atomic loads per poll; an armed deadline
+/// adds one monotonic clock read per poll (polls happen per batch, not
+/// per row).
+///
+/// `Clone` is `Arc::clone` — every clone observes the same atomics.
 /// The struct lives at the crate root so executor operators and the
 /// server crate share one definition without a circular dependency
 /// back through `ultrasql-server`.
 #[derive(Clone, Debug, Default)]
-pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct CancelFlag {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Statement deadline in microseconds of [`process_clock_micros`];
+    /// `0` means no deadline is armed.
+    deadline_micros: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Microseconds elapsed since the first call in this process — a cheap
+/// monotonic clock for statement deadlines (one `Instant::elapsed` read,
+/// no syscall on the hot platforms).
+fn process_clock_micros() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 
 impl CancelFlag {
     /// Construct a fresh, uncancelled flag.
@@ -402,19 +425,73 @@ impl CancelFlag {
     /// Read the flag. `Relaxed` is sufficient: a slightly stale read
     /// only delays cancellation by one batch, never compromises
     /// correctness.
+    ///
+    /// A poll that observes an expired deadline latches the cancel bit,
+    /// so cancellation stays visible (and later polls stay cheap) until
+    /// the owning session resets the flag at statement end.
     #[must_use]
     pub fn is_set(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let deadline = self
+            .deadline_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if deadline == 0 {
+            return false;
+        }
+        if process_clock_micros() >= deadline {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Set the flag. Idempotent.
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Clear the flag after a query-scoped cancellation has been observed.
     pub fn reset(&self) {
-        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Arm the statement deadline `timeout_ms` from now; `0` disarms.
+    ///
+    /// One relaxed atomic store (plus one clock read when arming) — cheap
+    /// enough to run unconditionally at statement start.
+    pub fn arm_deadline_in_ms(&self, timeout_ms: u64) {
+        let deadline = if timeout_ms == 0 {
+            0
+        } else {
+            process_clock_micros()
+                .saturating_add(timeout_ms.saturating_mul(1_000))
+                // `0` means "disarmed"; a saturated clock still deadlines.
+                .max(1)
+        };
+        self.deadline_micros
+            .store(deadline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Disarm the statement deadline (statement finished).
+    pub fn clear_deadline(&self) {
+        self.deadline_micros
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether an armed deadline has expired — distinguishes a
+    /// `statement_timeout` cancellation from a client `CancelRequest`
+    /// when both surface as [`ExecError::Cancelled`].
+    #[must_use]
+    pub fn deadline_expired(&self) -> bool {
+        let deadline = self
+            .deadline_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
+        deadline != 0 && process_clock_micros() >= deadline
     }
 }
 

@@ -54,6 +54,12 @@ pub async fn start_sample_server(application_name: &str) -> RunningServer {
     start_server(Arc::new(Server::with_sample_database()), application_name).await
 }
 
+/// Start a caller-configured [`Server`] (e.g. with a non-default
+/// statement-timeout or logging config applied before the listener binds).
+pub async fn start_configured_server(server: Server, application_name: &str) -> RunningServer {
+    start_server(Arc::new(server), application_name).await
+}
+
 pub async fn connect_as(
     bound: SocketAddr,
     user: &str,

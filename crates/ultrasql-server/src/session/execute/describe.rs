@@ -180,7 +180,9 @@ where
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
             "statement_timeout" => {
-                self.statement_timeout_ms = 0;
+                // RESET restores the server-wide default (PostgreSQL
+                // semantics: back to the configured default, not 0).
+                self.statement_timeout_ms = self.state.default_statement_timeout_ms;
                 self.session_settings.remove("statement_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }

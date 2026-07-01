@@ -196,6 +196,15 @@ and must document the break here.
   lookups after sysbench-style indexed DML churn.
 - `ultrasql validate` no longer mis-decodes internal `pg_catalog` heap rows as
   SQL user rows during heap-visibility checks.
+- New sessions default to a 30-second `statement_timeout`
+  (`ultrasqld --statement-timeout-ms` / `ULTRASQL_STATEMENT_TIMEOUT_MS`; `0`
+  disables) so one runaway query cannot occupy a connection forever on a
+  shared beta deployment. Any session may `SET statement_timeout` to any
+  value including `0`; `RESET statement_timeout` now restores the server-wide
+  default (PostgreSQL semantics) instead of hard-coding `0`. The timeout is
+  enforced by a deadline carried in the per-query cancel flag — no
+  per-statement timer thread — so arming it costs one clock read plus one
+  atomic store per statement.
 - All file-data durability barriers now route through one configurable
   primitive (`durability_sync`): data-page segments, the WAL writer/manifest,
   recovery truncation, runtime metadata, catalog/clog snapshots, replication

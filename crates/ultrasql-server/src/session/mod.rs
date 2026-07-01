@@ -218,6 +218,9 @@ where
         // listening; the receiver just buffers.
         let notify_rx = state.notify_hub.register_connection(pid);
         state.workload_recorder.register_session(pid, "tester");
+        // Sessions start at the server-wide default statement timeout; a
+        // client may `SET statement_timeout` to any value (including 0).
+        let statement_timeout_ms = state.default_statement_timeout_ms;
         Self {
             // Start plaintext; a client `SSLRequest` upgrades it in place when
             // the server has a TLS config (see `startup`).
@@ -237,7 +240,7 @@ where
             peer_ip,
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
-            statement_timeout_ms: 0,
+            statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: 0,
             session_settings: std::collections::HashMap::new(),
             notify_rx,

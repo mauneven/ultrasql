@@ -267,6 +267,14 @@ pub(crate) const READ_BUFFER_INITIAL: usize = 1 << 12;
 /// deployments will size this from configuration.
 const IN_MEMORY_POOL_FRAMES: usize = 65_536;
 
+/// Server-wide default `statement_timeout` in milliseconds (30 s).
+///
+/// A public multi-user beta must bound the damage of a single runaway
+/// query by default; any session may `SET statement_timeout` to another
+/// value, including `0` to disable. Overridable at startup with
+/// `ultrasqld --statement-timeout-ms` / `ULTRASQL_STATEMENT_TIMEOUT_MS`.
+pub const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
 /// Shared connection state: the catalog used by the binder plus the
 /// sample-table registry the lowerer consults.
 ///
@@ -412,6 +420,12 @@ pub struct Server {
     pub logging_config: LoggingConfig,
     /// Idle-session timeout in milliseconds; `0` disables idle disconnects.
     pub idle_session_timeout_ms: u64,
+    /// Server-wide default `statement_timeout` in milliseconds applied to
+    /// every new session; `0` disables. Sessions may override per-session
+    /// with `SET statement_timeout` (including back to `0`). A bounded
+    /// default keeps one runaway query from occupying a connection forever
+    /// on a public beta deployment.
+    pub default_statement_timeout_ms: u64,
     /// Runtime WAL archive command exposed through `pg_settings`.
     pub wal_archive_config: WalArchiveConfig,
     /// Two-phase commit coordinator. Owns the on-disk state directory

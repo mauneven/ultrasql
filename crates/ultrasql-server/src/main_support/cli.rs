@@ -126,6 +126,17 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0)]
     pub(crate) idle_session_timeout_ms: u64,
 
+    /// Server-wide default `statement_timeout` in milliseconds applied to
+    /// every session; 0 disables. Any session may override with
+    /// `SET statement_timeout` (including back to 0). The bounded default
+    /// keeps one runaway query from occupying a connection forever.
+    #[arg(
+        long,
+        env = "ULTRASQL_STATEMENT_TIMEOUT_MS",
+        default_value_t = ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS
+    )]
+    pub(crate) statement_timeout_ms: u64,
+
     /// On SIGTERM/SIGINT, stop accepting and drain in-flight sessions for
     /// this many milliseconds before aborting the rest. A second signal
     /// forces an immediate shutdown.
@@ -273,6 +284,7 @@ Production-oriented flags:
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
   - --wal-sync-method fsync|fsync_writethrough  durability flush primitive
+  - --statement-timeout-ms N  default per-session statement_timeout (0 disables)
   - --idle-session-timeout-ms N
   - --archive-command CMD  archive completed WAL files; %p=path, %f=name
   - --restore-command CMD  restore archived WAL before recovery; %p=path, %f=name

@@ -374,7 +374,10 @@ fn session_variable_surface_sets_shows_and_resets_supported_gucs() {
             .unwrap_or_else(|_| panic!("reset {name}"));
     }
     assert!(!session.jit_enabled);
-    assert_eq!(session.statement_timeout_ms, 0);
+    assert_eq!(
+        session.statement_timeout_ms, session.state.default_statement_timeout_ms,
+        "RESET restores the server-wide default statement_timeout"
+    );
     assert!(!session.session_settings.contains_key("ultrasql.tenant"));
     assert!(session.execute_set_variable_reset("unsupported").is_err());
 

@@ -1,15 +1,19 @@
 //! Statement timeout guard for query-scoped cancellation.
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+//!
+//! Arms the statement deadline carried inside [`CancelFlag`] — no
+//! per-statement timer thread. Executor operators (and any other
+//! deadline-aware wait loop) observe expiry through their regular
+//! [`CancelFlag::is_set`] polls, which turn into
+//! [`ExecError::Cancelled`](ultrasql_executor::ExecError::Cancelled)
+//! → SQLSTATE `57014`. Arming costs one clock read plus one relaxed
+//! atomic store, so a non-zero server-default `statement_timeout` adds
+//! no measurable per-statement overhead.
 
 use ultrasql_executor::CancelFlag;
 
-/// Arms a per-statement timer and flips the session cancel flag on expiry.
+/// Arms the per-statement deadline and clears it (plus any timeout-fired
+/// cancel latch) on drop.
 pub(super) struct StatementTimeoutGuard {
-    active: Arc<AtomicBool>,
-    fired: Arc<AtomicBool>,
     cancel_flag: CancelFlag,
 }
 
@@ -19,38 +23,20 @@ impl StatementTimeoutGuard {
         if timeout_ms == 0 {
             return None;
         }
-
-        let active = Arc::new(AtomicBool::new(true));
-        let fired = Arc::new(AtomicBool::new(false));
-        let timer_active = Arc::clone(&active);
-        let timer_fired = Arc::clone(&fired);
-        let timer_flag = cancel_flag.clone();
-        let spawned = std::thread::Builder::new()
-            .name("ultrasql-statement-timeout".to_owned())
-            .spawn(move || {
-                std::thread::sleep(Duration::from_millis(timeout_ms));
-                if timer_active.load(Ordering::Acquire) {
-                    timer_fired.store(true, Ordering::Release);
-                    timer_flag.cancel();
-                }
-            });
-        if spawned.is_err() {
-            fired.store(true, Ordering::Release);
-            cancel_flag.cancel();
-        }
-
-        Some(Self {
-            active,
-            fired,
-            cancel_flag,
-        })
+        cancel_flag.arm_deadline_in_ms(timeout_ms);
+        Some(Self { cancel_flag })
     }
 }
 
 impl Drop for StatementTimeoutGuard {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
-        if self.fired.load(Ordering::Acquire) {
+        // Order matters: read the fired state BEFORE disarming, then clear
+        // the latched cancel bit only when this guard's own deadline fired.
+        // A client `CancelRequest` that raced in stays latched for the
+        // session's normal cancel handling.
+        let fired = self.cancel_flag.deadline_expired();
+        self.cancel_flag.clear_deadline();
+        if fired {
             self.cancel_flag.reset();
         }
     }

@@ -70,6 +70,7 @@ fn autovacuum_config_from_cli_converts_scale_factors() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     let config = autovacuum_config_from_cli(&cli).expect("valid autovacuum config");
@@ -115,6 +116,7 @@ fn autovacuum_config_from_cli_rejects_invalid_scale_factor() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     assert!(autovacuum_config_from_cli(&cli).is_err());
@@ -155,6 +157,7 @@ fn logging_config_from_cli_rejects_invalid_duration() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     assert!(logging_config_from_cli(&cli).is_err());
@@ -195,6 +198,7 @@ fn logging_config_from_cli_accepts_duration_and_statement_mode() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     let config = logging_config_from_cli(&cli).expect("valid logging config");
@@ -239,6 +243,7 @@ fn listen_security_from_cli_rejects_wildcard_without_override() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     let err = listen_security_from_cli(&cli).expect_err("wildcard trust must be rejected");
@@ -367,6 +372,7 @@ fn md5_auth_from_cli_reads_password_file_and_secures_wildcard_listener() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     let auth = auth_config_from_cli(&cli).expect("password file auth config");
@@ -484,6 +490,7 @@ fn md5_auth_from_cli_rejects_partial_or_dirty_password_config() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     let err = auth_config_from_cli(&cli).expect_err("partial auth config rejected");
@@ -606,6 +613,7 @@ fn cli_with_auth_password_file(password_file: PathBuf) -> Cli {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     }
 }
 
@@ -644,6 +652,7 @@ fn ops_token_from_cli_rejects_weak_tokens() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
     assert!(

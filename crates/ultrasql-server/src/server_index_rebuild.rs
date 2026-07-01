@@ -165,6 +165,19 @@ impl Server {
         self.idle_session_timeout_ms = timeout_ms;
     }
 
+    /// Return the server-wide default `statement_timeout` in milliseconds.
+    #[must_use]
+    pub const fn default_statement_timeout_ms(&self) -> u64 {
+        self.default_statement_timeout_ms
+    }
+
+    /// Replace the server-wide default `statement_timeout` before the
+    /// listener starts; `0` disables the default (sessions may still SET
+    /// their own).
+    pub const fn set_default_statement_timeout_ms(&mut self, timeout_ms: u64) {
+        self.default_statement_timeout_ms = timeout_ms;
+    }
+
     /// Return runtime WAL archive settings.
     #[must_use]
     pub fn wal_archive_config(&self) -> WalArchiveConfig {
