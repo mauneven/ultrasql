@@ -424,6 +424,92 @@ async fn serializable_int32_pair_fast_path_records_read_lock_wire() {
     shutdown(running).await;
 }
 
+/// Companion to `serializable_int32_pair_fast_path_records_read_lock_wire`, for
+/// the *fused DELETE* fast path. An explicit-txn fused int32-pair DELETE used to
+/// bypass `run_plan_in_txn` with no SERIALIZABLE gate, dropping its
+/// write-conflict registration (and read predicate lock) — an SSI hole. Here two
+/// SERIALIZABLE txns each read the whole table then delete a disjoint row (the
+/// write-skew shape); the deletes must register write conflicts against the
+/// other txn's whole-table read so the dangerous cycle is detected and exactly
+/// one txn aborts with 40001.
+#[tokio::test]
+async fn serializable_int32_pair_fused_delete_records_write_conflict_wire() {
+    let running = start_sample_server("serializable_fused_delete_write_conflict").await;
+    let (peer, peer_handle) = connect_peer(
+        running.bound,
+        "serializable_fused_delete_write_conflict_peer",
+    )
+    .await;
+
+    running
+        .client
+        .batch_execute("CREATE TABLE pair_del (a INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create pair table");
+    running
+        .client
+        .batch_execute("INSERT INTO pair_del VALUES (1, 100), (2, 200)")
+        .await
+        .expect("seed pair table");
+
+    running
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    peer.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    // Each txn reads the whole table, then deletes a disjoint row via the fused
+    // int32-pair DELETE fast path. The two whole-table reads cross the two
+    // deletes' writes, so the rw-antidependencies form a dangerous cycle and one
+    // txn must abort — but only if the fused DELETE registers its write conflict
+    // (the SSI hole this guards).
+    let a_rows = running
+        .client
+        .query("SELECT a, b FROM pair_del", &[])
+        .await
+        .expect("read a");
+    assert_eq!(a_rows.len(), 2);
+    let b_rows = peer
+        .query("SELECT a, b FROM pair_del", &[])
+        .await
+        .expect("read b");
+    assert_eq!(b_rows.len(), 2);
+
+    running
+        .client
+        .batch_execute("DELETE FROM pair_del WHERE a = 1")
+        .await
+        .expect("delete a");
+    peer.batch_execute("DELETE FROM pair_del WHERE a = 2")
+        .await
+        .expect("delete b");
+
+    let a_commit = running.client.batch_execute("COMMIT").await;
+    let b_commit = peer.batch_execute("COMMIT").await;
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "one serializable tx must commit: a={a_commit:?}, b={b_commit:?}"
+    );
+    assert_eq!(
+        [&a_commit, &b_commit]
+            .iter()
+            .filter(|result| is_serialization_failure(result))
+            .count(),
+        1,
+        "one serializable tx must fail with 40001 (fused DELETE write conflict recorded): a={a_commit:?}, b={b_commit:?}"
+    );
+
+    close_peer(peer, peer_handle).await;
+    shutdown(running).await;
+}
+
 #[tokio::test]
 async fn serializable_indexed_disjoint_row_updates_both_commit_wire() {
     let running = start_sample_server("serializable_disjoint_indexed_rows").await;

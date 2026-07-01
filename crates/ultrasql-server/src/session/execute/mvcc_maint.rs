@@ -121,6 +121,19 @@ where
         if !returning.is_empty() {
             return Ok(None);
         }
+        // SERIALIZABLE gate: the fused in-place DELETE bypasses
+        // `run_plan_in_txn`, which is where `record_serializable_predicate_locks`
+        // and `record_serializable_write_conflicts` run. Short-circuiting here
+        // under SERIALIZABLE would drop this DELETE's SIREAD predicate lock (for
+        // its WHERE-scan read) and its write-conflict registration — an SSI
+        // serialization hole: a concurrent read-write dependency would go
+        // undetected. Fall through to the general MVCC DELETE path, which
+        // records both. READ COMMITTED / REPEATABLE READ record no predicate
+        // locks, so the fast path stays safe there. Mirrors the SERIALIZABLE
+        // guard on the cached int32-pair SELECT fast path in `run_plan_in_txn`.
+        if txn.isolation == IsolationLevel::Serializable {
+            return Ok(None);
+        }
         // No-savepoint gate: when a savepoint is open, fall through to the
         // general MVCC DELETE path. The fused in-place DELETE writes its
         // `xmax` stamp directly to the page; routing it through the general
