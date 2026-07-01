@@ -548,6 +548,37 @@ fn advance_replay_lsn(
         ))
 }
 
+/// Apply the WAL records in the half-open range `[from_lsn, to_lsn)` to
+/// `target`, dispatching each through [`dispatch_record_at_lsn`] with its stream
+/// LSN. Returns the LSN to resume from (the end of the last applied record, or
+/// `from_lsn` if the range was empty).
+///
+/// This is the incremental counterpart to [`replay_into`]: instead of scanning
+/// the whole log from the recovery floor, it applies only the bounded range, so
+/// a hot standby can call it repeatedly as newly-received WAL is landed
+/// (continuous apply), threading the returned LSN back in as the next
+/// `from_lsn`. `to_lsn` must not exceed the durably-landed position (it is read
+/// via [`crate::reader::read_wal_range`], which only touches flushed bytes).
+///
+/// # Errors
+/// - [`RecoveryError::Io`]/[`RecoveryError::Applier`] on a read or below-floor
+///   start (the standby is too far behind).
+/// - [`RecoveryError::Record`] on a malformed record.
+pub fn apply_range(
+    wal_dir: impl AsRef<std::path::Path>,
+    from_lsn: ultrasql_core::Lsn,
+    to_lsn: ultrasql_core::Lsn,
+    target: &dyn HeapTarget,
+) -> Result<ultrasql_core::Lsn, RecoveryError> {
+    let stream = crate::reader::read_wal_range(wal_dir.as_ref(), from_lsn, to_lsn)?;
+    for record in &stream.records {
+        let (decoded, _used) = WalRecord::decode(&record.bytes)?;
+        dispatch_record_at_lsn(target, &decoded, record.lsn)
+            .map_err(|e| RecoveryError::Applier(e.to_string()))?;
+    }
+    Ok(stream.next_lsn)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1130,6 +1161,60 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn apply_range_applies_the_bounded_records_incrementally() {
+        // Write N distinct HeapInsert records through the real writer.
+        let dir = TempDir::new().unwrap();
+        let n: usize = 10;
+        let buffer = Arc::new(WalBuffer::new(4 * 1024 * 1024, Lsn::ZERO));
+        let writer = WalWriter::open(
+            dir.path(),
+            Arc::clone(&buffer),
+            WalWriterConfig {
+                segment_size_bytes: 16 * 1024 * 1024,
+                fsync_window_us: 100,
+                fsync_batch_bytes: 1,
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            let payload = HeapInsertPayload {
+                tid: tid(1, 0, u16::try_from(i).unwrap()),
+                tuple_bytes: vec![u8::try_from(i).unwrap(); 4],
+            };
+            let rec = make_record(RecordType::HeapInsert, payload.encode().unwrap());
+            buffer.append(&rec).unwrap();
+        }
+        writer.notify();
+        writer.shutdown().unwrap();
+        let durable = buffer.durable_lsn();
+
+        // One-shot apply of the whole range.
+        let full = MockHeap::default();
+        assert_eq!(
+            apply_range(dir.path(), Lsn::ZERO, durable, &full).unwrap(),
+            durable
+        );
+        assert_eq!(full.inserts.lock().len(), n);
+
+        // Incremental apply in two chunks split on a record boundary must produce
+        // the identical result — no records skipped or double-applied.
+        let stream = crate::reader::read_wal_range(dir.path(), Lsn::ZERO, durable).unwrap();
+        let mid = stream.records[n / 2].lsn;
+        let inc = MockHeap::default();
+        assert_eq!(apply_range(dir.path(), Lsn::ZERO, mid, &inc).unwrap(), mid);
+        assert_eq!(inc.inserts.lock().len(), n / 2);
+        assert_eq!(
+            apply_range(dir.path(), mid, durable, &inc).unwrap(),
+            durable
+        );
+        assert_eq!(inc.inserts.lock().len(), n);
+        // Records were dispatched with their true stream LSNs, in order.
+        let expected: Vec<Lsn> = stream.records.iter().map(|r| r.lsn).collect();
+        assert_eq!(*inc.insert_lsns.lock(), expected);
+        assert_eq!(*inc.inserts.lock(), *full.inserts.lock());
     }
 
     // ── Test 6: proptest round-trip ───────────────────────────────────────────
