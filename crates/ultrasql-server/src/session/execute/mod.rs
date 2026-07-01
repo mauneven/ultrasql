@@ -314,6 +314,34 @@ fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
         .map_err(|_| ServerError::Unsupported("invalid statement_timeout"))
 }
 
+/// Parse a `SET log_statement` value: the four PostgreSQL statement
+/// classes, case-insensitively.
+fn parse_log_statement_mode(value: &str) -> Result<crate::LogStatementMode, ServerError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(crate::LogStatementMode::None),
+        "ddl" => Ok(crate::LogStatementMode::Ddl),
+        "mod" => Ok(crate::LogStatementMode::Mod),
+        "all" => Ok(crate::LogStatementMode::All),
+        _ => Err(ServerError::Unsupported("invalid log_statement")),
+    }
+}
+
+/// Parse a `SET log_min_duration_statement` value in milliseconds.
+/// `-1` disables duration-based logging (PostgreSQL semantics); `0`
+/// logs every statement; anything below `-1` is rejected.
+fn parse_log_min_duration_ms(value: &str) -> Result<i64, ServerError> {
+    let parsed = value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| ServerError::Unsupported("invalid log_min_duration_statement"))?;
+    if parsed < -1 {
+        return Err(ServerError::Unsupported(
+            "invalid log_min_duration_statement",
+        ));
+    }
+    Ok(parsed)
+}
+
 fn normalize_datestyle(value: &str) -> Result<String, ServerError> {
     let mut style = None;
     let mut order = None;

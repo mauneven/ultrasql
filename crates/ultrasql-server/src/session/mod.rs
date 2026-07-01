@@ -159,6 +159,14 @@ pub(crate) struct Session<RW> {
     /// 25P03), releasing the row/relation locks it held so other backends are
     /// not blocked indefinitely by an abandoned transaction.
     pub(super) idle_in_transaction_session_timeout_ms: u64,
+    /// Session-local `log_statement` class filter, controlled by
+    /// `SET log_statement` (`none` | `ddl` | `mod` | `all`). Starts at the
+    /// server-config value; `RESET` restores that default.
+    pub(super) log_statement: crate::LogStatementMode,
+    /// Session-local `log_min_duration_statement` in milliseconds; `-1`
+    /// disables duration-based statement logging, `0` logs every statement.
+    /// Starts at the server-config value; `RESET` restores that default.
+    pub(super) log_min_duration_statement_ms: i64,
     /// Session-local custom GUCs used by row-level security policies.
     pub(super) session_settings: std::collections::HashMap<String, String>,
     /// Receiver half of the per-connection notification channel.
@@ -221,6 +229,9 @@ where
         // Sessions start at the server-wide default statement timeout; a
         // client may `SET statement_timeout` to any value (including 0).
         let statement_timeout_ms = state.default_statement_timeout_ms;
+        // Statement-logging GUCs likewise start at the server-config
+        // defaults and are runtime-settable per session.
+        let logging_defaults = state.logging_config();
         Self {
             // Start plaintext; a client `SSLRequest` upgrades it in place when
             // the server has a TLS config (see `startup`).
@@ -242,6 +253,8 @@ where
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: 0,
+            log_statement: logging_defaults.log_statement,
+            log_min_duration_statement_ms: logging_defaults.log_min_duration_statement_ms,
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),

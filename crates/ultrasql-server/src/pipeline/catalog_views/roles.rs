@@ -406,23 +406,40 @@ pub(super) fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("bool"),
             v_text("sighup"),
         ],
+        // The two statement-logging GUCs are runtime-settable per session
+        // (`SET log_statement` / `SET log_min_duration_statement`); the
+        // session override lands in `session_settings`, so prefer it and
+        // fall back to the server-config default. PostgreSQL classifies
+        // both as `superuser` context.
         vec![
             v_text("log_min_duration_statement"),
-            v_text(ctx.logging_config.log_min_duration_statement_ms.to_string()),
+            v_text(
+                ctx.session_settings
+                    .get("log_min_duration_statement")
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ctx.logging_config.log_min_duration_statement_ms.to_string()
+                    }),
+            ),
             v_text("ms"),
             v_text("Reporting and Logging / When to Log"),
             v_text("Logs statements running at least this long."),
             v_text("integer"),
-            v_text("sighup"),
+            v_text("superuser"),
         ],
         vec![
             v_text("log_statement"),
-            v_text(ctx.logging_config.log_statement.as_str()),
+            v_text(
+                ctx.session_settings
+                    .get("log_statement")
+                    .cloned()
+                    .unwrap_or_else(|| ctx.logging_config.log_statement.as_str().to_owned()),
+            ),
             Value::Null,
             v_text("Reporting and Logging / What to Log"),
             v_text("Sets the statements logged by class."),
             v_text("enum"),
-            v_text("sighup"),
+            v_text("superuser"),
         ],
     ]
 }

@@ -564,16 +564,18 @@ where
         rows: u64,
         error: Option<&str>,
     ) {
-        let config = self.state.logging_config();
+        // Session-effective values: they start at the server-config
+        // defaults and are runtime-settable via `SET log_statement` /
+        // `SET log_min_duration_statement` (RESET restores the default).
         let class = statement_log_class(sql);
-        let duration_match = if config.log_min_duration_statement_ms >= 0 {
+        let duration_match = if self.log_min_duration_statement_ms >= 0 {
             let threshold_ms =
-                u64::try_from(config.log_min_duration_statement_ms).unwrap_or(u64::MAX);
+                u64::try_from(self.log_min_duration_statement_ms).unwrap_or(u64::MAX);
             elapsed >= Duration::from_millis(threshold_ms)
         } else {
             false
         };
-        let class_match = match config.log_statement {
+        let class_match = match self.log_statement {
             crate::LogStatementMode::None => false,
             crate::LogStatementMode::Ddl => class == "ddl",
             crate::LogStatementMode::Mod => class == "ddl" || class == "mod",

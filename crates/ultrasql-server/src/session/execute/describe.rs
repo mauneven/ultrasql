@@ -192,6 +192,19 @@ where
                     .remove("idle_in_transaction_session_timeout");
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "log_statement" => {
+                // RESET restores the server-config value (the same
+                // default the session started with), not `none`.
+                self.log_statement = self.state.logging_config().log_statement;
+                self.session_settings.remove("log_statement");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "log_min_duration_statement" => {
+                self.log_min_duration_statement_ms =
+                    self.state.logging_config().log_min_duration_statement_ms;
+                self.session_settings.remove("log_min_duration_statement");
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "work_mem" => {
                 // Drop the override; the lowering path falls back to
                 // DEFAULT_WORK_MEM_BYTES when the key is absent.
@@ -275,6 +288,25 @@ where
                     "idle_in_transaction_session_timeout".to_owned(),
                     parsed.to_string(),
                 );
+                Ok(())
+            }
+            // Statement-logging GUCs, runtime-settable per session. The
+            // logging call site (`log_completed_statement`) consults the
+            // session-effective values, which start at the server-config
+            // defaults; the `session_settings` copy makes the override
+            // visible to `pg_settings` / `current_setting`.
+            "log_statement" => {
+                let parsed = parse_log_statement_mode(value)?;
+                self.log_statement = parsed;
+                self.session_settings
+                    .insert("log_statement".to_owned(), parsed.as_str().to_owned());
+                Ok(())
+            }
+            "log_min_duration_statement" => {
+                let parsed = parse_log_min_duration_ms(value)?;
+                self.log_min_duration_statement_ms = parsed;
+                self.session_settings
+                    .insert("log_min_duration_statement".to_owned(), parsed.to_string());
                 Ok(())
             }
             // Per-statement work-memory budget. Stored canonically as a byte
@@ -406,6 +438,8 @@ where
             "idle_in_transaction_session_timeout" => {
                 self.idle_in_transaction_session_timeout_ms.to_string()
             }
+            "log_statement" => self.log_statement.as_str().to_owned(),
+            "log_min_duration_statement" => self.log_min_duration_statement_ms.to_string(),
             "work_mem" => self
                 .session_settings
                 .get("work_mem")

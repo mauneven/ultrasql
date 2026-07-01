@@ -17,6 +17,15 @@ and must document the break here.
   primary message (`M`) contains only the primary text. The encoder also
   supports an optional `D` (detail) field; no details or hints are invented
   for errors that never had them.
+- Runtime-settable statement-logging GUCs: `log_statement`
+  (`none` | `ddl` | `mod` | `all`) and `log_min_duration_statement`
+  (milliseconds; `-1` disables, `0` logs everything) now support per-session
+  `SET` / `SHOW` / `RESET`, mirroring how `statement_timeout` inherits its
+  server default (`RESET` restores the server-config value, not the built-in
+  default). The statement-log call site consults the session-effective
+  values, and `pg_settings` reports the session value with PostgreSQL's
+  `superuser` context. Both remain configurable at startup via the existing
+  CLI flags.
 - Read-only transactions: `BEGIN` and `SET TRANSACTION` now parse and honor
   `READ ONLY` / `READ WRITE` (and accept `[NOT] DEFERRABLE`, currently inert).
   A data-modifying statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE` /
