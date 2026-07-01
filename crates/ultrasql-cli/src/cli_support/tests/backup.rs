@@ -117,6 +117,19 @@ fn basebackup_dump_restore_and_manifest_helpers_round_trip_files() {
             .expect("backup label")
             .contains("ULTRASQL BACKUP FENCE")
     );
+    // The copy is a bootable data directory: it must come out 0700, because
+    // the server refuses to start from a group/world-readable data dir (a
+    // standby brought up from the backup would otherwise fail to boot).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "basebackup destination must be private (0700)");
+    }
     assert!(run_basebackup_copy(&data.to_path_buf(), &backup.to_path_buf(), None).is_err());
 
     let directory_dump = dir.path().join("dumpdir");

@@ -53,6 +53,15 @@ pub(crate) fn run_basebackup_copy(
         anyhow::bail!("basebackup destination already exists: {}", dest.display());
     }
     fs::create_dir_all(dest)?;
+    // The copy is a bootable data directory (credentials, sidecar metadata),
+    // and the server refuses to start from a group/world-readable data dir —
+    // hand it over with the same 0700 the server requires so a standby can
+    // boot from the backup without a manual chmod.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o700))?;
+    }
     let mut manifest = Vec::new();
     copy_tree_with_manifest(data_dir, data_dir, dest, &mut manifest)?;
     if let Some(fence) = checkpoint_fence {
