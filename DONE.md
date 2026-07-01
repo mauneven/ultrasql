@@ -79,6 +79,12 @@ warnings`), and `cargo fmt --check` green.
   exercises the previously-never-run `should_skip_redo` skip branch, plus
   `fpw_repairs_torn_page_while_lsn_gate_leaves_newer_page_alone`; 5 tests pass).
   Commit `6922fae0`.
+  **Superseded (2026-07-01):** `full_fsync` is now `durability_sync` and the
+  method is configurable via `ultrasqld --wal-sync-method`. The default is
+  `fsync` (`fsync(2)` directly — PostgreSQL's and SQLite's default durability
+  class per platform); `F_FULLFSYNC` is the opt-in `fsync_writethrough`. The
+  single-primitive routing above still holds — the change is which primitive
+  every barrier issues, not which barriers are covered.
 
 ## 2026-06-22 ALTER TABLE ADD CHECK / DROP CONSTRAINT
 

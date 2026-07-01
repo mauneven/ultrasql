@@ -49,7 +49,7 @@ use cli::Cli;
 use config::{
     apply_auth_config, apply_startup_signal_files, apply_tls_config, auth_config_from_cli,
     autovacuum_config_from_cli, init_tracing, listen_security_from_cli, logging_config_from_cli,
-    ops_token_from_cli, tls_config_from_cli,
+    ops_token_from_cli, tls_config_from_cli, wal_sync_method_from_cli,
 };
 use ops::run_ops_endpoint;
 use wal_archive::{command_timeout, restore_wal_once_with_timeout, run_wal_archiver_loop};
@@ -103,6 +103,18 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
+    // Configure the process-global durability sync primitive before any WAL
+    // or storage file is opened so every flush uses the configured method.
+    match wal_sync_method_from_cli(&cli) {
+        Ok(method) => {
+            ultrasql_core::fsync::set_wal_sync_method(method);
+            info!(target: "ultrasqld", wal_sync_method = method.as_str(), "durability sync method configured");
+        }
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid wal_sync_method configuration");
+            return std::process::ExitCode::from(1);
+        }
+    }
     let wal_archive_config = WalArchiveConfig {
         archive_command: cli.archive_command.clone().unwrap_or_default(),
         restore_command: cli.restore_command.clone().unwrap_or_default(),

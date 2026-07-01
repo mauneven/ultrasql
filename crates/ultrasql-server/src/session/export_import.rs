@@ -581,7 +581,7 @@ fn write_file_sync(path: &Path, bytes: &[u8]) -> Result<(), ServerError> {
         .map_err(|err| ServerError::ddl(format!("write {}: {err}", path.display())))?;
     file.write_all(bytes)
         .map_err(|err| ServerError::ddl(format!("write {}: {err}", path.display())))?;
-    ultrasql_core::fsync::full_fsync(&file)
+    ultrasql_core::fsync::durability_sync(&file)
         .map_err(|err| ServerError::ddl(format!("sync {}: {err}", path.display())))?;
     Ok(())
 }

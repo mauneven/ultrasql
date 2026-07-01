@@ -162,9 +162,15 @@ contract for every engine:
   on PATH may be older; the recorded `engine_version` always reflects the live
   server, not the client.
 - **Durability is matched.** A `data-dir` sweep records `storage_mode=data-dir`
-  and `durability_mode=durable` for every engine: UltraSQL runs WAL-backed,
-  PostgreSQL uses logged tables with `synchronous_commit=on`, SQLite uses
-  `journal_mode=WAL, synchronous=FULL`, DuckDB/ClickHouse use on-disk files.
+  and `durability_mode=durable` for every engine: UltraSQL runs WAL-backed with
+  its default `wal_sync_method=fsync` (`fsync(2)` per durability barrier — the
+  same class as the competitors' settings below; `F_FULLFSYNC` writethrough is
+  the opt-in `fsync_writethrough`), PostgreSQL uses logged tables with
+  `synchronous_commit=on`/`fsync=on` at its default `wal_sync_method` (no
+  `F_FULLFSYNC` on macOS), SQLite uses `journal_mode=WAL, synchronous=FULL`
+  (default `fullfsync` off — no `F_FULLFSYNC`), DuckDB/ClickHouse use on-disk
+  files (ClickHouse's `durable` label rests on on-disk MergeTree parts;
+  `fsync_after_insert` defaults to 0, so it fsyncs nothing per insert).
 - **Host descriptor.** Every run embeds the host block (CPU, cores, RAM, OS,
   rustc, git commit) and per-engine versions in
   `scale_sweep_manifest.json`. Incomplete descriptors are not publishable.

@@ -318,6 +318,17 @@ pub(crate) fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String
     })
 }
 
+/// Parse the `--wal-sync-method` value into the process-global sync method.
+///
+/// The clap `value_parser` already restricts the surface to the two canonical
+/// spellings; this converts to the typed [`ultrasql_core::fsync::WalSyncMethod`]
+/// and is unit-tested so a rename/regression in either layer is caught.
+pub(crate) fn wal_sync_method_from_cli(
+    cli: &Cli,
+) -> Result<ultrasql_core::fsync::WalSyncMethod, String> {
+    cli.wal_sync_method.parse()
+}
+
 pub(crate) fn listen_security_from_cli(cli: &Cli) -> Result<(), String> {
     require_auth_or_refuse(
         &cli.listen,

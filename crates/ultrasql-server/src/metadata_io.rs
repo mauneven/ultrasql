@@ -139,7 +139,7 @@ pub(crate) fn write_runtime_metadata_file(path: &Path, text: &str) -> Result<(),
         ServerError::Io(err)
     })?;
     std::io::Write::write_all(&mut file, text.as_bytes()).map_err(ServerError::Io)?;
-    ultrasql_core::fsync::full_fsync(&file).map_err(ServerError::Io)?;
+    ultrasql_core::fsync::durability_sync(&file).map_err(ServerError::Io)?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(ServerError::Io)?;
     sync_runtime_metadata_parent(path)

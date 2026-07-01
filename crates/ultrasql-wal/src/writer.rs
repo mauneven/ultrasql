@@ -26,12 +26,14 @@
 //! Platform fsync semantics
 //! ------------------------
 //!
-//! Durability goes through the shared [`ultrasql_core::fsync::full_fsync`],
-//! which flushes the file to truly stable storage. On most platforms that is
-//! `File::sync_all` (`fsync(2)`); on macOS plain `fsync` does NOT force the
-//! drive to flush its own write cache, so `full_fsync` issues
-//! `fcntl(F_FULLFSYNC)` there (as PostgreSQL and SQLite do) and only falls back
-//! to `sync_all` when the filesystem/device cannot support it.
+//! Durability goes through the shared [`ultrasql_core::fsync::durability_sync`],
+//! which issues the configured `wal_sync_method` primitive: `fsync` (the
+//! default — `fsync(2)` issued directly, PostgreSQL's and SQLite's default
+//! durability class on every platform) or `fsync_writethrough` (additionally
+//! forces the drive's own write cache to stable media via `fcntl(F_FULLFSYNC)`
+//! on macOS, matching PostgreSQL's `fsync_writethrough` / SQLite's
+//! `PRAGMA fullfsync`). See the `ultrasql_core::fsync` module docs for the
+//! power-loss semantics of each method per platform.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -714,7 +716,7 @@ impl WriterDriver {
         if let Some(file) = self.current_file.as_mut() {
             let started = Instant::now();
             file.flush()?;
-            ultrasql_core::fsync::full_fsync(file)?;
+            ultrasql_core::fsync::durability_sync(file)?;
             let elapsed_us = duration_as_micros_saturated(started.elapsed());
             self.shared.record_fsync_latency(elapsed_us);
         }

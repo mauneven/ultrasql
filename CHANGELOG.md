@@ -196,13 +196,23 @@ and must document the break here.
   lookups after sysbench-style indexed DML churn.
 - `ultrasql validate` no longer mis-decodes internal `pg_catalog` heap rows as
   SQL user rows during heap-visibility checks.
-- All file-data fsyncs now route through `F_FULLFSYNC` on macOS, not just the
-  WAL writer. Data-page segments, the WAL manifest, recovery truncation,
-  runtime metadata, catalog/clog snapshots, replication metadata, and
-  `EXPORT` files are all forced to the drive's own write cache (falling back to
-  `sync_all` only on `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`). Previously only the WAL
-  used `F_FULLFSYNC`; every other barrier used `sync_all`, which does not flush
-  the drive cache and could silently lose committed data on power loss.
+- All file-data durability barriers now route through one configurable
+  primitive (`durability_sync`): data-page segments, the WAL writer/manifest,
+  recovery truncation, runtime metadata, catalog/clog snapshots, replication
+  metadata, 2PC prepared-state files, and `EXPORT` files all issue the
+  configured `--wal-sync-method` (env `ULTRASQL_WAL_SYNC_METHOD`), mirroring
+  PostgreSQL's `wal_sync_method`. The default is `fsync` — `fsync(2)` issued
+  directly, the durability class PostgreSQL (`fsync = on` with its default
+  `wal_sync_method`) and SQLite (`synchronous=FULL`, default `fullfsync` off)
+  provide on every platform. `fsync_writethrough` additionally forces the
+  drive's own write cache to stable media (`fcntl(F_FULLFSYNC)` on macOS,
+  falling back to `sync_all` only on `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`) for
+  power-loss durability on drives with volatile caches, at a substantial
+  per-commit cost (~60x on Apple SSDs). This changes the default macOS
+  behavior from always-`F_FULLFSYNC` to PostgreSQL's default posture there;
+  Linux behavior is unchanged (`fsync(2)` already forces the device cache
+  through the block layer). See `docs/configuration.md` for the full
+  per-platform power-loss semantics.
 - Window function calls nested inside value expressions are now lifted and
   evaluated — e.g. `COALESCE(LAG(x) OVER w, 0)`,
   `CASE WHEN ... THEN row_number() OVER w END`, casts, `IN` lists, `BETWEEN`,

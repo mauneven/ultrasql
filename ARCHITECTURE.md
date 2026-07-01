@@ -196,14 +196,18 @@ is a known bottleneck and an open performance RFC.
 thread batches outstanding records into one WAL segment write per fsync
 window. The window is the smaller of (a) wall-clock 200 µs or (b) the
 batch size at which the next write would exceed 256 KiB. Both are
-tunable. The fsync at the end of each window is `full_fsync`
-(`crates/ultrasql-core/src/fsync.rs`), which on macOS issues `fcntl(F_FULLFSYNC)`
-to force the drive to flush its own write cache (as PostgreSQL and SQLite do),
-falling back to `sync_all` only on `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`. The same
-`full_fsync` backs every other file-data barrier — data segments, catalog/clog
-snapshots, metadata, the WAL manifest, recovery truncation, and export — so a
-plain `sync_all` (which does not flush the drive cache on macOS) is never the
-last barrier before a committed write is reported durable.
+tunable. The fsync at the end of each window is `durability_sync`
+(`crates/ultrasql-core/src/fsync.rs`), which issues the configured
+`--wal-sync-method` primitive: `fsync` (the default — `fsync(2)`, the
+durability class PostgreSQL's and SQLite's defaults provide on every
+platform) or `fsync_writethrough` (additionally forces the drive's own write
+cache to stable media via `fcntl(F_FULLFSYNC)` on macOS, matching
+PostgreSQL's `fsync_writethrough` and SQLite's `PRAGMA fullfsync`; it falls
+back to `sync_all` only on `ENOTSUP`/`EOPNOTSUPP`/`EINVAL`). The same
+`durability_sync` backs every other file-data barrier — data segments,
+catalog/clog snapshots, metadata, the WAL manifest, recovery truncation, and
+export — so every barrier before a committed write is reported durable uses
+one consistent, configured primitive.
 
 **Contracts.**
 

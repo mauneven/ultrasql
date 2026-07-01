@@ -301,7 +301,7 @@ impl SegmentFile {
 
     /// Flush file contents and metadata.
     fn fsync(&self) -> Result<(), SegmentError> {
-        ultrasql_core::fsync::full_fsync(&self.file)?;
+        ultrasql_core::fsync::durability_sync(&self.file)?;
         Ok(())
     }
 }

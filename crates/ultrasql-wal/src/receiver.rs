@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use ultrasql_core::Lsn;
-use ultrasql_core::fsync::full_fsync;
+use ultrasql_core::fsync::durability_sync;
 
 use crate::record::{MAX_RECORD_BYTES, RECORD_HEADER_SIZE_U32, WalRecordError};
 use crate::segment::{list_segments, segment_path};
@@ -202,7 +202,7 @@ impl WalReceiver {
     pub fn flush(&mut self) -> Result<(), WalWriterError> {
         if let Some(file) = self.current_file.as_mut() {
             file.flush()?;
-            full_fsync(file)?;
+            durability_sync(file)?;
         }
         // Every written record is now durable: the current segment was just
         // fsynced, and any earlier segments were fsynced on rotation.
@@ -291,7 +291,7 @@ impl WalReceiver {
         // records in the finished segment are now durable.
         if let Some(file) = self.current_file.as_mut() {
             file.flush()?;
-            full_fsync(file)?;
+            durability_sync(file)?;
             self.flushed_lsn = self.written_lsn;
         }
         self.current_file = None;

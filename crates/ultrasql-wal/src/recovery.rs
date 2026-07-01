@@ -376,7 +376,7 @@ pub fn repair_final_segment_tail(wal_dir: impl AsRef<Path>) -> Result<Option<u64
 
     let file = open_segment_for_truncate(path)?;
     file.set_len(good_len)?;
-    ultrasql_core::fsync::full_fsync(&file)?;
+    ultrasql_core::fsync::durability_sync(&file)?;
     sync_parent_dir(path)?;
     Ok(Some(file_len - good_len))
 }

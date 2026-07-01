@@ -167,6 +167,21 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0)]
     pub(crate) wal_segment_size_bytes: u64,
 
+    /// Durability sync primitive for WAL/data flushes, mirroring PostgreSQL's
+    /// `wal_sync_method`. `fsync` (default) issues `fsync(2)` — the durability
+    /// class PostgreSQL and SQLite defaults provide on every platform.
+    /// `fsync_writethrough` additionally forces the drive's own write cache to
+    /// stable media (`fcntl(F_FULLFSYNC)` on macOS, like PostgreSQL's
+    /// `fsync_writethrough`; identical to `fsync` elsewhere) so commits also
+    /// survive sudden power loss on drives with volatile caches.
+    #[arg(
+        long,
+        env = "ULTRASQL_WAL_SYNC_METHOD",
+        default_value = "fsync",
+        value_parser = ["fsync", "fsync_writethrough"],
+    )]
+    pub(crate) wal_sync_method: String,
+
     /// Shell command used to archive completed WAL files. `%p` expands to the
     /// source path and `%f` expands to the WAL filename.
     #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]
@@ -257,6 +272,7 @@ Production-oriented flags:
   - --log-format json   emit structured logs
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
+  - --wal-sync-method fsync|fsync_writethrough  durability flush primitive
   - --idle-session-timeout-ms N
   - --archive-command CMD  archive completed WAL files; %p=path, %f=name
   - --restore-command CMD  restore archived WAL before recovery; %p=path, %f=name

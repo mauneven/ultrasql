@@ -24,6 +24,21 @@ stored per connection.
 ## WAL
 
 - `ULTRASQL_DATA_DIR` or `ultrasqld --data-dir DIR` enables WAL-backed storage.
+- `ultrasqld --wal-sync-method fsync|fsync_writethrough` (env
+  `ULTRASQL_WAL_SYNC_METHOD`) selects the durability flush primitive,
+  mirroring PostgreSQL's `wal_sync_method`. The default `fsync` issues
+  `fsync(2)` on every durability barrier — the same class PostgreSQL
+  (`fsync = on` with its default `wal_sync_method`) and SQLite
+  (`synchronous=FULL` with default `fullfsync` off) provide. On Linux this
+  forces the device write cache, so completed commits survive power loss. On
+  macOS, `fsync(2)` does not force the drive's own cache — identical to the
+  PostgreSQL/SQLite default posture there — so commits survive an OS crash but
+  sudden power loss can lose or reorder whatever is still in the drive's
+  volatile cache (not only the newest commits: unordered destage can persist a
+  later barrier while an earlier cached write is lost, the same exposure
+  PostgreSQL documents for its macOS default); set `fsync_writethrough`
+  (PostgreSQL's name for `fcntl(F_FULLFSYNC)`) to force the drive cache to
+  stable media at a substantial per-commit latency cost (~60x on Apple SSDs).
 - `ultrasql --archive-wal WAL_PATH --archive-dir DIR` copies one WAL file into
   an archive directory.
 - `ultrasql --restore-wal WAL_NAME --archive-dir DIR --restore-output PATH`

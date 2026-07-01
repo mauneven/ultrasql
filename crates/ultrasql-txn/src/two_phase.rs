@@ -475,7 +475,11 @@ fn write_state_file(
             gid: gid.to_owned(),
             detail: e.to_string(),
         })?;
-    file.sync_all().map_err(|e| TwoPhaseError::Io {
+    // File-DATA durability barrier: use the configured sync method, the same
+    // class as the prepare's WAL records. A state file synced *stronger* than
+    // its WAL would invert the PREPARE ordering under power loss (state file
+    // survives, WAL prepare data lost -> phantom prepared txn at recovery).
+    ultrasql_core::fsync::durability_sync(&file).map_err(|e| TwoPhaseError::Io {
         gid: gid.to_owned(),
         detail: e.to_string(),
     })?;

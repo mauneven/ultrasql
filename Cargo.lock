@@ -3470,6 +3470,7 @@ dependencies = [
  "proptest",
  "rstest",
  "smallvec",
+ "tempfile",
  "thiserror",
  "xxhash-rust",
 ]
