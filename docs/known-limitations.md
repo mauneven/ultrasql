@@ -150,9 +150,8 @@ completed evidence.
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
   `DISTINCT` ordered-set forms, and additional multi-argument statistical
-  functions. Separately, `avg()` over an integer column returns double
-  precision (matching the DuckDB/SQLite differential oracle) rather than
-  PostgreSQL's `numeric`, so `avg` results are not arbitrary-precision.
+  functions. (`avg()` over integer and numeric columns now returns
+  PostgreSQL's `numeric`.)
 - PL/pgSQL, stored procedures, trigger semantics, event triggers, and
   extension loading are not complete.
 - There are two HNSW implementations. The production page-backed index
@@ -230,11 +229,11 @@ completed evidence.
   not full benchmark release certification. Full sign-off still needs the
   full benchmark profile and WAL-backed data-dir scale-sweep evidence.
 - Firebolt comparisons use local Firebolt Core only, not hosted Firebolt URLs.
-- Durable bulk `INSERT` at 1M rows is still recorded `not_available` in the
-  committed scoreboard, but the underlying `wal buffer full` failure is fixed in
-  code: per-record backpressure is wired and a single record larger than the
-  8 MiB WAL buffer is now admitted over-capacity. The artifact needs a re-run to
-  record a measurement. Checkpoint-driven WAL segment recycling is now
+- Durable bulk `INSERT` at 1M rows completes (the old `wal buffer full`
+  failure is fixed by per-record backpressure); the committed scoreboard
+  reflects whatever the latest full sweep run recorded — read
+  `benchmarks/results/latest/scale-sweep/` rather than this sentence for
+  current numbers. Checkpoint-driven WAL segment recycling is now
   implemented: at each checkpoint the WAL is truncated below a crash-safe floor
   (the minimum of the redo point, the oldest in-progress transaction's first
   written LSN, and each vector-index snapshot LSN) via

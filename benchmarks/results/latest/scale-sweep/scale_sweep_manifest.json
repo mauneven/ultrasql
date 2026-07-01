@@ -8,13 +8,13 @@
   },
   "host": {
     "cpu_model": "Apple M4",
-    "git_commit": "77a92d7c711cdc4d709d6291ab6a07781649693d",
+    "git_commit": "1faf525de6e134812b9d381074e2a379e8a32707",
     "hostname": "maunevens-Mac-mini.local",
     "logical_cpus": 10,
     "machine": "arm64",
     "memory_bytes": 17179869184,
-    "os": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+    "os": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
   },
   "iters": 32,
   "methodology": "UltraSQL external release artifact over TCP; competitors installed local clients including ClickHouse when available; bulk INSERT uses a fresh UltraSQL server per measured sample and 10k-row INSERT chunks across engines.",

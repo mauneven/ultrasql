@@ -26,7 +26,7 @@ all aspects, or that it is ready for unsupervised production use.
 
 The ethical claim today is narrower:
 
-- UltraSQL was the fastest measured engine on 17 of 24 comparable workloads in
+- UltraSQL was the fastest measured engine on 21 of 24 comparable workloads in
   the committed release-artifact DB-vs-DB scale sweep on the recorded Apple M4
   host; PostgreSQL, DuckDB, ClickHouse, and SQLite each win one or more of the
   remaining 7. This matches the Claim Policy below and the README scoreboard.
@@ -49,7 +49,7 @@ The ethical claim today is narrower:
 | Fuzz workflow | GitHub run `27529191424` for commit `f9fc5c6f` | success |
 | Sanitizers workflow | GitHub run `27526490428` for commit `f9fc5c6f` | success |
 | Bench workflow | GitHub run `27532810814` for commit `f9fc5c6f` | cancelled; latest committed scale-sweep artifact remains 2026-06-14 |
-| Release-artifact scale sweep | `benchmarks/results/latest/scale-sweep/scale_sweep.json` | UltraSQL fastest on 17 of 24 comparable measured rows; the other 7 are led by PostgreSQL / DuckDB / ClickHouse / SQLite |
+| Release-artifact scale sweep | `benchmarks/results/latest/scale-sweep/scale_sweep.json` | UltraSQL fastest on 21 of 24 comparable measured rows; the other 3 (1M bulk UPDATE, 1M bulk DELETE, point-op Mixed OLTP) are led by DuckDB / ClickHouse / in-process SQLite |
 | Benchmark certification status | `benchmarks/results/latest/benchmark_certification_status.json` | `not_ready`; committed scale sweep is stale, lacks data-dir mode evidence, and predates strict raw-artifact schema |
 | Aggregate release gate | `benchmarks/results/latest/release_gate_status.json` | `not_ready`; blockers remain across driver, operator soak, external audit, incident drill, and benchmark gates |
 | Operator soak status | `benchmarks/results/latest/operator_soak_status.json` | `not_ready`; 0 valid release reports, need 3 independent 30-day reports |
@@ -98,7 +98,7 @@ The ethical claim today is narrower:
 Allowed:
 
 ```text
-UltraSQL was the fastest measured engine on 17 of 24 workloads in the committed
+UltraSQL was the fastest measured engine on 21 of 24 workloads in the committed
 release-artifact DB-vs-DB scale sweep (pinned commit 77a92d7c) on the recorded
 Apple M4 host; PostgreSQL 17, DuckDB, ClickHouse, and SQLite each win one or more
 of the other workloads, and the durable 1M INSERT is recorded not_available.
