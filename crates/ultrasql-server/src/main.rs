@@ -49,7 +49,7 @@ use cli::Cli;
 use config::{
     apply_auth_config, apply_startup_signal_files, apply_tls_config, auth_config_from_cli,
     autovacuum_config_from_cli, init_tracing, listen_security_from_cli, logging_config_from_cli,
-    ops_token_from_cli, tls_config_from_cli, wal_sync_method_from_cli,
+    ops_token_from_cli, resolve_primary_conninfo, tls_config_from_cli, wal_sync_method_from_cli,
 };
 use ops::run_ops_endpoint;
 use wal_archive::{command_timeout, restore_wal_once_with_timeout, run_wal_archiver_loop};
@@ -194,6 +194,54 @@ fn main() -> std::process::ExitCode {
             info!(target: "ultrasqld", data_dir = %path.display(), "hot standby read-only mode enabled");
         }
     }
+    // Standby streaming: with standby mode enabled and a primary_conninfo
+    // (flag/env, or a `primary_conninfo` file in the data dir), launch the
+    // continuous walreceiver so this standby stays current on its own. Runs
+    // on a dedicated OS thread: WAL apply is blocking heap/commit-status I/O.
+    let walreceiver_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if state.is_standby_mode()
+        && let Some(path) = &cli.data_dir
+    {
+        match resolve_primary_conninfo(&cli, path) {
+            Ok(Some(conninfo)) => {
+                let receiver_state = Arc::clone(&state);
+                let wal_dir = path.join("pg_wal");
+                let segment_size_bytes = if cli.wal_segment_size_bytes > 0 {
+                    cli.wal_segment_size_bytes
+                } else {
+                    ultrasql_wal::WalWriterConfig::default().segment_size_bytes
+                };
+                let shutdown = Arc::clone(&walreceiver_shutdown);
+                info!(
+                    target: "ultrasqld",
+                    primary = %format!("{}:{}", conninfo.host, conninfo.port),
+                    "standby walreceiver configured; streaming from primary"
+                );
+                std::thread::Builder::new()
+                    .name("ultrasql-walreceiver".to_owned())
+                    .spawn(move || {
+                        ultrasql_server::walreceiver::run_standby_walreceiver(
+                            receiver_state,
+                            &conninfo,
+                            wal_dir,
+                            segment_size_bytes,
+                            shutdown,
+                        );
+                    })
+                    .ok();
+            }
+            Ok(None) => {
+                info!(
+                    target: "ultrasqld",
+                    "standby has no primary_conninfo; serving the recovered state without streaming"
+                );
+            }
+            Err(e) => {
+                error!(target: "ultrasqld", error = %e, "invalid primary_conninfo configuration");
+                return std::process::ExitCode::from(1);
+            }
+        }
+    }
     let outcome = runtime.block_on(async move {
         if let Some(ops_addr) = cli.ops_listen {
             let pg_addr = cli.listen;
@@ -205,7 +253,7 @@ fn main() -> std::process::ExitCode {
                 }
             });
         }
-        if cli.autovacuum_interval_ms > 0 {
+        if cli.autovacuum_interval_ms > 0 && !state.is_standby_mode() {
             let autovacuum_state = Arc::clone(&state);
             let interval = std::time::Duration::from_millis(cli.autovacuum_interval_ms);
             tokio::spawn(async move {
@@ -225,7 +273,13 @@ fn main() -> std::process::ExitCode {
                 }
             });
         }
-        if cli.checkpoint_interval_ms > 0 && cli.data_dir.is_some() {
+        // A standby must not append LOCAL WAL: a checkpoint barrier record or
+        // autovacuum WAL would diverge its byte stream from the primary's and
+        // corrupt the landed-WAL invariant the walreceiver relies on. Both
+        // background writers are therefore gated off in standby mode
+        // (PostgreSQL standbys likewise run neither autovacuum nor normal
+        // checkpoints); standby WAL is truncated on promotion/restart instead.
+        if cli.checkpoint_interval_ms > 0 && cli.data_dir.is_some() && !state.is_standby_mode() {
             let checkpoint_state = Arc::clone(&state);
             let interval = std::time::Duration::from_millis(cli.checkpoint_interval_ms);
             tokio::spawn(async move {
@@ -258,6 +312,9 @@ fn main() -> std::process::ExitCode {
         }
         run_server_with_signals(cli.listen, state, cli.shutdown_drain_timeout_ms).await
     });
+    // Stop the standby walreceiver thread (if any) before exiting so it does
+    // not race process teardown mid-landing.
+    walreceiver_shutdown.store(true, std::sync::atomic::Ordering::Release);
     match outcome {
         Ok(()) => std::process::ExitCode::from(0),
         Err(e) => {

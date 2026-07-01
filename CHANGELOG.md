@@ -221,6 +221,15 @@ and must document the break here.
   lookups after sysbench-style indexed DML churn.
 - `ultrasql validate` no longer mis-decodes internal `pg_catalog` heap rows as
   SQL user rows during heap-visibility checks.
+- Queryable hot standby with continuous streaming: a standby brought up from
+  `ultrasql --basebackup` output (now created `0700` so it boots directly)
+  with a `standby.signal` and a `primary_conninfo` (flag/env/file; optional
+  `slot=` uses a physical replication slot) auto-connects a walreceiver,
+  streams physical WAL, applies it continuously, and serves read-only queries
+  that observe the primary's post-backup commits — proven by a two-node
+  live-apply round trip over the wire. Standby-local checkpoints/autovacuum
+  are disabled so the standby never appends WAL that would diverge from the
+  primary's stream.
 - New sessions default to a 30-second `statement_timeout`
   (`ultrasqld --statement-timeout-ms` / `ULTRASQL_STATEMENT_TIMEOUT_MS`; `0`
   disables) so one runaway query cannot occupy a connection forever on a

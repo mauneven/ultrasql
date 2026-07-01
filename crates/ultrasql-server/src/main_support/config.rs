@@ -329,6 +329,38 @@ pub(crate) fn wal_sync_method_from_cli(
     cli.wal_sync_method.parse()
 }
 
+/// Resolve the standby's `primary_conninfo`: the `--primary-conninfo`
+/// flag/env wins; otherwise a `primary_conninfo` file inside the data dir is
+/// read (trimmed). `Ok(None)` means "standby without streaming" — it serves
+/// the recovered state read-only, exactly as before auto-connect existed.
+pub(crate) fn resolve_primary_conninfo(
+    cli: &Cli,
+    data_dir: &Path,
+) -> Result<Option<ultrasql_server::walreceiver::PrimaryConnInfo>, String> {
+    let text = if let Some(flag) = cli
+        .primary_conninfo
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        flag.to_owned()
+    } else {
+        let path = data_dir.join("primary_conninfo");
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let trimmed = contents.trim().to_owned();
+                if trimmed.is_empty() {
+                    return Err(format!("{} exists but is empty", path.display()));
+                }
+                trimmed
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("reading {}: {e}", path.display())),
+        }
+    };
+    ultrasql_server::walreceiver::parse_primary_conninfo(&text).map(Some)
+}
+
 pub(crate) fn listen_security_from_cli(cli: &Cli) -> Result<(), String> {
     require_auth_or_refuse(
         &cli.listen,

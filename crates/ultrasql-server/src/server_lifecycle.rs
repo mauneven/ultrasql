@@ -248,6 +248,15 @@ impl Server {
         self.standby_mode.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Raw hot-standby WAL-apply cursor (next LSN not yet applied by
+    /// continuous replay). Used by the standby walreceiver loop to skip
+    /// redundant apply calls and by diagnostics.
+    #[must_use]
+    pub fn standby_apply_lsn_raw(&self) -> u64 {
+        self.standby_apply_lsn
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// LSN through which the runtime WAL writer has fsynced.
     ///
     /// Returns `None` for in-memory sample servers because those instances do

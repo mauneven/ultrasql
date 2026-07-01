@@ -191,9 +191,16 @@ completed evidence.
 
 ## Replication and backup
 
-- Physical WAL sender/receiver utilities exist, but continuous networked
-  replication, synchronous replication modes, cascading replication, and
-  online backup fencing remain open.
+- Continuous streaming physical replication to a queryable hot standby works
+  end to end: base-backup bring-up (`ultrasql --basebackup` + `standby.signal`
+  + `primary_conninfo`), auto-connected walreceiver, continuous WAL apply, and
+  read-only query serving — proven by a two-node live-apply round trip.
+  Remaining gaps: synchronous replication modes (commit does not wait for the
+  standby), promotion/failover tooling, cascading replication, standby-side
+  WAL recycling (standby WAL grows until restart/promotion; checkpoints and
+  autovacuum are intentionally disabled on a standby), authz changes reach a
+  standby only via a new base backup (roles/privileges/RLS live in sidecar
+  metadata, not WAL), and online backup fencing remains coarse.
 - Logical decoding and `pgoutput` are not complete.
 - Archive dump/restore is partial and must be validated per workload.
 

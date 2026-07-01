@@ -193,6 +193,15 @@ pub(crate) struct Cli {
     )]
     pub(crate) wal_sync_method: String,
 
+    /// Standby streaming source: libpq-style `host=... port=... user=...`
+    /// (optional `slot=...`). Only used when the data dir carries a
+    /// `standby.signal`/`recovery.signal` marker; the standby then connects,
+    /// streams physical WAL from the primary, and applies it continuously so
+    /// read-only sessions stay current. A `primary_conninfo` file inside the
+    /// data dir is used when this flag/env is unset.
+    #[arg(long, env = "ULTRASQL_PRIMARY_CONNINFO")]
+    pub(crate) primary_conninfo: Option<String>,
+
     /// Shell command used to archive completed WAL files. `%p` expands to the
     /// source path and `%f` expands to the WAL filename.
     #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]

@@ -54,8 +54,19 @@ stored per connection.
   restores one archived WAL file.
 - `ultrasql --wal-send-once DEST --archive-dir DIR --data-dir DATA_DIR` and
   `ultrasql --wal-receive-once SOURCE --data-dir DATA_DIR` exercise file-backed
-  physical shipping. Continuous sender/receiver loops remain release hardening
-  work.
+  physical shipping.
+- Hot standby with continuous streaming: bring a standby up from
+  `ultrasql --basebackup` output (the copy includes catalog/authz sidecars and
+  is created `0700`), add a `standby.signal` file, and give it a
+  `primary_conninfo` — either `ultrasqld --primary-conninfo "host=... port=...
+  user=..."` (env `ULTRASQL_PRIMARY_CONNINFO`) or a `primary_conninfo` file in
+  the data dir (optional `slot=<name>` streams from a physical replication
+  slot so the primary retains the standby's WAL). The standby connects,
+  streams physical WAL, applies it continuously, and serves read-only
+  sessions (writes are rejected with SQLSTATE `25006`); primary and standby
+  must use the same `--wal-segment-size-bytes`. In standby mode the local
+  checkpointer and autovacuum are disabled so the standby never appends local
+  WAL that would diverge from the primary's stream.
 
 ## Object-store
 

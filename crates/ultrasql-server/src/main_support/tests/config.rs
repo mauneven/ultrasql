@@ -36,6 +36,59 @@ fn wal_sync_method_from_cli_maps_both_methods_and_rejects_unknown() {
 }
 
 #[test]
+fn resolve_primary_conninfo_prefers_flag_then_file_then_none() {
+    use crate::config::resolve_primary_conninfo;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cli = cli_with_auth_password_file(PathBuf::from("/unused"));
+
+    // No flag, no file: standby without streaming.
+    assert_eq!(
+        resolve_primary_conninfo(&cli, dir.path()).expect("ok"),
+        None
+    );
+
+    // File fallback.
+    std::fs::write(
+        dir.path().join("primary_conninfo"),
+        "host=127.0.0.1 port=5544 user=repl
+",
+    )
+    .expect("write conninfo file");
+    let from_file = resolve_primary_conninfo(&cli, dir.path())
+        .expect("ok")
+        .expect("some");
+    assert_eq!(from_file.port, 5544);
+
+    // Flag wins over the file.
+    cli.primary_conninfo = Some("host=10.1.1.1 port=6000 user=repl2".to_owned());
+    let from_flag = resolve_primary_conninfo(&cli, dir.path())
+        .expect("ok")
+        .expect("some");
+    assert_eq!(from_flag.host, "10.1.1.1");
+    assert_eq!(from_flag.port, 6000);
+
+    // An empty file is a configuration error, not silent no-streaming.
+    cli.primary_conninfo = None;
+    std::fs::write(
+        dir.path().join("primary_conninfo"),
+        "   
+",
+    )
+    .expect("write empty");
+    assert!(resolve_primary_conninfo(&cli, dir.path()).is_err());
+
+    // A malformed line is rejected.
+    std::fs::write(
+        dir.path().join("primary_conninfo"),
+        "host=only
+",
+    )
+    .expect("write partial");
+    assert!(resolve_primary_conninfo(&cli, dir.path()).is_err());
+}
+
+#[test]
 fn autovacuum_config_from_cli_converts_scale_factors() {
     let cli = Cli {
         listen: "127.0.0.1:5433".parse().expect("listen addr"),
@@ -70,6 +123,7 @@ fn autovacuum_config_from_cli_converts_scale_factors() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -116,6 +170,7 @@ fn autovacuum_config_from_cli_rejects_invalid_scale_factor() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -157,6 +212,7 @@ fn logging_config_from_cli_rejects_invalid_duration() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -198,6 +254,7 @@ fn logging_config_from_cli_accepts_duration_and_statement_mode() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -243,6 +300,7 @@ fn listen_security_from_cli_rejects_wildcard_without_override() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -372,6 +430,7 @@ fn md5_auth_from_cli_reads_password_file_and_secures_wildcard_listener() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -490,6 +549,7 @@ fn md5_auth_from_cli_rejects_partial_or_dirty_password_config() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
@@ -613,6 +673,7 @@ fn cli_with_auth_password_file(password_file: PathBuf) -> Cli {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     }
 }
@@ -652,6 +713,7 @@ fn ops_token_from_cli_rejects_weak_tokens() {
         archive_command_timeout_ms: 60_000,
         restore_command_timeout_ms: 60_000,
         wal_sync_method: "fsync".to_owned(),
+        primary_conninfo: None,
         statement_timeout_ms: ultrasql_server::DEFAULT_STATEMENT_TIMEOUT_MS,
     };
 
