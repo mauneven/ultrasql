@@ -383,6 +383,39 @@ pub(crate) fn metrics_body(state: &Server) -> String {
     push_metric(&mut body, "ultrasql_wal_bytes_total", wal_sink.wal_bytes);
     push_metric(&mut body, "ultrasql_wal_write_total", wal_sink.wal_write);
 
+    // WAL position gauges (LSN). `flushed_lsn` is the local writer's fsync point
+    // (0 for in-memory sample servers); `standby_apply_lsn` is the hot-standby
+    // replay cursor (seeded at recovery, advanced by `apply_landed_wal`).
+    // Replication lag is derived externally (primary flushed_lsn - standby
+    // apply_lsn) until continuous streaming apply is wired — see the design doc.
+    body.push_str(
+        "# HELP ultrasql_wal_flushed_lsn Last WAL LSN fsynced by the writer (0 if none).\n\
+         # TYPE ultrasql_wal_flushed_lsn gauge\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_flushed_lsn",
+        state.runtime_wal_flushed_lsn().map_or(0, |lsn| lsn.raw()),
+    );
+    body.push_str(
+        "# HELP ultrasql_standby_apply_lsn Hot-standby WAL-apply cursor LSN (next unapplied).\n\
+         # TYPE ultrasql_standby_apply_lsn gauge\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_standby_apply_lsn",
+        state.standby_apply_cursor_lsn().raw(),
+    );
+    body.push_str(
+        "# HELP ultrasql_standby_mode 1 when this node is a read-only hot standby.\n\
+         # TYPE ultrasql_standby_mode gauge\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_standby_mode",
+        u64::from(state.is_standby_mode()),
+    );
+
     body.push_str(
         "# HELP ultrasql_object_store_remote_bytes_total Object-store bytes fetched remotely.\n\
          # TYPE ultrasql_object_store_remote_bytes_total counter\n",

@@ -258,6 +258,17 @@ impl Server {
             .map(ultrasql_wal::WalWriter::flushed_lsn)
     }
 
+    /// Hot-standby WAL-apply cursor: the next LSN not yet replayed. Seeded at
+    /// recovery and advanced by [`Server::apply_landed_wal`]; on a primary it
+    /// stays at the recovered LSN.
+    #[must_use]
+    pub fn standby_apply_cursor_lsn(&self) -> ultrasql_core::Lsn {
+        ultrasql_core::Lsn::new(
+            self.standby_apply_lsn
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
     /// Append a commit marker for WAL-backed SQL recovery.
     ///
     /// `committed_subxids` are the subtransaction XIDs that committed atomically

@@ -24,6 +24,9 @@ fn metrics_body_reports_system_counters() {
         "ultrasql_wal_fsync_latency_us_sum",
         "ultrasql_wal_records_total",
         "ultrasql_wal_bytes_total",
+        "ultrasql_wal_flushed_lsn",
+        "ultrasql_standby_apply_lsn",
+        "ultrasql_standby_mode",
         "ultrasql_object_store_remote_bytes_total",
         "ultrasql_ann_candidates",
         "ultrasql_vector_index_memory_bytes",
@@ -33,6 +36,20 @@ fn metrics_body_reports_system_counters() {
     ] {
         assert!(body.contains(metric), "missing metric {metric}");
     }
+}
+
+#[test]
+fn metrics_body_reports_standby_mode_gauge() {
+    let state = Server::with_sample_database();
+    assert!(
+        metrics_body(&state).contains("ultrasql_standby_mode 0"),
+        "primary should report standby_mode 0"
+    );
+    state.set_standby_mode(true);
+    assert!(
+        metrics_body(&state).contains("ultrasql_standby_mode 1"),
+        "standby should report standby_mode 1"
+    );
 }
 
 #[tokio::test]
