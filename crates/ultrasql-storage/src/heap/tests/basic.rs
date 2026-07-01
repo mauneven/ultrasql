@@ -14,6 +14,31 @@ use super::*;
 use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
 
 #[test]
+fn rollback_stamp_pages_dedupe_and_preserve_first_touch_order() {
+    let heap = make_heap(8);
+    let rel = ultrasql_core::RelationId::new(42);
+    let xid = Xid::new(77);
+    let page = |block: u32| ultrasql_core::PageId::new(rel, BlockNumber::new(block));
+
+    // Interleaved duplicates: each page must be remembered exactly once,
+    // in first-touch order, regardless of how often the walker reports it.
+    for block in [3_u32, 1, 3, 2, 1, 3, 2] {
+        heap.remember_rollback_stamp_page(xid, page(block));
+    }
+    assert_eq!(
+        heap.take_rollback_stamp_pages(xid),
+        vec![page(3), page(1), page(2)]
+    );
+
+    // Taking drains the entry; a second take is empty.
+    assert!(heap.take_rollback_stamp_pages(xid).is_empty());
+
+    // The invalid xid is never recorded.
+    heap.remember_rollback_stamp_page(Xid::INVALID, page(1));
+    assert!(heap.take_rollback_stamp_pages(Xid::INVALID).is_empty());
+}
+
+#[test]
 fn seed_block_count_advances_monotonically() {
     let heap = make_heap(8);
     let rel = ultrasql_core::RelationId::new(42);

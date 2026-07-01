@@ -297,6 +297,30 @@ pub trait Catalog: Send + Sync {
 
 /// Heap access method.
 ///
+/// Insertion-ordered set of pages stamped with a transaction's `xmax`.
+///
+/// The membership set exists purely to dedupe: the page-major DELETE and
+/// classic-UPDATE walkers report every touched page once per page, but a
+/// bare `Vec::contains` dedupe made
+/// [`HeapAccess::remember_rollback_stamp_page`] quadratic in the number of
+/// touched pages (a 1M-row / ~6 500-page bulk DELETE spent more time in the
+/// dedupe scan than in the delete itself).
+#[derive(Debug, Default)]
+struct RollbackStampPages {
+    /// Unique stamped pages in first-touch order.
+    pages: Vec<PageId>,
+    /// O(1) membership index over `pages`.
+    seen: std::collections::HashSet<PageId>,
+}
+
+impl RollbackStampPages {
+    fn insert(&mut self, page_id: PageId) {
+        if self.seen.insert(page_id) {
+            self.pages.push(page_id);
+        }
+    }
+}
+
 /// One [`HeapAccess`] instance is shared across the executor; it does
 /// not own any per-statement state, so a single value can serve every
 /// concurrent query against the same buffer pool.
@@ -364,7 +388,7 @@ pub struct HeapAccess<L: PageLoader> {
     /// Rollback uses this to clear aborted DELETE/classic-UPDATE stamps without
     /// scanning every block of every relation. In-place UPDATE rollback uses
     /// `undo_log` instead because it must restore payload bytes too.
-    rollback_stamp_pages: Arc<DashMap<u64, parking_lot::Mutex<Vec<PageId>>>>,
+    rollback_stamp_pages: Arc<DashMap<u64, parking_lot::Mutex<RollbackStampPages>>>,
     /// Payload-only min/max cache for page-local `(Int32, Int32)` rows.
     ///
     /// Header-only DELETE stamps do not invalidate this cache because tuple
@@ -762,17 +786,15 @@ impl<L: PageLoader> HeapAccess<L> {
         let entry = self
             .rollback_stamp_pages
             .entry(xid_raw)
-            .or_insert_with(|| parking_lot::Mutex::new(Vec::new()));
+            .or_insert_with(|| parking_lot::Mutex::new(RollbackStampPages::default()));
         let mut pages = entry.lock();
-        if !pages.contains(&page_id) {
-            pages.push(page_id);
-        }
+        pages.insert(page_id);
     }
 
     pub(crate) fn take_rollback_stamp_pages(&self, xid: Xid) -> Vec<PageId> {
         self.rollback_stamp_pages
             .remove(&xid.raw())
-            .map_or_else(Vec::new, |(_, pages)| pages.into_inner())
+            .map_or_else(Vec::new, |(_, pages)| pages.into_inner().pages)
     }
 
     /// Borrow the buffer pool's WAL sink, if any.
