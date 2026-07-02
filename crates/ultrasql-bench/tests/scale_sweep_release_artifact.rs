@@ -359,7 +359,12 @@ fn ultrasql_raw_driver_records_storage_profile() {
 }
 
 #[test]
-fn ultrasql_mixed_oltp_batches_wire_roundtrips() {
+fn ultrasql_mixed_oltp_runs_one_op_per_wire_roundtrip() {
+    // Fairness contract: the mixed-OLTP loop must issue exactly one
+    // autocommitted operation per wire round trip, the same shape every
+    // competitor runs. The earlier `BEGIN; 20 ops; COMMIT` batch amortized
+    // wire latency 20x for UltraSQL only and overstated its µs/op; this test
+    // guards against that cheat ever returning.
     let driver = cross_compare_sql_driver_source();
     let start = driver
         .find("async fn run_mixed_oltp_iter")
@@ -368,11 +373,22 @@ fn ultrasql_mixed_oltp_batches_wire_roundtrips() {
     let end = tail.find("struct SplitMix64").expect("next marker");
     let body = &tail[..end];
 
-    assert!(body.contains("const MIXED_BATCH_OPS"));
-    assert!(body.contains("for _ in 0..MIXED_BATCH_OPS"));
-    assert!(body.contains("sql.push_str(\"BEGIN;\\n\")"));
-    assert!(body.contains("sql.push_str(\"COMMIT;\\n\")"));
-    assert!(body.contains(".batch_execute(&sql)"));
+    // No wire batching.
+    assert!(
+        !body.contains("MIXED_BATCH_OPS"),
+        "mixed OLTP must not batch ops per round trip"
+    );
+    assert!(
+        !body.contains(".batch_execute(&sql)"),
+        "mixed OLTP must not send multi-statement batches"
+    );
+    // One prepared op per round trip (matches psycopg prepared + the
+    // in-process drivers' per-op autocommit).
+    assert!(body.contains("client\n        .prepare(") || body.contains(".prepare(&format!("));
+    assert!(body.contains(".query(&select_stmt"));
+    assert!(body.contains(".execute(&update_stmt"));
+    assert!(body.contains(".execute(&insert_stmt"));
+    // Real workload still exercises the secondary index.
     assert!(body.contains("CREATE INDEX"));
     assert!(body.contains("bench_mixed_id_idx"));
 }
