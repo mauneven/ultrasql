@@ -303,33 +303,12 @@ impl<L: PageLoader> HeapAccess<L> {
                 continue;
             };
             let mut log = log_handle.write();
-            if log.entries.is_empty() && log.int32_pair_batches.is_empty() {
+            if log.is_empty() {
                 continue;
             }
-            // Partition entries: keep everything not written by `xid`;
-            // collect the rolled-back set so we can apply them under
-            // page guards.
-            let mut to_apply: Vec<UndoEntry> = Vec::new();
-            let mut compact_to_apply: Vec<Int32PairUndoBatch> = Vec::new();
-            let mut kept: Vec<UndoEntry> = Vec::with_capacity(log.entries.len());
-            for e in std::mem::take(&mut log.entries) {
-                if e.writer_xid == xid {
-                    to_apply.push(e);
-                } else {
-                    kept.push(e);
-                }
-            }
-            log.entries = kept;
-            let mut kept_batches: Vec<Int32PairUndoBatch> =
-                Vec::with_capacity(log.int32_pair_batches.len());
-            for batch in std::mem::take(&mut log.int32_pair_batches) {
-                if batch.writer_xid == xid {
-                    compact_to_apply.push(batch);
-                } else {
-                    kept_batches.push(batch);
-                }
-            }
-            log.int32_pair_batches = kept_batches;
+            // Partition: remove everything written by `xid` (returned for
+            // page-guard application below), keep other writers' records.
+            let (to_apply, compact_to_apply) = log.take_written_by(xid);
             drop(log);
 
             if to_apply.is_empty() && compact_to_apply.is_empty() {
@@ -818,11 +797,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            if log.int32_pair_batches.is_empty() {
-                log.int32_pair_batches
-                    .reserve(usize_from_u32(block_count, "block count overflow")?);
-            }
-            log.int32_pair_batches.append(&mut compact_undo_scratch);
+            log.append_int32_pair_batches(&mut compact_undo_scratch);
         }
 
         if total_updated > 0 {
@@ -956,11 +931,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            if log.int32_pair_batches.is_empty() {
-                log.int32_pair_batches
-                    .reserve(usize_from_u32(block_count, "block count overflow")?);
-            }
-            log.int32_pair_batches.append(&mut compact_undo_scratch);
+            log.append_int32_pair_batches(&mut compact_undo_scratch);
         }
 
         if total_updated > 0 {
@@ -1270,7 +1241,7 @@ impl<L: PageLoader> HeapAccess<L> {
             .entry(rel)
             .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
         let mut log = log_handle.write();
-        log.entries.push(UndoEntry {
+        log.push_entry(UndoEntry {
             tid,
             writer_xid: xid,
             old_payload: pre_image,

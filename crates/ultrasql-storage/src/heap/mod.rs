@@ -375,9 +375,9 @@ pub struct HeapAccess<L: PageLoader> {
     /// slot directly.
     ///
     /// Entries are appended in `(PageId, SlotIndex)` order by the
-    /// page-major UPDATE walker, which trivially yields entries
-    /// sorted by `tid`. Lookup is a single binary search across the
-    /// relation's Vec.
+    /// page-major UPDATE walker. Lookup goes through the log's per-tid /
+    /// per-page hash indices, so reconstructing one slot's pre-image costs
+    /// O(writers-for-that-slot), independent of the log's total size.
     ///
     /// VACUUM is responsible for trimming entries whose `writer_xid`
     /// is older than every live snapshot's `xmin` (no live reader
@@ -415,17 +415,176 @@ pub(crate) struct Int32PairPagePayloadStats {
     pub max1: i32,
 }
 
-/// Per-relation undo log entries, sorted by `tid` (ascending).
+/// Per-relation in-place-update undo log with O(1) slot-scoped lookup.
+///
+/// The log stores two record kinds (full-payload [`UndoEntry`]s and compact
+/// [`Int32PairUndoBatch`]es) in append order, plus hash indices keyed by
+/// [`TupleId`] / [`PageId`]. Every reader that reconstructs one slot's
+/// pre-image touches only that slot's writers — NOT the whole log. The old
+/// representation was two bare `Vec`s that the pre-image reconstruction
+/// (`undo_pre_image_from_log`) scanned END TO END per lookup: a background
+/// scan over a table with `B` live undo batches paid `O(rows x B)`, which at
+/// 1M rows turned maintenance scans into core-burning quadratics.
+///
+/// Fields are private so every mutation path keeps the indices coherent;
+/// mutate through the methods below.
 #[derive(Debug, Default)]
 pub struct UndoRelationLog {
-    /// Entries in ascending `tid` order. Appenders pushing
-    /// monotonically-increasing TIDs preserve the sort. Readers
-    /// binary-search.
-    pub entries: Vec<UndoEntry>,
-    /// Compact fixed-width in-place UPDATE batches. These cover the
-    /// `(Int32, Int32) SET col = col ± literal` path and avoid one
+    /// Full-payload entries in append order (per slot: oldest first).
+    entries: Vec<UndoEntry>,
+    /// Compact fixed-width in-place UPDATE batches, in append order. These
+    /// cover the `(Int32, Int32) SET col = col ± literal` path and avoid one
     /// full [`UndoEntry`] per row on bulk updates.
-    pub int32_pair_batches: Vec<Int32PairUndoBatch>,
+    int32_pair_batches: Vec<Int32PairUndoBatch>,
+    /// `tid` → ascending indices into `entries`.
+    entries_by_tid: std::collections::HashMap<TupleId, Vec<usize>>,
+    /// `page` → ascending indices into `int32_pair_batches`.
+    batches_by_page: std::collections::HashMap<PageId, Vec<usize>>,
+}
+
+impl UndoRelationLog {
+    /// Append a full-payload pre-image record.
+    pub fn push_entry(&mut self, entry: UndoEntry) {
+        self.entries_by_tid
+            .entry(entry.tid)
+            .or_default()
+            .push(self.entries.len());
+        self.entries.push(entry);
+    }
+
+    /// Append one compact int32-pair batch.
+    pub fn push_int32_pair_batch(&mut self, batch: Int32PairUndoBatch) {
+        self.batches_by_page
+            .entry(batch.page)
+            .or_default()
+            .push(self.int32_pair_batches.len());
+        self.int32_pair_batches.push(batch);
+    }
+
+    /// Drain `scratch` into the log (bulk-update append path).
+    pub fn append_int32_pair_batches(&mut self, scratch: &mut Vec<Int32PairUndoBatch>) {
+        self.int32_pair_batches.reserve(scratch.len());
+        for batch in scratch.drain(..) {
+            self.push_int32_pair_batch(batch);
+        }
+    }
+
+    /// Full-payload entries recorded for `tid`, oldest first.
+    pub fn entries_for_tid(
+        &self,
+        tid: TupleId,
+    ) -> impl DoubleEndedIterator<Item = &UndoEntry> + '_ {
+        self.entries_by_tid
+            .get(&tid)
+            .into_iter()
+            .flatten()
+            .filter_map(|&idx| self.entries.get(idx))
+    }
+
+    /// Compact batches recorded for `page`, oldest first.
+    pub fn batches_for_page(
+        &self,
+        page: PageId,
+    ) -> impl DoubleEndedIterator<Item = &Int32PairUndoBatch> + '_ {
+        self.batches_by_page
+            .get(&page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&idx| self.int32_pair_batches.get(idx))
+    }
+
+    /// All full-payload entries, in append order (vacuum/tests).
+    #[must_use]
+    pub fn entries(&self) -> &[UndoEntry] {
+        &self.entries
+    }
+
+    /// All compact batches, in append order (vacuum/tests).
+    #[must_use]
+    pub fn int32_pair_batches(&self) -> &[Int32PairUndoBatch] {
+        &self.int32_pair_batches
+    }
+
+    /// `true` when neither record kind holds anything.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.int32_pair_batches.is_empty()
+    }
+
+    /// Number of full-payload entries currently retained.
+    #[must_use]
+    pub fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Number of compact batches currently retained.
+    #[must_use]
+    pub fn int32_pair_batches_len(&self) -> usize {
+        self.int32_pair_batches.len()
+    }
+
+    /// Remove and return every record written by `xid` (rollback), keeping
+    /// all other writers' records and their relative order.
+    pub fn take_written_by(&mut self, xid: Xid) -> (Vec<UndoEntry>, Vec<Int32PairUndoBatch>) {
+        let mut taken_entries = Vec::new();
+        let mut kept_entries = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            if entry.writer_xid == xid {
+                taken_entries.push(entry);
+            } else {
+                kept_entries.push(entry);
+            }
+        }
+        self.entries = kept_entries;
+
+        let mut taken_batches = Vec::new();
+        let mut kept_batches = Vec::with_capacity(self.int32_pair_batches.len());
+        for batch in self.int32_pair_batches.drain(..) {
+            if batch.writer_xid == xid {
+                taken_batches.push(batch);
+            } else {
+                kept_batches.push(batch);
+            }
+        }
+        self.int32_pair_batches = kept_batches;
+
+        self.rebuild_indices();
+        (taken_entries, taken_batches)
+    }
+
+    /// Drop every record whose writer is older than `oldest_active_xid`
+    /// (vacuum trim: those writers are terminal and visible to every
+    /// possible snapshot). Returns `(entries_trimmed, batches_trimmed)`.
+    pub fn trim_below(&mut self, oldest_active_xid: Xid) -> (usize, usize) {
+        let entries_before = self.entries.len();
+        self.entries.retain(|e| e.writer_xid >= oldest_active_xid);
+        let batches_before = self.int32_pair_batches.len();
+        self.int32_pair_batches
+            .retain(|b| b.writer_xid >= oldest_active_xid);
+        let trimmed = (
+            entries_before - self.entries.len(),
+            batches_before - self.int32_pair_batches.len(),
+        );
+        if trimmed != (0, 0) {
+            self.rebuild_indices();
+        }
+        trimmed
+    }
+
+    /// Recompute both hash indices from the record vectors.
+    fn rebuild_indices(&mut self) {
+        self.entries_by_tid.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.entries_by_tid.entry(entry.tid).or_default().push(idx);
+        }
+        self.batches_by_page.clear();
+        for (idx, batch) in self.int32_pair_batches.iter().enumerate() {
+            self.batches_by_page
+                .entry(batch.page)
+                .or_default()
+                .push(idx);
+        }
+    }
 }
 
 /// One pre-image record carried by the in-place-update undo log.
@@ -532,16 +691,11 @@ where
     O: ultrasql_mvcc::XidStatusOracle + ?Sized,
 {
     // Full-payload path: select the oldest invisible writer's
-    // pre-image. Entries are appended in `(tid, writer_xid)` order;
-    // walking forward visits writers oldest-first, so the first
-    // invisible writer we meet is the oldest. For the bench's
-    // autocommit workload `entries` is short; binary search by tid
-    // would be a follow-up.
+    // pre-image. The per-tid index yields exactly this slot's writers in
+    // append order (oldest first), so the scan is O(writers-per-slot)
+    // regardless of how many other slots hold live undo records.
     let mut oldest_invisible_full: Option<(Xid, &[u8; 9])> = None;
-    for entry in &log.entries {
-        if entry.tid != tid {
-            continue;
-        }
+    for entry in log.entries_for_tid(tid) {
         let writer = entry.writer_xid;
         // Skip writers the snapshot already sees — their change is
         // baked into `current_payload` and must NOT be reversed.
@@ -559,8 +713,8 @@ where
     let mut sum_delta_col0: i64 = 0;
     let mut sum_delta_col1: i64 = 0;
     let mut saw_compact_invisible = false;
-    for batch in &log.int32_pair_batches {
-        if batch.page != tid.page || !batch.contains_slot(tid.slot) {
+    for batch in log.batches_for_page(tid.page) {
+        if !batch.contains_slot(tid.slot) {
             continue;
         }
         if undo_writer_visible_to_snapshot(batch.writer_xid, snapshot, oracle) {

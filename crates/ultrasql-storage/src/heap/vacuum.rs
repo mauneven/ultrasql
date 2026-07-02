@@ -301,31 +301,23 @@ impl<L: PageLoader> HeapAccess<L> {
                 continue;
             };
             let mut log = log_handle.write();
-            if log.entries.is_empty() && log.int32_pair_batches.is_empty() {
+            if log.is_empty() {
                 continue;
             }
-            // `retain` walks once, `O(n)`, dropping entries whose
-            // writer is older than the oldest live snapshot. The
-            // log's monotonic-tid invariant is preserved because the
-            // retained entries keep their relative order.
-            let before = log.entries.len();
-            log.entries.retain(|e| e.writer_xid >= oldest_active_xid);
-            let after = log.entries.len();
-            let trimmed_entries = before
-                .checked_sub(after)
-                .ok_or(HeapError::MalformedHeader("undo trim count underflow"))?;
-            total_trimmed =
-                checked_heap_count_add(total_trimmed, trimmed_entries, "undo trim count overflow")?;
+            // Trim walks once, `O(n)`, dropping records whose writer is
+            // older than the oldest live snapshot; retained records keep
+            // their relative order and the slot indices are rebuilt.
             let before_slots: usize =
-                log.int32_pair_batches
+                log.int32_pair_batches()
                     .iter()
                     .try_fold(0_usize, |total, batch| {
                         checked_heap_count_add(total, batch.slot_len(), "undo slot count overflow")
                     })?;
-            log.int32_pair_batches
-                .retain(|batch| batch.writer_xid >= oldest_active_xid);
+            let (trimmed_entries, _trimmed_batches) = log.trim_below(oldest_active_xid);
+            total_trimmed =
+                checked_heap_count_add(total_trimmed, trimmed_entries, "undo trim count overflow")?;
             let after_slots: usize =
-                log.int32_pair_batches
+                log.int32_pair_batches()
                     .iter()
                     .try_fold(0_usize, |total, batch| {
                         checked_heap_count_add(total, batch.slot_len(), "undo slot count overflow")
@@ -349,7 +341,7 @@ impl<L: PageLoader> HeapAccess<L> {
     pub fn undo_log_len(&self, rel: RelationId) -> usize {
         self.undo_log
             .get(&rel)
-            .map_or(0, |h| h.read().entries.len())
+            .map_or(0, |h| h.read().entries_len())
     }
 
     /// Number of compact int32-pair undo batches retained for `rel`.

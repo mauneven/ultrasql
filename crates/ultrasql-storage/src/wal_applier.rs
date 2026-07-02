@@ -531,9 +531,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            let already = log.entries.iter().rev().any(|e| {
-                e.tid == payload.tid
-                    && e.writer_xid == payload.writer_xid
+            let already = log.entries_for_tid(payload.tid).rev().any(|e| {
+                e.writer_xid == payload.writer_xid
                     && e.old_payload.as_slice() == payload.pre_image_bytes.as_slice()
             });
             if !already {
@@ -548,7 +547,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 }
                 let mut pre = [0_u8; 9];
                 pre.copy_from_slice(&payload.pre_image_bytes);
-                log.entries.push(UndoEntry {
+                log.push_entry(UndoEntry {
                     tid: payload.tid,
                     writer_xid: payload.writer_xid,
                     old_payload: pre,
@@ -644,13 +643,12 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             let mut log = log_handle.write();
             for entry in &payload.entries {
                 let tid = TupleId::new(page_id, entry.slot);
-                let already = log.entries.iter().rev().any(|existing| {
-                    existing.tid == tid
-                        && existing.writer_xid == payload.writer_xid
+                let already = log.entries_for_tid(tid).rev().any(|existing| {
+                    existing.writer_xid == payload.writer_xid
                         && existing.old_payload == entry.pre_image
                 });
                 if !already {
-                    log.entries.push(UndoEntry {
+                    log.push_entry(UndoEntry {
                         tid,
                         writer_xid: payload.writer_xid,
                         old_payload: entry.pre_image,
@@ -794,9 +792,8 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 .entry(rel)
                 .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
             let mut log = log_handle.write();
-            let already = log.int32_pair_batches.iter().rev().any(|existing| {
-                existing.page == page_id
-                    && existing.writer_xid == payload.writer_xid
+            let already = log.batches_for_page(page_id).rev().any(|existing| {
+                existing.writer_xid == payload.writer_xid
                     && existing.command_id == payload.command_id
                     && existing.target_col == payload.target_col
                     && existing.delta == payload.delta
@@ -808,7 +805,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                         operation: "heap_update_int32_pair_delta_batch",
                         detail: format!("slot count {} exceeds u16", payload.slots.len()),
                     })?;
-                log.int32_pair_batches.push(Int32PairUndoBatch {
+                log.push_int32_pair_batch(Int32PairUndoBatch {
                     page: page_id,
                     writer_xid: payload.writer_xid,
                     command_id: payload.command_id,

@@ -756,3 +756,78 @@ fn point_inplace_int32_update_rechecks_tid_predicate() {
     assert_eq!(skipped, 0);
     assert_eq!(heap.fetch(first).unwrap().data, int32_pair_payload(1, 10));
 }
+
+#[test]
+fn undo_log_indices_scope_lookups_and_survive_trim_and_rollback_partition() {
+    use super::super::{Int32PairUndoBatch, UndoEntry, UndoRelationLog};
+
+    let mut log = UndoRelationLog::default();
+    let tid_a = TupleId::new(PageId::new(RelationId::new(1), BlockNumber::new(1)), 0);
+    let tid_b = TupleId::new(PageId::new(RelationId::new(1), BlockNumber::new(2)), 3);
+    let entry = |tid: TupleId, xid: u64, tag: u8| UndoEntry {
+        tid,
+        writer_xid: Xid::new(xid),
+        old_payload: [tag; 9],
+    };
+
+    // Interleaved appends across two slots: per-tid iteration yields only
+    // that slot's writers, oldest first.
+    log.push_entry(entry(tid_a, 10, 1));
+    log.push_entry(entry(tid_b, 11, 2));
+    log.push_entry(entry(tid_a, 12, 3));
+    let a_writers: Vec<u64> = log
+        .entries_for_tid(tid_a)
+        .map(|e| e.writer_xid.raw())
+        .collect();
+    assert_eq!(a_writers, vec![10, 12]);
+    let b_writers: Vec<u64> = log
+        .entries_for_tid(tid_b)
+        .map(|e| e.writer_xid.raw())
+        .collect();
+    assert_eq!(b_writers, vec![11]);
+
+    // Batches are scoped per page the same way.
+    let batch = |block: u32, xid: u64, delta: i32| Int32PairUndoBatch {
+        page: PageId::new(RelationId::new(1), BlockNumber::new(block)),
+        writer_xid: Xid::new(xid),
+        command_id: CommandId::new(0),
+        target_col: 1,
+        delta,
+        first_slot: 0,
+        slot_count: 4,
+        slots: Vec::new(),
+    };
+    log.push_int32_pair_batch(batch(1, 10, 7));
+    log.push_int32_pair_batch(batch(2, 11, -2));
+    log.push_int32_pair_batch(batch(1, 12, 5));
+    let page1 = PageId::new(RelationId::new(1), BlockNumber::new(1));
+    let deltas: Vec<i32> = log.batches_for_page(page1).map(|b| b.delta).collect();
+    assert_eq!(deltas, vec![7, 5]);
+
+    // Rollback partition removes exactly one writer's records everywhere
+    // and the indices stay coherent for the survivors.
+    let (taken_entries, taken_batches) = log.take_written_by(Xid::new(12));
+    assert_eq!(taken_entries.len(), 1);
+    assert_eq!(taken_batches.len(), 1);
+    let a_writers: Vec<u64> = log
+        .entries_for_tid(tid_a)
+        .map(|e| e.writer_xid.raw())
+        .collect();
+    assert_eq!(a_writers, vec![10]);
+    let deltas: Vec<i32> = log.batches_for_page(page1).map(|b| b.delta).collect();
+    assert_eq!(deltas, vec![7]);
+
+    // Vacuum trim below xid 11 drops writer 10 from both kinds; the
+    // indices reflect the survivors only.
+    let (trimmed_entries, trimmed_batches) = log.trim_below(Xid::new(11));
+    assert_eq!((trimmed_entries, trimmed_batches), (1, 1));
+    assert!(log.entries_for_tid(tid_a).next().is_none());
+    assert!(log.batches_for_page(page1).next().is_none());
+    let b_writers: Vec<u64> = log
+        .entries_for_tid(tid_b)
+        .map(|e| e.writer_xid.raw())
+        .collect();
+    assert_eq!(b_writers, vec![11]);
+    assert_eq!(log.entries_len(), 1);
+    assert_eq!(log.int32_pair_batches_len(), 1);
+}

@@ -590,12 +590,12 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
             .get(&rel())
             .expect("undo log entry for rel");
         let log = log_handle.read();
-        let rebuilt_slots: usize = log.int32_pair_batches.iter().map(|b| b.slot_len()).sum();
+        let rebuilt_slots: usize = log.int32_pair_batches().iter().map(|b| b.slot_len()).sum();
         assert_eq!(
             rebuilt_slots, ROWS,
             "compact undo batches must cover one slot per replayed row"
         );
-        for batch in log.int32_pair_batches.iter() {
+        for batch in log.int32_pair_batches().iter() {
             assert_eq!(batch.writer_xid, Xid::new(2));
             assert_eq!(batch.target_col, 1);
             assert_eq!(batch.delta, DELTA);
