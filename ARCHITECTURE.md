@@ -167,6 +167,18 @@ and the version's last writer is invalid, own, or committed — i.e. the relatio
 is quiescent for that snapshot. Under any concurrency the reader falls back to a
 correct heap scan, so stale or incoherent columnar data is never returned.
 
+**Result-replay cache (`cached_select.rs`).** Distinct from the columnar
+shadow above, the server also memoizes the *final result* — up to pre-encoded
+wire bytes — of repeated identical `SELECT id, val` scans and scalar
+aggregates (SUM/AVG/Filter+SUM) over a quiescent table, keyed and invalidated
+by the same MVCC relation version. A replay hit skips recomputation entirely.
+This is correct and useful for read-mostly workloads, but a hit measures a
+cache lookup, not query execution. Because that would make a benchmark
+measure the cache rather than the engine — while peer engines recompute — the
+release scale sweep runs with `ULTRASQL_RESULT_CACHE=off`, so the published
+aggregate/scan rows reflect real per-row compute (their medians scale with row
+count, not the flat latency of a replay). See BENCHMARKS.md "Result caches".
+
 **Performance implications.** The slotted-page layout keeps OLTP inserts on a
 compact row path. The B-link tree variant scales better than lock-coupling
 trees on concurrent inserters; this is one of the main concurrency wins.
