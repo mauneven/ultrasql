@@ -465,27 +465,19 @@ fn scale_sweep_verifies_mixed_correctness_before_ranking() {
 
 #[test]
 fn scale_sweep_records_million_row_insert_honestly() {
-    // The durable 1M INSERT currently fails — the 8 MiB WAL buffer rejects
-    // records instead of applying backpressure — so it is recorded as an
-    // explicit not_available artifact with a reason, never a fabricated win.
-    // Tracked in TODO.md with a measurable exit condition.
+    // The durable 1M INSERT must be an HONEST artifact in whichever state it
+    // is in: a real measurement (status "measured" with recorded samples —
+    // the current state, after WAL backpressure replaced the old
+    // reject-on-full failure), or an explicit not_available with a non-empty
+    // reason and no fabricated win. Never a bare claim.
     let raw =
         repo_file("benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json");
     let value: serde_json::Value =
         serde_json::from_str(&raw).expect("parse insert_throughput_1m-ultrasql");
 
     assert_eq!(value["engine"], "ultrasql");
-    assert_eq!(value["status"], "not_available");
     assert_eq!(value["n_rows"], 1_000_000);
-    assert!(
-        value["reason"]
-            .as_str()
-            .is_some_and(|r| !r.trim().is_empty()),
-        "not_available artifact must carry a non-empty reason"
-    );
 
-    // Since UltraSQL is not_available for the 1M INSERT, a competitor is the
-    // fastest measured engine for that rendered row.
     let rendered_json = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.json");
     let rendered: serde_json::Value =
         serde_json::from_str(&rendered_json).expect("parse rendered scale_sweep.json");
@@ -498,10 +490,39 @@ fn scale_sweep_records_million_row_insert_honestly() {
         })
         .expect("1m insert row");
     let fastest = one_m_insert["fastest_engine"].as_str();
-    assert!(
-        fastest.is_some() && fastest != Some("ultrasql"),
-        "1M INSERT must be won by a competitor while UltraSQL is not_available, got {fastest:?}"
-    );
+
+    match value["status"].as_str() {
+        Some("measured") => {
+            assert!(
+                value["median_us"].as_f64().is_some_and(|m| m > 0.0),
+                "a measured artifact must carry a positive median"
+            );
+            assert!(
+                value["iterations_us"]
+                    .as_array()
+                    .is_some_and(|iters| !iters.is_empty()),
+                "a measured artifact must carry its raw samples"
+            );
+            assert_eq!(
+                value["durability_mode"], "durable",
+                "the committed sweep is the durable data-dir run"
+            );
+        }
+        Some("not_available") => {
+            assert!(
+                value["reason"]
+                    .as_str()
+                    .is_some_and(|r| !r.trim().is_empty()),
+                "not_available artifact must carry a non-empty reason"
+            );
+            // An unmeasured engine can never be rendered as the winner.
+            assert!(
+                fastest.is_some() && fastest != Some("ultrasql"),
+                "1M INSERT cannot be won by an unmeasured UltraSQL, got {fastest:?}"
+            );
+        }
+        other => panic!("unexpected artifact status {other:?}"),
+    }
 }
 
 #[test]
