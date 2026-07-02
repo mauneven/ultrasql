@@ -903,33 +903,52 @@ impl<L: PageLoader> HeapAccess<L> {
             );
         }
 
-        let workers_u32 =
-            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
-        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
         let predicate_ref = &predicate;
         let mut updates = Vec::with_capacity(workers);
+        // Work-stealing chunks (see the parallel WAL paths): fast cores take
+        // proportionally more chunks so the slowest core never gates the
+        // statement.
+        let chunk_blocks = 512_u32;
+        let next_chunk = std::sync::atomic::AtomicU32::new(0);
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            let mut start_block = 0_u32;
-            while start_block < block_count {
-                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+            for _ in 0..workers {
+                let next_chunk = &next_chunk;
                 handles.push(scope.spawn(move || {
-                    self.update_int32_pair_range_no_wal(UpdateInt32PairRange {
-                        rel,
-                        start_block,
-                        end_block,
-                        snapshot,
-                        oracle,
-                        predicate: predicate_ref,
-                        target_col,
-                        delta,
-                        xid,
-                        command_id,
-                        vm,
-                    })
+                    let mut merged = Int32PairRangeUpdate {
+                        total_updated: 0,
+                        compact_undo: Vec::new(),
+                    };
+                    loop {
+                        let start_block = next_chunk
+                            .fetch_add(chunk_blocks, std::sync::atomic::Ordering::Relaxed);
+                        if start_block >= block_count {
+                            return Ok::<Int32PairRangeUpdate, HeapError>(merged);
+                        }
+                        let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+                        let mut chunk =
+                            self.update_int32_pair_range_no_wal(UpdateInt32PairRange {
+                                rel,
+                                start_block,
+                                end_block,
+                                snapshot,
+                                oracle,
+                                predicate: predicate_ref,
+                                target_col,
+                                delta,
+                                xid,
+                                command_id,
+                                vm,
+                            })?;
+                        merged.total_updated = checked_heap_count_add(
+                            merged.total_updated,
+                            chunk.total_updated,
+                            "updated tuple count overflow",
+                        )?;
+                        merged.compact_undo.append(&mut chunk.compact_undo);
+                    }
                 }));
-                start_block = end_block;
             }
 
             for handle in handles {
@@ -1044,41 +1063,60 @@ impl<L: PageLoader> HeapAccess<L> {
             );
         }
 
-        let workers_u32 =
-            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
-        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
         let predicate_ref = &predicate;
         let chain = std::sync::atomic::AtomicU64::new(wal.last_lsn_for(xid).raw());
         let mut updates = Vec::with_capacity(workers);
+        // Work-stealing chunks: on asymmetric cores an equal split gates the
+        // whole statement on the slowest core; small chunks claimed via
+        // fetch_add let fast cores take proportionally more work.
+        let chunk_blocks = PARALLEL_WAL_UPDATE_BLOCKS_PER_WORKER.max(1);
+        let next_chunk = std::sync::atomic::AtomicU32::new(0);
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            let mut start_block = 0_u32;
-            while start_block < block_count {
-                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+            for _ in 0..workers {
                 handles.push(scope.spawn({
                     let chain = &chain;
+                    let next_chunk = &next_chunk;
                     move || {
-                        self.update_int32_pair_range_wal(
-                            UpdateInt32PairRange {
-                                rel,
-                                start_block,
-                                end_block,
-                                snapshot,
-                                oracle,
-                                predicate: predicate_ref,
-                                target_col,
-                                delta,
-                                xid,
-                                command_id,
-                                vm,
-                            },
-                            wal,
-                            chain,
-                        )
+                        let mut merged = Int32PairRangeUpdate {
+                            total_updated: 0,
+                            compact_undo: Vec::new(),
+                        };
+                        loop {
+                            let start_block = next_chunk
+                                .fetch_add(chunk_blocks, std::sync::atomic::Ordering::Relaxed);
+                            if start_block >= block_count {
+                                return Ok::<Int32PairRangeUpdate, HeapError>(merged);
+                            }
+                            let end_block =
+                                start_block.saturating_add(chunk_blocks).min(block_count);
+                            let mut chunk = self.update_int32_pair_range_wal(
+                                UpdateInt32PairRange {
+                                    rel,
+                                    start_block,
+                                    end_block,
+                                    snapshot,
+                                    oracle,
+                                    predicate: predicate_ref,
+                                    target_col,
+                                    delta,
+                                    xid,
+                                    command_id,
+                                    vm,
+                                },
+                                wal,
+                                chain,
+                            )?;
+                            merged.total_updated = checked_heap_count_add(
+                                merged.total_updated,
+                                chunk.total_updated,
+                                "updated tuple count overflow",
+                            )?;
+                            merged.compact_undo.append(&mut chunk.compact_undo);
+                        }
                     }
                 }));
-                start_block = end_block;
             }
 
             for handle in handles {

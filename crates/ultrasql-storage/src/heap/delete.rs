@@ -1333,37 +1333,53 @@ impl<L: PageLoader> HeapAccess<L> {
             );
         }
 
-        let workers_u32 =
-            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
-        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
         let predicate_ref = &predicate;
         let chain = std::sync::atomic::AtomicU64::new(wal.last_lsn_for(xid).raw());
         let mut total_deleted = 0_usize;
 
+        // Work-stealing chunks instead of one equal slice per worker: on
+        // asymmetric cores (performance + efficiency) an equal split gates
+        // the whole statement on the slowest core; small chunks claimed via
+        // fetch_add let fast cores take proportionally more work.
+        let chunk_blocks = Self::PARALLEL_WAL_DELETE_BLOCKS_PER_WORKER.max(1);
+        let next_chunk = std::sync::atomic::AtomicU32::new(0);
+
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            let mut start_block = 0_u32;
-            while start_block < block_count {
-                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+            for _ in 0..workers {
                 handles.push(scope.spawn({
                     let chain = &chain;
+                    let next_chunk = &next_chunk;
                     move || {
-                        self.delete_int32_pair_range_wal(DeleteInt32PairWalRange {
-                            rel,
-                            start_block,
-                            end_block,
-                            snapshot,
-                            oracle,
-                            predicate: predicate_ref,
-                            xid,
-                            command_id,
-                            wal,
-                            chain,
-                            vm,
-                        })
+                        let mut deleted = 0_usize;
+                        loop {
+                            let start_block = next_chunk
+                                .fetch_add(chunk_blocks, std::sync::atomic::Ordering::Relaxed);
+                            if start_block >= block_count {
+                                return Ok::<usize, HeapError>(deleted);
+                            }
+                            let end_block =
+                                start_block.saturating_add(chunk_blocks).min(block_count);
+                            deleted = checked_heap_count_add(
+                                deleted,
+                                self.delete_int32_pair_range_wal(DeleteInt32PairWalRange {
+                                    rel,
+                                    start_block,
+                                    end_block,
+                                    snapshot,
+                                    oracle,
+                                    predicate: predicate_ref,
+                                    xid,
+                                    command_id,
+                                    wal,
+                                    chain,
+                                    vm,
+                                })?,
+                                "deleted tuple count overflow",
+                            )?;
+                        }
                     }
                 }));
-                start_block = end_block;
             }
 
             for handle in handles {
