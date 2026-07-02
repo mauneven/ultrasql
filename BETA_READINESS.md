@@ -71,15 +71,16 @@ The committed scale-sweep artifacts under
 `benchmarks/results/latest/scale-sweep/` are regenerated from real runs of
 `benchmarks/run_scale_sweep.sh` (durable data-dir mode, equal-durability
 settings per engine, symmetric warmups, UltraSQL's result-replay cache
-disabled, methodology in `BENCHMARKS.md`). In the committed 2026-07-02 run,
-UltraSQL is the fastest measured engine on 20 of 24 workloads against DuckDB,
-ClickHouse, SQLite, and a tuned PostgreSQL 17 on the same host; the four
-losses (1M sequential scan — ClickHouse, 1M bulk UPDATE — DuckDB, 1M bulk
-DELETE — ClickHouse, point-op Mixed OLTP — in-process SQLite then PostgreSQL)
-are reported in the same artifact. Point-op Mixed OLTP is UltraSQL's real
-weak spot: ~125 µs/op vs SQLite's 20 µs and PostgreSQL's 33 µs, its true
-per-statement wire+dispatch cost with no batching. Do not quote numbers that
-are not in those artifacts. The benchmark-fairness contract — same host, same
+disabled, methodology in `BENCHMARKS.md`). In the committed 2026-07-02 run
+(median of three full sweeps), UltraSQL is the fastest measured engine on 21
+of 24 workloads against DuckDB, ClickHouse, SQLite, and a tuned PostgreSQL 17
+on the same host; the three losses (1M bulk UPDATE — DuckDB, 1M bulk DELETE —
+ClickHouse, point-op Mixed OLTP — in-process SQLite then PostgreSQL) are
+reported in the same artifact. The 1M sequential scan is a ~2% run-to-run tie
+with ClickHouse (parity, not a decisive lead). Point-op Mixed OLTP is
+UltraSQL's real weak spot: ~130 µs/op vs SQLite's 16 µs and PostgreSQL's
+34 µs, its true per-statement wire+dispatch cost with no batching. Do not
+quote numbers that are not in those artifacts. The benchmark-fairness contract — same host, same
 durability class per engine, symmetric warmups, result cache disabled,
 failures recorded as `not_available`, no winner claims over unmeasured
 engines — is enforced by `benchmarks/scripts/check_supremacy.py` and the

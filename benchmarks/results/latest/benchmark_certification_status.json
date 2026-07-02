@@ -2,20 +2,16 @@
   "artifact_dir": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep",
   "comparable_row_count": 24,
   "complete_row_count": 24,
-  "errors": [
-    "manifest host.git_commit expected commit 8119039b7f952d243dc5cf6253be96a8a763b550, got d419704f08db13dcaaa1c649ed58515595b781db"
-  ],
-  "expected_commit": "8119039b7f952d243dc5cf6253be96a8a763b550",
+  "errors": [],
+  "expected_commit": "a6a97af18d3e78fa73b9e6541df4398c7f255b39",
   "manifest": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/scale_sweep_manifest.json",
   "min_comparable_rows": 24,
   "missing_required_engine_rows": [],
   "policy": "ready means fair symmetric methodology, schema-valid artifacts, all required engines measured or explicitly not_available with a reason, data-dir storage, a pinned release commit, and a host descriptor. Per-row wins and losses are reported in the scoreboard, not gated.",
   "raw_dir": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/raw",
-  "ready": false,
-  "reasons": [
-    "manifest host.git_commit expected commit 8119039b7f952d243dc5cf6253be96a8a763b550, got d419704f08db13dcaaa1c649ed58515595b781db"
-  ],
-  "release_commit": "d419704f08db13dcaaa1c649ed58515595b781db",
+  "ready": true,
+  "reasons": [],
+  "release_commit": "a6a97af18d3e78fa73b9e6541df4398c7f255b39",
   "rendered_json": "/Users/mauneven/Code/ultraSQL/benchmarks/results/latest/scale-sweep/scale_sweep.json",
   "required_engines": [
     "clickhouse",
@@ -87,7 +83,7 @@
       "workload": "select_scan"
     },
     {
-      "fastest_engine": "clickhouse",
+      "fastest_engine": "ultrasql",
       "measured_engines": [
         "clickhouse",
         "duckdb",
@@ -319,241 +315,233 @@
   "scoreboard": {
     "losses": [
       {
-        "gap_pct": 5.105185858796379,
+        "gap_pct": 18.922890484258616,
         "n_rows": 1000000,
-        "ultrasql_median_us": 61483.7085,
-        "winner": "clickhouse",
-        "winner_median_us": 58497.312,
-        "workload": "select_scan"
-      },
-      {
-        "gap_pct": 40.371940800565255,
-        "n_rows": 1000000,
-        "ultrasql_median_us": 3061.6875,
+        "ultrasql_median_us": 3129.6045,
         "winner": "duckdb",
-        "winner_median_us": 2181.125004426576,
+        "winner_median_us": 2631.6249859519303,
         "workload": "update_throughput"
       },
       {
-        "gap_pct": 25.233513498984173,
+        "gap_pct": 32.158703403189,
         "n_rows": 1000000,
-        "ultrasql_median_us": 3354.5625,
+        "ultrasql_median_us": 3639.541,
         "winner": "clickhouse",
-        "winner_median_us": 2678.646,
+        "winner_median_us": 2753.917,
         "workload": "delete_throughput"
       },
       {
-        "gap_pct": 525.3319832918378,
+        "gap_pct": 698.8144971095286,
         "n_rows": 10000,
-        "ultrasql_median_us": 124.93947915137728,
+        "ultrasql_median_us": 130.19396157991463,
         "winner": "sqlite3",
-        "winner_median_us": 19.979703979585025,
+        "winner_median_us": 16.298397444089353,
         "workload": "mixed_oltp_pgbench_like"
       }
     ],
     "rows": [
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 1475.1670000000001,
+        "fastest_median_us": 1548.6665,
         "n_rows": 10000,
-        "ultrasql_median_us": 1475.1670000000001,
+        "ultrasql_median_us": 1548.6665,
         "ultrasql_result": "win",
         "workload": "insert_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 9814.5625,
+        "fastest_median_us": 10301.146,
         "n_rows": 100000,
-        "ultrasql_median_us": 9814.5625,
+        "ultrasql_median_us": 10301.146,
         "ultrasql_result": "win",
         "workload": "insert_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 109248.3955,
+        "fastest_median_us": 110110.20850000001,
         "n_rows": 1000000,
-        "ultrasql_median_us": 109248.3955,
+        "ultrasql_median_us": 110110.20850000001,
         "ultrasql_result": "win",
         "workload": "insert_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 728.5415,
+        "fastest_median_us": 692.5625,
         "n_rows": 10000,
-        "ultrasql_median_us": 728.5415,
+        "ultrasql_median_us": 692.5625,
         "ultrasql_result": "win",
         "workload": "select_scan"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 6536.5205000000005,
+        "fastest_median_us": 6225.979,
         "n_rows": 100000,
-        "ultrasql_median_us": 6536.5205000000005,
+        "ultrasql_median_us": 6225.979,
         "ultrasql_result": "win",
         "workload": "select_scan"
       },
       {
-        "fastest_engine": "clickhouse",
-        "fastest_median_us": 58497.312,
+        "fastest_engine": "ultrasql",
+        "fastest_median_us": 59923.5625,
         "n_rows": 1000000,
-        "ultrasql_median_us": 61483.7085,
-        "ultrasql_result": "loss",
+        "ultrasql_median_us": 59923.5625,
+        "ultrasql_result": "win",
         "workload": "select_scan"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 51.1045,
+        "fastest_median_us": 41.354,
         "n_rows": 10000,
-        "ultrasql_median_us": 51.1045,
+        "ultrasql_median_us": 41.354,
         "ultrasql_result": "win",
         "workload": "select_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 47.7915,
+        "fastest_median_us": 53.1875,
         "n_rows": 100000,
-        "ultrasql_median_us": 47.7915,
+        "ultrasql_median_us": 53.1875,
         "ultrasql_result": "win",
         "workload": "select_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 122.9375,
+        "fastest_median_us": 127.02050000000001,
         "n_rows": 1000000,
-        "ultrasql_median_us": 122.9375,
+        "ultrasql_median_us": 127.02050000000001,
         "ultrasql_result": "win",
         "workload": "select_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 43.7085,
+        "fastest_median_us": 52.2715,
         "n_rows": 10000,
-        "ultrasql_median_us": 43.7085,
+        "ultrasql_median_us": 52.2715,
         "ultrasql_result": "win",
         "workload": "select_avg"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 50.458,
+        "fastest_median_us": 62.083,
         "n_rows": 100000,
-        "ultrasql_median_us": 50.458,
+        "ultrasql_median_us": 62.083,
         "ultrasql_result": "win",
         "workload": "select_avg"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 123.14599999999999,
+        "fastest_median_us": 126.8125,
         "n_rows": 1000000,
-        "ultrasql_median_us": 123.14599999999999,
+        "ultrasql_median_us": 126.8125,
         "ultrasql_result": "win",
         "workload": "select_avg"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 42.5625,
+        "fastest_median_us": 42.688,
         "n_rows": 10000,
-        "ultrasql_median_us": 42.5625,
+        "ultrasql_median_us": 42.688,
         "ultrasql_result": "win",
         "workload": "filter_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 61.667,
+        "fastest_median_us": 56.479,
         "n_rows": 100000,
-        "ultrasql_median_us": 61.667,
+        "ultrasql_median_us": 56.479,
         "ultrasql_result": "win",
         "workload": "filter_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 108.167,
+        "fastest_median_us": 137.02100000000002,
         "n_rows": 1000000,
-        "ultrasql_median_us": 108.167,
+        "ultrasql_median_us": 137.02100000000002,
         "ultrasql_result": "win",
         "workload": "filter_sum"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 120.1045,
+        "fastest_median_us": 120.8335,
         "n_rows": 10000,
-        "ultrasql_median_us": 120.1045,
+        "ultrasql_median_us": 120.8335,
         "ultrasql_result": "win",
         "workload": "update_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 384.39549999999997,
+        "fastest_median_us": 369.54200000000003,
         "n_rows": 100000,
-        "ultrasql_median_us": 384.39549999999997,
+        "ultrasql_median_us": 369.54200000000003,
         "ultrasql_result": "win",
         "workload": "update_throughput"
       },
       {
         "fastest_engine": "duckdb",
-        "fastest_median_us": 2181.125004426576,
+        "fastest_median_us": 2631.6249859519303,
         "n_rows": 1000000,
-        "ultrasql_median_us": 3061.6875,
+        "ultrasql_median_us": 3129.6045,
         "ultrasql_result": "loss",
         "workload": "update_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 94.187,
+        "fastest_median_us": 97.104,
         "n_rows": 10000,
-        "ultrasql_median_us": 94.187,
+        "ultrasql_median_us": 97.104,
         "ultrasql_result": "win",
         "workload": "delete_throughput"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 375.04150000000004,
+        "fastest_median_us": 369.7085,
         "n_rows": 100000,
-        "ultrasql_median_us": 375.04150000000004,
+        "ultrasql_median_us": 369.7085,
         "ultrasql_result": "win",
         "workload": "delete_throughput"
       },
       {
         "fastest_engine": "clickhouse",
-        "fastest_median_us": 2678.646,
+        "fastest_median_us": 2753.917,
         "n_rows": 1000000,
-        "ultrasql_median_us": 3354.5625,
+        "ultrasql_median_us": 3639.541,
         "ultrasql_result": "loss",
         "workload": "delete_throughput"
       },
       {
         "fastest_engine": "sqlite3",
-        "fastest_median_us": 19.979703979585025,
+        "fastest_median_us": 16.298397444089353,
         "n_rows": 10000,
-        "ultrasql_median_us": 124.93947915137728,
+        "ultrasql_median_us": 130.19396157991463,
         "ultrasql_result": "loss",
         "workload": "mixed_oltp_pgbench_like"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 145.2915,
+        "fastest_median_us": 138.812,
         "n_rows": 100000,
-        "ultrasql_median_us": 145.2915,
+        "ultrasql_median_us": 138.812,
         "ultrasql_result": "win",
         "workload": "mixed_correctness"
       },
       {
         "fastest_engine": "ultrasql",
-        "fastest_median_us": 4849.979,
+        "fastest_median_us": 4881.916499999999,
         "n_rows": 65536,
-        "ultrasql_median_us": 4849.979,
+        "ultrasql_median_us": 4881.916499999999,
         "ultrasql_result": "win",
         "workload": "window_row_number"
       }
     ],
-    "rows_not_led_by_ultrasql": 4,
-    "ultrasql_loss_count": 4,
+    "rows_not_led_by_ultrasql": 3,
+    "ultrasql_loss_count": 3,
     "ultrasql_not_available_count": 0,
-    "ultrasql_win_count": 20
+    "ultrasql_win_count": 21
   },
-  "status": "not_ready",
+  "status": "ready",
   "total_rendered_row_count": 24,
-  "ultrasql_fastest_comparable_row_count": 20,
-  "ultrasql_fastest_row_count": 20,
+  "ultrasql_fastest_comparable_row_count": 21,
+  "ultrasql_fastest_row_count": 21,
   "ultrasql_storage_mode": "data-dir",
-  "validated_at_utc": "2026-07-02T16:20:56.535335Z"
+  "validated_at_utc": "2026-07-02T17:46:43.978295Z"
 }

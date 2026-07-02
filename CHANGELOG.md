@@ -28,7 +28,9 @@ and must document the break here.
   both gone); PostgreSQL's timed regions no longer include BEGIN/ROLLBACK
   round trips or table-reset work, and aborted-version bloat is vacuumed
   between samples. Scoreboard numbers published before these fixes are
-  withdrawn pending a fresh sweep.
+  withdrawn; the fresh honest result (median of three full sweeps, cache off)
+  is UltraSQL fastest on 21 of 24 workloads, with the 1M bulk UPDATE/DELETE
+  (columnar engines) and point-op Mixed OLTP as the three reported losses.
 - The docs CI gate no longer fails when the scale sweep contains rows where
   UltraSQL is not the fastest engine — losses are reported as data. It also
   audits git-tracked docs only.

@@ -4,27 +4,27 @@ UltraSQL is an external release binary launched as ultrasqld; measured engines u
 
 | Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |
 |---|---:|---:|---:|---:|---:|---:|---|
-| INSERT throughput | 10 000 | **1.48 ms** | 31.31 ms (2022.6% slower) | 62.51 ms (4137.2% slower) | 1.61 ms (8.9% slower) | 2.96 ms (100.7% slower) | UltraSQL |
-| INSERT throughput | 100 000 | **9.81 ms** | 326.33 ms (3224.9% slower) | 634.90 ms (6368.9% slower) | 17.42 ms (77.4% slower) | 23.37 ms (138.1% slower) | UltraSQL |
-| INSERT throughput | 1 000 000 | **109.25 ms** | 3216.22 ms (2844% slower) | 6510.90 ms (5859.7% slower) | 225.67 ms (106.6% slower) | 247.64 ms (126.7% slower) | UltraSQL |
-| SELECT scan | 10 000 | **728.54 µs** | 937.31 µs (28.7% slower) | 962.33 µs (32.1% slower) | 1.91 ms (161.9% slower) | 1.39 ms (90.9% slower) | UltraSQL |
-| SELECT scan | 100 000 | **6.54 ms** | 9.34 ms (42.9% slower) | 7.67 ms (17.4% slower) | 20.26 ms (210% slower) | 16.48 ms (152% slower) | UltraSQL |
-| SELECT scan | 1 000 000 | 61.48 ms (5.1% slower) | 92.16 ms (57.5% slower) | **58.50 ms** | 202.91 ms (246.9% slower) | 158.81 ms (171.5% slower) | ClickHouse |
-| SELECT SUM(x) | 10 000 | **51.10 µs** | 70.21 µs (37.4% slower) | 428.02 µs (737.5% slower) | 138.79 µs (171.6% slower) | 294.88 µs (477% slower) | UltraSQL |
-| SELECT SUM(x) | 100 000 | **47.79 µs** | 85.00 µs (77.9% slower) | 643.50 µs (1246.5% slower) | 1.42 ms (2866.7% slower) | 2.36 ms (4847.1% slower) | UltraSQL |
-| SELECT SUM(x) | 1 000 000 | **122.94 µs** | 156.85 µs (27.6% slower) | 1.57 ms (1174.7% slower) | 15.59 ms (12581.6% slower) | 10.95 ms (8805.8% slower) | UltraSQL |
-| SELECT AVG(x) | 10 000 | **43.71 µs** | 69.44 µs (58.9% slower) | 446.92 µs (922.5% slower) | 136.40 µs (212.1% slower) | 317.35 µs (626.1% slower) | UltraSQL |
-| SELECT AVG(x) | 100 000 | **50.46 µs** | 115.13 µs (128.2% slower) | 679.44 µs (1246.5% slower) | 1.45 ms (2776.9% slower) | 2.62 ms (5087.1% slower) | UltraSQL |
-| SELECT AVG(x) | 1 000 000 | **123.15 µs** | 238.63 µs (93.8% slower) | 1.66 ms (1247.7% slower) | 15.59 ms (12562.3% slower) | 11.44 ms (9189.8% slower) | UltraSQL |
-| Filter + SUM | 10 000 | **42.56 µs** | 76.73 µs (80.3% slower) | 535.79 µs (1158.8% slower) | 152.60 µs (258.5% slower) | 308.54 µs (624.9% slower) | UltraSQL |
-| Filter + SUM | 100 000 | **61.67 µs** | 126.60 µs (105.3% slower) | 746.19 µs (1110% slower) | 1.58 ms (2462.2% slower) | 2.57 ms (4070.2% slower) | UltraSQL |
-| Filter + SUM | 1 000 000 | **108.17 µs** | 168.92 µs (56.2% slower) | 1.37 ms (1167.4% slower) | 17.45 ms (16031.1% slower) | 11.67 ms (10692.1% slower) | UltraSQL |
-| UPDATE throughput | 10 000 | **120.10 µs** | 156.15 µs (30% slower) | 3.38 ms (2711.5% slower) | 460.31 µs (283.3% slower) | 4.02 ms (3249.3% slower) | UltraSQL |
-| UPDATE throughput | 100 000 | **384.40 µs** | 739.65 µs (92.4% slower) | 12.03 ms (3029.9% slower) | 5.63 ms (1365.2% slower) | 38.59 ms (9938.5% slower) | UltraSQL |
-| UPDATE throughput | 1 000 000 | 3.06 ms (40.4% slower) | **2.18 ms** | 31.72 ms (1354.4% slower) | 58.86 ms (2598.6% slower) | 1634.02 ms (74816.3% slower) | DuckDB |
-| DELETE throughput | 10 000 | **94.19 µs** | 99.15 µs (5.3% slower) | 4.55 ms (4732.8% slower) | 572.08 µs (507.4% slower) | 1.31 ms (1287.3% slower) | UltraSQL |
-| DELETE throughput | 100 000 | **375.04 µs** | 409.29 µs (9.1% slower) | 3.99 ms (962.9% slower) | 7.16 ms (1809.3% slower) | 12.47 ms (3225.3% slower) | UltraSQL |
-| DELETE throughput | 1 000 000 | 3.35 ms (25.2% slower) | 4.30 ms (60.7% slower) | **2.68 ms** | 71.09 ms (2554.1% slower) | 300.20 ms (11107.3% slower) | ClickHouse |
-| Mixed OLTP | 10 000 | 124.94 µs/op (525.3% slower) | 143.10 µs/op (616.2% slower) | 27.30 ms/op (136520% slower) | **19.98 µs/op** | 32.92 µs/op (64.8% slower) | SQLite |
-| Mixed correctness | 100 000 | **145.29 µs** | 265.40 µs (82.7% slower) | 82.70 ms (56823.4% slower) | 2.26 ms (1452.8% slower) | 3.16 ms (2078.3% slower) | UltraSQL |
-| Window row_number() | 65 536 | **4.85 ms** | 6.79 ms (40% slower) | 5.42 ms (11.9% slower) | 27.07 ms (458.2% slower) | 15.75 ms (224.8% slower) | UltraSQL |
+| INSERT throughput | 10 000 | **1.55 ms** | 32.75 ms (2015% slower) | 60.19 ms (3786.6% slower) | 1.68 ms (8.6% slower) | 3.07 ms (98.3% slower) | UltraSQL |
+| INSERT throughput | 100 000 | **10.30 ms** | 319.68 ms (3003.3% slower) | 610.19 ms (5823.5% slower) | 17.28 ms (67.8% slower) | 20.68 ms (100.8% slower) | UltraSQL |
+| INSERT throughput | 1 000 000 | **110.11 ms** | 3391.86 ms (2980.4% slower) | 6143.87 ms (5479.7% slower) | 240.89 ms (118.8% slower) | 253.81 ms (130.5% slower) | UltraSQL |
+| SELECT scan | 10 000 | **692.56 µs** | 885.94 µs (27.9% slower) | 992.85 µs (43.4% slower) | 1.88 ms (170.8% slower) | 1.46 ms (110.6% slower) | UltraSQL |
+| SELECT scan | 100 000 | **6.23 ms** | 9.20 ms (47.8% slower) | 6.73 ms (8.1% slower) | 19.71 ms (216.6% slower) | 15.74 ms (152.8% slower) | UltraSQL |
+| SELECT scan | 1 000 000 | **59.92 ms** | 96.02 ms (60.2% slower) | 61.15 ms (2.1% slower) | 207.69 ms (246.6% slower) | 162.73 ms (171.6% slower) | UltraSQL |
+| SELECT SUM(x) | 10 000 | **41.35 µs** | 67.02 µs (62.1% slower) | 467.25 µs (1029.9% slower) | 136.79 µs (230.8% slower) | 282.65 µs (583.5% slower) | UltraSQL |
+| SELECT SUM(x) | 100 000 | **53.19 µs** | 87.31 µs (64.2% slower) | 655.77 µs (1132.9% slower) | 1.42 ms (2577.2% slower) | 2.36 ms (4343.4% slower) | UltraSQL |
+| SELECT SUM(x) | 1 000 000 | **127.02 µs** | 158.08 µs (24.5% slower) | 1.59 ms (1152.8% slower) | 16.12 ms (12594.8% slower) | 11.18 ms (8699.8% slower) | UltraSQL |
+| SELECT AVG(x) | 10 000 | **52.27 µs** | 70.15 µs (34.2% slower) | 442.71 µs (746.9% slower) | 137.04 µs (162.2% slower) | 313.06 µs (498.9% slower) | UltraSQL |
+| SELECT AVG(x) | 100 000 | **62.08 µs** | 113.81 µs (83.3% slower) | 682.67 µs (999.6% slower) | 1.41 ms (2179.1% slower) | 2.58 ms (4060.2% slower) | UltraSQL |
+| SELECT AVG(x) | 1 000 000 | **126.81 µs** | 224.10 µs (76.7% slower) | 1.58 ms (1143.8% slower) | 15.72 ms (12297.6% slower) | 11.84 ms (9235% slower) | UltraSQL |
+| Filter + SUM | 10 000 | **42.69 µs** | 74.71 µs (75% slower) | 523.15 µs (1125.5% slower) | 152.69 µs (257.7% slower) | 312.04 µs (631% slower) | UltraSQL |
+| Filter + SUM | 100 000 | **56.48 µs** | 121.25 µs (114.7% slower) | 764.21 µs (1253.1% slower) | 1.56 ms (2658.4% slower) | 2.56 ms (4430% slower) | UltraSQL |
+| Filter + SUM | 1 000 000 | **137.02 µs** | 168.19 µs (22.7% slower) | 1.38 ms (905.3% slower) | 17.58 ms (12731.8% slower) | 11.78 ms (8500.7% slower) | UltraSQL |
+| UPDATE throughput | 10 000 | **120.83 µs** | 157.50 µs (30.3% slower) | 3.99 ms (3204.7% slower) | 483.17 µs (299.9% slower) | 4.02 ms (3229% slower) | UltraSQL |
+| UPDATE throughput | 100 000 | **369.54 µs** | 751.60 µs (103.4% slower) | 11.43 ms (2994.3% slower) | 5.50 ms (1388.2% slower) | 38.33 ms (10272.3% slower) | UltraSQL |
+| UPDATE throughput | 1 000 000 | 3.13 ms (18.9% slower) | **2.63 ms** | 33.68 ms (1179.8% slower) | 59.80 ms (2172.3% slower) | 1643.89 ms (62366.6% slower) | DuckDB |
+| DELETE throughput | 10 000 | **97.10 µs** | 113.85 µs (17.3% slower) | 3.21 ms (3208.4% slower) | 592.19 µs (509.8% slower) | 1.36 ms (1297.2% slower) | UltraSQL |
+| DELETE throughput | 100 000 | **369.71 µs** | 409.29 µs (10.7% slower) | 3.28 ms (788.1% slower) | 7.13 ms (1827.5% slower) | 12.28 ms (3222.6% slower) | UltraSQL |
+| DELETE throughput | 1 000 000 | 3.64 ms (32.2% slower) | 4.41 ms (60% slower) | **2.75 ms** | 71.75 ms (2505.3% slower) | 355.62 ms (12813.4% slower) | ClickHouse |
+| Mixed OLTP | 10 000 | 130.19 µs/op (698.8% slower) | 145.94 µs/op (795.4% slower) | 26.62 ms/op (163252.6% slower) | **16.30 µs/op** | 34.20 µs/op (109.9% slower) | SQLite |
+| Mixed correctness | 100 000 | **138.81 µs** | 266.29 µs (91.8% slower) | 74.05 ms (53243.3% slower) | 2.23 ms (1507.4% slower) | 3.20 ms (2207.4% slower) | UltraSQL |
+| Window row_number() | 65 536 | **4.88 ms** | 6.88 ms (41% slower) | 5.74 ms (17.6% slower) | 27.70 ms (467.4% slower) | 16.23 ms (232.4% slower) | UltraSQL |

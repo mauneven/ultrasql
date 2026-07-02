@@ -23,9 +23,10 @@ allowed to say:
 - `DONE.md`, `GOVERNANCE.md`, and `RFC_PROCESS.md` were removed: the first
   repeated withdrawn claims, the latter two described a multi-maintainer
   process this single-maintainer project does not run.
-- The scale-sweep scoreboard and its prose are being re-measured with the
-  result-cache disclosure and harness-fairness fixes; until that run lands,
-  treat scoreboard numbers as historical.
+- The scale-sweep scoreboard and its prose were re-measured with the
+  result-cache-off + harness-fairness fixes (median of three full sweeps);
+  the committed result is 21 of 24 workloads led by UltraSQL, cert `ready`
+  for the measured commit.
 
 ## Ledger
 

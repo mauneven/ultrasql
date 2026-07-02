@@ -22,11 +22,11 @@ database in all aspects, or that it is ready for unsupervised production use.
   removed from the engine; the artifacts were deleted. No TPC-H claim exists
   until the runners are re-executed against the real executor (see the
   retraction in `BENCHMARKS.md`).
-- **The scale-sweep scoreboard is being re-measured.** The committed sweep
-  predates the harness-fairness fixes (result-cache disclosure, symmetric
-  warmups, persistent-connection inserts for every engine). Until the fresh
-  run lands, scoreboard numbers are historical and must not be quoted as
-  current.
+- **The scale-sweep scoreboard was re-measured** with the harness-fairness
+  fixes (result cache disabled, symmetric warmups, persistent-connection
+  inserts for every engine, one-op-per-round-trip mixed OLTP). The committed
+  result (median of three full sweeps) is 21 of 24 workloads led by UltraSQL;
+  `benchmark_certification_status.json` is `ready` for the measured commit.
 - The docs gate no longer fails when UltraSQL loses a benchmark row; losses
   are reported as data.
 
