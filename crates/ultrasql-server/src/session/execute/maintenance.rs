@@ -174,7 +174,10 @@ where
             })?],
             None => snapshot.tables.values().cloned().collect(),
         };
-        let oldest = self.state.txn_manager.oldest_in_progress();
+        // Snapshot-safe horizon, not just the oldest in-progress XID: a live
+        // snapshot may still be entitled to rows whose lower-XID deleter
+        // committed after that snapshot was taken.
+        let oldest = self.state.txn_manager.vacuum_horizon();
         for entry in tables {
             let rel = RelationId(entry.oid);
             let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);

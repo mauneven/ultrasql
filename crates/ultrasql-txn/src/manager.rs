@@ -303,6 +303,17 @@ pub struct TransactionManager {
     /// source of truth for visibility lookups (`XidStatusOracle`) and
     /// recovery.
     in_progress: parking_lot::Mutex<std::collections::BTreeSet<Xid>>,
+    /// Per-live-transaction snapshot `xmin` floor: the lowest XID each
+    /// in-progress top-level transaction's current snapshot still treats
+    /// as in-progress. Recorded at [`Self::begin`], raised when a
+    /// ReadCommitted statement re-snapshots, removed in
+    /// [`Self::terminate_with_subxids`]. Vacuum must respect these floors:
+    /// a REPEATABLE READ snapshot can be entitled to see a row whose
+    /// *lower-XID* deleter committed after the snapshot was taken, which
+    /// [`Self::oldest_in_progress`] alone cannot express (see
+    /// [`Self::vacuum_horizon`]). Lock order: `in_progress` may be held
+    /// while taking this lock, never the reverse.
+    snapshot_xmins: parking_lot::Mutex<std::collections::BTreeMap<Xid, Xid>>,
     /// Subtransaction → parent-(top-level)-XID map (a `pg_subtrans`
     /// analog). Recorded in [`Self::begin_savepoint`] when a subxid is
     /// allocated; consulted by [`XidStatusOracle::status`] so a foreign
@@ -350,6 +361,7 @@ impl TransactionManager {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            snapshot_xmins: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             subxid_parent: DashMap::new(),
             ssi: None,
             lock_manager: Arc::new(LockManager::new()),
@@ -370,6 +382,7 @@ impl TransactionManager {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            snapshot_xmins: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             subxid_parent: DashMap::new(),
             ssi: Some(ssi),
             lock_manager: Arc::new(LockManager::new()),
@@ -419,6 +432,12 @@ impl TransactionManager {
         //    fresh transaction has no savepoints yet, so the own-subxid
         //    sets are empty.
         let snapshot = self.build_snapshot(xid, CommandId::FIRST, &OwnSubxids::empty());
+
+        // Record this transaction's snapshot-xmin floor for the vacuum
+        // horizon. Insert *after* the snapshot exists but while the XID is
+        // already published in-progress, so vacuum sees either the XID
+        // (via `oldest_in_progress`) or the floor — never neither.
+        self.snapshot_xmins.lock().insert(xid, snapshot.xmin);
 
         // 4. Register with SSI if this is a serializable transaction and an
         //    SSI manager is installed.
@@ -477,6 +496,11 @@ impl TransactionManager {
                 // rolled-back ones.
                 let own = OwnSubxids::from_subtxn(&txn.subtxn_stack);
                 txn.snapshot = self.build_snapshot(txn.xid, txn.current_command, &own);
+                // The discarded snapshot's xmin floor no longer binds the
+                // vacuum horizon; raise it to the fresh snapshot's.
+                self.snapshot_xmins
+                    .lock()
+                    .insert(txn.xid, txn.snapshot.xmin);
             }
             IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
                 // Snapshot stays frozen. Keep `current_command` coherent so
@@ -843,6 +867,9 @@ impl TransactionManager {
             }
         }
         active.remove(&parent);
+        // Lock order: `in_progress` (held) → `snapshot_xmins`; no path
+        // acquires them in the reverse order.
+        self.snapshot_xmins.lock().remove(&parent);
 
         // Count this terminal transition exactly once (the parent flip above
         // succeeds at most once per txn). Drives the xact_commit / xact_rollback
@@ -904,6 +931,24 @@ impl TransactionManager {
             }
         }
         oldest.unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
+    }
+
+    /// Vacuum horizon: no slot whose deleter's XID is at or above this
+    /// value may be reclaimed.
+    ///
+    /// This is `min(oldest_in_progress, oldest live snapshot xmin)`. The
+    /// second term is what makes it safe: a live REPEATABLE READ snapshot
+    /// taken while deleter `D` (a *lower* XID) was still uncommitted is
+    /// entitled to keep seeing the row after `D` commits, but by then `D`
+    /// is no longer in-progress, so `oldest_in_progress` alone would let
+    /// vacuum reclaim the slot out from under that snapshot.
+    pub fn vacuum_horizon(&self) -> Xid {
+        let oldest = self.oldest_in_progress();
+        let floors = self.snapshot_xmins.lock();
+        match floors.values().min() {
+            Some(&xmin) if xmin < oldest => xmin,
+            _ => oldest,
+        }
     }
 
     /// Whether `xid` is currently recorded as in progress.
@@ -2334,5 +2379,61 @@ mod tests {
             XidStatus::Aborted,
             "a rolled-back subxid must not be revived Committed at parent commit"
         );
+    }
+
+    #[test]
+    fn vacuum_horizon_is_held_back_by_a_live_repeatable_read_snapshot() {
+        // Deleter D begins first (lower XID), then reader R (RR) takes a
+        // snapshot while D is still in progress — so R's snapshot xmin is
+        // pinned at D's XID. When D commits, `oldest_in_progress` rises to
+        // R's XID, but the vacuum horizon must stay at D's XID because R's
+        // snapshot is still entitled to see rows D deleted.
+        let mgr = TransactionManager::new();
+        let d = mgr.begin(IsolationLevel::ReadCommitted);
+        let r = mgr.begin(IsolationLevel::RepeatableRead);
+        assert!(d.xid < r.xid);
+        // R's frozen snapshot treats D as in-progress.
+        assert!(r.snapshot.xmin <= d.xid);
+
+        let r_xid = r.xid;
+        let r_xmin = r.snapshot.xmin;
+        let d_xid = d.xid;
+        mgr.commit(d).unwrap();
+
+        // Only R is in progress now, so the naive horizon jumps to R.xid.
+        assert_eq!(mgr.oldest_in_progress(), r_xid);
+        // The snapshot-safe horizon must stay at (or below) D's XID so a
+        // slot D deleted is not reclaimed out from under R.
+        assert!(
+            mgr.vacuum_horizon() <= d_xid,
+            "vacuum horizon {:?} must not pass live RR snapshot xmin {:?}",
+            mgr.vacuum_horizon(),
+            r_xmin
+        );
+
+        // Once R ends, nothing pins the horizon and it advances.
+        mgr.commit(r).unwrap();
+        assert!(mgr.vacuum_horizon() >= r_xid);
+    }
+
+    #[test]
+    fn read_committed_resnapshot_releases_the_vacuum_floor() {
+        // A ReadCommitted transaction that re-snapshots after an older
+        // transaction commits must not keep pinning the horizon at the
+        // stale xmin.
+        let mgr = TransactionManager::new();
+        let older = mgr.begin(IsolationLevel::ReadCommitted);
+        let mut rc = mgr.begin(IsolationLevel::ReadCommitted);
+        assert!(mgr.vacuum_horizon() <= older.xid);
+
+        mgr.commit(older).unwrap();
+        // rc still holds its original snapshot (xmin at older.xid) until it
+        // re-snapshots.
+        mgr.refresh_snapshot(&mut rc);
+        assert!(
+            mgr.vacuum_horizon() >= rc.xid,
+            "after re-snapshot with no older live txn, the floor must lift to rc.xid"
+        );
+        mgr.commit(rc).unwrap();
     }
 }

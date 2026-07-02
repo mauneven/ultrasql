@@ -955,3 +955,79 @@ fn delete_after_committed_inplace_update_is_not_lost_and_preserves_old_snapshots
         "between-commits snapshot must observe the post-update payload"
     );
 }
+
+#[test]
+fn update_after_committed_inplace_update_succeeds_and_new_value_is_visible() {
+    // Sibling scenario of the lost-DELETE regression above, UPDATE flavor:
+    // a committed in-place UPDATE permanently leaves the writer's stamp in
+    // `xmax` (with UPDATED_IN_PLACE marking the slot as the CURRENT
+    // version — vacuum keeps the slot for exactly that reason). A later
+    // general (non-fused) UPDATE of that same, visible row must treat the
+    // stale writer stamp as "alive current version", not as "deleted
+    // tuple". The executor reaches this path whenever the fused int32-pair
+    // rewrite does not apply, with the TID coming from a visible scan.
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+
+    // In-place UPDATE by xid 20 (val 10 -> 15), then commit it.
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
+        None,
+        None,
+    )
+    .unwrap();
+    oracle.set_committed(Xid::new(20));
+
+    // General UPDATE by xid 30 on the same slot: (1, 15) -> (1, 99).
+    oracle.set_in_progress(Xid::new(30));
+    let outcome = heap
+        .update(tid, &int32_pair_payload(1, 99), update_opts(30))
+        .expect("general update over a committed in-place update must succeed");
+    assert_eq!(outcome.old_tid, tid);
+    oracle.set_committed(Xid::new(30));
+
+    // A snapshot that sees all three commits observes exactly one row,
+    // carrying the general update's new value.
+    let after_all = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(40),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &after_all, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        visible.len(),
+        1,
+        "exactly one version must be visible after the general update"
+    );
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 99),
+        "the general update's new value must be visible"
+    );
+}

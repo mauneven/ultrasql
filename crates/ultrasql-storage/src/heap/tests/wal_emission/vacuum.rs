@@ -124,3 +124,77 @@ fn vacuum_heap_skips_alive_tuples() {
     );
     assert_eq!(stats.pages_compacted, 0);
 }
+
+#[test]
+fn vacuum_heap_keeps_row_visible_to_snapshot_that_predates_deleters_commit() {
+    use crate::heap::HeapTuple;
+
+    let heap = make_heap(16);
+    let r = rel();
+
+    // Insert under XID 10, committed long ago.
+    let t = heap.insert(r, b"row", opts(10)).unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+
+    // Deleter D (XID 90) stamps the row but has NOT committed yet.
+    oracle.set_in_progress(Xid::new(90));
+    heap.delete(t, del_opts(90, 0)).unwrap();
+
+    // Reader R (XID 100) begins while D is still in progress: R's
+    // snapshot lists 90 as active, so D's delete is invisible to R and
+    // the row must stay visible to R for R's entire lifetime.
+    oracle.set_in_progress(Xid::new(100));
+    let reader_100 = Snapshot::new(
+        Xid::new(90),
+        Xid::new(101),
+        Xid::new(100),
+        CommandId::FIRST,
+        [Xid::new(90)],
+    );
+    let before: Vec<HeapTuple> = heap
+        .scan_visible(r, heap.block_count(r), &reader_100, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        1,
+        "setup: R's snapshot must see the row while D is still in progress"
+    );
+
+    // D commits. The oldest transaction still in progress is now R
+    // (XID 100), but R's live snapshot still treats 90 as in-progress —
+    // so the horizon VACUUM receives must be R's snapshot xmin (90), not
+    // R's own XID. `TransactionManager::vacuum_horizon()` computes exactly
+    // that min-over-live-snapshot-xmins floor (see its unit tests); the
+    // server's VACUUM path (session/execute/maintenance.rs) passes it
+    // here. With the correct horizon the slot must survive.
+    oracle.set_committed(Xid::new(90));
+    let stats = heap.vacuum_heap(r, Xid::new(90), &oracle).unwrap();
+    assert_eq!(
+        stats.tuples_reclaimed, 0,
+        "a horizon at the live snapshot's xmin must protect the slot"
+    );
+
+    // R's ORIGINAL snapshot must still see the row after VACUUM.
+    let after: Vec<HeapTuple> = heap
+        .scan_visible(r, heap.block_count(r), &reader_100, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "VACUUM ({stats:?}) must not reclaim a row that reader XID 100's live \
+         snapshot (taken before deleter XID 90 committed) is entitled to see"
+    );
+    assert_eq!(after[0].data, b"row");
+
+    // Once no live snapshot needs the pre-image (reader gone, horizon
+    // past both XIDs), the same slot is reclaimable — vacuum still works.
+    let stats = heap.vacuum_heap(r, Xid::new(101), &oracle).unwrap();
+    assert_eq!(
+        stats.tuples_reclaimed, 1,
+        "with no live snapshot at or below the deleter, the slot must be reclaimed"
+    );
+}

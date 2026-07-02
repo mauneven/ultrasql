@@ -98,7 +98,11 @@ impl<L: PageLoader> HeapAccess<L> {
             let mut page = guard.write();
             let n_atts;
 
-            // Verify the old tuple is alive before touching anything.
+            // Verify the old tuple is alive before touching anything. A
+            // committed in-place update leaves its writer stamp in `xmax`
+            // with `UPDATED_IN_PLACE` set — that tuple is alive (vacuum
+            // special-cases the same state); only a classical `xmax` death
+            // mark rejects the update.
             {
                 let bytes = page.read_tuple(old_tid.slot)?;
                 if bytes.len() < TUPLE_HEADER_SIZE {
@@ -106,7 +110,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
                 let (hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
                     .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-                if !hdr.is_alive() {
+                if !hdr.is_alive() && !hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
                     return Err(HeapError::MalformedHeader("update on deleted tuple"));
                 }
                 n_atts = hdr.n_atts;
@@ -167,6 +171,15 @@ impl<L: PageLoader> HeapAccess<L> {
             old_hdr.xmax = opts.xid;
             old_hdr.cmax = opts.command_id;
             old_hdr.infomask.set(InfoMask::HOT_UPDATED);
+            // Superseding a committed in-place post-image: the new xmax is a
+            // classical death mark, so migrate UPDATED_IN_PLACE →
+            // INPLACE_HISTORY (mirroring the delete path). Otherwise the dead
+            // old slot keeps reading as a live in-place post-image and both
+            // versions stay visible.
+            if old_hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+                old_hdr.infomask.clear(InfoMask::UPDATED_IN_PLACE);
+                old_hdr.infomask.set(InfoMask::INPLACE_HISTORY);
+            }
             old_hdr.ctid = new_tid;
             let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
             Self::tuple_header_bytes_mut(page_bytes, old_off, "old header outside page")?
@@ -213,7 +226,11 @@ impl<L: PageLoader> HeapAccess<L> {
         {
             let bytes = page.as_bytes_mut();
             let existing_xmax = Self::read_xmax(bytes, old_off)?;
-            if existing_xmax != 0 {
+            let existing_infomask = Self::read_infomask(bytes, old_off)?;
+            // A committed in-place update leaves a writer stamp in `xmax`
+            // with `UPDATED_IN_PLACE` set — the tuple is alive and updatable;
+            // only a classical death mark rejects the update.
+            if existing_xmax != 0 && existing_infomask & InfoMask::UPDATED_IN_PLACE == 0 {
                 return Err(HeapError::MalformedHeader("update on deleted tuple"));
             }
             n_atts = Self::read_n_atts(bytes, old_off)?;
@@ -253,10 +270,16 @@ impl<L: PageLoader> HeapAccess<L> {
         Self::write_ctid(page_bytes, new_off, new_tid)?;
 
         // Old tuple stamps: xmax | cmax | infomask |= HOT_UPDATED | ctid.
+        // A committed in-place post-image being superseded migrates
+        // UPDATED_IN_PLACE → INPLACE_HISTORY so its new xmax reads as a
+        // classical death mark, not a still-live in-place payload.
         Self::write_xmax(page_bytes, old_off, opts.xid)?;
         Self::write_cmax(page_bytes, old_off, opts.command_id)?;
         let cur_infomask = Self::read_infomask(page_bytes, old_off)?;
-        let new_infomask = cur_infomask | InfoMask::HOT_UPDATED;
+        let mut new_infomask = cur_infomask | InfoMask::HOT_UPDATED;
+        if new_infomask & InfoMask::UPDATED_IN_PLACE != 0 {
+            new_infomask = (new_infomask & !InfoMask::UPDATED_IN_PLACE) | InfoMask::INPLACE_HISTORY;
+        }
         Self::write_infomask(page_bytes, old_off, new_infomask)?;
         Self::write_ctid(page_bytes, old_off, new_tid)?;
 
@@ -306,8 +329,13 @@ impl<L: PageLoader> HeapAccess<L> {
         // Check tuple is alive — `is_alive == xmax.is_invalid()`,
         // and `Xid::INVALID == 0`, so read the 8-byte xmax field
         // and compare to zero. Eight bytes — one cache-line touch.
+        // Exception: `UPDATED_IN_PLACE` means `xmax` is a committed
+        // in-place writer's stamp, not a death mark — the tuple is alive
+        // and updatable.
         let existing_xmax = Self::read_xmax(page_bytes, slot_offset)?;
-        if existing_xmax != 0 {
+        let cur_infomask = Self::read_infomask(page_bytes, slot_offset)?;
+        let inplace_stamped = cur_infomask & InfoMask::UPDATED_IN_PLACE != 0;
+        if existing_xmax != 0 && !inplace_stamped {
             return Err(HeapError::MalformedHeader("update on deleted tuple"));
         }
 
@@ -317,9 +345,15 @@ impl<L: PageLoader> HeapAccess<L> {
         // Stamp cmax (bytes 20..24).
         Self::write_cmax(page_bytes, slot_offset, command_id)?;
 
-        // OR `UPDATED` into infomask (bytes 24..26).
-        let cur_infomask = Self::read_infomask(page_bytes, slot_offset)?;
-        let new_infomask = cur_infomask | InfoMask::UPDATED;
+        // OR `UPDATED` into infomask (bytes 24..26). When overwriting a
+        // committed in-place writer stamp, migrate `UPDATED_IN_PLACE` to
+        // `INPLACE_HISTORY` (mirroring the delete path): the new `xmax`
+        // reads as a classical death mark while snapshots that predate the
+        // in-place update keep resolving pre-images through the undo log.
+        let mut new_infomask = cur_infomask | InfoMask::UPDATED;
+        if inplace_stamped {
+            new_infomask = (new_infomask & !InfoMask::UPDATED_IN_PLACE) | InfoMask::INPLACE_HISTORY;
+        }
         Self::write_infomask(page_bytes, slot_offset, new_infomask)?;
 
         // Stamp ctid relation (bytes 32..36).
@@ -341,12 +375,21 @@ impl<L: PageLoader> HeapAccess<L> {
         }
         let (mut hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
             .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-        if !hdr.is_alive() {
+        // `UPDATED_IN_PLACE` carries a committed in-place writer's stamp in
+        // `xmax`, not a death mark — the tuple is alive and updatable; the
+        // stamp below migrates it to `INPLACE_HISTORY` exactly like the
+        // delete path so old snapshots keep resolving undo pre-images.
+        let inplace_stamped = hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE);
+        if !hdr.is_alive() && !inplace_stamped {
             return Err(HeapError::MalformedHeader("update on deleted tuple"));
         }
         hdr.xmax = opts.xid;
         hdr.cmax = opts.command_id;
         hdr.infomask.set(InfoMask::UPDATED);
+        if inplace_stamped {
+            hdr.infomask.clear(InfoMask::UPDATED_IN_PLACE);
+            hdr.infomask.set(InfoMask::INPLACE_HISTORY);
+        }
         hdr.ctid = new_tid;
         let hdr_bytes = Self::collect_header_bytes(&hdr);
 
