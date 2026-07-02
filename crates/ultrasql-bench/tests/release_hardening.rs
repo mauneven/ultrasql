@@ -492,8 +492,12 @@ fn packaging_and_docs_site_surface_is_release_ready() {
         "docker/build-push-action",
         "ghcr.io/${{ github.repository_owner }}/ultrasql",
         "platforms: linux/amd64",
-        "provenance: mode=max",
-        "sbom: true",
+        // Image provenance/SBOM are disabled so GHCR shows a clean platform
+        // list (docs/install.md); this matches scripts/validate-release-workflow.py.
+        // Binary/checksum supply-chain provenance is still provided via the
+        // cosign sign-blob + attest-build-provenance steps below.
+        "provenance: false",
+        "sbom: false",
         "cosign sign-blob",
         "attest-build-provenance",
         "makensis",
