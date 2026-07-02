@@ -395,7 +395,7 @@ c.execute("DROP TABLE IF EXISTS bench_write SYNC")
 c.execute("CREATE TABLE bench_write (id Int64, val Int64) ENGINE = MergeTree() ORDER BY id")
 c.execute("INSERT INTO bench_write (id, val) VALUES", rows)
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     c.execute(f"ALTER TABLE bench_write UPDATE val = val + 1 WHERE id BETWEEN 0 AND {n-1}")
 
 for _ in range(n_iters):
@@ -566,7 +566,7 @@ c.execute("CREATE TABLE bench_select_scan (id Int32, val Int32) ENGINE = MergeTr
 rows = [(j, j * 10) for j in range(n)]
 c.execute("INSERT INTO bench_select_scan (id, val) VALUES", rows)
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     c.execute("SELECT id, val FROM bench_select_scan")
 
 for _ in range(n_iters):
@@ -615,7 +615,7 @@ c.execute("CREATE TABLE bench_analytical (id Int32, x Int32) ENGINE = MergeTree(
 rows = [(j, j * 10) for j in range(n)]
 c.execute("INSERT INTO bench_analytical (id, x) VALUES", rows)
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     c.execute(query)
 
 for _ in range(n_iters):

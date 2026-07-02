@@ -40,6 +40,11 @@ OUT="${SCALE_SWEEP_OUT:-benchmarks/results/latest/scale-sweep}"
 RAW="$OUT/raw"
 ROWS="${SCALE_SWEEP_ROWS:-10000 100000 1000000}"
 INSERT_CHUNK_ROWS="${INSERT_CHUNK_ROWS:-10000}"
+# Scoreboard fairness: result-cache *replay* is disabled for measured rows so
+# aggregate/scan rows compare real compute across engines (competitor query
+# caches are off/absent). Cache-on numbers may only be published explicitly
+# labeled as replay. See BENCHMARKS.md "Result caches".
+export ULTRASQL_RESULT_CACHE="${ULTRASQL_RESULT_CACHE:-off}"
 STORAGE_MODE="${SCALE_SWEEP_STORAGE:-memory}"
 case "$STORAGE_MODE" in
     memory|data-dir) ;;
@@ -414,14 +419,19 @@ run_competitor_script() {
     local err_log="$OUT/competitor-${selector}-${engine}.err"
 
     rm -f "$err_log"
+    # BENCH_WARMUP/WARMUP: every engine gets the same warmup count as the
+    # UltraSQL rows (--warmup "$WARMUP" above); asymmetric warmups were a
+    # methodology violation.
     if [[ "$row_mode" == "analytical" ]]; then
         if RAW_DIR="$RAW" N_ITERS="$ITERS" ANALYTICAL_ROWS="$rows" \
+            BENCH_WARMUP="$WARMUP" WARMUP="$WARMUP" \
             BENCH_STORAGE_MODE="$STORAGE_MODE" BENCH_DATA_ROOT="$DATA_ROOT/competitors" \
             bash "$script" "$selector" 2>"$err_log"; then
             return
         fi
     else
         if RAW_DIR="$RAW" N_ITERS="$ITERS" N_ROWS="$rows" INSERT_CHUNK_ROWS="$INSERT_CHUNK_ROWS" \
+            BENCH_WARMUP="$WARMUP" WARMUP="$WARMUP" \
             BENCH_STORAGE_MODE="$STORAGE_MODE" BENCH_DATA_ROOT="$DATA_ROOT/competitors" \
             bash "$script" "$selector" 2>"$err_log"; then
             return

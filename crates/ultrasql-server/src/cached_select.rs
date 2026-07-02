@@ -5,6 +5,26 @@ use ultrasql_vec::column::StringColumn;
 
 use super::*;
 
+/// Result-cache *replay* gate.
+///
+/// The two `try_run_cached_*` entry points below return memoized results —
+/// up to pre-encoded wire bytes — for repeated identical reads over a
+/// quiescent table. Replay is correct (entries are MVCC-version-gated and
+/// invalidated by writes), but a hit is a cache lookup, not query
+/// execution. `ULTRASQL_RESULT_CACHE=off|0|false|no` disables replay so
+/// benchmarks can compare real compute across engines; the committed scale
+/// sweep publishes cache-off numbers and discloses cache-on numbers
+/// separately (see the "Result caches" section of BENCHMARKS.md).
+pub(crate) fn result_cache_replay_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("ULTRASQL_RESULT_CACHE").ok().as_deref(),
+            Some("off" | "OFF" | "0" | "false" | "FALSE" | "no" | "NO")
+        )
+    })
+}
+
 pub(crate) fn try_run_cached_int32_pair_select(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
@@ -13,6 +33,9 @@ pub(crate) fn try_run_cached_int32_pair_select(
     oracle: &dyn ultrasql_mvcc::XidStatusOracle,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
+    if !result_cache_replay_enabled() {
+        return None;
+    }
     let (table, output_schema) = match plan {
         LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
         LogicalPlan::Project {
@@ -93,6 +116,9 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     oracle: &dyn ultrasql_mvcc::XidStatusOracle,
     stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
+    if !result_cache_replay_enabled() {
+        return None;
+    }
     let (aggregate_input, group_by, aggregates, output_schema) = match plan {
         LogicalPlan::Project {
             input,

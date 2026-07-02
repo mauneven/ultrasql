@@ -146,13 +146,46 @@ contract for every engine:
   - PostgreSQL — one `psycopg` (v3) connection with server-side prepared
     statements (`benchmarks/scripts/run_postgres_writes.py`).
   - DuckDB / SQLite — one in-process driver connection
-    (`duckdb` / `sqlite3` Python modules).
+    (`duckdb` / `sqlite3` Python modules). Since 2026-07-01 this includes the
+    INSERT rows: the previous insert path timed a `sqlite3`/`duckdb` CLI
+    process per sample (process + interpreter startup inside the timer),
+    which contradicted this contract and inflated those engines' margins —
+    insert numbers published before that date are withdrawn.
   - ClickHouse — one `clickhouse_driver` native-TCP session.
   - The earlier `psql -c` / `duckdb -c` per-query process-spawn paths are gone;
     they timed process startup, parse, and plan rather than execution.
-- **Warmup uses the measured path.** Warmup samples run the identical preloaded
-  query against the identical persistent connection. Preloads (table creation +
-  row load) happen once, outside the timed region.
+- **Warmup is symmetric.** Every engine runs the same warmup count as
+  UltraSQL (the sweep exports `WARMUP`/`BENCH_WARMUP` to every engine
+  script; full mode is 8 warmup + 32 measured). Earlier sweeps warmed
+  UltraSQL 8 times but competitors only twice; those runs predate this
+  contract.
+- **Mixed OLTP is one operation per round trip.** Every engine's mixed loop
+  issues one autocommitted operation per client round trip (prepared
+  statements where the driver supports them). Earlier sweeps sent UltraSQL
+  20-operation `BEGIN…COMMIT` batches while PostgreSQL ran per-op round
+  trips inside one long transaction; both shapes are gone.
+- **Timed regions exclude restore work for every engine.** BEGIN/ROLLBACK
+  bookkeeping, table resets, and PostgreSQL's between-sample `VACUUM`
+  (which reclaims the rollback pattern's aborted-version bloat) run outside
+  the timer.
+- **Known residual asymmetry (disclosed).** UltraSQL is drained by a
+  compiled Rust client while PostgreSQL/SQLite/DuckDB rows are drained by
+  Python drivers; on large result sets (the 1M-row scans) Python object
+  materialization is part of the competitor's measured time. This inflates
+  competitor latencies on drain-heavy rows and is on the fix list
+  (same-driver measurement for the wire engines).
+- **Result caches are disclosed and disabled for the scoreboard.** UltraSQL
+  ships MVCC-version-gated result-replay caches for repeated identical
+  scans/scalar aggregates over quiescent tables
+  (`crates/ultrasql-server/src/cached_select.rs`). A replay hit returns
+  memoized (even pre-encoded) results without recomputation — legitimate in
+  production, but a benchmark that repeats one identical query against a
+  quiescent table measures the cache, not the executor, while competitors
+  (e.g. ClickHouse's query cache, off by default) recompute. The published
+  scoreboard therefore runs `ultrasqld` with `ULTRASQL_RESULT_CACHE=off`;
+  cache-on numbers may be quoted only when explicitly labeled as result-cache
+  replay. Scoreboards published before 2026-07-01 did not disable or
+  disclose this and their aggregate/scan rows are withdrawn.
 - **Fair, tuned competitors.** PostgreSQL is a dedicated, same-host
   **PostgreSQL 17** cluster brought up by
   `benchmarks/scripts/pg17_bench_server.sh` with documented OLTP/analytics

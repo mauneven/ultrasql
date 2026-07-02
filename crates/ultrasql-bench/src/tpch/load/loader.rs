@@ -90,26 +90,6 @@ pub(crate) fn tpch_progress_enabled() -> bool {
 }
 
 #[cfg(feature = "sql-bench")]
-pub(crate) fn tpch_progress_pool_stats_enabled() -> bool {
-    matches!(
-        std::env::var("ULTRASQL_TPCH_PROGRESS_POOL_STATS")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
-    )
-}
-
-#[cfg(feature = "sql-bench")]
-pub(crate) fn ultrasql_analyze_after_load_enabled() -> bool {
-    matches!(
-        std::env::var("ULTRASQL_TPCH_ANALYZE_AFTER_LOAD")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
-    )
-}
-
-#[cfg(feature = "sql-bench")]
 pub(crate) fn tpch_progress_bytes() -> u64 {
     std::env::var("ULTRASQL_TPCH_PROGRESS_BYTES")
         .ok()

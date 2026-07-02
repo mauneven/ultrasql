@@ -132,7 +132,16 @@ def preload_int_table(conn, table: str, kind: str, col: str, rows: list[tuple[in
     conn.commit()
 
 
-def time_samples(warmup: int, iters: int, body: Callable[[], None]) -> list[float]:
+def time_samples(
+    warmup: int,
+    iters: int,
+    body: Callable[[], None],
+    between: Callable[[], None] | None = None,
+) -> list[float]:
+    # `between` runs after each timed sample, outside the timed region —
+    # rollback/restore/vacuum bookkeeping must not count against the engine,
+    # matching the other engine scripts (their BEGIN/ROLLBACK sits outside
+    # the timer too).
     samples: list[float] = []
     for i in range(warmup + iters):
         t0 = time.perf_counter()
@@ -140,7 +149,32 @@ def time_samples(warmup: int, iters: int, body: Callable[[], None]) -> list[floa
         dt = (time.perf_counter() - t0) * 1e6
         if i >= warmup:
             samples.append(dt)
+        if between is not None:
+            between()
     return samples
+
+
+def open_txn(conn) -> None:
+    # psycopg sends an implicit BEGIN with the first statement of a
+    # transaction; issue it here so the timed statement does not pay that
+    # extra round trip (the other engines keep BEGIN outside the timer).
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1")
+
+
+def vacuum_table(conn, table: str) -> None:
+    # Reclaim aborted row versions between samples so later samples do not
+    # scan monotonically growing bloat that the rollback-restore pattern
+    # leaves behind in PostgreSQL only (the other engines' rollbacks restore
+    # the page image).
+    conn.rollback()
+    prior = conn.autocommit
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"VACUUM {table}")
+    finally:
+        conn.autocommit = prior
 
 
 def run_insert(conn, args, kind: str) -> list[float]:
@@ -153,13 +187,20 @@ def run_insert(conn, args, kind: str) -> list[float]:
 
     def load() -> None:
         with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE {table}")
             with cur.copy(f"COPY {table} (id, val) FROM STDIN") as copy:
                 for row in rows:
                     copy.write_row(row)
         conn.commit()
 
-    return time_samples(args.warmup, args.iters, load)
+    def reset() -> None:
+        # Empty the table outside the timed region; each timed sample is
+        # COPY + COMMIT only, matching the other engines' untimed
+        # drop/recreate.
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE {table}")
+        conn.commit()
+
+    return time_samples(args.warmup, args.iters, load, between=reset)
 
 
 def run_update(conn, args, kind: str) -> list[float]:
@@ -171,9 +212,13 @@ def run_update(conn, args, kind: str) -> list[float]:
     def body() -> None:
         with conn.cursor() as cur:
             cur.execute(query, prepare=True)
-        conn.rollback()
 
-    return time_samples(args.warmup, args.iters, body)
+    def restore() -> None:
+        vacuum_table(conn, table)
+        open_txn(conn)
+
+    open_txn(conn)
+    return time_samples(args.warmup, args.iters, body, between=restore)
 
 
 def run_delete(conn, args, kind: str) -> list[float]:
@@ -185,9 +230,13 @@ def run_delete(conn, args, kind: str) -> list[float]:
     def body() -> None:
         with conn.cursor() as cur:
             cur.execute(query, prepare=True)
-        conn.rollback()
 
-    return time_samples(args.warmup, args.iters, body)
+    def restore() -> None:
+        vacuum_table(conn, table)
+        open_txn(conn)
+
+    open_txn(conn)
+    return time_samples(args.warmup, args.iters, body, between=restore)
 
 
 def run_select_scan(conn, args, kind: str) -> list[float]:
@@ -225,33 +274,41 @@ def run_mixed(conn, args, kind: str) -> list[float]:
     for sample in range(args.warmup + args.iters):
         preload_write_table(conn, table, kind, shuffled_write_rows(n), pk=True)
         rng = random.Random(0xBEEF + sample)
+        # One operation per round trip, each op its own autocommitted
+        # transaction — the contract every engine's mixed loop runs. The
+        # previous shape kept the whole 1s window inside a single
+        # transaction, paying one COMMIT per window instead of per op.
+        prior_autocommit = conn.autocommit
+        conn.autocommit = True
         deadline = time.perf_counter() + window
         count = 0
         next_id = n
-        with conn.cursor() as cur:
-            while time.perf_counter() < deadline:
-                r = rng.random()
-                if r < 0.50:
-                    row_id = rng.randint(0, n - 1)
-                    cur.execute(
-                        f"SELECT val FROM {table} WHERE id = %s", (row_id,), prepare=True
-                    )
-                    cur.fetchall()
-                elif r < 0.80:
-                    row_id = rng.randint(0, n - 1)
-                    cur.execute(
-                        f"UPDATE {table} SET val = val + 1 WHERE id = %s", (row_id,), prepare=True
-                    )
-                else:
-                    new_val = rng.randint(-(2**31), 2**31 - 1)
-                    cur.execute(
-                        f"INSERT INTO {table} (id, val) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                        (next_id, new_val),
-                        prepare=True,
-                    )
-                    next_id += 1
-                count += 1
-        conn.commit()
+        try:
+            with conn.cursor() as cur:
+                while time.perf_counter() < deadline:
+                    r = rng.random()
+                    if r < 0.50:
+                        row_id = rng.randint(0, n - 1)
+                        cur.execute(
+                            f"SELECT val FROM {table} WHERE id = %s", (row_id,), prepare=True
+                        )
+                        cur.fetchall()
+                    elif r < 0.80:
+                        row_id = rng.randint(0, n - 1)
+                        cur.execute(
+                            f"UPDATE {table} SET val = val + 1 WHERE id = %s", (row_id,), prepare=True
+                        )
+                    else:
+                        new_val = rng.randint(-(2**31), 2**31 - 1)
+                        cur.execute(
+                            f"INSERT INTO {table} (id, val) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                            (next_id, new_val),
+                            prepare=True,
+                        )
+                        next_id += 1
+                    count += 1
+        finally:
+            conn.autocommit = prior_autocommit
         elapsed = time.perf_counter() - (deadline - window)
         if sample >= args.warmup:
             samples.append(elapsed * 1e6 / max(count, 1))

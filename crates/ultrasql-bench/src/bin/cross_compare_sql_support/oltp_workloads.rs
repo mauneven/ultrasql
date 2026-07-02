@@ -335,10 +335,6 @@ pub(crate) async fn run_mixed_oltp_iter(
 
     /// Mirrors `benchmarks/scripts/run_*_writes.sh::run_mixed` window.
     const MIXED_WINDOW_SECS: f64 = 1.0;
-    /// SQLite batches 20 statements per subprocess invocation; DuckDB batches
-    /// 50. Use the smaller batch so UltraSQL gets comparable wire amortization
-    /// without increasing the operation grouping beyond the SQLite baseline.
-    const MIXED_BATCH_OPS: usize = 20;
 
     let conn_str = format!("host=127.0.0.1 port={} user=bench_runner", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -367,50 +363,53 @@ pub(crate) async fn run_mixed_oltp_iter(
     let seed = 0xBEEFu64.wrapping_add(u64::try_from(ix).unwrap_or(0));
     let mut rng = SplitMix64::new(seed);
     let n_rows_u64 = u64::try_from(n_rows).unwrap_or(u64::MAX);
-    let mut next_id = i64::try_from(n_rows).unwrap_or(i64::MAX);
+    let mut next_id = i32::try_from(n_rows).unwrap_or(i32::MAX);
+
+    // One operation per wire round trip, autocommit, via prepared
+    // statements — the identical contract every engine's mixed loop runs
+    // (PostgreSQL: psycopg `prepare=True` autocommit ops; SQLite/DuckDB:
+    // per-op autocommit on the in-process driver). The previous shape sent
+    // `BEGIN; 20 ops; COMMIT` per round trip, which amortized wire latency
+    // 20x for UltraSQL only and overstated its µs/op.
+    let select_stmt = client
+        .prepare(&format!("SELECT val FROM {table} WHERE id = $1"))
+        .await
+        .with_context(|| format!("prepare mixed SELECT on {table}"))?;
+    let update_stmt = client
+        .prepare(&format!("UPDATE {table} SET val = val + 1 WHERE id = $1"))
+        .await
+        .with_context(|| format!("prepare mixed UPDATE on {table}"))?;
+    let insert_stmt = client
+        .prepare(&format!("INSERT INTO {table} (id, val) VALUES ($1, $2)"))
+        .await
+        .with_context(|| format!("prepare mixed INSERT on {table}"))?;
 
     let window = Duration::from_secs_f64(MIXED_WINDOW_SECS);
     let started = Instant::now();
     let mut count: u64 = 0;
     while started.elapsed() < window {
-        let mut sql = String::with_capacity(MIXED_BATCH_OPS * 72 + 16);
-        sql.push_str("BEGIN;\n");
-        let mut batch_count = 0_u64;
-        for _ in 0..MIXED_BATCH_OPS {
-            let r = rng.next_unit_f64();
-            if r < 0.50 {
-                let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
-                sql.push_str("SELECT val FROM ");
-                sql.push_str(&table);
-                sql.push_str(" WHERE id = ");
-                sql.push_str(&row_id.to_string());
-                sql.push_str(";\n");
-            } else if r < 0.80 {
-                let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
-                sql.push_str("UPDATE ");
-                sql.push_str(&table);
-                sql.push_str(" SET val = val + 1 WHERE id = ");
-                sql.push_str(&row_id.to_string());
-                sql.push_str(";\n");
-            } else {
-                let new_val = rng.next_i32();
-                sql.push_str("INSERT INTO ");
-                sql.push_str(&table);
-                sql.push_str(" (id, val) VALUES (");
-                sql.push_str(&next_id.to_string());
-                sql.push(',');
-                sql.push_str(&new_val.to_string());
-                sql.push_str(");\n");
-                next_id += 1;
-            }
-            batch_count = batch_count.saturating_add(1);
+        let r = rng.next_unit_f64();
+        if r < 0.50 {
+            let row_id = i32::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+            client
+                .query(&select_stmt, &[&row_id])
+                .await
+                .with_context(|| format!("mixed OLTP SELECT on {table}"))?;
+        } else if r < 0.80 {
+            let row_id = i32::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+            client
+                .execute(&update_stmt, &[&row_id])
+                .await
+                .with_context(|| format!("mixed OLTP UPDATE on {table}"))?;
+        } else {
+            let new_val = rng.next_i32();
+            client
+                .execute(&insert_stmt, &[&next_id, &new_val])
+                .await
+                .with_context(|| format!("mixed OLTP INSERT on {table}"))?;
+            next_id = next_id.saturating_add(1);
         }
-        sql.push_str("COMMIT;\n");
-        client
-            .batch_execute(&sql)
-            .await
-            .with_context(|| format!("mixed OLTP batch on {table}"))?;
-        count = count.saturating_add(batch_count);
+        count = count.saturating_add(1);
     }
     let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
     let op_count = u64_to_f64(count.max(1), "mixed OLTP operation count")?;

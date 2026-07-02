@@ -6,6 +6,35 @@ and must document the break here.
 
 ## Unreleased
 
+### Integrity (2026-07-01 truthfulness pass)
+
+- **Removed the TPC-H answer-cache fast paths and withdrew every TPC-H
+  claim.** The server contained 21 per-query TPC-H shape-matching pipelines
+  that served answers precomputed by the benchmark loader; published
+  "certifications" (SF1 "351x vs PostgreSQL 17", SF10 "passed") timed cache
+  replay against engines executing real queries. The pipelines, loader
+  sidecars, and invalid artifacts are gone; TPC-H now runs through the real
+  executor and has no published result until fresh runs land.
+- **Result-cache replay is now a disclosed, switchable feature.**
+  `ULTRASQL_RESULT_CACHE=off` disables the MVCC-version-gated scan/aggregate
+  result-replay fast paths; the release scale sweep runs with replay
+  disabled so scoreboard rows compare real compute (BENCHMARKS.md "Result
+  caches").
+- **Benchmark harness fairness fixes**: DuckDB/SQLite INSERT rows now run on
+  persistent in-process driver connections instead of timing a CLI process
+  per sample; warmup counts are symmetric across engines; mixed OLTP is one
+  autocommitted operation per round trip for every engine (UltraSQL's
+  20-op wire batching and PostgreSQL's one-transaction-per-window shapes are
+  both gone); PostgreSQL's timed regions no longer include BEGIN/ROLLBACK
+  round trips or table-reset work, and aborted-version bloat is vacuumed
+  between samples. Scoreboard numbers published before these fixes are
+  withdrawn pending a fresh sweep.
+- The docs CI gate no longer fails when the scale sweep contains rows where
+  UltraSQL is not the fastest engine — losses are reported as data. It also
+  audits git-tracked docs only.
+- Removed `DONE.md`, `GOVERNANCE.md`, and `RFC_PROCESS.md` (stale claims and
+  process fiction for a single-maintainer project).
+
 ### Added
 
 - Structured wire `ErrorResponse` fields: every server error now carries the

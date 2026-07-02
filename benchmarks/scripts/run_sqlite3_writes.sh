@@ -204,79 +204,91 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
-# Common SQLite preamble.
-# ---------------------------------------------------------------------------
-if [[ "$BENCH_STORAGE_MODE" == "data-dir" ]]; then
-    SQLITE_PREAMBLE="PRAGMA journal_mode=WAL;
-PRAGMA synchronous=FULL;
-PRAGMA temp_store=DEFAULT;"
-else
-    SQLITE_PREAMBLE="PRAGMA journal_mode=MEMORY;
-PRAGMA synchronous=OFF;
-PRAGMA temp_store=MEMORY;"
-fi
-
-sqlite_db_path() {
-    local workload="$1"
-    local sample="$2"
-    if [[ "$BENCH_STORAGE_MODE" == "memory" ]]; then
-        echo ":memory:"
-        return
-    fi
-    local dir="$BENCH_DATA_ROOT/sqlite3"
-    mkdir -p "$dir"
-    echo "$dir/${workload}-${sample}.sqlite3"
-}
-
-reset_sqlite_db() {
-    local db_path="$1"
-    if [[ "$db_path" != ":memory:" ]]; then
-        rm -f "$db_path" "$db_path-wal" "$db_path-shm"
-    fi
-}
-
-# ---------------------------------------------------------------------------
 # Workload: insert_throughput_10k
 # ---------------------------------------------------------------------------
 run_insert() {
     local wl="insert_throughput_$(row_suffix "$N_ROWS")"
     echo "  workload: ${wl}"
 
-    local values_sql
-    values_sql="$(mktemp /tmp/sqlite_insert_XXXX.sql)"
-    python3 - "$N_ROWS" "$INSERT_CHUNK_ROWS" "$values_sql" <<'PYEOF'
-import sys, random
+    # Persistent in-process connection via the Python sqlite3 driver — the
+    # same methodology as every other row (see run_update). Each sample
+    # recreates an empty table outside the timed region, then times
+    # BEGIN + chunked multi-row INSERTs + COMMIT. The previous path timed a
+    # `sqlite3` CLI process per sample (interpreter + process startup,
+    # PRAGMA setup, CREATE TABLE), which violated the no-process-spawn
+    # methodology contract and inflated SQLite's reported latencies.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" "$INSERT_CHUNK_ROWS" "$BENCH_STORAGE_MODE" "$BENCH_DATA_ROOT" "$wl" <<'PYEOF'
+import os
+import sys, time, random
+import sqlite3
+from pathlib import Path
+
 n = int(sys.argv[1])
-chunk_rows = int(sys.argv[2])
-out = sys.argv[3]
+n_iters = int(sys.argv[2])
+chunk_rows = int(sys.argv[3])
+storage_mode = sys.argv[4]
+data_root = Path(sys.argv[5])
+workload = sys.argv[6]
+warmup = int(os.environ.get("BENCH_WARMUP", "2"))
+
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER NOT NULL, val INTEGER);\n")
-    f.write("BEGIN;\n")
-    chunks = [ids[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
-    vchunks = [vals[i:i+chunk_rows] for i in range(0, n, chunk_rows)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-    f.write("COMMIT;\n")
+vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
+
+stmts = []
+for i in range(0, n, chunk_rows):
+    rows = ",".join(
+        f"({j},{v})" for j, v in zip(ids[i:i + chunk_rows], vals[i:i + chunk_rows])
+    )
+    stmts.append(f"INSERT INTO bench_write(id,val) VALUES {rows};")
+
+if storage_mode == "data-dir":
+    db_path = data_root / "sqlite3" / f"{workload}-{os.getpid()}.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{db_path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+else:
+    db_path = Path(":memory:")
+
+con = sqlite3.connect(str(db_path), isolation_level=None)
+if storage_mode == "data-dir":
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=FULL;")
+    con.execute("PRAGMA temp_store=DEFAULT;")
+else:
+    con.execute("PRAGMA journal_mode=MEMORY;")
+    con.execute("PRAGMA synchronous=OFF;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+
+
+def one_sample():
+    con.execute("DROP TABLE IF EXISTS bench_write;")
+    con.execute("CREATE TABLE bench_write(id INTEGER NOT NULL, val INTEGER);")
+    t0 = time.perf_counter()
+    con.execute("BEGIN;")
+    for stmt in stmts:
+        con.execute(stmt)
+    con.execute("COMMIT;")
+    t1 = time.perf_counter()
+    return (t1 - t0) * 1e6
+
+
+for _ in range(warmup):
+    one_sample()
+for _ in range(n_iters):
+    print(one_sample())
 PYEOF
+)"
 
     local samples=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt db_path
-        db_path="$(sqlite_db_path "$wl" "$i")"
-        reset_sqlite_db "$db_path"
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$values_sql" | sqlite3 "$db_path" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples+=("$dt")
-    done
-
-    rm -f "$values_sql"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -343,7 +355,7 @@ con.executemany(
 )
 con.execute("COMMIT;")
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     con.execute("BEGIN;")
     con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};")
     con.execute("ROLLBACK;")
@@ -428,7 +440,7 @@ con.executemany(
 )
 con.execute("COMMIT;")
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     con.execute("BEGIN;")
     con.execute(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};")
     con.execute("ROLLBACK;")
@@ -619,7 +631,7 @@ con.executemany(
 )
 con.execute("COMMIT;")
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     con.execute("SELECT id, val FROM bench_select_scan;").fetchall()
 
 for _ in range(n_iters):
@@ -701,7 +713,7 @@ con.executemany(
 )
 con.execute("COMMIT;")
 
-for _ in range(2):
+for _ in range(int(__import__("os").environ.get("BENCH_WARMUP", "2"))):
     con.execute(query).fetchall()
 
 for _ in range(n_iters):
