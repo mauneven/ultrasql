@@ -118,7 +118,6 @@ fn chaos_recovery_runner_documents_fault_coverage() {
     let script = repo_file("benchmarks/chaos_recovery.sh");
     let docs = repo_file("docs/chaos-recovery.md");
     let release = repo_file("docs/release-checklist.md");
-    let done = repo_file("DONE.md");
 
     for needle in [
         "chaos_recovery_manifest.json",
@@ -151,7 +150,6 @@ fn chaos_recovery_runner_documents_fault_coverage() {
 
     assert!(release.contains("Chaos recovery"));
     assert!(release.contains("benchmarks/chaos_recovery.sh"));
-    assert!(done.contains("Chaos testing: random kill, WAL truncation, disk full"));
 }
 
 #[test]

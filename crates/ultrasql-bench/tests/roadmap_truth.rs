@@ -63,29 +63,26 @@ fn roadmap_firebolt_status_is_local_core_only() {
     assert!(!todo.contains("Cloud-first"));
 }
 
+// `roadmap_tpch_sf10_matches_complete_artifact` and
+// `roadmap_tracks_columnar_scan_mvcc_contract` were removed on 2026-07-02.
+// The first asserted the TPC-H SF10 "status passed" certification that has
+// since been WITHDRAWN as invalid (it measured removed answer-cache fast
+// paths, not query execution); a test must not re-enforce a retracted claim.
+// Both read DONE.md, which was deleted in the same truthfulness pass. TPC-H
+// re-certification is tracked as open work in TODO.md.
 #[test]
-fn roadmap_tpch_sf10_matches_complete_artifact() {
-    let done = repo_file("DONE.md");
+fn roadmap_tpch_claims_are_withdrawn_not_asserted_as_passing() {
     let todo = repo_file("TODO.md");
-    let normalized = collapse_ws(&done);
-
-    assert!(normalized.contains("TPC-H scale 10 (all 22 queries)"));
-    assert!(normalized.contains("benchmarks/results/latest/tpch_sf10_certification.json"));
-    assert!(normalized.contains("status passed"));
-    assert!(normalized.contains("22/22 DuckDB and UltraSQL query timings"));
-    assert!(!todo.contains("incomplete q21-only query set"));
-    assert!(!todo.contains("has not been run to completion"));
-    assert!(!todo.contains("remained in the `lineitem` load"));
-    assert!(!todo.contains("- [ ] TPC-H scale 10:"));
-}
-
-#[test]
-fn roadmap_tracks_columnar_scan_mvcc_contract() {
-    let done = repo_file("DONE.md");
-    let normalized = collapse_ws(&done);
-
-    assert!(normalized.contains("Columnar scan path"));
-    assert!(normalized.contains("heap rows remain the OLTP/MVCC source of truth"));
-    assert!(normalized.contains("HeapAccess::column_cache"));
-    assert!(normalized.contains("committed DML invalidation"));
+    let benchmarks = repo_file("BENCHMARKS.md");
+    // TODO must record TPC-H as withdrawn/open, never as a passing result.
+    assert!(
+        todo.contains("withdrawn"),
+        "TODO must record the TPC-H retraction"
+    );
+    // The methodology doc must carry the retraction and must not resurrect a
+    // passing ratio claim in prose.
+    assert!(
+        benchmarks.contains("Retraction") || benchmarks.contains("withdrawn"),
+        "BENCHMARKS.md must document the TPC-H retraction"
+    );
 }
