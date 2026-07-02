@@ -25,8 +25,6 @@ use super::LoadStats;
 #[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 use super::arith::tpch_u64_to_f64;
 #[cfg(feature = "sql-bench")]
-use super::direct_load::load_ultrasql_table;
-#[cfg(feature = "sql-bench")]
 use super::encode::build_ultrasql_insert_sql;
 #[cfg(feature = "sql-bench")]
 use super::parse_tbl_line;
@@ -81,14 +79,6 @@ pub(crate) fn ultrasql_tpch_pool_frames() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|frames| *frames > 0)
         .unwrap_or(DEFAULT_ULTRASQL_TPCH_POOL_FRAMES)
-}
-
-#[cfg(feature = "sql-bench")]
-pub(crate) fn ultrasql_direct_load_enabled() -> bool {
-    !matches!(
-        std::env::var("ULTRASQL_TPCH_DIRECT_LOAD").ok().as_deref(),
-        Some("0" | "false" | "FALSE" | "no" | "NO")
-    )
 }
 
 #[cfg(feature = "sql-bench")]
@@ -277,6 +267,20 @@ pub fn load_ultrasql(data_dir: &Path) -> Result<Vec<LoadStats>> {
 #[cfg(not(feature = "sql-bench"))]
 pub fn load_ultrasql(_data_dir: &Path) -> Result<Vec<LoadStats>> {
     bail!("NotYetWired: sql-bench feature is not enabled; rebuild with --features sql-bench")
+}
+
+/// Loads one TPC-H table over the wire using the configured method
+/// (COPY by default, batched INSERT via `ULTRASQL_TPCH_LOAD_METHOD=insert`).
+#[cfg(feature = "sql-bench")]
+pub(crate) async fn load_ultrasql_table(
+    client: &tokio_postgres::Client,
+    table: &str,
+    data_dir: &Path,
+) -> Result<LoadStats> {
+    match ultrasql_load_method()? {
+        UltrasqlLoadMethod::Copy => load_ultrasql_table_copy(client, table, data_dir).await,
+        UltrasqlLoadMethod::Insert => load_ultrasql_table_insert(client, table, data_dir).await,
+    }
 }
 
 /// Loads all TPC-H tables from `data_dir` into an already-connected UltraSQL client.

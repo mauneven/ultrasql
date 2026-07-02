@@ -260,6 +260,6 @@ cargo build --locked --profile release-ship --bin ultrasqld --bin ultrasql --bin
 
 Binary packaging does not mean the database is production-stable. The stable
 release decision is controlled by `docs/release-checklist.md`, `TODO.md`,
-`DONE.md`, CI, benchmark artifacts, security evidence, and operator-soak evidence.
+CI, benchmark artifacts, security evidence, and operator-soak evidence.
 See `docs/packaging.md` for docs site, Docker, npm publish, Homebrew,
 AUR, Chocolatey, Debian, RPM, and release workflow details.

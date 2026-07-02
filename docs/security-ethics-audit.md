@@ -19,7 +19,7 @@ Run these before release:
 ```bash
 rg -n "TH3|proprietary|confidential|internal use only|do not distribute" tests docs crates benchmarks
 rg -n "decompiled|reverse engineered|Firebolt source|closed-source code" .
-rg -n "faster than|beats|winner|unsupported benchmark claim" README.md TODO.md DONE.md BENCHMARKS.md docs benchmarks
+rg -n "faster than|beats|winner|unsupported benchmark claim" README.md TODO.md BENCHMARKS.md docs benchmarks
 ```
 
 Any hit must resolve to one of:

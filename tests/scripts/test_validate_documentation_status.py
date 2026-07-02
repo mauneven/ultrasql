@@ -112,6 +112,42 @@ class DocumentationStatusValidatorTests(unittest.TestCase):
             self.assertEqual(status["old_status_matches"], [])
             self.assertEqual(status["benchmark"]["ultrasql_fastest_row_count"], 2)
 
+    def test_scale_sweep_losses_are_reported_not_errors(self) -> None:
+        # A row where another engine is fastest is an honest measurement.
+        # It must appear in the summary but must never fail the audit.
+        with tempfile_dir() as tmp_path:
+            write_minimal_repo(tmp_path)
+            write_json(
+                tmp_path
+                / "benchmarks"
+                / "results"
+                / "latest"
+                / "scale-sweep"
+                / "scale_sweep.json",
+                {
+                    "schema_version": 1,
+                    "rows": [
+                        {"workload": "select_scan", "n_rows": 10, "fastest_engine": "ultrasql"},
+                        {"workload": "update_1m", "n_rows": 1000000, "fastest_engine": "duckdb"},
+                    ],
+                },
+            )
+
+            status = run_validator(tmp_path)
+
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["benchmark"]["ultrasql_fastest_row_count"], 1)
+            self.assertEqual(
+                status["benchmark"]["non_ultrasql_fastest_rows"],
+                [
+                    {
+                        "workload": "update_1m",
+                        "n_rows": 1000000,
+                        "fastest_engine": "duckdb",
+                    }
+                ],
+            )
+
     def test_rejects_missing_markdown_ledger_entry(self) -> None:
         with tempfile_dir() as tmp_path:
             write_minimal_repo(tmp_path)

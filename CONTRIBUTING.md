@@ -10,11 +10,11 @@ this document tells you how to send one that has a good chance of landing.
 For anything beyond a typo fix or a localized bug fix:
 
 1. Open an issue describing what you want to do and why. The
-   maintainer will respond with directional feedback, a pointer to a
-   related design, or a request for an RFC.
+   maintainer will respond with directional feedback or a pointer to a
+   related design.
 2. For changes that cross subsystem boundaries or touch on-disk
-   formats / wire protocols / public APIs, open an RFC under `rfcs/`
-   using the template described in [RFC_PROCESS.md](RFC_PROCESS.md).
+   formats / wire protocols / public APIs, agree on a written design in
+   the issue before implementing.
 3. For changes within a single crate that match the existing
    architecture, an issue is sufficient.
 

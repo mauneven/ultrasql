@@ -180,8 +180,8 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the longer treatment.
   subsystem's responsibilities or contracts, you update ARCHITECTURE.md
   in the same PR.
 - Decisions that cross subsystem boundaries — choice of execution model,
-  on-disk format, wire protocol policy — go through the RFC process
-  documented in [RFC_PROCESS.md](RFC_PROCESS.md).
+  on-disk format, wire protocol policy — need a written design agreed in
+  the tracking issue before implementation (see CONTRIBUTING.md).
 
 ---
 
@@ -348,8 +348,6 @@ ultrasql/
 ├── TODO.md                        open work + release gates
 ├── CONTRIBUTING.md                contributor guide
 ├── SECURITY.md                    vulnerability disclosure
-├── RFC_PROCESS.md                 design change process
-├── GOVERNANCE.md                  project governance
 ├── CODE_OF_CONDUCT.md             behavior expectations
 ├── crates/
 │   ├── ultrasql-core/             foundational types, errors, datums

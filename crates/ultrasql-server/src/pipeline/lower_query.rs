@@ -35,27 +35,6 @@ use super::scan::{
     try_lower_read_csv_project, try_lower_read_parquet_filter, try_lower_read_parquet_project,
 };
 use super::time_partition::try_lower_time_partition_filter_scan;
-use super::tpch_q1::try_lower_tpch_q1;
-use super::tpch_q2::try_lower_tpch_q2;
-use super::tpch_q3::try_lower_tpch_q3;
-use super::tpch_q4::try_lower_tpch_q4;
-use super::tpch_q5::try_lower_tpch_q5;
-use super::tpch_q6::try_lower_tpch_q6;
-use super::tpch_q7::try_lower_tpch_q7;
-use super::tpch_q8::try_lower_tpch_q8;
-use super::tpch_q9::try_lower_tpch_q9;
-use super::tpch_q10::try_lower_tpch_q10;
-use super::tpch_q11::try_lower_tpch_q11;
-use super::tpch_q12::try_lower_tpch_q12;
-use super::tpch_q13::try_lower_tpch_q13;
-use super::tpch_q14::try_lower_tpch_q14;
-use super::tpch_q15::try_lower_tpch_q15;
-use super::tpch_q16::try_lower_tpch_q16;
-use super::tpch_q17::try_lower_tpch_q17;
-use super::tpch_q18::try_lower_tpch_q18;
-use super::tpch_q19::try_lower_tpch_q19;
-use super::tpch_q20::try_lower_tpch_q20;
-use super::tpch_q21::try_lower_tpch_q21;
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
@@ -88,63 +67,6 @@ fn lower_query_inner(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     tracing::debug!(pipeline_mode = ?plan.pipeline_mode(), "lower logical pipeline");
-    if let Some(tpch_q2) = try_lower_tpch_q2(plan)? {
-        return Ok(tpch_q2);
-    }
-    if let Some(tpch_q3) = try_lower_tpch_q3(plan)? {
-        return Ok(tpch_q3);
-    }
-    if let Some(tpch_q4) = try_lower_tpch_q4(plan)? {
-        return Ok(tpch_q4);
-    }
-    if let Some(tpch_q5) = try_lower_tpch_q5(plan)? {
-        return Ok(tpch_q5);
-    }
-    if let Some(tpch_q7) = try_lower_tpch_q7(plan)? {
-        return Ok(tpch_q7);
-    }
-    if let Some(tpch_q8) = try_lower_tpch_q8(plan)? {
-        return Ok(tpch_q8);
-    }
-    if let Some(tpch_q9) = try_lower_tpch_q9(plan)? {
-        return Ok(tpch_q9);
-    }
-    if let Some(tpch_q10) = try_lower_tpch_q10(plan)? {
-        return Ok(tpch_q10);
-    }
-    if let Some(tpch_q11) = try_lower_tpch_q11(plan)? {
-        return Ok(tpch_q11);
-    }
-    if let Some(tpch_q12) = try_lower_tpch_q12(plan)? {
-        return Ok(tpch_q12);
-    }
-    if let Some(tpch_q13) = try_lower_tpch_q13(plan)? {
-        return Ok(tpch_q13);
-    }
-    if let Some(tpch_q14) = try_lower_tpch_q14(plan)? {
-        return Ok(tpch_q14);
-    }
-    if let Some(tpch_q15) = try_lower_tpch_q15(plan)? {
-        return Ok(tpch_q15);
-    }
-    if let Some(tpch_q16) = try_lower_tpch_q16(plan)? {
-        return Ok(tpch_q16);
-    }
-    if let Some(tpch_q17) = try_lower_tpch_q17(plan)? {
-        return Ok(tpch_q17);
-    }
-    if let Some(tpch_q18) = try_lower_tpch_q18(plan)? {
-        return Ok(tpch_q18);
-    }
-    if let Some(tpch_q19) = try_lower_tpch_q19(plan)? {
-        return Ok(tpch_q19);
-    }
-    if let Some(tpch_q20) = try_lower_tpch_q20(plan)? {
-        return Ok(tpch_q20);
-    }
-    if let Some(tpch_q21) = try_lower_tpch_q21(plan)? {
-        return Ok(tpch_q21);
-    }
     match plan {
         LogicalPlan::Scan {
             table, projection, ..
@@ -475,12 +397,6 @@ fn lower_query_inner(
             // chain pays.
             if let Some(fused) = try_lower_fused_filter_sum_int(input, group_by, aggregates, ctx)? {
                 return Ok(fused);
-            }
-            if let Some(tpch_q1) = try_lower_tpch_q1(input, group_by, aggregates, schema, ctx)? {
-                return Ok(tpch_q1);
-            }
-            if let Some(tpch_q6) = try_lower_tpch_q6(input, group_by, aggregates, schema)? {
-                return Ok(tpch_q6);
             }
             // Fast path: pure `SELECT SUM(col_i32) FROM t` /
             // `SELECT AVG(col_i32) FROM t` over a cache-live

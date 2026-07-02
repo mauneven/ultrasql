@@ -1,9 +1,6 @@
 //! Loader smoke tests: `.tbl` parsing, column counts, and row encoders.
 
-#[cfg(any(test, feature = "sql-bench"))]
 use crate::tpch::load::encode::build_ultrasql_insert_sql;
-#[cfg(feature = "sql-bench")]
-use crate::tpch::load::encode::encode_direct_tbl_row;
 use crate::tpch::load::{column_count, read_tbl};
 
 #[test]
@@ -62,91 +59,4 @@ fn ultrasql_insert_sql_formats_typed_literals() {
     assert!(sql.contains("123.45"), "decimal literal stays numeric");
     assert!(sql.contains("DATE '1994-01-01'"), "date literal is typed");
     assert!(sql.contains("'note''s ok'"), "text is SQL-escaped");
-}
-
-#[cfg(feature = "sql-bench")]
-#[test]
-fn direct_lineitem_encoder_round_trips_through_row_codec() {
-    use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_executor::RowCodec;
-
-    let schema = Schema::new([
-        Field::required("l_orderkey", DataType::Int32),
-        Field::required("l_partkey", DataType::Int32),
-        Field::required("l_suppkey", DataType::Int32),
-        Field::required("l_linenumber", DataType::Int32),
-        Field::required(
-            "l_quantity",
-            DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2),
-            },
-        ),
-        Field::required(
-            "l_extendedprice",
-            DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2),
-            },
-        ),
-        Field::required(
-            "l_discount",
-            DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2),
-            },
-        ),
-        Field::required(
-            "l_tax",
-            DataType::Decimal {
-                precision: Some(15),
-                scale: Some(2),
-            },
-        ),
-        Field::required("l_returnflag", DataType::Text { max_len: None }),
-        Field::required("l_linestatus", DataType::Text { max_len: None }),
-        Field::required("l_shipdate", DataType::Date),
-        Field::required("l_commitdate", DataType::Date),
-        Field::required("l_receiptdate", DataType::Date),
-        Field::required("l_shipinstruct", DataType::Text { max_len: None }),
-        Field::required("l_shipmode", DataType::Text { max_len: None }),
-        Field::required("l_comment", DataType::Text { max_len: None }),
-    ])
-    .expect("lineitem schema");
-    let payload = encode_direct_tbl_row(
-        &schema,
-        "1|2|3|4|5.00|100.00|0.10|0.05|N|O|1998-09-01|1998-09-02|1998-09-03|DELIVER IN PERSON|AIR|comment",
-    )
-    .expect("direct encode");
-    let row = RowCodec::new(schema).decode(&payload).expect("row decode");
-
-    assert_eq!(row[0], Value::Int32(1));
-    assert_eq!(
-        row[4],
-        Value::Decimal {
-            value: 500,
-            scale: 2
-        }
-    );
-    assert_eq!(row[8], Value::Text("N".to_owned()));
-    assert_eq!(row[10], Value::Date(-487));
-    assert_eq!(row[15], Value::Text("comment".to_owned()));
-}
-
-#[cfg(feature = "sql-bench")]
-#[test]
-fn direct_char_encoder_round_trips_padded_bpchar() {
-    use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_executor::RowCodec;
-
-    let schema = Schema::new([
-        Field::required("r_name", DataType::Char { len: Some(4) }),
-        Field::required("r_comment", DataType::Text { max_len: None }),
-    ])
-    .expect("char schema");
-    let payload = encode_direct_tbl_row(&schema, "EU|comment").expect("direct encode");
-    let row = RowCodec::new(schema).decode(&payload).expect("row decode");
-
-    assert_eq!(row[0], Value::Char("EU  ".to_owned()));
-    assert_eq!(row[1], Value::Text("comment".to_owned()));
 }

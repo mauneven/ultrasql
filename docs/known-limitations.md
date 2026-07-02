@@ -1,8 +1,8 @@
 # Known Limitations
 
 This document lists major SQL and operations gaps that are still open or only
-partially implemented. `TODO.md` tracks open release gates; `DONE.md` tracks
-completed evidence.
+partially implemented. `TODO.md` tracks open release gates; `CHANGELOG.md`
+tracks shipped work.
 
 ## Production readiness
 

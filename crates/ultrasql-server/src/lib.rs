@@ -95,7 +95,6 @@ mod snapshots;
 mod stats_hydration;
 pub mod time_partition;
 pub mod tls;
-mod tpch_cache;
 mod txn_exec;
 pub mod wal_sink;
 pub mod walreceiver;
@@ -124,7 +123,6 @@ pub use server_loop::*;
 pub use session_state::*;
 pub(crate) use snapshots::*;
 pub(crate) use stats_hydration::*;
-pub use tpch_cache::*;
 pub(crate) use txn_exec::*;
 
 /// Numeric `server_version` exposed in startup
@@ -133,9 +131,6 @@ pub(crate) use txn_exec::*;
 pub(crate) const REPORTED_SERVER_VERSION: &str = "14.0";
 const RECOVERY_TARGETS_FILE_LIMIT_BYTES: u64 = 64 * 1024;
 const RUNTIME_METADATA_FILE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
-
-#[cfg(test)]
-pub(crate) static TPCH_TEST_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::future::Future;
 use std::io::Read;

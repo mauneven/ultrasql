@@ -229,7 +229,6 @@ fuzz/         parser, wire, WAL, and planner fuzz targets
 - [docs/production-readiness.md](docs/production-readiness.md) - current audited readiness verdict.
 - [docs/documentation-status-audit.md](docs/documentation-status-audit.md) - current docs truth audit.
 - [TODO.md](TODO.md) - open work and release gates.
-- [DONE.md](DONE.md) - completed milestones and evidence ledger.
 - [docs/getting-started.md](docs/getting-started.md) - local first steps.
 - [docs/install.md](docs/install.md) - release archives, package managers, and source build.
 - [docs/ai-database-strategy.md](docs/ai-database-strategy.md) - AI database and memory-engine plan.

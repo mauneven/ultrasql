@@ -252,15 +252,9 @@ pub fn run_ultrasql(
             }
         }
         if schema_errors.is_empty() {
-            if load::ultrasql_direct_load_enabled() {
-                load::load_ultrasql_direct_into_server(state.as_ref(), &client, data_dir)
-                    .await
-                    .context("direct-load TPC-H data into UltraSQL")?;
-            } else {
-                load::load_ultrasql_into_client(&client, data_dir)
-                    .await
-                    .context("load TPC-H data into UltraSQL")?;
-            }
+            load::load_ultrasql_into_client(&client, data_dir)
+                .await
+                .context("load TPC-H data into UltraSQL")?;
             if progress_enabled() {
                 eprintln!("ultrasql tpch: load complete");
             }
@@ -436,15 +430,9 @@ pub fn run_ultrasql_result_outcomes(
                 .await
                 .with_context(|| format!("DDL: {}", stmt.lines().next().unwrap_or("").trim()))?;
         }
-        if load::ultrasql_direct_load_enabled() {
-            load::load_ultrasql_direct_into_server(state.as_ref(), &client, data_dir)
-                .await
-                .context("direct-load TPC-H data into UltraSQL")?;
-        } else {
-            load::load_ultrasql_into_client(&client, data_dir)
-                .await
-                .context("load TPC-H data into UltraSQL")?;
-        }
+        load::load_ultrasql_into_client(&client, data_dir)
+            .await
+            .context("load TPC-H data into UltraSQL")?;
         if progress_enabled() {
             eprintln!("ultrasql tpch validate: load complete");
         }

@@ -376,10 +376,17 @@ Certification passes only when
 all 22 PostgreSQL and UltraSQL timings and UltraSQL's geometric mean is
 at most half PostgreSQL 17's geometric mean.
 
-Latest local evidence: passed. PostgreSQL 17 geometric mean was
-195.8068411679629 ms, UltraSQL geometric mean was
-0.5577649211787137 ms, for a 351.05621334910796x UltraSQL/PostgreSQL
-throughput ratio.
+**Retraction (2026-07-01).** Every previously published TPC-H result for
+UltraSQL — including a claimed "passed, 351x vs PostgreSQL 17" SF1
+certification — was invalid and has been withdrawn. The engine contained
+per-query TPC-H shape-matching pipelines that served answers precomputed
+by the benchmark loader at load time, so the timed region measured cache
+replay while PostgreSQL and DuckDB executed real queries. Those pipelines
+and the loader sidecars were removed from the engine; the certification
+artifacts were deleted rather than left to mislead. There is currently
+**no valid TPC-H claim** in this repository. TPC-H runs through the real
+executor now; results will be republished only from fresh runs of the
+committed runners, whatever they show.
 
 ### TPC-H SF10 Certification
 
@@ -399,6 +406,11 @@ per-query baselines under `benchmarks/results/latest/raw/`, and writes
 `benchmarks/results/latest/tpch_sf10_certification.json` with geometric
 mean timings and the pass/fail decision. The v0.7 milestone is complete
 only when that summary reports `passed: true` for all 22 queries.
+
+The retraction note above applies here too: the previously committed
+SF10 "passed" artifact measured the removed answer-cache pipelines, not
+query execution, and was deleted. No SF10 claim exists until the runner is
+re-executed against the real executor.
 
 Because the current in-process UltraSQL benchmark server is
 memory-backed, SF10 needs a host with enough RAM for the loaded heap

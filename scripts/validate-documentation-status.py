@@ -41,12 +41,39 @@ def is_excluded(relative_path: str) -> bool:
 
 
 def first_party_markdown(root: Path) -> list[str]:
+    # Git-tracked files are the source of truth: untracked scratch,
+    # worktrees, and vendored checkouts on disk are not first-party docs.
+    # Fall back to a filesystem walk only where git is unavailable
+    # (e.g. the validator's own unit-test fixtures).
+    tracked = git_tracked_markdown(root)
+    if tracked is not None:
+        return sorted(path for path in tracked if not is_excluded(path))
     files = []
     for path in root.rglob("*.md"):
         relative_path = rel(path, root)
         if not is_excluded(relative_path):
             files.append(relative_path)
     return sorted(files)
+
+
+def git_tracked_markdown(root: Path) -> list[str] | None:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    entries = [
+        entry.decode("utf-8")
+        for entry in proc.stdout.split(b"\0")
+        if entry
+    ]
+    return entries or None
 
 
 def read_text(path: Path) -> str:
@@ -135,11 +162,10 @@ def benchmark_summary(root: Path, errors: list[str]) -> dict:
         summary["scale_sweep_present"] = True
         summary["scale_sweep_row_count"] = len(rows)
         summary["ultrasql_fastest_row_count"] = len(rows) - len(non_ultrasql)
+        # Losses are legitimate measurements and are reported, never errored:
+        # a docs gate that fails when UltraSQL is not fastest everywhere is an
+        # incentive to rig benchmarks, not an honesty check.
         summary["non_ultrasql_fastest_rows"] = non_ultrasql
-        if non_ultrasql:
-            errors.append(
-                "scale sweep contains rows where UltraSQL is not the fastest engine"
-            )
     else:
         errors.append(f"{SCALE_SWEEP_JSON.as_posix()} is missing")
 

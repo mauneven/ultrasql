@@ -71,5 +71,5 @@ Release assets include:
 
 ## Known Gaps
 
-See `CHANGELOG.md`, `TODO.md`, `DONE.md`, and
+See `CHANGELOG.md`, `TODO.md`, and
 `docs/known-limitations.md`.
