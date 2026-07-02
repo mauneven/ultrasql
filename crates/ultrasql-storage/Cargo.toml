@@ -42,7 +42,7 @@ num-traits    = { workspace = true }
 
 [dev-dependencies]
 ultrasql-mvcc    = { workspace = true, features = ["testing"] }
-ultrasql-storage = { path = ".", version = "0.0.9", features = ["testing"] }
+ultrasql-storage = { path = ".", version = "0.1.0", features = ["testing"] }
 proptest  = { workspace = true }
 rstest    = { workspace = true }
 criterion = { workspace = true }
