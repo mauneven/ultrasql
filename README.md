@@ -98,7 +98,7 @@ Beta scope, quickstart, and honest limitations: [`BETA_READINESS.md`](BETA_READI
 ## Release-Artifact DB-vs-DB Benchmark
 
 Fresh data-dir (WAL-backed) run (2026-07-01), pinned to commit
-`1faf525d`:
+`e0dca2b6`:
 `PGHOST=127.0.0.1 PGPORT=55417 PGUSER=$(id -un) PGDATABASE=ultrasql_bench CH_BIN="$(command -v clickhouse)" SCALE_SWEEP_ROWS="10000 100000 1000000" SCALE_SWEEP_STORAGE=data-dir ULTRASQLD_BIN=target/release-ship/ultrasqld benchmarks/run_scale_sweep.sh full`,
 with a tuned PostgreSQL 17 cluster from `benchmarks/scripts/pg17_bench_server.sh start`.
 UltraSQL v0.0.9 (external `ultrasqld` over TCP) was measured on the same Apple
