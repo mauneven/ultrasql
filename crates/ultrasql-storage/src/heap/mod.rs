@@ -932,6 +932,33 @@ impl<L: PageLoader> HeapAccess<L> {
             .retain(|page_id, _| page_id.relation != rel);
     }
 
+    /// `true` when every undo writer recorded for `tid` is visible to
+    /// `snapshot` — i.e. the slot's current bytes are exactly the payload
+    /// this snapshot should observe and a row flagged
+    /// [`ultrasql_mvcc::tuple_header::InfoMask::INPLACE_HISTORY`] can be
+    /// treated as plainly [`ultrasql_mvcc::Visibility::Visible`]. When it
+    /// returns `false`, some earlier in-place update is invisible to the
+    /// snapshot: readers must substitute the undo pre-image, and mutators
+    /// must raise the same retryable conflict as for a pending in-place
+    /// update instead of acting on bytes the snapshot cannot see.
+    pub fn undo_slot_state_current<O>(
+        &self,
+        rel: RelationId,
+        tid: TupleId,
+        current_payload: &[u8],
+        snapshot: &ultrasql_mvcc::Snapshot,
+        oracle: &O,
+    ) -> bool
+    where
+        O: ultrasql_mvcc::XidStatusOracle + ?Sized,
+    {
+        let Some(log_handle) = self.undo_log.get(&rel) else {
+            return true;
+        };
+        let log = log_handle.read();
+        undo_pre_image_from_log(&log, tid, current_payload, snapshot, oracle).is_none()
+    }
+
     pub(crate) fn remember_rollback_stamp_page(&self, xid: Xid, page_id: PageId) {
         let xid_raw = xid.raw();
         if xid_raw == 0 {

@@ -609,7 +609,8 @@ impl<L: PageLoader> HeapAccess<L> {
                 let infomask_bits = read_le_u16(src_bytes, offset + 24, "infomask out of bounds")?;
                 let xmin_xid = Xid::new(xmin_raw);
 
-                let visibility = if xmax_raw == 0 {
+                let visibility = if xmax_raw == 0 && infomask_bits & InfoMask::INPLACE_HISTORY == 0
+                {
                     match xmin_cache {
                         Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
                             if cv {
@@ -661,6 +662,30 @@ impl<L: PageLoader> HeapAccess<L> {
                             ));
                         }
                         continue;
+                    }
+                    Visibility::VisibleMaybePreImage => {
+                        // Visible with in-place undo history. When every
+                        // recorded writer is visible to this snapshot the
+                        // slot bytes are current and the row mutates like
+                        // any visible row; otherwise acting on them would
+                        // use a payload this snapshot must not observe —
+                        // raise the same retryable conflict as a pending
+                        // in-place update.
+                        let tid = TupleId::new(src_page_id, src_slot);
+                        if !self.undo_slot_state_current(
+                            rel,
+                            tid,
+                            &src_bytes[payload_off..payload_off + 9],
+                            snapshot,
+                            oracle,
+                        ) {
+                            if predicate(id, val) {
+                                return Err(HeapError::WriteConflict(
+                                    "in-place tuple has an unresolved writer",
+                                ));
+                            }
+                            continue;
+                        }
                     }
                     Visibility::Invisible | Visibility::DeletedByOwn => continue,
                 }
@@ -942,6 +967,417 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(total_updated)
     }
 
+    /// Parallel WAL-backed variant for large fused `(Int32, Int32)` UPDATEs.
+    ///
+    /// Each worker owns a disjoint block range; per-page delta records are
+    /// appended with the per-transaction chain link resolved atomically
+    /// inside the sink (no chain mutex), and the first post-checkpoint touch
+    /// of a page logs a full page image first (torn-page protection).
+    /// Requires a nonblocking WAL sink; smaller relations and single-core
+    /// hosts fall back to the sequential path unchanged.
+    pub fn update_int32_pair_inplace_undo_parallel_wal<O, P>(
+        &self,
+        scan: UpdateInt32PairScan<'_, O, P>,
+        edit: UpdateInt32PairEdit,
+        stamp: UpdateInt32PairStamp,
+        wal: &dyn WalSink,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + Sync + ?Sized,
+        P: Fn(i32, i32) -> bool + Sync,
+    {
+        const PARALLEL_WAL_UPDATE_MIN_BLOCKS: u32 = 128;
+        const PARALLEL_WAL_UPDATE_BLOCKS_PER_WORKER: u32 = 256;
+
+        let available_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let UpdateInt32PairScan {
+            rel,
+            block_count,
+            snapshot,
+            oracle,
+            predicate,
+        } = scan;
+        if block_count < PARALLEL_WAL_UPDATE_MIN_BLOCKS
+            || available_workers <= 1
+            || !wal.appends_without_blocking_io()
+        {
+            return self.update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                edit,
+                stamp,
+                Some(wal),
+                vm,
+            );
+        }
+        let UpdateInt32PairEdit { target_col, delta } = edit;
+        let UpdateInt32PairStamp { xid, command_id } = stamp;
+
+        let block_count_usize = usize_from_u32(block_count, "block count overflow")?;
+        let blocks_per_worker = usize_from_u32(
+            PARALLEL_WAL_UPDATE_BLOCKS_PER_WORKER,
+            "blocks per worker overflow",
+        )?;
+        let workers = available_workers
+            .min(block_count_usize.div_ceil(blocks_per_worker))
+            .min(block_count_usize)
+            .max(1);
+        if workers <= 1 {
+            return self.update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel,
+                    block_count,
+                    snapshot,
+                    oracle,
+                    predicate,
+                },
+                edit,
+                stamp,
+                Some(wal),
+                vm,
+            );
+        }
+
+        let workers_u32 =
+            u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
+        let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
+        let predicate_ref = &predicate;
+        let chain = std::sync::atomic::AtomicU64::new(wal.last_lsn_for(xid).raw());
+        let mut updates = Vec::with_capacity(workers);
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            let mut start_block = 0_u32;
+            while start_block < block_count {
+                let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
+                handles.push(scope.spawn({
+                    let chain = &chain;
+                    move || {
+                        self.update_int32_pair_range_wal(
+                            UpdateInt32PairRange {
+                                rel,
+                                start_block,
+                                end_block,
+                                snapshot,
+                                oracle,
+                                predicate: predicate_ref,
+                                target_col,
+                                delta,
+                                xid,
+                                command_id,
+                                vm,
+                            },
+                            wal,
+                            chain,
+                        )
+                    }
+                }));
+                start_block = end_block;
+            }
+
+            for handle in handles {
+                let update = handle.join().map_err(|_| {
+                    HeapError::MalformedHeader("parallel WAL update worker panicked")
+                })??;
+                updates.push(update);
+            }
+            Ok::<(), HeapError>(())
+        })?;
+
+        let total_updated = updates.iter().try_fold(0_usize, |total, update| {
+            checked_heap_count_add(total, update.total_updated, "updated tuple count overflow")
+        })?;
+        let mut compact_undo_scratch = Vec::with_capacity(block_count_usize);
+        for mut update in updates {
+            compact_undo_scratch.append(&mut update.compact_undo);
+        }
+
+        if !compact_undo_scratch.is_empty() {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            log.append_int32_pair_batches(&mut compact_undo_scratch);
+        }
+
+        if total_updated > 0 {
+            self.invalidate_int32_pair_payload_stats_relation(rel);
+            self.column_cache.bump_version(rel, xid);
+        }
+
+        Ok(total_updated)
+    }
+
+    /// WAL-backed range worker for the parallel fused UPDATE: the no-WAL
+    /// range body plus WAL-before-mutation ordering. Per page: emit an FPW
+    /// for the first post-checkpoint touch (image captured under the held
+    /// exclusive guard), collect matching slots WITHOUT mutating, append the
+    /// page's delta record through the linked chain, then apply the header
+    /// stamps + payload writes and set the page LSN — all before the guard
+    /// drops, so the record is in the durable pipeline before the mutated
+    /// page can ever be flushed.
+    fn update_int32_pair_range_wal<O, P>(
+        &self,
+        request: UpdateInt32PairRange<'_, O, P>,
+        wal: &dyn WalSink,
+        chain: &std::sync::atomic::AtomicU64,
+    ) -> Result<Int32PairRangeUpdate, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool + ?Sized,
+    {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
+
+        let UpdateInt32PairRange {
+            rel,
+            start_block,
+            end_block,
+            snapshot,
+            oracle,
+            predicate,
+            target_col,
+            delta,
+            xid,
+            command_id,
+            vm,
+        } = request;
+        let range_len = usize_from_u32(
+            end_block.saturating_sub(start_block),
+            "block range overflow",
+        )?;
+        let mut total_updated: usize = 0;
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+        let vm = vm.filter(|vm| vm.contains_relation(rel));
+        let mut compact_undo_scratch: Vec<Int32PairUndoBatch> = Vec::with_capacity(range_len);
+        let mut wal_scratch: Vec<u16> = Vec::with_capacity(256);
+        let mut wal_payload_buf: Vec<u8> = Vec::with_capacity(512);
+        let mut page_mutations: Vec<UpdateInt32PairMutation> = Vec::with_capacity(256);
+        let xid_bytes = xid.raw().to_le_bytes();
+        let cmd_bytes = command_id.raw().to_le_bytes();
+
+        for src_block in start_block..end_block {
+            let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let mut page_updated = false;
+            wal_scratch.clear();
+            page_mutations.clear();
+
+            let src_guard = self.get_page_relieved(src_page_id)?;
+            let mut src_page = src_guard.write();
+            // Torn-page protection under parallelism (see the parallel DELETE
+            // worker): first post-checkpoint touch logs the pre-mutation
+            // image through the same linked chain.
+            let checkpoint_lsn = self
+                .last_checkpoint_lsn
+                .load(std::sync::atomic::Ordering::Acquire);
+            if checkpoint_lsn != 0 && src_page.header().lsn < checkpoint_lsn {
+                let payload = ultrasql_wal::payload::FullPageWritePayload {
+                    page: src_page_id,
+                    page_bytes: src_page.as_bytes().to_vec(),
+                };
+                let fpw_lsn = wal.append_borrowed_linked(
+                    ultrasql_wal::record::RecordType::FullPageWrite,
+                    xid,
+                    0,
+                    &payload.encode()?,
+                    chain,
+                )?;
+                src_page.set_lsn(fpw_lsn.raw());
+            }
+            let src_bytes = src_page.as_bytes_mut();
+            let src_slot_count = {
+                let hdr = crate::page::PageHeader::decode(src_bytes).map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+
+            for src_slot in 0..src_slot_count {
+                let item_id_off = PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_raw = read_le_u32(src_bytes, item_id_off, "item id out of bounds")?;
+                if item_raw & 0b11 != 1 {
+                    continue;
+                }
+                let (length, offset) = itemid_window(item_raw)?;
+                if length < TUPLE_HEADER_SIZE
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|e| e > src_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+
+                let xmin_raw = read_le_u64(src_bytes, offset, "xmin out of bounds")?;
+                let xmax_raw = read_le_u64(src_bytes, offset + 8, "xmax out of bounds")?;
+                let infomask_bits = read_le_u16(src_bytes, offset + 24, "infomask out of bounds")?;
+                let xmin_xid = Xid::new(xmin_raw);
+
+                let visibility = if xmax_raw == 0 && infomask_bits & InfoMask::INPLACE_HISTORY == 0
+                {
+                    match xmin_cache {
+                        Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
+                            if cv {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
+                        }
+                        _ => {
+                            let (h, _) =
+                                TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                            let v = matches!(is_visible(&h, snapshot, oracle), Visibility::Visible);
+                            xmin_cache = Some((h.xmin, h.infomask.bits(), v));
+                            if v {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
+                        }
+                    }
+                } else {
+                    let (h, _) =
+                        TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    is_visible(&h, snapshot, oracle)
+                };
+
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                if payload_off + 9 > offset + length {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                let pair = read_le_u64(
+                    src_bytes,
+                    payload_off + 1,
+                    "int32 pair payload out of bounds",
+                )?;
+                let (id, val) = decode_int32_pair(pair);
+
+                match visibility {
+                    Visibility::Visible => {}
+                    Visibility::VisiblePreImage => {
+                        if predicate(id, val) {
+                            return Err(HeapError::WriteConflict(
+                                "in-place tuple has an unresolved writer",
+                            ));
+                        }
+                        continue;
+                    }
+                    Visibility::VisibleMaybePreImage => {
+                        // Visible with in-place undo history. When every
+                        // recorded writer is visible to this snapshot the
+                        // slot bytes are current and the row mutates like
+                        // any visible row; otherwise acting on them would
+                        // use a payload this snapshot must not observe —
+                        // raise the same retryable conflict as a pending
+                        // in-place update.
+                        let tid = TupleId::new(src_page_id, src_slot);
+                        if !self.undo_slot_state_current(
+                            rel,
+                            tid,
+                            &src_bytes[payload_off..payload_off + 9],
+                            snapshot,
+                            oracle,
+                        ) {
+                            if predicate(id, val) {
+                                return Err(HeapError::WriteConflict(
+                                    "in-place tuple has an unresolved writer",
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    Visibility::Invisible | Visibility::DeletedByOwn => continue,
+                }
+
+                if !predicate(id, val) {
+                    continue;
+                }
+
+                let (new_id, new_val) = checked_int32_pair_add(id, val, target_col, delta)?;
+
+                wal_scratch.push(src_slot);
+                page_mutations.push(UpdateInt32PairMutation {
+                    offset,
+                    payload_off,
+                    infomask_bits,
+                    new_pair: encode_int32_pair(new_id, new_val),
+                });
+
+                total_updated += 1;
+                page_updated = true;
+            }
+
+            if !wal_scratch.is_empty() {
+                let lsn = Self::emit_update_int32_pair_delta_batch_wal_linked(
+                    wal,
+                    src_page_id,
+                    xid,
+                    command_id,
+                    target_col,
+                    delta,
+                    &wal_scratch,
+                    chain,
+                    &mut wal_payload_buf,
+                )?;
+                let src_bytes = src_page.as_bytes_mut();
+                for mutation in &page_mutations {
+                    let offset = mutation.offset;
+                    src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
+                    src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
+                    let new_infomask =
+                        mutation.infomask_bits | InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE;
+                    src_bytes[offset + 24..offset + 26]
+                        .copy_from_slice(&new_infomask.to_le_bytes());
+                    src_bytes[mutation.payload_off + 1..mutation.payload_off + 9]
+                        .copy_from_slice(&mutation.new_pair.to_le_bytes());
+                }
+                src_page.set_lsn(lsn.raw());
+            }
+
+            drop(src_page);
+            drop(src_guard);
+
+            // The WAL slot list IS the undo slot list: derive the compact
+            // pre-image batch from it once per page instead of paying a
+            // second per-row push. Slots are collected in ascending order,
+            // so contiguity is a single O(1) check.
+            if let (Some(&first), Some(&last)) = (wal_scratch.first(), wal_scratch.last()) {
+                let slot_count = u16::try_from(wal_scratch.len())
+                    .map_err(|_| HeapError::MalformedHeader("undo slot count overflow"))?;
+                let contiguous = usize::from(last - first) + 1 == wal_scratch.len();
+                compact_undo_scratch.push(Int32PairUndoBatch {
+                    page: src_page_id,
+                    writer_xid: xid,
+                    command_id,
+                    target_col,
+                    delta,
+                    first_slot: first,
+                    slot_count,
+                    slots: if contiguous {
+                        Vec::new()
+                    } else {
+                        wal_scratch.clone()
+                    },
+                });
+            }
+            if page_updated && let Some(vm) = vm {
+                vm.clear(src_page_id.relation, src_page_id.block);
+            }
+        }
+
+        Ok(Int32PairRangeUpdate {
+            total_updated,
+            compact_undo: compact_undo_scratch,
+        })
+    }
+
     fn update_int32_pair_range_no_wal<O, P>(
         &self,
         request: UpdateInt32PairRange<'_, O, P>,
@@ -1009,7 +1445,8 @@ impl<L: PageLoader> HeapAccess<L> {
                 let infomask_bits = read_le_u16(src_bytes, offset + 24, "infomask out of bounds")?;
                 let xmin_xid = Xid::new(xmin_raw);
 
-                let visibility = if xmax_raw == 0 {
+                let visibility = if xmax_raw == 0 && infomask_bits & InfoMask::INPLACE_HISTORY == 0
+                {
                     match xmin_cache {
                         Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
                             if cv {
@@ -1060,6 +1497,30 @@ impl<L: PageLoader> HeapAccess<L> {
                             ));
                         }
                         continue;
+                    }
+                    Visibility::VisibleMaybePreImage => {
+                        // Visible with in-place undo history. When every
+                        // recorded writer is visible to this snapshot the
+                        // slot bytes are current and the row mutates like
+                        // any visible row; otherwise acting on them would
+                        // use a payload this snapshot must not observe —
+                        // raise the same retryable conflict as a pending
+                        // in-place update.
+                        let tid = TupleId::new(src_page_id, src_slot);
+                        if !self.undo_slot_state_current(
+                            rel,
+                            tid,
+                            &src_bytes[payload_off..payload_off + 9],
+                            snapshot,
+                            oracle,
+                        ) {
+                            if predicate(id, val) {
+                                return Err(HeapError::WriteConflict(
+                                    "in-place tuple has an unresolved writer",
+                                ));
+                            }
+                            continue;
+                        }
                     }
                     Visibility::Invisible | Visibility::DeletedByOwn => continue,
                 }
@@ -1198,6 +1659,25 @@ impl<L: PageLoader> HeapAccess<L> {
                         ));
                     }
                     return Ok(0);
+                }
+                Visibility::VisibleMaybePreImage => {
+                    // Visible with in-place undo history (see the range
+                    // loops): the slot bytes are mutable only when every
+                    // recorded writer is visible to this snapshot.
+                    if !self.undo_slot_state_current(
+                        tid.page.relation,
+                        tid,
+                        &bytes[payload_off..payload_off + 9],
+                        snapshot,
+                        oracle,
+                    ) {
+                        if predicate(id, val) {
+                            return Err(HeapError::WriteConflict(
+                                "in-place tuple has an unresolved writer",
+                            ));
+                        }
+                        return Ok(0);
+                    }
                 }
                 Visibility::Invisible | Visibility::DeletedByOwn => return Ok(0),
             }

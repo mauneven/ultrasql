@@ -77,6 +77,19 @@ impl InfoMask {
     /// pre-update / pre-delete state.
     pub const UPDATED_IN_PLACE: u16 = 1 << 10;
 
+    /// Tuple was DELETED (or classically updated) *after* one or more
+    /// committed in-place updates whose pre-images may still live in the
+    /// side-channel undo log.
+    ///
+    /// A delete that lands on a tuple carrying [`Self::UPDATED_IN_PLACE`]
+    /// clears that bit (its `xmax` now names the DELETER, with classical
+    /// delete semantics) and sets this one so readers whose snapshots
+    /// predate one of the earlier in-place updates still consult the undo
+    /// log for the payload they should observe. Without this bit the
+    /// deleter's `xmax` would be mistaken for another in-place update and
+    /// the delete silently lost — every snapshot would keep seeing the row.
+    pub const INPLACE_HISTORY: u16 = 1 << 11;
+
     const KNOWN_BITS: u16 = Self::HAS_NULL
         | Self::HAS_VARWIDTH
         | Self::XMIN_COMMITTED
@@ -87,7 +100,8 @@ impl InfoMask {
         | Self::HOT_UPDATED
         | Self::FROZEN
         | Self::SUBXACT
-        | Self::UPDATED_IN_PLACE;
+        | Self::UPDATED_IN_PLACE
+        | Self::INPLACE_HISTORY;
 
     /// Wrap an existing 16-bit mask.
     #[must_use]
@@ -295,6 +309,18 @@ impl TupleHeader {
     pub const fn mark_deleted(&mut self, xmax: Xid, cmax: CommandId) {
         self.xmax = xmax;
         self.cmax = cmax;
+        // Deleting a tuple whose slot bytes are an in-place-update post-image
+        // ends the in-place chain: `xmax` now names a DELETER with classical
+        // semantics. Keep the undo linkage alive through INPLACE_HISTORY so
+        // snapshots that predate one of the earlier committed in-place
+        // updates still resolve their payload through the undo log — without
+        // the swap, the deleter's xmax would read as just another in-place
+        // update and the delete would be silently lost to every snapshot.
+        if self.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+            self.infomask = InfoMask::from_bits(
+                (self.infomask.bits() & !InfoMask::UPDATED_IN_PLACE) | InfoMask::INPLACE_HISTORY,
+            );
+        }
     }
 }
 

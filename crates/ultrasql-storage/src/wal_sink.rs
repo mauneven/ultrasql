@@ -99,6 +99,31 @@ pub trait WalSink: Send + Sync {
         self.append(record)
     }
 
+    /// Append a borrowed-payload record whose per-transaction chain link is
+    /// resolved atomically with LSN assignment.
+    ///
+    /// `link` holds the raw LSN of the transaction's previous record (`0`
+    /// for none); the record's `prev_lsn` is read from it and the assigned
+    /// LSN stored back. Sinks that admit CONCURRENT appenders for one
+    /// transaction (the parallel bulk-mutation paths) MUST override this so
+    /// the read-link/append/store-link step is atomic with the append —
+    /// otherwise two appenders can read the same link and fork the chain.
+    /// The default performs the three steps non-atomically, which is correct
+    /// for every single-threaded caller and test sink.
+    fn append_borrowed_linked(
+        &self,
+        record_type: RecordType,
+        xid: Xid,
+        flags: u8,
+        payload: &[u8],
+        link: &std::sync::atomic::AtomicU64,
+    ) -> Result<Lsn, WalSinkError> {
+        let prev = Lsn::new(link.load(std::sync::atomic::Ordering::Acquire));
+        let lsn = self.append_borrowed(record_type, xid, prev, flags, payload)?;
+        link.store(lsn.raw(), std::sync::atomic::Ordering::Release);
+        Ok(lsn)
+    }
+
     /// Return `true` when [`Self::append_ref`] performs no blocking filesystem
     /// I/O or fsync and acquires no buffer-pool page latch or storage lock — so
     /// it is safe to call while holding a page's write guard.

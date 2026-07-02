@@ -404,6 +404,24 @@ impl LateMaterializeScan {
                     }
                     return Ok(None);
                 }
+                Visibility::VisibleMaybePreImage => {
+                    // Visible with in-place undo history: pre-image when an
+                    // earlier writer is invisible to this snapshot, slot
+                    // bytes otherwise; recheck the entry key either way.
+                    let pre = self
+                        .heap
+                        .fetch_visible_pre_image(current, &self.snapshot, self.oracle.as_ref())
+                        .map_err(|_| {
+                            ultrasql_executor::ExecError::Internal(
+                                "LateMaterializeScan pre-image fetch failed",
+                            )
+                        })?;
+                    let payload = pre.unwrap_or(tuple.data);
+                    if !self.payload_matches_key(&payload, key) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(payload));
+                }
                 Visibility::VisiblePreImage => {
                     // Surface the pre-image (design §3 R6) so a late-
                     // materialized index scan agrees with a seq scan, after

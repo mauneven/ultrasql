@@ -39,6 +39,14 @@ pub enum Visibility {
     /// the caller would return the post-image, silently violating
     /// snapshot isolation.
     VisiblePreImage,
+    /// The tuple is visible under classical delete rules, **but** it
+    /// carries [`InfoMask::INPLACE_HISTORY`]: earlier committed in-place
+    /// updates may hold pre-images in the undo log that THIS snapshot
+    /// should observe instead of the slot bytes. The caller consults the
+    /// undo log exactly as for [`Self::VisiblePreImage`], but when no
+    /// invisible writer remains (the common case) it falls back to the
+    /// slot's current bytes — the row is visible either way.
+    VisibleMaybePreImage,
 }
 
 /// Decide whether `header` is visible to `snapshot`, consulting the
@@ -167,6 +175,11 @@ pub fn is_visible<O: XidStatusOracle + ?Sized>(
     // --- check xmax -----------------------------------------------------
 
     if header.xmax.is_invalid() {
+        // A rolled-back deleter clears `xmax` but the row may still carry
+        // undo history from earlier committed in-place updates.
+        if header.infomask.contains(InfoMask::INPLACE_HISTORY) {
+            return Visibility::VisibleMaybePreImage;
+        }
         return Visibility::Visible;
     }
 
@@ -210,20 +223,33 @@ pub fn is_visible<O: XidStatusOracle + ?Sized>(
         return Visibility::VisiblePreImage;
     }
 
+    // Rows carrying INPLACE_HISTORY follow the classical delete rules for
+    // `xmax` (it names a DELETER, not an in-place updater), but any outcome
+    // that leaves the row visible must still route the reader through the
+    // undo log: a snapshot predating one of the earlier committed in-place
+    // updates has to observe that update's pre-image, not the slot bytes.
+    let visible = |header: &TupleHeader| {
+        if header.infomask.contains(InfoMask::INPLACE_HISTORY) {
+            Visibility::VisibleMaybePreImage
+        } else {
+            Visibility::Visible
+        }
+    };
+
     if snapshot.is_current_xid(header.xmax) {
         // We deleted it ourselves. Hidden at the deleting command and
         // every later command in the same transaction.
         if header.cmax < snapshot.current_command {
             return Visibility::Invisible;
         }
-        return Visibility::Visible;
+        return visible(header);
     }
 
     if is_committed_before_snapshot(header.xmax, snapshot, oracle) {
         return Visibility::Invisible;
     }
 
-    Visibility::Visible
+    visible(header)
 }
 
 /// Helper: `xid` committed *and* it committed before this snapshot.

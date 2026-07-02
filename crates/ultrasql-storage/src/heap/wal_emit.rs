@@ -508,6 +508,57 @@ impl<L: PageLoader> HeapAccess<L> {
         clippy::too_many_arguments,
         reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
     )]
+    /// Linked-chain variant of
+    /// [`Self::emit_update_int32_pair_delta_batch_wal_before_reuse`]: the
+    /// per-transaction chain link is resolved atomically with the append, so
+    /// concurrent parallel-update workers keep a linear chain lock-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
+    pub(super) fn emit_update_int32_pair_delta_batch_wal_linked(
+        sink: &dyn WalSink,
+        page_id: PageId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        target_col: u8,
+        delta: i32,
+        slots: &[u16],
+        chain: &std::sync::atomic::AtomicU64,
+        payload_buf: &mut Vec<u8>,
+    ) -> Result<Lsn, HeapError> {
+        let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
+            HeapUpdateInt32PairDeltaRangeBatchPayload {
+                page: page_id,
+                writer_xid,
+                command_id,
+                target_col,
+                delta,
+                first_slot,
+                slot_count,
+            }
+            .encode_into(payload_buf)?;
+            RecordType::HeapUpdateInt32PairDeltaRangeBatch
+        } else {
+            HeapUpdateInt32PairDeltaBatchPayload::encode_slots_into(
+                page_id,
+                writer_xid,
+                command_id,
+                target_col,
+                delta,
+                slots,
+                payload_buf,
+            )?;
+            RecordType::HeapUpdateInt32PairDeltaBatch
+        };
+        sink.append_borrowed_linked(record_type, writer_xid, 0, payload_buf, chain)
+            .map_err(HeapError::Wal)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
     pub(super) fn emit_update_int32_pair_delta_batch_wal_before_reuse(
         sink: &dyn WalSink,
         page_id: PageId,
@@ -660,6 +711,83 @@ impl<L: PageLoader> HeapAccess<L> {
             RecordType::HeapDeleteInPlaceBatch
         };
         sink.append_borrowed(record_type, xmax, prev_lsn, 0, payload_buf)
+            .map_err(HeapError::Wal)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
+    /// Linked-chain variant of
+    /// [`Self::emit_delete_in_place_range_batch_wal_before_reuse`]: the
+    /// per-transaction chain link is resolved atomically with the append, so
+    /// concurrent parallel-delete workers keep a linear chain lock-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
+    )]
+    pub(super) fn emit_delete_in_place_range_batch_wal_linked(
+        sink: &dyn WalSink,
+        page_id: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        first_slot: u16,
+        slot_count: u16,
+        payload_buf: &mut Vec<u8>,
+        chain: &std::sync::atomic::AtomicU64,
+    ) -> Result<Lsn, HeapError> {
+        HeapDeleteInPlaceRangeBatchPayload::encode_range_into(
+            page_id,
+            xmax,
+            cmax,
+            first_slot,
+            slot_count,
+            payload_buf,
+        )?;
+        sink.append_borrowed_linked(
+            RecordType::HeapDeleteInPlaceRangeBatch,
+            xmax,
+            0,
+            payload_buf,
+            chain,
+        )
+        .map_err(HeapError::Wal)
+    }
+
+    /// Linked-chain variant of the sparse-slot batch emit (see
+    /// [`Self::emit_delete_in_place_range_batch_wal_linked`]). Mirrors the
+    /// sequential helper exactly, including collapsing a contiguous slot set
+    /// into the compact range payload.
+    pub(super) fn emit_delete_in_place_batch_wal_linked(
+        sink: &dyn WalSink,
+        page_id: PageId,
+        xmax: Xid,
+        cmax: CommandId,
+        slots: &[u16],
+        payload_buf: &mut Vec<u8>,
+        chain: &std::sync::atomic::AtomicU64,
+    ) -> Result<Lsn, HeapError> {
+        let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
+            HeapDeleteInPlaceRangeBatchPayload::encode_range_into(
+                page_id,
+                xmax,
+                cmax,
+                first_slot,
+                slot_count,
+                payload_buf,
+            )?;
+            RecordType::HeapDeleteInPlaceRangeBatch
+        } else {
+            HeapDeleteInPlaceBatchPayload::encode_slots_into(
+                page_id,
+                xmax,
+                cmax,
+                slots,
+                payload_buf,
+            )?;
+            RecordType::HeapDeleteInPlaceBatch
+        };
+        sink.append_borrowed_linked(record_type, xmax, 0, payload_buf, chain)
             .map_err(HeapError::Wal)
     }
 

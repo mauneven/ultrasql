@@ -207,7 +207,8 @@ impl<L: PageLoader> HeapAccess<L> {
                 let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                     .ok_or(HeapError::MalformedHeader("header decode failed"))?;
                 let outcome = is_visible(&header, snapshot, oracle);
-                if header.xmax.is_invalid() {
+                if header.xmax.is_invalid() && !matches!(outcome, Visibility::VisibleMaybePreImage)
+                {
                     let visible = matches!(outcome, Visibility::Visible);
                     xmin_cache = Some((header.xmin, header.infomask.bits(), visible));
                 }
@@ -239,6 +240,26 @@ impl<L: PageLoader> HeapAccess<L> {
                             oracle,
                         ) {
                             f(tid, &header, &pre)?;
+                        }
+                    }
+                    Visibility::VisibleMaybePreImage => {
+                        // Row visible under classical delete rules but
+                        // carrying in-place undo history (INPLACE_HISTORY):
+                        // substitute the pre-image when some earlier writer
+                        // is invisible to this snapshot; otherwise the slot
+                        // bytes are exactly current — emit them.
+                        if let Some(pre) = Self::lookup_undo_pre_image(
+                            &self.undo_log,
+                            rel,
+                            tid,
+                            &header,
+                            &slot_bytes[TUPLE_HEADER_SIZE..],
+                            snapshot,
+                            oracle,
+                        ) {
+                            f(tid, &header, &pre)?;
+                        } else {
+                            f(tid, &header, &slot_bytes[TUPLE_HEADER_SIZE..])?;
                         }
                     }
                     Visibility::Invisible | Visibility::DeletedByOwn => {}
@@ -607,6 +628,26 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_
                                 tup.data = pre;
                                 return Some(Ok(tup));
                             }
+                        }
+                        Visibility::VisibleMaybePreImage => {
+                            // Visible with in-place undo history: pre-image
+                            // when an earlier writer is invisible to this
+                            // snapshot, slot bytes otherwise.
+                            let rel = tup.tid.page.relation;
+                            if let Some(pre) = HeapAccess::<L>::lookup_undo_pre_image(
+                                self.undo_log,
+                                rel,
+                                tup.tid,
+                                &tup.header,
+                                &tup.data,
+                                self.snapshot,
+                                self.oracle,
+                            ) {
+                                let mut tup = tup;
+                                tup.data = pre;
+                                return Some(Ok(tup));
+                            }
+                            return Some(Ok(tup));
                         }
                         Visibility::Invisible | Visibility::DeletedByOwn => {}
                     }

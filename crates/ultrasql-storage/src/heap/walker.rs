@@ -248,6 +248,25 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                     }
                     // Fall through to next slot.
                 }
+                Visibility::VisibleMaybePreImage => {
+                    // Visible with in-place undo history: pre-image when an
+                    // earlier writer is invisible to this snapshot, slot
+                    // bytes otherwise.
+                    self.pre_image_scratch.clear();
+                    if let Some(payload) = lookup_undo_pre_image_owned(
+                        &self.undo_log,
+                        self.rel,
+                        tid,
+                        &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length],
+                        self.snapshot,
+                        self.oracle,
+                    ) {
+                        self.pre_image_scratch.extend_from_slice(&payload);
+                        return Ok(Some((tid, header, &self.pre_image_scratch[..])));
+                    }
+                    let payload = &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
+                    return Ok(Some((tid, header, payload)));
+                }
                 Visibility::Invisible | Visibility::DeletedByOwn => {}
             }
         }

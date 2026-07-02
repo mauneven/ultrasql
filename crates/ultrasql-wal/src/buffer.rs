@@ -334,6 +334,54 @@ impl WalBuffer {
         Ok(Lsn::new(lsn))
     }
 
+    /// Append a record from a borrowed payload with its per-transaction
+    /// chain link resolved atomically with LSN assignment.
+    ///
+    /// `link` holds the raw LSN of the transaction's previous record (0 for
+    /// none). The header's `prev_lsn` is read from `link` and the newly
+    /// assigned LSN stored back **inside the append critical section**, so
+    /// any number of concurrent appenders sharing one `link` still produce a
+    /// strictly linear per-transaction chain — without any lock beyond the
+    /// buffer mutex every append already takes.
+    pub fn append_borrowed_linked(
+        &self,
+        record_type: RecordType,
+        xid: ultrasql_core::Xid,
+        flags: u8,
+        payload: &[u8],
+        link: &std::sync::atomic::AtomicU64,
+    ) -> Result<Lsn, WalBufferError> {
+        // Compute the record length from a placeholder header: `prev_lsn`
+        // does not affect the encoded length, only the header bytes.
+        let probe =
+            WalRecord::header_for_borrowed_payload(record_type, xid, Lsn::ZERO, flags, payload)?;
+        let byte_len = u64::from(probe.total_length);
+        let record_len =
+            usize::try_from(probe.total_length).map_err(|_| WalBufferError::LsnOverflow {
+                current: u64::MAX,
+                bytes: byte_len,
+            })?;
+        let lsn = {
+            let mut inner = self.reserve(record_len)?;
+            let prev = Lsn::new(link.load(Ordering::Acquire));
+            let header =
+                WalRecord::header_for_borrowed_payload(record_type, xid, prev, flags, payload)?;
+            let lsn = inner.next_lsn;
+            inner.next_lsn =
+                inner
+                    .next_lsn
+                    .checked_add(byte_len)
+                    .ok_or(WalBufferError::LsnOverflow {
+                        current: inner.next_lsn,
+                        bytes: byte_len,
+                    })?;
+            append_encoded_parts_to(&header, payload, &mut inner.bytes);
+            link.store(lsn, Ordering::Release);
+            lsn
+        };
+        Ok(Lsn::new(lsn))
+    }
+
     /// Drain the buffer into a single contiguous byte vector. Returns
     /// the bytes plus the LSN at which they begin and the LSN
     /// immediately after them (i.e. the next available position).
@@ -729,6 +777,76 @@ mod tests {
             .expect("appender thread joins")
             .expect_err("append on a closed buffer must fail rather than hang");
         assert!(matches!(err, WalBufferError::Closed), "{err:?}");
+    }
+
+    #[test]
+    fn concurrent_linked_appends_produce_one_strictly_linear_chain() {
+        use std::sync::atomic::AtomicU64;
+        use std::thread;
+
+        // 4 workers x 64 linked appends for ONE xid, racing on one link
+        // cell. Decoding the buffer afterwards must yield a single linear
+        // prev_lsn chain covering every record exactly once — the invariant
+        // the parallel bulk-mutation paths rely on instead of a chain mutex.
+        // Non-zero initial LSN, like a real WAL: `prev == 0` is the
+        // "no previous record" sentinel and must never collide with a
+        // record's own address.
+        let buf = Arc::new(WalBuffer::new(1024 * 1024, Lsn::new(4096)));
+        let link = Arc::new(AtomicU64::new(0));
+        let xid = Xid::new(9);
+
+        thread::scope(|scope| {
+            for worker in 0_u8..4 {
+                let buf = Arc::clone(&buf);
+                let link = Arc::clone(&link);
+                scope.spawn(move || {
+                    for i in 0_u8..64 {
+                        buf.append_borrowed_linked(
+                            RecordType::HeapInsert,
+                            xid,
+                            0,
+                            &[worker, i],
+                            &link,
+                        )
+                        .expect("linked append succeeds");
+                    }
+                });
+            }
+        });
+
+        let drained = buf.drain().expect("drain");
+        let mut offset = 0;
+        let mut by_lsn = std::collections::BTreeMap::new();
+        let mut lsn = 4096_u64;
+        while offset < drained.bytes.len() {
+            let (rec, used) = WalRecord::decode(&drained.bytes[offset..]).unwrap();
+            by_lsn.insert(lsn, rec.header.prev_lsn.raw());
+            lsn += u64::from(rec.header.total_length);
+            offset += used;
+        }
+        assert_eq!(by_lsn.len(), 256, "every append decoded");
+        // Walk the chain from the link's final head back to the start:
+        // it must visit every record exactly once and terminate at 0.
+        let mut cursor = link.load(Ordering::Acquire);
+        let mut visited = 0_usize;
+        while cursor != 0 || (visited < 256 && by_lsn.contains_key(&cursor)) {
+            let Some(&prev) = by_lsn.get(&cursor) else {
+                panic!("chain cursor {cursor} does not point at a record");
+            };
+            visited += 1;
+            if visited > 256 {
+                panic!("chain revisits records (fork or cycle)");
+            }
+            if prev == cursor {
+                panic!("self-referential chain link");
+            }
+            cursor = prev;
+            if visited == 256 {
+                break;
+            }
+        }
+        assert_eq!(visited, 256, "chain covers every record exactly once");
+        assert_eq!(cursor, 0, "chain terminates at the pre-append link value");
     }
 
     #[test]

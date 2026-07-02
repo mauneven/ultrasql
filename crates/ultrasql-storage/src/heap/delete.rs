@@ -538,7 +538,14 @@ fn stamp_delete_int32_pair_header(
 ) {
     bytes[offset + 8..offset + 16].copy_from_slice(xid_bytes);
     bytes[offset + 20..offset + 24].copy_from_slice(cmd_bytes);
-    let new_infomask = infomask_bits | InfoMask::UPDATED;
+    // Mirror TupleHeader::mark_deleted: deleting an in-place-update
+    // post-image ends the in-place chain (classical deleter xmax) but keeps
+    // the undo linkage alive via INPLACE_HISTORY, so the delete is never
+    // mistaken for another in-place update and silently lost.
+    let mut new_infomask = infomask_bits | InfoMask::UPDATED;
+    if new_infomask & InfoMask::UPDATED_IN_PLACE != 0 {
+        new_infomask = (new_infomask & !InfoMask::UPDATED_IN_PLACE) | InfoMask::INPLACE_HISTORY;
+    }
     bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
 }
 
@@ -564,7 +571,10 @@ struct DeleteInt32PairWalRange<'a, O: ?Sized, P: ?Sized> {
     xid: Xid,
     command_id: CommandId,
     wal: &'a dyn WalSink,
-    prev_lsn: &'a parking_lot::Mutex<Lsn>,
+    /// Per-transaction WAL chain link (raw LSN of the txn's previous
+    /// record). Resolved atomically with each append inside the sink, so
+    /// concurrent workers keep the chain strictly linear with no extra lock.
+    chain: &'a std::sync::atomic::AtomicU64,
     vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
@@ -1256,11 +1266,12 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Each worker owns a disjoint block range. WAL appends are serialized so
     /// `prev_lsn` remains a real per-transaction chain; page scans and tuple
-    /// stamping run in parallel. The method uses this path only for
-    /// nonblocking WAL sinks before the first checkpoint, where each page
-    /// mutation can append its compact page-local record while holding the page
-    /// write guard and then stamp the page with the returned LSN. Other cases
-    /// fall back to the sequential WAL path.
+    /// stamping run in parallel. The method requires a nonblocking WAL sink;
+    /// each page mutation appends its compact page-local record while holding
+    /// the page write guard and stamps the page with the returned LSN. The
+    /// first post-checkpoint touch of a page logs a full page image first
+    /// (torn-page protection) through the same per-transaction chain mutex,
+    /// so the path stays correct across checkpoint cycles.
     pub fn delete_int32_pair_inplace_parallel_wal<O, P>(
         &self,
         scan: DeleteInt32PairScan<'_, O, P>,
@@ -1283,7 +1294,6 @@ impl<L: PageLoader> HeapAccess<L> {
         if block_count < Self::PARALLEL_WAL_DELETE_MIN_BLOCKS
             || available_workers <= 1
             || !wal.appends_without_blocking_io()
-            || self.last_checkpoint_lsn.load(Ordering::Acquire) != 0
         {
             return self.delete_int32_pair_inplace(
                 DeleteInt32PairScan {
@@ -1327,7 +1337,7 @@ impl<L: PageLoader> HeapAccess<L> {
             u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
         let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
         let predicate_ref = &predicate;
-        let prev_lsn = parking_lot::Mutex::new(wal.last_lsn_for(xid));
+        let chain = std::sync::atomic::AtomicU64::new(wal.last_lsn_for(xid).raw());
         let mut total_deleted = 0_usize;
 
         std::thread::scope(|scope| {
@@ -1336,7 +1346,7 @@ impl<L: PageLoader> HeapAccess<L> {
             while start_block < block_count {
                 let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
                 handles.push(scope.spawn({
-                    let prev_lsn = &prev_lsn;
+                    let chain = &chain;
                     move || {
                         self.delete_int32_pair_range_wal(DeleteInt32PairWalRange {
                             rel,
@@ -1348,7 +1358,7 @@ impl<L: PageLoader> HeapAccess<L> {
                             xid,
                             command_id,
                             wal,
-                            prev_lsn,
+                            chain,
                             vm,
                         })
                     }
@@ -1499,7 +1509,7 @@ impl<L: PageLoader> HeapAccess<L> {
             xid,
             command_id,
             wal,
-            prev_lsn,
+            chain,
             vm,
         } = request;
         let mut total_deleted: usize = 0;
@@ -1520,6 +1530,30 @@ impl<L: PageLoader> HeapAccess<L> {
 
             let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
+            // Torn-page protection under parallelism: the first
+            // post-checkpoint touch of this page logs its full pre-mutation
+            // image BEFORE the delta record, exactly like the sequential
+            // path's maybe_emit_fpw. The exclusive guard is already held, so
+            // the image is read in place; the per-transaction chain mutex
+            // keeps the FPW's prev_lsn link linear across workers, and page
+            // ownership is disjoint per worker so no page can race its own
+            // FPW. Appending under the page guard is deadlock-free (WAL
+            // backpressure never takes page latches; see WalBuffer docs).
+            let checkpoint_lsn = self.last_checkpoint_lsn.load(Ordering::Acquire);
+            if checkpoint_lsn != 0 && src_page.header().lsn < checkpoint_lsn {
+                let payload = ultrasql_wal::payload::FullPageWritePayload {
+                    page: src_page_id,
+                    page_bytes: src_page.as_bytes().to_vec(),
+                };
+                let fpw_lsn = wal.append_borrowed_linked(
+                    RecordType::FullPageWrite,
+                    xid,
+                    0,
+                    &payload.encode()?,
+                    chain,
+                )?;
+                src_page.set_lsn(fpw_lsn.raw());
+            }
             {
                 let src_bytes = src_page.as_bytes_mut();
                 let src_slot_count = {
@@ -1645,37 +1679,32 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             if !wal_scratch.is_empty() {
-                let lsn = {
-                    let mut prev_lsn_guard = prev_lsn.lock();
-                    let lsn = match wal_scratch.view() {
-                        DeleteSlotWalView::Range {
-                            first_slot,
-                            slot_count,
-                        } => Self::emit_delete_in_place_range_batch_wal_before_reuse(
+                let lsn = match wal_scratch.view() {
+                    DeleteSlotWalView::Range {
+                        first_slot,
+                        slot_count,
+                    } => Self::emit_delete_in_place_range_batch_wal_linked(
+                        wal,
+                        src_page_id,
+                        xid,
+                        command_id,
+                        first_slot,
+                        slot_count,
+                        &mut wal_payload_buf,
+                        chain,
+                    )?,
+                    DeleteSlotWalView::Sparse(slots) => {
+                        Self::emit_delete_in_place_batch_wal_linked(
                             wal,
                             src_page_id,
                             xid,
                             command_id,
-                            first_slot,
-                            slot_count,
+                            slots,
                             &mut wal_payload_buf,
-                            *prev_lsn_guard,
-                        )?,
-                        DeleteSlotWalView::Sparse(slots) => {
-                            Self::emit_delete_in_place_batch_wal_before_reuse(
-                                wal,
-                                src_page_id,
-                                xid,
-                                command_id,
-                                slots,
-                                &mut wal_payload_buf,
-                                *prev_lsn_guard,
-                            )?
-                        }
-                        DeleteSlotWalView::Empty => continue,
-                    };
-                    *prev_lsn_guard = lsn;
-                    lsn
+                            chain,
+                        )?
+                    }
+                    DeleteSlotWalView::Empty => continue,
                 };
 
                 let src_bytes = src_page.as_bytes_mut();

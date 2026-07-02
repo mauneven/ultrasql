@@ -359,7 +359,9 @@ impl EvalPlanQual {
         for _ in 0..64 {
             let tuple = (self.fetch)(current)?;
             match is_visible(&tuple.header, snapshot, &*self.oracle) {
-                Visibility::Visible | Visibility::VisiblePreImage => {
+                Visibility::Visible
+                | Visibility::VisiblePreImage
+                | Visibility::VisibleMaybePreImage => {
                     // Visible terminal version is the latest committed row
                     // to mutate. `VisiblePreImage` reaching a fresh snapshot
                     // means the chain still redirects (an out-of-place

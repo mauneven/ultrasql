@@ -226,6 +226,40 @@ impl WalSink for WalBufferSink {
         Ok(lsn)
     }
 
+    fn append_borrowed_linked(
+        &self,
+        record_type: RecordType,
+        xid: Xid,
+        flags: u8,
+        payload: &[u8],
+        link: &std::sync::atomic::AtomicU64,
+    ) -> Result<Lsn, WalSinkError> {
+        let payload_len = u64::try_from(payload.len()).map_err(|_| {
+            WalSinkError::Rejected("borrowed WAL payload length overflow".to_owned())
+        })?;
+        let header_len = u64::try_from(RECORD_HEADER_SIZE)
+            .map_err(|_| WalSinkError::Rejected("WAL header length overflow".to_owned()))?;
+        let total_length = header_len
+            .checked_add(payload_len)
+            .ok_or_else(|| WalSinkError::Rejected("borrowed WAL length overflow".to_owned()))?;
+        let is_fpi = record_type == RecordType::FullPageWrite;
+        // The buffer resolves the chain link inside its append critical
+        // section, so concurrent appenders sharing `link` produce a strictly
+        // linear per-transaction chain.
+        let lsn = self
+            .buffer
+            .append_borrowed_linked(record_type, xid, flags, payload, link)
+            .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
+        self.publish_last_lsn(xid, lsn);
+        self.record_first_lsn(xid, lsn);
+        self.wal_records.fetch_add(1, Ordering::Relaxed);
+        self.wal_bytes.fetch_add(total_length, Ordering::Relaxed);
+        if is_fpi {
+            self.wal_fpi.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(lsn)
+    }
+
     fn appends_without_blocking_io(&self) -> bool {
         true
     }

@@ -128,9 +128,10 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
         match is_visible(header, snapshot, oracle) {
             // Visible / our own write / pre-image of an in-place update —
             // the row logically exists for this key: a real conflict.
-            Visibility::Visible | Visibility::VisiblePreImage | Visibility::DeletedByOwn => {
-                Ok(UniqueConflict::Live)
-            }
+            Visibility::Visible
+            | Visibility::VisiblePreImage
+            | Visibility::VisibleMaybePreImage
+            | Visibility::DeletedByOwn => Ok(UniqueConflict::Live),
             Visibility::Invisible => {
                 // Invisible has two causes that must be told apart:
                 //   1. The inserter is still in-progress (a foreign writer's

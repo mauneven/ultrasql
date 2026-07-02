@@ -831,3 +831,127 @@ fn undo_log_indices_scope_lookups_and_survive_trim_and_rollback_partition() {
     assert_eq!(log.entries_len(), 1);
     assert_eq!(log.int32_pair_batches_len(), 1);
 }
+
+#[test]
+fn delete_after_committed_inplace_update_is_not_lost_and_preserves_old_snapshots() {
+    // Regression for a silent LOST DELETE: deleting a row whose slot bytes
+    // are an in-place-update post-image used to leave UPDATED_IN_PLACE set,
+    // so the deleter's xmax read as "just another in-place update" and every
+    // snapshot kept seeing the row forever. The delete stamp now swaps the
+    // flag for INPLACE_HISTORY: new snapshots see the delete; snapshots that
+    // predate the UPDATE still observe the pre-update payload via undo.
+    let heap = make_heap(8);
+    heap.insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+
+    // In-place UPDATE by xid 20 (val 10 -> 15), then commit it.
+    oracle.set_in_progress(Xid::new(20));
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        update_int32_scan(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+        ),
+        update_int32_edit(1, 5),
+        update_int32_stamp(20),
+        None,
+        None,
+    )
+    .unwrap();
+    oracle.set_committed(Xid::new(20));
+
+    // DELETE by xid 30 through the fused path, then commit it.
+    oracle.set_in_progress(Xid::new(30));
+    let deleter_30 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let deleted = heap
+        .delete_int32_pair_inplace(
+            DeleteInt32PairScan {
+                rel: rel(),
+                block_count: heap.block_count(rel()),
+                snapshot: &deleter_30,
+                oracle: &oracle,
+                predicate: |id: i32, _val: i32| id == 1,
+            },
+            DeleteInt32PairStamp {
+                xid: Xid::new(30),
+                command_id: CommandId::FIRST,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(deleted, 1, "the fused delete must find the updated row");
+    oracle.set_committed(Xid::new(30));
+
+    // A NEW snapshot (sees both commits) must observe the delete.
+    let after_all = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(40),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &after_all, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(visible.is_empty(), "the delete must not be silently lost");
+
+    // A snapshot that predates BOTH the update and the delete still sees
+    // the ORIGINAL payload (undo pre-image through INPLACE_HISTORY).
+    let before_update = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(15),
+        CommandId::FIRST,
+        [Xid::new(20), Xid::new(30)],
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &before_update, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1, "pre-update snapshot still sees the row");
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 10),
+        "pre-update snapshot must observe the pre-update payload"
+    );
+
+    // A snapshot between the two commits (sees the update, not the delete)
+    // observes the post-update payload.
+    let between = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(25),
+        CommandId::FIRST,
+        [Xid::new(30)],
+    );
+    let visible: Vec<HeapTuple> = heap
+        .scan_visible(rel(), heap.block_count(rel()), &between, &oracle)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(
+        int32_pair_from_payload(&visible[0].data),
+        (1, 15),
+        "between-commits snapshot must observe the post-update payload"
+    );
+}

@@ -359,19 +359,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 xid: self.xid,
                 command_id: self.command_id,
             };
-            if wal_sink.is_none() {
+            if let Some(sink) = wal_sink {
+                self.heap.update_int32_pair_inplace_undo_parallel_wal(
+                    scan,
+                    edit,
+                    stamp,
+                    sink,
+                    self.vm.as_deref(),
+                )
+            } else {
                 self.heap.update_int32_pair_inplace_undo_parallel_no_wal(
                     scan,
                     edit,
                     stamp,
-                    self.vm.as_deref(),
-                )
-            } else {
-                self.heap.update_int32_pair_inplace_undo(
-                    scan,
-                    edit,
-                    stamp,
-                    wal_sink,
                     self.vm.as_deref(),
                 )
             }

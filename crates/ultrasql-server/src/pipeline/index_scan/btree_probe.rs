@@ -455,6 +455,21 @@ pub(super) fn fetch_visible_index_payload(
                 }
                 return Ok(None);
             }
+            Visibility::VisibleMaybePreImage => {
+                // Visible with in-place undo history: substitute the
+                // pre-image when an earlier writer is invisible to this
+                // snapshot, otherwise the slot bytes are current. Both
+                // outcomes recheck the entry key (Option-A).
+                let pre = ctx
+                    .heap
+                    .fetch_visible_pre_image(current, &ctx.snapshot, ctx.oracle.as_ref())
+                    .map_err(|e| ServerError::ddl(format!("IndexScan pre-image fetch: {e}")))?;
+                let payload = pre.unwrap_or(tuple.data);
+                if recheck.is_some_and(|rc| !rc.payload_matches(&payload)) {
+                    return Ok(None);
+                }
+                return Ok(Some(payload));
+            }
             Visibility::VisiblePreImage => {
                 // The slot holds the post-image of an in-place UPDATE the
                 // reader's snapshot does not see (or one a rolled-back subxid
