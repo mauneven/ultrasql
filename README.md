@@ -43,10 +43,13 @@ recall-vs-latency versus pgvector / Qdrant / LanceDB, and
 filtered ANN and competitive recall benchmarks are tracked there with measurable
 exit conditions).
 
-This is not a "fastest at everything" claim. UltraSQL's measured strengths are
-reads, scans, aggregations, and unified retrieval; heavy single-row OLTP write
-throughput is a documented weak spot. The same-host scoreboard below reports
-wins and losses honestly.
+This is not a "fastest at everything" claim. UltraSQL leads 21 of 24 measured
+workloads on the pinned host — every INSERT, scan, aggregate, window, and
+10k/100k mutation row — and the scoreboard below reports the three remaining
+losses honestly: the two 1M-row bulk mutations (columnar engines rewrite
+chunks; UltraSQL stamps per-row MVCC headers durably) and point-op Mixed OLTP
+against in-process SQLite (no wire round trip; UltraSQL is within 2% of the
+tuned PostgreSQL wire peer there).
 
 The project is alpha: the engine is broad enough for serious evaluation,
 compatibility testing, and reproducible benchmarking, but release readiness is
