@@ -420,7 +420,7 @@ fn readme_scale_sweep_matches_rendered_artifact() {
     let readme = repo_file("README.md");
     let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
 
-    assert!(readme.contains("## Release-Artifact DB-vs-DB Benchmark"));
+    assert!(readme.contains("## Release-Artifact End-to-End Benchmark"));
     assert!(readme.contains("benchmarks/run_scale_sweep.sh full"));
     assert!(readme.contains("Fastest"));
     assert!(!readme.contains("buffer-pool exhaustion"));
