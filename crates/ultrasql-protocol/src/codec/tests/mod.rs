@@ -353,7 +353,7 @@ fn backend_key_data_round_trip() {
 
 #[test]
 fn ready_for_query_round_trip() {
-    for status in [b'I', b'T', b'E'] {
+    for status in *b"ITE" {
         let msg = BackendMessage::ReadyForQuery { status };
         let decoded = round_trip_backend(&msg);
         assert_eq!(decoded, msg);

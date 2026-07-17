@@ -19,7 +19,7 @@ fn readme_db_snapshot_matches_latest_raw_artifacts() {
     let readme = repo_file("README.md");
     let scale_md = repo_file("benchmarks/results/latest/scale-sweep/scale_sweep.md");
 
-    assert!(readme.contains("## Release-Artifact DB-vs-DB Benchmark"));
+    assert!(readme.contains("## Release-Artifact End-to-End Benchmark"));
     assert!(readme.contains("benchmarks/run_scale_sweep.sh full"));
     // The README documents the actual PostgreSQL version measured. The fair
     // same-host sweep uses a tuned PostgreSQL 17 cluster, not the old 14.22.
