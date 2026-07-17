@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use ultrasql_core::Xid;
-use ultrasql_txn::TransactionManager;
+use ultrasql_mvcc::{XidStatus, XidStatusOracle};
+
+use crate::Server;
 
 /// RAII guard that aborts an *autocommit* transaction's XID if it is dropped
 /// while still armed — i.e. on an unwind out of the statement-execution path.
@@ -26,16 +28,16 @@ use ultrasql_txn::TransactionManager;
 /// Explicit `BEGIN` blocks do NOT use this guard: their handle lives in the
 /// session state and is aborted by the client's `ROLLBACK`/`COMMIT`.
 pub(crate) struct AutocommitAbortGuard {
-    manager: Arc<TransactionManager>,
+    state: Arc<Server>,
     xid: Xid,
     armed: bool,
 }
 
 impl AutocommitAbortGuard {
-    /// Arm a guard for `xid` against `manager`.
-    pub(crate) fn arm(manager: Arc<TransactionManager>, xid: Xid) -> Self {
+    /// Arm a guard for `xid` against the owning server state.
+    pub(crate) fn arm(state: Arc<Server>, xid: Xid) -> Self {
         Self {
-            manager,
+            state,
             xid,
             armed: true,
         }
@@ -51,10 +53,26 @@ impl AutocommitAbortGuard {
 
 impl Drop for AutocommitAbortGuard {
     fn drop(&mut self) {
-        if self.armed {
-            // Only fires on an unwind (or a forgotten `disarm`). Idempotent:
-            // a no-op if the XID was already committed/aborted.
-            self.manager.abort_in_progress_by_xid(self.xid);
+        if !self.armed
+            || XidStatusOracle::status(self.state.txn_manager.as_ref(), self.xid)
+                != XidStatus::InProgress
+        {
+            return;
         }
+
+        // Physical post-images must be restored before CLOG says Aborted.
+        // Otherwise undo GC can discard the sole pre-image after a caught
+        // executor panic and make a row disappear. A cleanup failure cannot
+        // safely return to the connection; terminate so crash recovery remains
+        // the authority for the unresolved XID.
+        if let Err(error) = self.state.rollback_in_place_update_family([self.xid]) {
+            tracing::error!(
+                xid = self.xid.raw(),
+                %error,
+                "fatal autocommit panic rollback failure"
+            );
+            std::process::abort();
+        }
+        self.state.txn_manager.abort_in_progress_by_xid(self.xid);
     }
 }

@@ -5,15 +5,15 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
 use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 
-use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
+use crate::buffer_pool::{PageGuard, PageLoader};
 use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, PAGE_HEADER_SIZE, Page, PageError};
+use crate::wal_sink::WalSink;
 
 use super::{
     HeapAccess, HeapError, InsertOptions, checked_heap_u64_count_add, checked_tuple_space_needed,
@@ -85,7 +85,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // Invalidate the columnar projection cache for this
         // relation — a new row makes any cached `Vec<Column>`
         // stale until the next `SeqScan` re-builds it.
-        self.invalidate_int32_pair_payload_stats_relation(rel);
+        self.invalidate_int32_pair_payload_stats_page(tid.page);
         self.column_cache.bump_version(rel, writer_xid);
         Ok(tid)
     }
@@ -96,6 +96,25 @@ impl<L: PageLoader> HeapAccess<L> {
         payload: &[u8],
         opts: InsertOptions<'_>,
     ) -> Result<TupleId, HeapError> {
+        let (tid, guard) = self.insert_inner_pinned(rel, payload, opts, None)?;
+        drop(guard);
+        Ok(tid)
+    }
+
+    /// Insert while returning the original destination-page pin.
+    ///
+    /// `fpw_sink` covers callers such as classic non-HOT UPDATE that suppress
+    /// the internal `HeapInsert` record because one logical `HeapUpdate`
+    /// record will describe both pages. The destination still needs an FPW at
+    /// the checkpoint boundary, and the returned pin must live until that
+    /// outer update record is appended and stamped.
+    pub(super) fn insert_inner_pinned(
+        &self,
+        rel: RelationId,
+        payload: &[u8],
+        opts: InsertOptions<'_>,
+        fpw_sink: Option<&dyn WalSink>,
+    ) -> Result<(TupleId, PageGuard<L>), HeapError> {
         let counter = self.counter_for(rel);
         let cursor = self.cursor_for(rel);
         let existing = counter.load(Ordering::Acquire);
@@ -111,13 +130,14 @@ impl<L: PageLoader> HeapAccess<L> {
                 .map_err(|_| HeapError::MalformedHeader("tuple size overflow"))?;
             if let Some(hint_block) = fsm.find_block_with_at_least(rel, min_free) {
                 let page_id = PageId::new(rel, hint_block);
-                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                    Ok(tid) => {
-                        Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
-                        // Update FSM and VM after the successful insert.
-                        Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
+                    Ok((tid, guard)) => {
+                        // Update the advisory FSM after the successful insert.
+                        // The correctness-critical VM clear happens while the
+                        // page write latch is held in `insert_into_pinned`.
+                        Self::post_insert_fsm(&self.pool, tid.page, opts);
                         cursor.store(tid.page.block.raw(), Ordering::Release);
-                        return Ok(tid);
+                        return Ok((tid, guard));
                     }
                     // Hint was stale (page filled up since we recorded it);
                     // fall through to the linear scan.
@@ -142,12 +162,11 @@ impl<L: PageLoader> HeapAccess<L> {
             .min(existing.saturating_sub(1));
         for block in start..existing {
             let page_id = PageId::new(rel, BlockNumber::new(block));
-            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                Ok(tid) => {
-                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
-                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
+                Ok((tid, guard)) => {
+                    Self::post_insert_fsm(&self.pool, tid.page, opts);
                     cursor.store(block, Ordering::Release);
-                    return Ok(tid);
+                    return Ok((tid, guard));
                 }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
                 Err(other) => return Err(other),
@@ -161,12 +180,11 @@ impl<L: PageLoader> HeapAccess<L> {
         // before the tail, or concurrent extension).
         for block in 0..start {
             let page_id = PageId::new(rel, BlockNumber::new(block));
-            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                Ok(tid) => {
-                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
-                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
+                Ok((tid, guard)) => {
+                    Self::post_insert_fsm(&self.pool, tid.page, opts);
                     cursor.store(block, Ordering::Release);
-                    return Ok(tid);
+                    return Ok((tid, guard));
                 }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
                 Err(other) => return Err(other),
@@ -182,12 +200,11 @@ impl<L: PageLoader> HeapAccess<L> {
                 return Err(HeapError::OutOfBlocks);
             }
             let page_id = PageId::new(rel, BlockNumber::new(new_block));
-            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                Ok(tid) => {
-                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
-                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
+                Ok((tid, guard)) => {
+                    Self::post_insert_fsm(&self.pool, tid.page, opts);
                     cursor.store(new_block, Ordering::Release);
-                    return Ok(tid);
+                    return Ok((tid, guard));
                 }
                 // A concurrent thread could have raced into this block
                 // and used the space — extend again.
@@ -303,10 +320,15 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             let page_id = PageId::new(rel, BlockNumber::new(cursor));
-            let page_out_start = out.len();
-            let page_row_start = row_idx;
-            let drained =
-                Self::batch_fill_page(&self.pool, page_id, rows, &mut out, row_idx, opts, n_atts)?;
+            let drained = self.batch_fill_page(
+                page_id,
+                rows,
+                &mut out,
+                row_idx,
+                opts,
+                n_atts,
+                &mut wal_payload_buf,
+            )?;
             row_idx += drained;
             if drained == 0 {
                 let tuple_size = TUPLE_HEADER_SIZE
@@ -320,19 +342,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     }));
                 }
             } else {
-                // After this page, the post hooks fire once for the affected page.
-                Self::post_insert_fsm_vm(&self.pool, page_id, opts);
-                if opts.wal.is_some() && out.len() > page_out_start {
-                    Self::emit_insert_batch_wal_from_payloads(
-                        &self.pool,
-                        page_id,
-                        &out[page_out_start..],
-                        &rows[page_row_start..row_idx],
-                        &opts,
-                        n_atts,
-                        &mut wal_payload_buf,
-                    )?;
-                }
+                // The advisory FSM hook fires once for the affected page.
+                // `batch_fill_page` already cleared the VM while it held the
+                // page write latch.
+                Self::post_insert_fsm(&self.pool, page_id, opts);
             }
 
             if row_idx == rows.len() {
@@ -415,9 +428,6 @@ impl<L: PageLoader> HeapAccess<L> {
                 }));
             }
             writer(page_id, &page)?;
-            if let Some(vm) = opts.vm {
-                vm.mark_all_visible(page_id.relation, page_id.block);
-            }
             row_idx += drained;
             inserted = checked_heap_u64_count_add(inserted, drained, "bulk load count overflow")?;
             insert_cursor.store(block, Ordering::Release);
@@ -436,23 +446,37 @@ impl<L: PageLoader> HeapAccess<L> {
     /// for even the first remaining row; the caller should advance to
     /// the next page.
     ///
-    /// FSM/VM hooks are *not* invoked here: this helper is responsible
-    /// only for the page-local fill loop. The caller fires the
-    /// per-page post-hooks once after each call so the FSM sees the
-    /// final post-batch free space (and the page guard is released
-    /// before the FSM/VM lookup).
+    /// The correctness-critical VM clear happens under the page write latch
+    /// before the mutated bytes can be observed. The caller updates the
+    /// advisory FSM after this helper returns so the FSM sees the final
+    /// post-batch free space without extending the page-latch lifetime.
     ///
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "page-local batch insert threads caller-owned row/TID/WAL scratch buffers explicitly to avoid hot-path allocations"
+    )]
     pub(super) fn batch_fill_page(
-        pool: &Arc<BufferPool<L>>,
+        &self,
         page_id: PageId,
         rows: &[&[u8]],
         out: &mut Vec<TupleId>,
         row_idx: usize,
         opts: InsertOptions<'_>,
         n_atts: u16,
+        wal_payload_buf: &mut Vec<u8>,
     ) -> Result<usize, HeapError> {
+        if let Some(sink) = opts.wal {
+            Self::maybe_emit_fpw(
+                &self.pool,
+                page_id,
+                sink,
+                &self.last_checkpoint_lsn,
+                opts.xmin,
+            )?;
+        }
+        let out_start = out.len();
+        let guard = self.pool.get_page_relieved(page_id)?;
         let filled = {
-            let guard = pool.get_page_relieved(page_id)?;
             let mut page = guard.write();
             let mut filled: usize = 0;
 
@@ -527,10 +551,25 @@ impl<L: PageLoader> HeapAccess<L> {
                 header.lower = header_bound_from_cursor(cur_lower, "page lower overflow")?;
                 header.upper = header_bound_from_cursor(cur_upper, "page upper overflow")?;
                 header.encode(page.as_bytes_mut());
+                if let Some(vm) = opts.vm {
+                    vm.clear(page_id.relation, page_id.block);
+                }
             }
 
             filled
         };
+        if filled > 0 {
+            Self::emit_insert_batch_wal_from_payloads(
+                &self.pool,
+                &guard,
+                page_id,
+                &out[out_start..],
+                &rows[row_idx..row_idx + filled],
+                &opts,
+                n_atts,
+                wal_payload_buf,
+            )?;
+        }
         Ok(filled)
     }
 
@@ -604,12 +643,13 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
         n_atts: u16,
         tuple_size: usize,
-    ) -> Result<TupleId, HeapError> {
+        fpw_sink: Option<&dyn WalSink>,
+    ) -> Result<(TupleId, PageGuard<L>), HeapError> {
         // Emit a full-page-write record if this is the first modification of
         // the page since the last checkpoint. The FPW is emitted under a
         // shared pin so the read and the WAL append complete before we take
         // the exclusive write lock below.
-        if let Some(sink) = opts.wal {
+        if let Some(sink) = opts.wal.or(fpw_sink) {
             Self::maybe_emit_fpw(
                 &self.pool,
                 page_id,
@@ -619,7 +659,13 @@ impl<L: PageLoader> HeapAccess<L> {
             )?;
         }
         let guard = self.get_page_relieved(page_id)?;
-        Self::insert_into_pinned(&guard, page_id, payload, opts, n_atts, tuple_size)
+        let tid = Self::insert_into_pinned(&guard, page_id, payload, opts, n_atts, tuple_size)?;
+        // Keep the original pin from the first dirty byte through WAL append
+        // and the monotonic page-LSN stamp. Checkpoint flushes skip pinned
+        // frames, so there is no flushable old-LSN window even when a sink
+        // blocks on its own WAL I/O.
+        Self::emit_insert_wal(&self.pool, tid, &opts, &guard)?;
+        Ok((tid, guard))
     }
 
     /// Pin-and-insert helper. Splitting this out of
@@ -670,6 +716,14 @@ impl<L: PageLoader> HeapAccess<L> {
             let page_bytes = page.as_bytes_mut();
             let (slot_offset, _) = Self::slot_window(page_bytes, slot)?;
             page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+
+            // A scanner snapshots the page bytes and VM state while holding
+            // this same page latch. Clear the bit before releasing the latch
+            // so no scanner can pair the new tuple with a stale all-visible
+            // certification.
+            if let Some(vm) = opts.vm {
+                vm.clear(page_id.relation, page_id.block);
+            }
 
             final_tid
         };

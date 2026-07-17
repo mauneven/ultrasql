@@ -14,11 +14,12 @@ use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::HeapDeletePayload;
 use ultrasql_wal::record::RecordType;
 
-use crate::buffer_pool::{PageGuard, PageLoader};
+use crate::buffer_pool::{PageGuard, PageLoader, PageWrite};
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, Int32PairPagePayloadStats, checked_heap_count_add,
+    DeleteOptions, HeapAccess, HeapError, Int32PairPagePayloadStats, UndoRelationLog,
+    checked_heap_count_add, undo_pre_image_from_log,
 };
 
 #[inline]
@@ -334,6 +335,57 @@ fn int32_pair_delete_predicate_matches_planned<P: Int32PairPredicateEval + ?Size
     }
 }
 
+fn delete_visibility_allows_current_mutation<O, P>(
+    visibility: Visibility,
+    undo_log: &parking_lot::RwLock<UndoRelationLog>,
+    tid: TupleId,
+    current_payload: &[u8],
+    mvcc: (&Snapshot, &O),
+    predicate_plan: DeletePredicatePlan,
+    predicate: &P,
+) -> Result<bool, HeapError>
+where
+    O: XidStatusOracle + ?Sized,
+    P: Int32PairPredicateEval + ?Sized,
+{
+    let (snapshot, oracle) = mvcc;
+    match visibility {
+        Visibility::Visible => Ok(true),
+        Visibility::Invisible | Visibility::DeletedByOwn => Ok(false),
+        Visibility::VisiblePreImage | Visibility::VisibleMaybePreImage => {
+            let pre_image =
+                undo_pre_image_from_log(&undo_log.read(), tid, current_payload, snapshot, oracle);
+            let Some(pre_image) = pre_image else {
+                // `VisibleMaybePreImage` also covers the common case where all
+                // historical writers are visible and the physical bytes are
+                // the logical row. `VisiblePreImage` promises the opposite;
+                // missing undo there is conservatively a serialization
+                // conflict instead of silently evaluating the post-image.
+                return if matches!(visibility, Visibility::VisibleMaybePreImage) {
+                    Ok(true)
+                } else {
+                    Err(HeapError::WriteConflict(
+                        "visible tuple pre-image is unavailable",
+                    ))
+                };
+            };
+            if int32_pair_delete_predicate_matches_planned(
+                &pre_image,
+                0,
+                pre_image.len(),
+                predicate_plan,
+                predicate,
+            )? {
+                Err(HeapError::WriteConflict(
+                    "in-place tuple has an unresolved writer",
+                ))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DeleteVisibilityCache {
     xmin_raw: u64,
@@ -492,7 +544,12 @@ fn int32_pair_stats_prove_all_match(
     slot_count: u16,
     plan: DeletePredicatePlan,
 ) -> bool {
-    if stats.slot_count != slot_count || stats.normal_slots == 0 {
+    // A partial scan (for example, because another snapshot-visible version
+    // had to be reconstructed from undo) cannot prove a predicate for slots
+    // it did not observe. Requiring every ItemId to contribute keeps this
+    // shortcut conservative; pages with dead/unused slots simply take the
+    // regular per-row predicate path.
+    if stats.slot_count != slot_count || stats.normal_slots != slot_count {
         return false;
     }
     let DeletePredicatePlan::ColumnCmp {
@@ -578,6 +635,11 @@ struct DeleteInt32PairWalRange<'a, O: ?Sized, P: ?Sized> {
     vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
+struct ParallelDeleteWorkerOutput {
+    deleted: Result<usize, HeapError>,
+    rollback_pages: Vec<PageId>,
+}
+
 /// Page-major scan request for fused `(Int32, Int32)` DELETE.
 ///
 /// Closure predicates receive decoded `(id, value)` payloads. Typed
@@ -618,6 +680,32 @@ impl<L: PageLoader> HeapAccess<L> {
     const PARALLEL_WAL_DELETE_MIN_BLOCKS: u32 = 128;
     const PARALLEL_WAL_DELETE_BLOCKS_PER_WORKER: u32 = 256;
 
+    fn finish_parallel_delete(
+        &self,
+        xid: Xid,
+        mut worker_outputs: Vec<ParallelDeleteWorkerOutput>,
+        worker_panicked: bool,
+    ) -> Result<usize, HeapError> {
+        // Every worker owns disjoint page ranges and records touched pages
+        // locally. Merge all completed work before propagating a sibling's
+        // error so transaction abort can still clear stamps written by workers
+        // that finished successfully.
+        self.remember_rollback_stamp_pages(
+            xid,
+            worker_outputs
+                .iter_mut()
+                .flat_map(|output| output.rollback_pages.drain(..)),
+        );
+        if worker_panicked {
+            return Err(HeapError::ParallelWorkerPanic);
+        }
+        worker_outputs
+            .into_iter()
+            .try_fold(0_usize, |total, output| {
+                checked_heap_count_add(total, output.deleted?, "deleted tuple count overflow")
+            })
+    }
+
     /// Clear `xmax` stamps for an aborted transaction.
     ///
     /// Regular MVCC visibility can treat an aborted `xmax` as visible,
@@ -631,21 +719,28 @@ impl<L: PageLoader> HeapAccess<L> {
     /// rolled-back subtransaction's DELETE stamps directly. (The full-abort
     /// path reaches this via [`Self::rollback_in_place_updates`], which
     /// calls it after restoring in-place pre-images.)
+    ///
+    /// Each page is validated completely before any header is changed. Its
+    /// registry entry is removed only after the page restoration succeeds, so
+    /// a malformed or temporarily unavailable later page remains retryable.
     pub fn rollback_delete_stamps(&self, xid: Xid) -> Result<usize, HeapError> {
         use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE, PageHeader};
 
         let mut total_restored = 0_usize;
-        let pages = self.take_rollback_stamp_pages(xid);
+        let pages = self.rollback_stamp_pages_snapshot(xid);
         let mut restored_relations: Vec<RelationId> = Vec::new();
         for page_id in pages {
-            let mut page_restored = false;
             let guard = self.get_page_relieved(page_id)?;
             let mut page = guard.write();
             let bytes = page.as_bytes_mut();
             let slot_count = PageHeader::decode(bytes)
                 .map_err(HeapError::Page)?
                 .slot_count();
+            let mut restored_headers = Vec::new();
 
+            // Complete every fallible decode and bounds check before writing
+            // the first header. A failure therefore leaves both the page and
+            // its rollback registry membership unchanged.
             for slot in 0..slot_count {
                 let item_id_off = PAGE_HEADER_SIZE + usize::from(slot) * ITEMID_SIZE;
                 let item_raw = u32::from_le_bytes([
@@ -683,11 +778,24 @@ impl<L: PageLoader> HeapAccess<L> {
                 );
                 let mut header_bytes = [0_u8; TUPLE_HEADER_SIZE];
                 restored.encode(&mut header_bytes);
-                bytes[offset..offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
-                page_restored = true;
-                total_restored += 1;
+                restored_headers.push((offset, header_bytes));
             }
-            if page_restored && !restored_relations.contains(&page_id.relation) {
+
+            let next_total = checked_heap_count_add(
+                total_restored,
+                restored_headers.len(),
+                "rollback tuple count overflow",
+            )?;
+            for (offset, header_bytes) in &restored_headers {
+                bytes[*offset..*offset + TUPLE_HEADER_SIZE].copy_from_slice(header_bytes);
+            }
+            // Keep the page latch through registry retirement. Mutators use
+            // the same page → registry order, so no observer can see a
+            // restored page that still races with a newly published stamp.
+            self.mark_rollback_stamp_page_restored(xid, page_id);
+            total_restored = next_total;
+
+            if !restored_headers.is_empty() && !restored_relations.contains(&page_id.relation) {
                 restored_relations.push(page_id.relation);
             }
         }
@@ -706,9 +814,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// will hide the tuple from snapshots that observe `xmax` as committed.
     ///
     /// If `opts.wal` is `Some`, a `RecordType::HeapDelete` record is appended
-    /// to the sink after the in-place stamp succeeds. The page guard is
-    /// dropped before the WAL append so a future blocking WAL writer cannot
-    /// starve buffer-pool eviction.
+    /// after the in-place stamp succeeds. The page latch is released first so
+    /// readers remain live, but the original frame pin is retained through
+    /// append and LSN publication so eviction/checkpoint cannot expose the
+    /// post-delete bytes under their previous WAL dependency.
     ///
     /// Payload encoding runs before the page mutation so an encode failure
     /// short-circuits without touching the page. If encoding succeeds but
@@ -748,29 +857,42 @@ impl<L: PageLoader> HeapAccess<L> {
             None
         };
 
-        // Mutate the page. Guard is dropped at the end of this block so
-        // the pin is released before WAL I/O begins.
-        {
-            let guard = self.get_page_relieved(tid.page)?;
-            Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
-            self.remember_rollback_stamp_page(opts.xmax, tid.page);
-            // guard drops here — pin released before WAL append
-        }
-
-        // Append the WAL record outside the pin scope. If append returns
-        // Err the page has already been mutated; poison the buffer pool and
-        // return a fatal WAL error so the service can restart from WAL.
         if let Some((sink, record)) = wal_record {
+            // Keep this original pin from the first dirty byte through WAL
+            // append and page-LSN publication. The page write latch is released
+            // after the header stamp, so readers remain live, but the
+            // checkpointer cannot flush this frame with its previous LSN while
+            // a WAL sink is blocked.
+            let guard = self.get_page_relieved(tid.page)?;
+            if let Some(vm) = opts.vm {
+                Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax, Some(vm))?;
+            } else {
+                Self::delete_in_place_no_vm(&guard, tid, opts.xmax, opts.cmax)?;
+            }
+            self.remember_rollback_stamp_page(opts.xmax, tid.page);
+
+            // Append outside the page-latch scope but while the frame remains
+            // pinned. If append returns Err, poison before releasing that pin.
             let lsn: Lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
-            // Stamp the page LSN so recovery knows the on-page state was
-            // logged at this LSN. WAL append completes before stamp so the
-            // page LSN is never ahead of the WAL.
-            Self::stamp_page_lsn(&self.pool, tid.page, lsn)?;
+            Self::stamp_pinned_page_lsn(&guard, lsn);
+        } else {
+            // The in-memory benchmark/embedded path has no WAL ordering
+            // dependency. Release its pin immediately after the page mutation
+            // so the common no-WAL call keeps the same short critical lifetime
+            // as a plain buffer-pool write.
+            {
+                let guard = self.get_page_relieved(tid.page)?;
+                if let Some(vm) = opts.vm {
+                    Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax, Some(vm))?;
+                } else {
+                    Self::delete_in_place_no_vm(&guard, tid, opts.xmax, opts.cmax)?;
+                }
+            }
+            self.remember_rollback_stamp_page(opts.xmax, tid.page);
         }
-        // Update FSM (optimistically record the dead tuple's space as free so
-        // future inserters can find this block) and clear the VM all-visible
-        // bit (the page now has a deleted tuple invisible to future snapshots).
-        Self::post_delete_fsm_vm(&self.pool, tid.page, opts);
+        // Update FSM optimistically so future inserters can find this block.
+        // VM was already cleared atomically with the page mutation above.
+        Self::post_delete_fsm(&self.pool, tid.page, opts);
         // Invalidate the columnar projection cache for this
         // relation — a mutated row makes any cached `Vec<Column>`
         // stale until the next `SeqScan` re-builds it.
@@ -788,7 +910,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// strictly necessary. `delete_many` groups the input by
     /// `page_id`, takes **one** write guard per page, stamps every
     /// slot on that page under that single guard, then drops the
-    /// guard before its WAL append / FSM hook batch.
+    /// guard before its WAL append and FSM hook.
     ///
     /// Semantics are equivalent to invoking [`Self::delete`] N
     /// times in order: each tuple's header is stamped with
@@ -796,8 +918,9 @@ impl<L: PageLoader> HeapAccess<L> {
     /// emits one `HeapDelete` record per stamped slot (the WAL
     /// applier replays them identically to `delete`); FSM hints
     /// and VM clears, when `opts.fsm` / `opts.vm` are configured,
-    /// run **once per page touched** (record the final free-space
-    /// after every delete on the page lands).
+    /// run **once per page touched**. VM is cleared under the page
+    /// write latch before the first stamp; FSM records final free
+    /// space after every delete on the page lands.
     ///
     /// Slots within a page are stamped in ascending slot order; the
     /// between-page order is the iteration order of the
@@ -817,9 +940,9 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// # Concurrency
     ///
-    /// At most one [`PageGuard`] is held at any instant. The guard is
-    /// dropped before WAL I/O begins, so a concurrent reader on
-    /// another page is never blocked by this method's pin.
+    /// At most one [`PageGuard`] is held at any instant. Its page latch is
+    /// dropped before WAL I/O begins, so concurrent page readers remain live;
+    /// its frame pin is retained until the batch's final LSN is published.
     pub fn delete_many<I>(&self, tids: I, opts: DeleteOptions<'_>) -> Result<usize, HeapError>
     where
         I: IntoIterator<Item = TupleId>,
@@ -867,18 +990,40 @@ impl<L: PageLoader> HeapAccess<L> {
                 None
             };
 
-            // Mutate every slot on this page under one write guard.
+            // Mutate every slot on this page under one write guard. Retain the
+            // original page pin until every per-tuple record is appended and
+            // the page receives their maximum LSN.
+            let guard = self.get_page_relieved(page_id)?;
             {
-                let guard = self.get_page_relieved(page_id)?;
+                let mut page = guard.write();
+                let mut clear_vm = opts.vm;
+                let mut mutated = false;
                 for &slot in &slots {
                     let tid = TupleId::new(page_id, slot);
-                    Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
+                    if let Err(err) =
+                        Self::delete_in_place_locked(&mut page, tid, opts.xmax, opts.cmax, clear_vm)
+                    {
+                        if mutated && opts.wal.is_some() {
+                            self.pool.poison_after_wal_error();
+                        }
+                        return Err(err);
+                    }
+                    if !mutated {
+                        // Register while the first successful stamp is still
+                        // protected by the page latch. A malformed later slot
+                        // must not strand this page outside abort rollback.
+                        self.remember_rollback_stamp_page(opts.xmax, page_id);
+                        mutated = true;
+                    }
+                    // The first successful stamp cleared this page while its
+                    // write latch was held; avoid repeating the VM lookup for
+                    // every remaining tuple in the page-local batch.
+                    clear_vm = None;
                 }
-                self.remember_rollback_stamp_page(opts.xmax, page_id);
-                // guard drops here — pin released before WAL append.
+                // The page write latch drops here; the pin stays live.
             }
 
-            // Append every per-tuple WAL record outside the pin scope.
+            // Append every per-tuple WAL record outside the page-latch scope.
             // The page LSN is stamped once at the final LSN of the
             // batch (recovery replays records in append order, so the
             // final per-slot stamp is the only state recovery needs).
@@ -886,15 +1031,28 @@ impl<L: PageLoader> HeapAccess<L> {
                 let mut last_lsn: Lsn = Lsn::ZERO;
                 for payload in payloads {
                     let prev_lsn = sink.last_lsn_for(opts.xmax);
-                    let record =
-                        WalRecord::new(RecordType::HeapDelete, opts.xmax, prev_lsn, 0, payload)?;
+                    let record = match WalRecord::new(
+                        RecordType::HeapDelete,
+                        opts.xmax,
+                        prev_lsn,
+                        0,
+                        payload,
+                    ) {
+                        Ok(record) => record,
+                        Err(err) => {
+                            self.pool.poison_after_wal_error();
+                            return Err(HeapError::WalRecord(err));
+                        }
+                    };
                     last_lsn = Self::append_after_page_mutation(&self.pool, sink, record)?;
                 }
-                Self::stamp_page_lsn(&self.pool, page_id, last_lsn)?;
+                Self::stamp_pinned_page_lsn(&guard, last_lsn);
             }
+            drop(guard);
 
-            // FSM/VM hooks fire once per page touched.
-            Self::post_delete_fsm_vm(&self.pool, page_id, opts);
+            // The FSM hook fires once per page touched. VM was cleared under
+            // the page write latch before the first tuple stamp.
+            Self::post_delete_fsm(&self.pool, page_id, opts);
             // Column-cache invalidation: bump the relation's version
             // for every page we touch. The first bump invalidates the
             // entry; subsequent bumps just move the version forward.
@@ -929,9 +1087,10 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// When `wal` is `Some`, one
     /// [`RecordType::HeapDeleteInPlaceBatch`] record is appended per
-    /// mutated page after the page guard is dropped and the page LSN is
-    /// stamped with that batch LSN, mirroring the FPW + page-batch +
-    /// page-LSN pattern in [`Self::update_int32_pair_inplace_undo`].
+    /// mutated page after validation but before VM or tuple bytes change.
+    /// The page LSN is stamped with that batch LSN under the same write
+    /// guard, mirroring the FPW + page-batch + page-LSN pattern in
+    /// [`Self::update_int32_pair_inplace_undo`].
     /// A `None` value
     /// retains the non-durable benchmark path for the executor's
     /// fused operator (the pipeline lowerer threads the live sink in
@@ -964,10 +1123,11 @@ impl<L: PageLoader> HeapAccess<L> {
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
         let vm = vm.filter(|vm| vm.contains_relation(rel));
+        let undo_log_handle = self.undo_log_handle(rel);
 
-        // Per-page slot scratch: collect under the write guard, emit
-        // WAL once the guard is dropped, same shape as the update
-        // path. Reused across pages.
+        // Per-page slot scratch is reused across pages. The compact WAL record
+        // is emitted after the page scan has validated every candidate and
+        // before VM state or tuple bytes are changed.
         let mut wal_scratch =
             DeleteSlotWalScratch::with_capacity(if wal.is_some() { 256 } else { 0 });
         let mut wal_payload_buf: Vec<u8> = if wal.is_some() {
@@ -981,12 +1141,11 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             _ => None,
         };
-        let wal_appends_before_stamp = wal.is_some_and(WalSink::appends_without_blocking_io);
-        let mut stamp_offsets: Vec<u16> = if wal_appends_before_stamp {
-            Vec::with_capacity(256)
-        } else {
-            Vec::new()
-        };
+        // Stage page-local tuple offsets so every predicate, visibility,
+        // conflict, bounds, and WAL operation finishes before the first page
+        // byte changes. This also lets the VM bit be cleared under the same
+        // write guard immediately before the stamps become visible.
+        let mut stamp_offsets: Vec<u16> = Vec::with_capacity(256);
 
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
@@ -1075,11 +1234,26 @@ impl<L: PageLoader> HeapAccess<L> {
                             visibility
                         }
                     };
-                    if !matches!(visibility, Visibility::Visible) {
+                    let payload_off = offset + TUPLE_HEADER_SIZE;
+                    let payload_end = payload_off
+                        .checked_add(9)
+                        .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
+                    if payload_end > tuple_end {
+                        return Err(HeapError::MalformedHeader(
+                            "payload shorter than (Int32, Int32)",
+                        ));
+                    }
+                    if !delete_visibility_allows_current_mutation(
+                        visibility,
+                        &undo_log_handle,
+                        TupleId::new(src_page_id, src_slot),
+                        &src_bytes[payload_off..payload_end],
+                        (snapshot, oracle),
+                        predicate_plan,
+                        &predicate,
+                    )? {
                         continue;
                     }
-
-                    let payload_off = offset + TUPLE_HEADER_SIZE;
                     if let Some(builder) = stats_builder.as_mut() {
                         let payload_end = payload_off
                             .checked_add(9)
@@ -1126,19 +1300,9 @@ impl<L: PageLoader> HeapAccess<L> {
                     if wal.is_some() {
                         wal_scratch.push(src_slot)?;
                     }
-                    if wal_appends_before_stamp {
-                        let offset_u16 = u16::try_from(offset)
-                            .map_err(|_| HeapError::MalformedHeader("tuple offset overflow"))?;
-                        stamp_offsets.push(offset_u16);
-                    } else {
-                        stamp_delete_int32_pair_header(
-                            src_bytes,
-                            offset,
-                            infomask_bits,
-                            &xid_bytes,
-                            &cmd_bytes,
-                        );
-                    }
+                    let offset_u16 = u16::try_from(offset)
+                        .map_err(|_| HeapError::MalformedHeader("tuple offset overflow"))?;
+                    stamp_offsets.push(offset_u16);
 
                     total_deleted += 1;
                     page_deleted = true;
@@ -1152,7 +1316,6 @@ impl<L: PageLoader> HeapAccess<L> {
 
             let mut guard_appended_lsn = None;
             if let Some(sink) = wal
-                && wal_appends_before_stamp
                 && !wal_scratch.is_empty()
             {
                 let prev_lsn = delete_prev_lsn.unwrap_or_else(|| sink.last_lsn_for(xid));
@@ -1187,7 +1350,15 @@ impl<L: PageLoader> HeapAccess<L> {
                 guard_appended_lsn = Some(lsn);
             }
 
-            if let Some(lsn) = guard_appended_lsn {
+            if page_deleted {
+                // Register abort cleanup and clear VM while the page is still
+                // write-locked, immediately before the infallible byte stamps.
+                // A coherent walker therefore cannot copy post-delete bytes
+                // while still trusting a stale all-visible bit.
+                self.remember_rollback_stamp_page(xid, src_page_id);
+                if let Some(vm) = vm {
+                    vm.clear(src_page_id.relation, src_page_id.block);
+                }
                 let src_bytes = src_page.as_bytes_mut();
                 for &offset in &stamp_offsets {
                     let offset = usize::from(offset);
@@ -1200,59 +1371,15 @@ impl<L: PageLoader> HeapAccess<L> {
                         &cmd_bytes,
                     );
                 }
-                src_page.set_lsn(lsn.raw());
+                if let Some(lsn) = guard_appended_lsn {
+                    src_page.set_lsn(lsn.raw());
+                }
                 wal_scratch.clear();
                 stamp_offsets.clear();
             }
 
             drop(src_page);
             drop(src_guard);
-
-            // Emit one WAL record for every stamped slot on this page with the
-            // page guard dropped when the sink can block.
-            if let Some(sink) = wal {
-                if !wal_scratch.is_empty() {
-                    let prev_lsn = delete_prev_lsn.unwrap_or_else(|| sink.last_lsn_for(xid));
-                    let lsn = match wal_scratch.view() {
-                        DeleteSlotWalView::Range {
-                            first_slot,
-                            slot_count,
-                        } => Self::emit_delete_in_place_range_batch_wal_reuse_after(
-                            &self.pool,
-                            sink,
-                            src_page_id,
-                            xid,
-                            command_id,
-                            first_slot,
-                            slot_count,
-                            &mut wal_payload_buf,
-                            prev_lsn,
-                        )?,
-                        DeleteSlotWalView::Sparse(slots) => {
-                            Self::emit_delete_in_place_batch_wal_reuse_after(
-                                &self.pool,
-                                sink,
-                                src_page_id,
-                                xid,
-                                command_id,
-                                slots,
-                                &mut wal_payload_buf,
-                                prev_lsn,
-                            )?
-                        }
-                        DeleteSlotWalView::Empty => continue,
-                    };
-                    delete_prev_lsn = Some(lsn);
-                    Self::stamp_page_lsn(&self.pool, src_page_id, lsn)?;
-                }
-                wal_scratch.clear();
-            }
-            if page_deleted && let Some(vm) = vm {
-                vm.clear(src_page_id.relation, src_page_id.block);
-            }
-            if page_deleted {
-                self.remember_rollback_stamp_page(xid, src_page_id);
-            }
         }
 
         if total_deleted > 0 {
@@ -1264,14 +1391,13 @@ impl<L: PageLoader> HeapAccess<L> {
 
     /// Parallel WAL-backed variant for large fused `(Int32, Int32)` DELETEs.
     ///
-    /// Each worker owns a disjoint block range. WAL appends are serialized so
-    /// `prev_lsn` remains a real per-transaction chain; page scans and tuple
-    /// stamping run in parallel. The method requires a nonblocking WAL sink;
-    /// each page mutation appends its compact page-local record while holding
-    /// the page write guard and stamps the page with the returned LSN. The
-    /// first post-checkpoint touch of a page logs a full page image first
-    /// (torn-page protection) through the same per-transaction chain mutex,
-    /// so the path stays correct across checkpoint cycles.
+    /// Each worker owns disjoint block ranges. The sink resolves the shared
+    /// `prev_lsn` link atomically with each append so the transaction keeps one
+    /// linear WAL chain while page scans and tuple stamping run in parallel.
+    /// The method requires a nonblocking WAL sink; each page mutation appends
+    /// its compact page-local record while holding the page write guard and
+    /// stamps the page with the returned LSN. The first post-checkpoint touch
+    /// logs a full page image first through the same linked append path.
     pub fn delete_int32_pair_inplace_parallel_wal<O, P>(
         &self,
         scan: DeleteInt32PairScan<'_, O, P>,
@@ -1294,6 +1420,7 @@ impl<L: PageLoader> HeapAccess<L> {
         if block_count < Self::PARALLEL_WAL_DELETE_MIN_BLOCKS
             || available_workers <= 1
             || !wal.appends_without_blocking_io()
+            || !wal.supports_concurrent_linked_appends()
         {
             return self.delete_int32_pair_inplace(
                 DeleteInt32PairScan {
@@ -1335,7 +1462,8 @@ impl<L: PageLoader> HeapAccess<L> {
 
         let predicate_ref = &predicate;
         let chain = std::sync::atomic::AtomicU64::new(wal.last_lsn_for(xid).raw());
-        let mut total_deleted = 0_usize;
+        let mut worker_outputs = Vec::with_capacity(workers);
+        let mut worker_panicked = false;
 
         // Work-stealing chunks instead of one equal slice per worker: on
         // asymmetric cores (performance + efficiency) an equal split gates
@@ -1351,47 +1479,60 @@ impl<L: PageLoader> HeapAccess<L> {
                     let chain = &chain;
                     let next_chunk = &next_chunk;
                     move || {
-                        let mut deleted = 0_usize;
-                        loop {
-                            let start_block = next_chunk
-                                .fetch_add(chunk_blocks, std::sync::atomic::Ordering::Relaxed);
-                            if start_block >= block_count {
-                                return Ok::<usize, HeapError>(deleted);
-                            }
-                            let end_block =
-                                start_block.saturating_add(chunk_blocks).min(block_count);
-                            deleted = checked_heap_count_add(
-                                deleted,
-                                self.delete_int32_pair_range_wal(DeleteInt32PairWalRange {
-                                    rel,
-                                    start_block,
-                                    end_block,
-                                    snapshot,
-                                    oracle,
-                                    predicate: predicate_ref,
-                                    xid,
-                                    command_id,
-                                    wal,
-                                    chain,
-                                    vm,
-                                })?,
-                                "deleted tuple count overflow",
-                            )?;
+                        let mut rollback_pages = Vec::with_capacity(blocks_per_worker);
+                        let deleted =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let mut deleted = 0_usize;
+                                loop {
+                                    let start_block = next_chunk.fetch_add(
+                                        chunk_blocks,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    if start_block >= block_count {
+                                        return Ok::<usize, HeapError>(deleted);
+                                    }
+                                    let end_block =
+                                        start_block.saturating_add(chunk_blocks).min(block_count);
+                                    deleted = checked_heap_count_add(
+                                        deleted,
+                                        self.delete_int32_pair_range_wal(
+                                            DeleteInt32PairWalRange {
+                                                rel,
+                                                start_block,
+                                                end_block,
+                                                snapshot,
+                                                oracle,
+                                                predicate: predicate_ref,
+                                                xid,
+                                                command_id,
+                                                wal,
+                                                chain,
+                                                vm,
+                                            },
+                                            &mut rollback_pages,
+                                        )?,
+                                        "deleted tuple count overflow",
+                                    )?;
+                                }
+                            }))
+                            .unwrap_or(Err(HeapError::ParallelWorkerPanic));
+                        ParallelDeleteWorkerOutput {
+                            deleted,
+                            rollback_pages,
                         }
                     }
                 }));
             }
 
             for handle in handles {
-                let deleted = handle.join().map_err(|_| {
-                    HeapError::MalformedHeader("parallel WAL delete worker panicked")
-                })??;
-                total_deleted =
-                    checked_heap_count_add(total_deleted, deleted, "deleted tuple count overflow")?;
+                match handle.join() {
+                    Ok(output) => worker_outputs.push(output),
+                    Err(_) => worker_panicked = true,
+                }
             }
-            Ok::<(), HeapError>(())
-        })?;
+        });
 
+        let total_deleted = self.finish_parallel_delete(xid, worker_outputs, worker_panicked)?;
         if total_deleted > 0 {
             self.column_cache.bump_version(rel, xid);
         }
@@ -1402,9 +1543,8 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Parallel no-WAL variant for large in-memory fused `(Int32, Int32)`
     /// DELETEs.
     ///
-    /// WAL-backed deletes stay sequential so per-transaction WAL chain ordering
-    /// remains unchanged. Without WAL, each worker owns a disjoint page range
-    /// and stamps matching visible tuples under the same MVCC rules as
+    /// Each worker owns a disjoint page range and stamps matching visible
+    /// tuples under the same MVCC rules as
     /// [`Self::delete_int32_pair_inplace`].
     pub fn delete_int32_pair_inplace_parallel_no_wal<O, P>(
         &self,
@@ -1465,7 +1605,8 @@ impl<L: PageLoader> HeapAccess<L> {
             u32::try_from(workers).map_err(|_| HeapError::MalformedHeader("worker overflow"))?;
         let chunk_blocks = block_count.div_ceil(workers_u32).max(1);
         let predicate_ref = &predicate;
-        let mut total_deleted = 0_usize;
+        let mut worker_outputs = Vec::with_capacity(workers);
+        let mut worker_panicked = false;
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
@@ -1473,31 +1614,41 @@ impl<L: PageLoader> HeapAccess<L> {
             while start_block < block_count {
                 let end_block = start_block.saturating_add(chunk_blocks).min(block_count);
                 handles.push(scope.spawn(move || {
-                    self.delete_int32_pair_range_no_wal(DeleteInt32PairRange {
-                        rel,
-                        start_block,
-                        end_block,
-                        snapshot,
-                        oracle,
-                        predicate: predicate_ref,
-                        xid,
-                        command_id,
-                        vm,
-                    })
+                    let mut rollback_pages = Vec::with_capacity(512);
+                    let deleted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.delete_int32_pair_range_no_wal(
+                            DeleteInt32PairRange {
+                                rel,
+                                start_block,
+                                end_block,
+                                snapshot,
+                                oracle,
+                                predicate: predicate_ref,
+                                xid,
+                                command_id,
+                                vm,
+                            },
+                            &mut rollback_pages,
+                        )
+                    }))
+                    .unwrap_or(Err(HeapError::ParallelWorkerPanic));
+                    ParallelDeleteWorkerOutput {
+                        deleted,
+                        rollback_pages,
+                    }
                 }));
                 start_block = end_block;
             }
 
             for handle in handles {
-                let deleted = handle
-                    .join()
-                    .map_err(|_| HeapError::MalformedHeader("parallel delete worker panicked"))??;
-                total_deleted =
-                    checked_heap_count_add(total_deleted, deleted, "deleted tuple count overflow")?;
+                match handle.join() {
+                    Ok(output) => worker_outputs.push(output),
+                    Err(_) => worker_panicked = true,
+                }
             }
-            Ok::<(), HeapError>(())
-        })?;
+        });
 
+        let total_deleted = self.finish_parallel_delete(xid, worker_outputs, worker_panicked)?;
         if total_deleted > 0 {
             self.column_cache.bump_version(rel, xid);
         }
@@ -1508,6 +1659,7 @@ impl<L: PageLoader> HeapAccess<L> {
     fn delete_int32_pair_range_wal<O, P>(
         &self,
         request: DeleteInt32PairWalRange<'_, O, P>,
+        rollback_pages: &mut Vec<PageId>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -1534,6 +1686,7 @@ impl<L: PageLoader> HeapAccess<L> {
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
         let vm = vm.filter(|vm| vm.contains_relation(rel));
+        let undo_log_handle = self.undo_log_handle(rel);
         let mut wal_scratch = DeleteSlotWalScratch::with_capacity(256);
         let mut wal_payload_buf = Vec::with_capacity(512);
         let mut stamp_offsets = Vec::with_capacity(256);
@@ -1550,8 +1703,8 @@ impl<L: PageLoader> HeapAccess<L> {
             // post-checkpoint touch of this page logs its full pre-mutation
             // image BEFORE the delta record, exactly like the sequential
             // path's maybe_emit_fpw. The exclusive guard is already held, so
-            // the image is read in place; the per-transaction chain mutex
-            // keeps the FPW's prev_lsn link linear across workers, and page
+            // the image is read in place; the sink resolves the shared
+            // transaction chain link atomically with the append, and page
             // ownership is disjoint per worker so no page can race its own
             // FPW. Appending under the page guard is deadlock-free (WAL
             // backpressure never takes page latches; see WalBuffer docs).
@@ -1635,11 +1788,26 @@ impl<L: PageLoader> HeapAccess<L> {
                             visibility
                         }
                     };
-                    if !matches!(visibility, Visibility::Visible) {
+                    let payload_off = offset + TUPLE_HEADER_SIZE;
+                    let payload_end = payload_off
+                        .checked_add(9)
+                        .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
+                    if payload_end > tuple_end {
+                        return Err(HeapError::MalformedHeader(
+                            "payload shorter than (Int32, Int32)",
+                        ));
+                    }
+                    if !delete_visibility_allows_current_mutation(
+                        visibility,
+                        &undo_log_handle,
+                        TupleId::new(src_page_id, src_slot),
+                        &src_bytes[payload_off..payload_end],
+                        (snapshot, oracle),
+                        predicate_plan,
+                        predicate,
+                    )? {
                         continue;
                     }
-
-                    let payload_off = offset + TUPLE_HEADER_SIZE;
                     if let Some(builder) = stats_builder.as_mut() {
                         let payload_end = payload_off
                             .checked_add(9)
@@ -1723,6 +1891,13 @@ impl<L: PageLoader> HeapAccess<L> {
                     DeleteSlotWalView::Empty => continue,
                 };
 
+                // All validation and the linked WAL append completed without
+                // mutating the page. Publish abort ownership and clear VM under
+                // the held write guard before the first header stamp.
+                rollback_pages.push(src_page_id);
+                if let Some(vm) = vm {
+                    vm.clear(src_page_id.relation, src_page_id.block);
+                }
                 let src_bytes = src_page.as_bytes_mut();
                 for &offset in &stamp_offsets {
                     let offset = usize::from(offset);
@@ -1741,12 +1916,7 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_page);
             drop(src_guard);
 
-            if page_deleted && let Some(vm) = vm {
-                vm.clear(src_page_id.relation, src_page_id.block);
-            }
-            if page_deleted {
-                self.remember_rollback_stamp_page(xid, src_page_id);
-            }
+            debug_assert_eq!(page_deleted, !stamp_offsets.is_empty());
         }
 
         Ok(total_deleted)
@@ -1755,6 +1925,7 @@ impl<L: PageLoader> HeapAccess<L> {
     fn delete_int32_pair_range_no_wal<O, P>(
         &self,
         request: DeleteInt32PairRange<'_, O, P>,
+        rollback_pages: &mut Vec<PageId>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -1779,9 +1950,12 @@ impl<L: PageLoader> HeapAccess<L> {
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
         let vm = vm.filter(|vm| vm.contains_relation(rel));
+        let undo_log_handle = self.undo_log_handle(rel);
+        let mut stamp_offsets = Vec::with_capacity(256);
         for src_block in start_block..end_block {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
             let mut page_deleted = false;
+            stamp_offsets.clear();
 
             let src_guard = self.get_page_relieved(src_page_id)?;
             let mut src_page = src_guard.write();
@@ -1829,11 +2003,26 @@ impl<L: PageLoader> HeapAccess<L> {
                         visibility
                     }
                 };
-                if !matches!(visibility, Visibility::Visible) {
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                let payload_end = payload_off
+                    .checked_add(9)
+                    .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
+                if payload_end > tuple_end {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                if !delete_visibility_allows_current_mutation(
+                    visibility,
+                    &undo_log_handle,
+                    TupleId::new(src_page_id, src_slot),
+                    &src_bytes[payload_off..payload_end],
+                    (snapshot, oracle),
+                    predicate_plan,
+                    predicate,
+                )? {
                     continue;
                 }
-
-                let payload_off = offset + TUPLE_HEADER_SIZE;
                 if !int32_pair_delete_predicate_matches_planned(
                     src_bytes,
                     payload_off,
@@ -1858,24 +2047,41 @@ impl<L: PageLoader> HeapAccess<L> {
                     ));
                 }
 
-                src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
-                src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
-                let new_infomask = infomask_bits | InfoMask::UPDATED;
-                src_bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
+                let offset_u16 = u16::try_from(offset)
+                    .map_err(|_| HeapError::MalformedHeader("tuple offset overflow"))?;
+                stamp_offsets.push(offset_u16);
+                page_deleted = true;
 
                 total_deleted += 1;
-                page_deleted = true;
+            }
+
+            if page_deleted {
+                // The full page scan completed, so no fallible predicate,
+                // visibility, conflict, or bounds work remains. Record abort
+                // ownership and clear VM under the write guard immediately
+                // before applying the proven-infallible stamps.
+                rollback_pages.push(src_page_id);
+                if let Some(vm) = vm {
+                    vm.clear(src_page_id.relation, src_page_id.block);
+                }
+                let src_bytes = src_page.as_bytes_mut();
+                for &offset in &stamp_offsets {
+                    let offset = usize::from(offset);
+                    let infomask_bits = read_u16_at(src_bytes, offset + 24);
+                    stamp_delete_int32_pair_header(
+                        src_bytes,
+                        offset,
+                        infomask_bits,
+                        &xid_bytes,
+                        &cmd_bytes,
+                    );
+                }
             }
 
             drop(src_page);
             drop(src_guard);
 
-            if page_deleted && let Some(vm) = vm {
-                vm.clear(src_page_id.relation, src_page_id.block);
-            }
-            if page_deleted {
-                self.remember_rollback_stamp_page(xid, src_page_id);
-            }
+            debug_assert_eq!(page_deleted, !stamp_offsets.is_empty());
         }
 
         Ok(total_deleted)
@@ -1903,25 +2109,66 @@ impl<L: PageLoader> HeapAccess<L> {
         tid: TupleId,
         xmax: Xid,
         cmax: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<(), HeapError> {
-        {
-            let mut page = guard.write();
-            let bytes = page.read_tuple(tid.slot)?;
-            if bytes.len() < TUPLE_HEADER_SIZE {
-                return Err(HeapError::MalformedHeader("slot shorter than header"));
-            }
-            let (mut header, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
-                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-            header.mark_deleted(xmax, cmax);
-            let header_bytes = Self::collect_header_bytes(&header);
+        let mut page = guard.write();
+        Self::delete_in_place_locked(&mut page, tid, xmax, cmax, vm)
+    }
 
-            let page_bytes = page.as_bytes_mut();
-            let (slot_offset, slot_length) = Self::slot_window(page_bytes, tid.slot)?;
-            if slot_length < TUPLE_HEADER_SIZE {
-                return Err(HeapError::MalformedHeader("slot shorter than header"));
-            }
-            page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+    /// Header-only fast path when the caller has no visibility map.
+    ///
+    /// Keeping the no-VM path branch-free matters for embedded and benchmark
+    /// workloads that stamp rows one at a time. It has the same mutation
+    /// contract as [`Self::delete_in_place`], minus the VM-clear operation
+    /// that cannot apply when no map was supplied.
+    #[inline]
+    fn delete_in_place_no_vm(
+        guard: &PageGuard<L>,
+        tid: TupleId,
+        xmax: Xid,
+        cmax: CommandId,
+    ) -> Result<(), HeapError> {
+        let mut page = guard.write();
+        let page_bytes = page.as_bytes_mut();
+        let (slot_offset, slot_length) = Self::slot_window(page_bytes, tid.slot)?;
+        if slot_length < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("slot shorter than header"));
         }
+        let header_end = slot_offset + TUPLE_HEADER_SIZE;
+        let (mut header, _) = TupleHeader::decode(&page_bytes[slot_offset..header_end])
+            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+        header.mark_deleted(xmax, cmax);
+        let header_bytes = Self::collect_header_bytes(&header);
+        page_bytes[slot_offset..header_end].copy_from_slice(&header_bytes);
+        Ok(())
+    }
+
+    fn delete_in_place_locked(
+        page: &mut PageWrite<'_>,
+        tid: TupleId,
+        xmax: Xid,
+        cmax: CommandId,
+        vm: Option<&crate::vm::VisibilityMap>,
+    ) -> Result<(), HeapError> {
+        let page_bytes = page.as_bytes_mut();
+        let (slot_offset, slot_length) = Self::slot_window(page_bytes, tid.slot)?;
+        if slot_length < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("slot shorter than header"));
+        }
+        let header_end = slot_offset + TUPLE_HEADER_SIZE;
+        let (mut header, _) = TupleHeader::decode(&page_bytes[slot_offset..header_end])
+            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+        header.mark_deleted(xmax, cmax);
+        let header_bytes = Self::collect_header_bytes(&header);
+
+        // This is the first externally observable state change. Keep it under
+        // the same exclusive page latch as the header copy so a coherent
+        // walker can see either old bytes + all-visible or new bytes + VM
+        // clear, never new bytes + stale all-visible.
+        if let Some(vm) = vm {
+            vm.clear(tid.page.relation, tid.page.block);
+        }
+        page_bytes[slot_offset..header_end].copy_from_slice(&header_bytes);
         Ok(())
     }
 }

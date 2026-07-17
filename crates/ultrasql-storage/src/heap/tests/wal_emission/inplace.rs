@@ -174,12 +174,12 @@ fn inplace_int32_delete_keeps_sparse_batch_record() {
 fn parallel_wal_backed_int32_delete_preserves_wal_chain() {
     let (heap, sink) = make_heap_with_sink(512);
     let mut inserted = 0_i32;
-    while heap.block_count(rel()) < 140 {
+    while heap.block_count(rel()) < 300 {
         heap.insert(rel(), &int32_pair_payload(inserted, inserted), opts(10))
             .unwrap();
         inserted += 1;
     }
-    let block_count = heap.block_count(rel());
+    let populated_block_count = heap.block_count(rel());
 
     let oracle = MapOracle::new();
     oracle.set_committed(Xid::new(10));
@@ -194,7 +194,10 @@ fn parallel_wal_backed_int32_delete_preserves_wal_chain() {
         .delete_int32_pair_inplace_parallel_wal(
             DeleteInt32PairScan {
                 rel: rel(),
-                block_count,
+                // Both 256-block chunks contain rows, so multi-core hosts
+                // exercise concurrent linked appends instead of assigning all
+                // WAL-producing work to the first chunk.
+                block_count: 512,
                 snapshot: &snapshot,
                 oracle: &oracle,
                 predicate: |_id, _val| true,
@@ -210,7 +213,10 @@ fn parallel_wal_backed_int32_delete_preserves_wal_chain() {
 
     assert_eq!(deleted, usize::try_from(inserted).unwrap());
     let records = sink.records();
-    assert_eq!(records.len(), usize::try_from(block_count).unwrap());
+    assert_eq!(
+        records.len(),
+        usize::try_from(populated_block_count).unwrap()
+    );
     let mut prev_lsn = Lsn::ZERO;
     for (lsn, record) in records {
         assert_eq!(record.header.prev_lsn, prev_lsn);
@@ -220,6 +226,243 @@ fn parallel_wal_backed_int32_delete_preserves_wal_chain() {
         );
         prev_lsn = lsn;
     }
+    assert_eq!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap(),
+        deleted
+    );
+}
+
+#[test]
+fn parallel_wal_backed_dense_int32_update_rolls_back_exactly() {
+    let (heap, sink) = make_heap_with_sink(512);
+    let mut tids = Vec::new();
+    let mut inserted = 0_i32;
+    while heap.block_count(rel()) < 300 {
+        tids.push(
+            heap.insert(
+                rel(),
+                &int32_pair_payload(inserted, inserted * 10),
+                opts(10),
+            )
+            .unwrap(),
+        );
+        inserted += 1;
+    }
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo_parallel_wal(
+            UpdateInt32PairScan {
+                rel: rel(),
+                // Two work chunks select the parallel implementation on
+                // multi-core hosts while blank tail pages remain valid.
+                block_count: 512,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: |_id, _val| true,
+            },
+            UpdateInt32PairEdit {
+                target_col: 1,
+                delta: 7,
+            },
+            UpdateInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            sink.as_ref(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, usize::try_from(inserted).unwrap());
+    for &index in &[0, tids.len() / 2, tids.len() - 1] {
+        let id = i32::try_from(index).unwrap();
+        assert_eq!(
+            heap.fetch(tids[index]).unwrap().data,
+            int32_pair_payload(id, id * 10 + 7)
+        );
+    }
+
+    assert_eq!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap(),
+        updated
+    );
+    for &index in &[0, tids.len() / 2, tids.len() - 1] {
+        let id = i32::try_from(index).unwrap();
+        assert_eq!(
+            heap.fetch(tids[index]).unwrap().data,
+            int32_pair_payload(id, id * 10)
+        );
+    }
+}
+
+#[test]
+fn parallel_wal_update_error_preserves_completed_undo_for_rollback() {
+    if std::thread::available_parallelism().map_or(1, |workers| workers.get()) <= 1 {
+        return;
+    }
+
+    let (heap, sink) = make_heap_with_sink(512);
+    let mut inserted = 0_i32;
+    let mut original_rows = Vec::new();
+    let mut overflow_tid = None;
+    while heap.block_count(rel()) < 270 {
+        let inject_overflow = overflow_tid.is_none() && heap.block_count(rel()) >= 264;
+        let value = if inject_overflow {
+            i32::MAX
+        } else {
+            inserted * 10
+        };
+        let tid = heap
+            .insert(rel(), &int32_pair_payload(inserted, value), opts(10))
+            .unwrap();
+        if inject_overflow {
+            assert!(
+                tid.page.block.raw() >= 256,
+                "overflow row must land in the second worker chunk"
+            );
+            overflow_tid = Some(tid);
+        }
+        original_rows.push((tid, inserted, value));
+        inserted += 1;
+    }
+    assert!(overflow_tid.is_some());
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let error = heap
+        .update_int32_pair_inplace_undo_parallel_wal(
+            UpdateInt32PairScan {
+                rel: rel(),
+                block_count: 512,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: |_id, _val| true,
+            },
+            UpdateInt32PairEdit {
+                target_col: 1,
+                delta: 1,
+            },
+            UpdateInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            sink.as_ref(),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::heap::HeapError::NumericOverflow(_)),
+        "the worker's original numeric error must be preserved: {error:?}"
+    );
+    assert!(
+        heap.int32_pair_undo_batch_len(rel()) > 0,
+        "completed pages from both workers must reach the global undo log"
+    );
+
+    assert!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap() > 0,
+        "the failed statement must have completed mutations to restore"
+    );
+    for (tid, id, value) in original_rows {
+        assert_eq!(
+            heap.fetch(tid).unwrap().data,
+            int32_pair_payload(id, value),
+            "rollback must restore every row after a late worker error"
+        );
+    }
+}
+
+#[test]
+fn parallel_wal_update_panic_preserves_earlier_page_undo() {
+    if std::thread::available_parallelism().map_or(1, |workers| workers.get()) <= 1 {
+        return;
+    }
+
+    let (heap, sink) = make_heap_with_sink(512);
+    let mut first_page_rows = Vec::new();
+    let mut row_id = 0_i32;
+    let (panic_id, second_page_tid) = loop {
+        let tid = heap
+            .insert(rel(), &int32_pair_payload(row_id, row_id * 10), opts(10))
+            .unwrap();
+        if tid.page.block == BlockNumber::new(0) {
+            first_page_rows.push((tid, row_id));
+            row_id += 1;
+            continue;
+        }
+        break (row_id, tid);
+    };
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let error = heap
+        .update_int32_pair_inplace_undo_parallel_wal(
+            UpdateInt32PairScan {
+                rel: rel(),
+                block_count: 512,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: move |id, _val| {
+                    assert_ne!(id, panic_id, "injected parallel WAL update panic");
+                    true
+                },
+            },
+            UpdateInt32PairEdit {
+                target_col: 1,
+                delta: 1,
+            },
+            UpdateInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            sink.as_ref(),
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, crate::heap::HeapError::ParallelWorkerPanic));
+    assert_eq!(
+        heap.int32_pair_undo_batch_len(rel()),
+        1,
+        "the page completed before the panic must reach the global undo log"
+    );
+
+    assert_eq!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap(),
+        first_page_rows.len()
+    );
+    for (tid, id) in first_page_rows {
+        assert_eq!(
+            heap.fetch(tid).unwrap().data,
+            int32_pair_payload(id, id * 10)
+        );
+    }
+    assert_eq!(
+        heap.fetch(second_page_tid).unwrap().data,
+        int32_pair_payload(panic_id, panic_id * 10)
+    );
 }
 
 #[test]

@@ -4,8 +4,8 @@
 //! the fsync writer. Writers append serialized records; a dedicated
 //! flusher thread drains the buffer in LSN order, writes the bytes to
 //! the on-disk segment, and fsyncs. Once the flusher publishes a new
-//! `durable_lsn` value, every writer whose commit record's LSN is
-//! `<= durable_lsn` is unblocked.
+//! `durable_lsn` end boundary, every writer whose commit record starts
+//! strictly below that boundary is unblocked.
 //!
 //! This module provides the in-memory primitive only — segment file
 //! I/O and the flusher thread will land in a follow-up that bolts on
@@ -240,8 +240,11 @@ impl WalBuffer {
         }
     }
 
-    /// LSN that the flusher has committed durably. Visible to every
-    /// other thread via acquire ordering.
+    /// Exclusive end boundary of the WAL prefix committed durably.
+    ///
+    /// Record LSNs are start positions, so a record is durable only when its
+    /// LSN is strictly below this boundary. Visible to every other thread via
+    /// acquire ordering.
     #[must_use]
     pub fn durable_lsn(&self) -> Lsn {
         Lsn::new(self.durable_lsn.load(Ordering::Acquire))
@@ -433,9 +436,9 @@ impl WalBuffer {
         })
     }
 
-    /// Record that the flusher has made all bytes up to and including
-    /// `lsn` durable on disk. Subsequent calls to [`Self::durable_lsn`]
-    /// observe this value under acquire ordering.
+    /// Record that the flusher has made every byte strictly before `lsn`
+    /// durable on disk. Subsequent calls to [`Self::durable_lsn`] observe this
+    /// exclusive end boundary under acquire ordering.
     ///
     /// `lsn` must monotonically increase across calls; callers that
     /// violate this invariant invoke a debug-build panic.

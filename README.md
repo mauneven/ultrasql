@@ -43,15 +43,14 @@ recall-vs-latency versus pgvector / Qdrant / LanceDB, and
 filtered ANN and competitive recall benchmarks are tracked there with measurable
 exit conditions).
 
-This is not a "fastest at everything" claim. UltraSQL leads 21 of 24 measured
-workloads on the pinned host — every INSERT, every aggregate (with its result
-cache disabled), every scan, the window, and every 10k/100k mutation row — and
-the scoreboard below reports all three losses honestly: the 1M bulk DELETE to
-ClickHouse and the 1M bulk UPDATE to DuckDB (columnar engines rewrite chunks;
-UltraSQL stamps per-row MVCC headers durably), and point-op Mixed OLTP, where
-UltraSQL's per-statement wire cost puts it third behind in-process SQLite and
-PostgreSQL — the honest weak spot. The 1M sequential scan is a run-to-run
-near-tie with ClickHouse (~2%).
+This is not a universal performance claim. In the one committed scale sweep
+pinned to `a6a97af1`, UltraSQL has the lowest median in 21 of 24 rows — every
+INSERT, every aggregate (with its result cache disabled), every scan, the
+window, and every 10k/100k mutation row. The same artifact reports all three
+losses: 1M bulk DELETE to ClickHouse, 1M bulk UPDATE to DuckDB, and point-op
+Mixed OLTP to in-process SQLite (with PostgreSQL second). The 1M sequential
+scan differs from ClickHouse by about 2% in that sweep; one run does not
+establish repeat-run parity.
 
 The project is alpha: the engine is broad enough for serious evaluation,
 compatibility testing, and reproducible benchmarking, but release readiness is
@@ -79,8 +78,8 @@ close before v1.0 or production use.
 
 UltraSQL publishes benchmark claims only from committed scripts and raw
 artifacts. The release-artifact table below is DB-vs-DB: installed engines on
-the same host, raw measurements, per-row fastest engine, and slower percentage
-for every other measured engine.
+the same host, raw measurements, the per-row lowest median, and the slower
+percentage for every other measured engine.
 
 That is a workload-specific artifact claim, not a blanket promise. If a number
 is not reproducible from `benchmarks/` on a recorded host, it does not belong in
@@ -98,49 +97,60 @@ python3 scripts/run-benchmark-certification.py --mode full
 Raw benchmark data lives under
 [`benchmarks/results/latest/`](benchmarks/results/latest/). Methodology lives in
 [`BENCHMARKS.md`](BENCHMARKS.md).
-Beta scope, quickstart, and honest limitations: [`BETA_READINESS.md`](BETA_READINESS.md).
+Alpha scope, quickstart, and the public-beta readiness assessment:
+[`BETA_READINESS.md`](BETA_READINESS.md).
 
-## Release-Artifact DB-vs-DB Benchmark
+## Release-Artifact End-to-End Benchmark
 
-Median of three fresh data-dir (WAL-backed) full sweeps (2026-07-02), pinned to
+One committed data-dir (WAL-backed) full sweep (2026-07-02), pinned to artifact
 commit `a6a97af1`:
 `PGHOST=127.0.0.1 PGPORT=55417 PGUSER=$(id -un) PGDATABASE=ultrasql_bench CH_BIN="$(command -v clickhouse)" SCALE_SWEEP_ROWS="10000 100000 1000000" SCALE_SWEEP_STORAGE=data-dir ULTRASQLD_BIN=target/release-ship/ultrasqld benchmarks/run_scale_sweep.sh full`,
 with a tuned PostgreSQL 17 cluster from `benchmarks/scripts/pg17_bench_server.sh start`.
 UltraSQL v0.1.0 (external `ultrasqld` over TCP) was measured on the same Apple
 M4 host as installed DuckDB v1.5.2, ClickHouse 26.5.2.39, SQLite 3.51.0, and
-**PostgreSQL 17.10** (Homebrew). Every engine is measured over a single
-persistent connection/session with prepared statements; no timed region spawns
-a client process per query, warmups are symmetric across engines, and
-UltraSQL runs with its result-replay cache **disabled**
+**PostgreSQL 17.10** (Homebrew). UltraSQL and PostgreSQL use external wire
+servers, SQLite and DuckDB use embedded Python drivers, and ClickHouse uses its
+native TCP driver. Connection/process reuse, physical schemas, bulk APIs,
+result draining, and effective warmup differ by workload; ClickHouse also runs
+with `fsync_after_insert=0`. UltraSQL runs with its result-replay cache
+**disabled**
 (`ULTRASQL_RESULT_CACHE=off`) so aggregate/scan rows measure real compute (see
-the Methodology & Fairness note in [BENCHMARKS.md](BENCHMARKS.md)). Each row
-uses 32 measured samples after 8 warmup samples; lower is better; bold marks
-the fastest *measured* engine. The published table is a single contention-free
-run whose per-row winners equal the per-row median across all three runs; the
-committed raw samples under `benchmarks/results/latest/scale-sweep/raw/` are
-that run's.
+the disclosed implementation differences in [BENCHMARKS.md](BENCHMARKS.md)).
+The sweep requests 8 warmups and records 32 measured samples, but a manifest
+warmup value does not prove that every competitor runner consumed it. Lower is
+better; bold marks the lowest median among available implementations for that
+exact row and host. The table and raw samples under
+`benchmarks/results/latest/scale-sweep/raw/` describe this one committed
+contention-free sweep; no median-across-sweeps or two-of-three stability claim
+is made.
 
-**UltraSQL is the fastest measured engine in 21 of 24 workloads on this host; all three losses are reported below.** This is an honest scoreboard, not a
-clean sweep. UltraSQL leads every INSERT row (including the durable 1M-row
-bulk load, ~2× SQLite and PostgreSQL), every aggregate (SUM/AVG/Filter+SUM,
-**cache disabled** — the executor is genuinely fast, and unlike a result-cache
-replay these medians scale with row count), all three sequential scans, the
-windowed scan, mixed correctness, and every 10k/100k UPDATE and DELETE. The
-three losses are reported, not hidden:
+The artifact records UltraSQL as the lowest-median implementation in 21 of 24
+rows on this host. It records the lowest median for every INSERT, aggregate
+(SUM/AVG/Filter+SUM, **cache disabled**), sequential scan, the windowed scan,
+mixed correctness, and every 10k/100k UPDATE and DELETE row. The three losses
+are reported in the same table:
 
 - **1M bulk UPDATE** → DuckDB (19% slower) and **1M bulk DELETE** →
-  ClickHouse (32% slower): columnar engines rewrite chunks while UltraSQL
-  stamps per-row MVCC headers at full WAL durability.
+  ClickHouse (32% slower): the recorded columnar implementations rewrite
+  chunks while UltraSQL's row-store path stamps per-row MVCC headers. For these
+  mutation rows, the timer covers the UPDATE or DELETE statement inside a
+  transaction; the outer `ROLLBACK` is outside the timer, so the values are not
+  commit/fsync latency measurements. Durability settings are also not
+  identical; see [BENCHMARKS.md](BENCHMARKS.md).
 - **Point-op Mixed OLTP** → in-process SQLite (16.30 µs/op), with PostgreSQL
   second (34.20 µs/op) and UltraSQL third (130.19 µs/op). This is UltraSQL's
   real per-statement wire+dispatch cost with one operation per round trip and
-  no batching — the honest weak spot, tracked in [TODO.md](TODO.md).
+  no batching. SQLite's number is an embedded driver call with no network
+  round trip, so this row is an end-to-end implementation comparison, not an
+  isolated engine-operator ranking; it is tracked in [TODO.md](TODO.md).
 
-The 1M sequential scan is a near-tie — UltraSQL (59.92 ms) and ClickHouse
-(61.15 ms) trade the win run-to-run within ~2%, so treat it as parity, not a
-decisive lead. The benchmark-certification gate certifies *fair methodology*
-and reports per-row wins and losses as a scoreboard rather than demanding a
-clean sweep; `benchmark_certification_status.json` is `ready` for this commit.
+The 1M sequential-scan medians in this sweep are UltraSQL 59.92 ms and
+ClickHouse 61.15 ms, a 2.1% difference; repeat-run stability has not been
+established. The benchmark-certification gate certifies artifact integrity,
+raw/rendered consistency, and provenance—not symmetric or fair methodology—and
+reports per-row wins and losses as a scoreboard rather than demanding a clean
+sweep. `benchmark_certification_status.json` is `ready` for pinned artifact
+commit `a6a97af1`; that does not make the aggregate release gate ready.
 
 | Workload | Rows | UltraSQL | DuckDB | ClickHouse | SQLite | PostgreSQL | Fastest |
 |---|---:|---:|---:|---:|---:|---:|---|

@@ -248,6 +248,44 @@ impl Transaction {
         self.current_xid()
     }
 
+    /// Return every XID that may own a physical heap write in this transaction.
+    ///
+    /// The family contains the top-level [`Self::xid`], live savepoint XIDs,
+    /// released (merged-up) savepoint XIDs, and savepoint XIDs already marked
+    /// rolled back. The last group matters for retryable cleanup: a
+    /// `ROLLBACK TO SAVEPOINT` can update CLOG before physical heap undo
+    /// reports an error, so the eventual top-level abort must retry those
+    /// pre-images too.
+    ///
+    /// The result is sorted and deduplicated. Abort callers must capture it
+    /// while they still own the [`Transaction`] handle, then physically undo
+    /// each member before terminating the family in CLOG.
+    #[must_use]
+    pub fn abort_write_xid_family(&self) -> Vec<Xid> {
+        let mut family = vec![self.xid];
+        family.extend(self.subtxn_stack.live_stack_subxids());
+        family.extend(self.subtxn_stack.merged_up_subxids());
+        family.extend(self.subtxn_stack.rolled_back_subxids());
+        family.sort_unstable();
+        family.dedup();
+        family
+    }
+
+    /// Return the savepoint XIDs that commit with this transaction.
+    ///
+    /// The family contains released (merged-up) and still-live savepoint XIDs;
+    /// `ROLLBACK TO`-aborted members and the top-level [`Self::xid`] are
+    /// excluded. The result is sorted and deduplicated for stable WAL and
+    /// prepared-state encoding.
+    #[must_use]
+    pub fn committed_subxid_family(&self) -> Vec<Xid> {
+        let mut family = self.subtxn_stack.merged_up_subxids();
+        family.extend(self.subtxn_stack.live_stack_subxids());
+        family.sort_unstable();
+        family.dedup();
+        family
+    }
+
     /// Debug-only invariant check for a heap stamp site.
     ///
     /// Asserts that `stamped` is the XID `write_xid()` would have
@@ -785,11 +823,7 @@ impl TransactionManager {
     /// released by PostgreSQL, which we model here by treating the live
     /// stack as merged-up too.
     fn merged_up_family(&self, txn: &Transaction) -> Vec<Xid> {
-        let mut family = txn.subtxn_stack.merged_up_subxids();
-        family.extend(txn.subtxn_stack.live_stack_subxids());
-        family.sort_unstable();
-        family.dedup();
-        family
+        txn.committed_subxid_family()
     }
 
     /// The subxid family folded into a parent **abort**: live stack +
@@ -1224,7 +1258,7 @@ impl TransactionManager {
 
     // ---- 2PC helper --------------------------------------------------------
 
-    /// Consume `txn` into the two-phase-commit coordinator.
+    /// Register `txn` with the two-phase-commit coordinator.
     ///
     /// Records the XID under `gid` in `coordinator`, leaving the XID in the
     /// CLOG as `InProgress` until the coordinator resolves it with
@@ -1242,27 +1276,24 @@ impl TransactionManager {
     /// This reuses `merged_up_family` — the same set single-phase commit
     /// folds.
     ///
-    /// The `Transaction` handle is consumed so it cannot be double-committed
-    /// via the normal path.
+    /// The caller retains the [`Transaction`] handle until this function
+    /// succeeds. It must drop the handle after success; on failure it can still
+    /// physically roll back and abort the full family without reconstructing
+    /// savepoint state.
     ///
     /// Returns [`crate::two_phase::TwoPhaseError`] if the GID is a duplicate
     /// or if state-file I/O fails.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "by-value enforces the at-most-once lifecycle invariant: prepare consumes the Transaction handle"
-    )]
     pub fn prepare_transaction(
         &self,
         gid: &str,
-        txn: Transaction,
+        txn: &Transaction,
         coordinator: &crate::two_phase::TwoPhaseCoordinator,
     ) -> Result<(), crate::two_phase::TwoPhaseError> {
-        // Capture the committed-subxid family BEFORE `txn` (and its savepoint
-        // stack) is dropped — the same family single-phase COMMIT folds.
-        let committed_subxids = self.merged_up_family(&txn);
+        // Capture the same family single-phase COMMIT folds. The caller keeps
+        // `txn` alive until coordinator persistence succeeds so a failure can
+        // still drive a complete physical+CLOG abort.
+        let committed_subxids = self.merged_up_family(txn);
         coordinator.prepare(gid, txn.xid, &committed_subxids)
-        // `txn` is dropped here; the CLOG entry remains `InProgress` until
-        // the coordinator resolves via `commit_prepared` / `rollback_prepared`.
     }
 
     /// Finalise a previously-prepared transaction by stamping its
@@ -2293,7 +2324,11 @@ mod tests {
 
         // ROLLBACK TO outer: the cutoff is outer.xid; inner.xid >= cutoff,
         // so the merged-up inner must be pruned into rolled-back.
-        mgr.rollback_to_savepoint(&mut t, "outer").unwrap();
+        let aborted = mgr.rollback_to_savepoint(&mut t, "outer").unwrap();
+        assert!(
+            aborted.contains(&inner.xid),
+            "the caller must physically undo the pruned RELEASEd subxid"
+        );
         assert_eq!(mgr.status(inner.xid), XidStatus::Aborted);
         assert_eq!(mgr.status(outer.xid), XidStatus::Aborted);
         assert!(t.snapshot.own_subxid_rolled_back(inner.xid));
@@ -2349,6 +2384,40 @@ mod tests {
             );
             assert!(!mgr.is_in_progress(sub));
         }
+    }
+
+    #[test]
+    fn abort_write_xid_family_covers_live_released_and_rolled_back_members() {
+        let mgr = TransactionManager::new();
+        let mut txn = mgr.begin(IsolationLevel::ReadCommitted);
+        let parent = txn.xid;
+
+        let rolled_back = mgr.begin_savepoint(&mut txn, "rolled_back");
+        mgr.rollback_to_savepoint(&mut txn, "rolled_back")
+            .expect("rollback target");
+        let replacement_live = txn.write_xid();
+
+        let released = mgr.begin_savepoint(&mut txn, "released");
+        mgr.release_savepoint(&mut txn, "released")
+            .expect("release savepoint");
+
+        let final_live = mgr.begin_savepoint(&mut txn, "live");
+        assert_eq!(
+            txn.committed_subxid_family(),
+            vec![replacement_live, released.xid, final_live.xid]
+        );
+        let family = txn.abort_write_xid_family();
+
+        assert_eq!(
+            family,
+            vec![
+                parent,
+                rolled_back.xid,
+                replacement_live,
+                released.xid,
+                final_live.xid,
+            ]
+        );
     }
 
     #[test]

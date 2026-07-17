@@ -187,7 +187,9 @@ where
                 // transaction. Order: data WAL durable -> state file durable
                 // (inside prepare_transaction) -> ack PREPARE (returning Ok).
                 let xid = txn.xid;
-                if let Err(e) = self.state.wait_for_txn_data_wal_durable(xid) {
+                let committed_subxids = txn.committed_subxid_family();
+                let wal_family = std::iter::once(xid).chain(committed_subxids.iter().copied());
+                if let Err(e) = self.state.wait_for_txn_data_wal_family_durable(wal_family) {
                     // The txn's data WAL is not durable: do NOT prepare/ack.
                     // Roll the txn back (releasing its locks) and surface the
                     // durability error so the coordinator never sees it as
@@ -204,11 +206,24 @@ where
                 }
                 if let Err(e) = self.state.txn_manager.prepare_transaction(
                     gid,
-                    txn,
+                    &txn,
                     self.state.two_phase.as_ref(),
                 ) {
-                    return Err(ServerError::Ddl(format!("prepare_transaction({gid}): {e}")));
+                    let original = ServerError::Ddl(format!("prepare_transaction({gid}): {e}"));
+                    let err = self.rollback_transaction_after_error_with_abort_marker(
+                        txn,
+                        original,
+                        "PREPARE TRANSACTION rollback after coordinator persistence failure",
+                        true,
+                    );
+                    self.discard_pending_catalog_ddl();
+                    self.clear_pending_dml_effects();
+                    return Err(err);
                 }
+                // The coordinator now owns the durable resolution state. Drop
+                // the live handle without terminating CLOG; phase 2 resolves
+                // the parent and recorded savepoint family.
+                drop(txn);
                 // Prepared transactions leave this session's state.
                 // Keep local modification counters from leaking into
                 // subsequent unrelated transactions on this connection.
@@ -228,7 +243,8 @@ where
                     .workload_recorder
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
-                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                let abort_family = txn.abort_write_xid_family();
+                if let Err(e) = self.state.rollback_in_place_update_family(abort_family) {
                     self.txn_state = TxnState::Failed(txn);
                     return Err(ServerError::Ddl(format!(
                         "PREPARE TRANSACTION rollback in-place updates: {e}"
@@ -365,42 +381,63 @@ where
             .begin_resolution(gid)
             .map_err(|e| ServerError::Ddl(format!("rollback_prepared({gid}): {e}")))?;
         let xid = prepared.xid;
-        let result = (|| -> Result<(), ServerError> {
-            self.state
-                .txn_manager
-                .validate_prepared(xid)
-                .map_err(|e| ServerError::Ddl(format!("validate_prepared({gid}): {e}")))?;
-            self.state
-                .heap
-                .rollback_in_place_updates(xid)
-                .map_err(|e| {
-                    ServerError::Ddl(format!("rollback prepared in-place updates({gid}): {e}"))
-                })?;
-            if let Some(abort_lsn) = self.state.append_abort_record(xid)? {
-                self.state.wait_for_wal_durable(abort_lsn)?;
-            }
-            // A rolled-back prepared transaction's savepoint family is aborted:
-            // it appears in no committed list, so recovery's default-abort sweep
-            // discards their rows durably. Force-abort the family in memory too
-            // so the same live process agrees with that durable outcome — in the
-            // same-process happy path (no restart) the subxids are still
-            // InProgress and must be folded to Aborted; after a prepare-restart
-            // they are already Aborted and force-abort is idempotent.
-            let family = prepared.committed_subxids.clone();
-            self.state
-                .txn_manager
-                .finalise_prepared(xid, &family, ultrasql_mvcc::XidStatus::Aborted)
-                .map_err(|e| ServerError::Ddl(format!("finalise_prepared({gid} aborted): {e}")))?;
-            Ok(())
-        })();
-        if let Err(err) = result {
+        if let Err(error) = self.state.txn_manager.validate_prepared(xid) {
             self.state.two_phase.abort_resolution(&prepared);
-            return Err(err);
+            return Err(ServerError::Ddl(format!(
+                "validate_prepared({gid}): {error}"
+            )));
         }
-        self.state
-            .two_phase
-            .finish_resolution(&prepared)
-            .map_err(|e| ServerError::Ddl(format!("rollback_prepared({gid}): {e}")))?;
+
+        // Persist the phase-2 ABORT decision before destroying any page
+        // pre-image. Until append succeeds it is safe to leave the transaction
+        // in doubt and committable. Once the record enters the WAL pipeline,
+        // failure is fatal/ambiguous: recovery must decide and finish cleanup;
+        // this process must never return the GID to a COMMIT-capable state.
+        let abort_lsn = match self.state.append_abort_record(xid) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.state.two_phase.abort_resolution(&prepared);
+                return Err(error);
+            }
+        };
+        if let Some(abort_lsn) = abort_lsn
+            && let CommitDurability::Fatal(reason) =
+                self.state.resolve_commit_durability_after_append(abort_lsn)
+        {
+            self.state
+                .fatal_commit_durability_failure(xid, "ROLLBACK PREPARED", &reason);
+        }
+
+        let family = std::iter::once(xid).chain(prepared.committed_subxids.iter().copied());
+        if let Err(error) = self.state.rollback_in_place_update_family(family) {
+            self.state.fatal_commit_durability_failure(
+                xid,
+                "ROLLBACK PREPARED cleanup",
+                &error.to_string(),
+            );
+        }
+        // A rolled-back prepared transaction's savepoint family is aborted:
+        // it appears in no committed list, so recovery's default-abort sweep
+        // discards their rows durably. Force-abort the family in memory too
+        // so the same live process agrees with that durable outcome.
+        if let Err(error) = self.state.txn_manager.finalise_prepared(
+            xid,
+            &prepared.committed_subxids,
+            ultrasql_mvcc::XidStatus::Aborted,
+        ) {
+            self.state.fatal_commit_durability_failure(
+                xid,
+                "ROLLBACK PREPARED CLOG finalize",
+                &error.to_string(),
+            );
+        }
+        if let Err(error) = self.state.two_phase.finish_resolution(&prepared) {
+            self.state.fatal_commit_durability_failure(
+                xid,
+                "ROLLBACK PREPARED state cleanup",
+                &error.to_string(),
+            );
+        }
         Ok(SelectResult {
             messages: vec![BackendMessage::CommandComplete {
                 tag: "ROLLBACK PREPARED".to_string(),
@@ -639,7 +676,8 @@ where
                     .workload_recorder
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
-                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                let abort_family = txn.abort_write_xid_family();
+                if let Err(e) = self.state.rollback_in_place_update_family(abort_family) {
                     self.txn_state = TxnState::Failed(txn);
                     return Err(ServerError::Ddl(format!(
                         "explicit COMMIT rollback in-place updates: {e}"
@@ -702,7 +740,8 @@ where
                     .workload_recorder
                     .clear_session_transaction_start(self.pid);
                 let xid = txn.xid;
-                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                let abort_family = txn.abort_write_xid_family();
+                if let Err(e) = self.state.rollback_in_place_update_family(abort_family) {
                     self.txn_state = TxnState::Failed(txn);
                     return Err(ServerError::Ddl(format!(
                         "explicit ROLLBACK in-place updates: {e}"
@@ -944,6 +983,7 @@ mod tests {
 
     use super::*;
     use tokio::io::{DuplexStream, duplex};
+    use ultrasql_mvcc::XidStatusOracle;
 
     use crate::Server;
 
@@ -963,6 +1003,130 @@ mod tests {
             panic!("missing command tag");
         };
         tag
+    }
+
+    fn int32_pair_payload(id: i32, value: i32) -> [u8; 9] {
+        let mut payload = [0_u8; 9];
+        payload[1..5].copy_from_slice(&id.to_le_bytes());
+        payload[5..9].copy_from_slice(&value.to_le_bytes());
+        payload
+    }
+
+    fn int32_pair_value(payload: &[u8]) -> i32 {
+        i32::from_le_bytes(payload[5..9].try_into().expect("int32 value bytes"))
+    }
+
+    fn stage_released_savepoint_update(
+        session: &mut Session<DuplexStream>,
+        relation: ultrasql_core::RelationId,
+    ) -> ultrasql_core::TupleId {
+        let base = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let tid = session
+            .state
+            .heap
+            .insert(
+                relation,
+                &int32_pair_payload(1, 100),
+                ultrasql_storage::heap::InsertOptions {
+                    xmin: base.write_xid(),
+                    command_id: base.current_command,
+                    n_atts: 2,
+                    wal: None,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .expect("seed row");
+        session
+            .state
+            .txn_manager
+            .commit(base)
+            .expect("commit seed row");
+
+        session.execute_begin(None, None).expect("BEGIN");
+        let parent_updated = {
+            let TxnState::InTransaction(txn) = &session.txn_state else {
+                panic!("transaction must be active");
+            };
+            session
+                .state
+                .heap
+                .update_int32_pair_inplace_undo(
+                    ultrasql_storage::heap::UpdateInt32PairScan {
+                        rel: relation,
+                        block_count: session.state.heap.block_count(relation),
+                        snapshot: &txn.snapshot,
+                        oracle: session.state.txn_manager.as_ref(),
+                        predicate: |id, _value| id == 1,
+                    },
+                    ultrasql_storage::heap::UpdateInt32PairEdit {
+                        target_col: 1,
+                        delta: 10,
+                    },
+                    ultrasql_storage::heap::UpdateInt32PairStamp {
+                        xid: txn.write_xid(),
+                        command_id: txn.current_command,
+                    },
+                    None,
+                    None,
+                )
+                .expect("parent in-place update")
+        };
+        assert_eq!(parent_updated, 1);
+        let TxnState::InTransaction(txn) = &mut session.txn_state else {
+            panic!("transaction must remain active");
+        };
+        session.state.txn_manager.refresh_snapshot(txn);
+        session
+            .execute_savepoint("released_writer")
+            .expect("SAVEPOINT");
+        let updated = {
+            let TxnState::InTransaction(txn) = &session.txn_state else {
+                panic!("transaction must be active");
+            };
+            session
+                .state
+                .heap
+                .update_int32_pair_inplace_undo(
+                    ultrasql_storage::heap::UpdateInt32PairScan {
+                        rel: relation,
+                        block_count: session.state.heap.block_count(relation),
+                        snapshot: &txn.snapshot,
+                        oracle: session.state.txn_manager.as_ref(),
+                        predicate: |id, _value| id == 1,
+                    },
+                    ultrasql_storage::heap::UpdateInt32PairEdit {
+                        target_col: 1,
+                        delta: 40,
+                    },
+                    ultrasql_storage::heap::UpdateInt32PairStamp {
+                        xid: txn.write_xid(),
+                        command_id: txn.current_command,
+                    },
+                    None,
+                    None,
+                )
+                .expect("savepoint in-place update")
+        };
+        assert_eq!(updated, 1);
+        session
+            .execute_release_savepoint("released_writer")
+            .expect("RELEASE");
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch post-image")
+                    .data
+            ),
+            150
+        );
+        tid
     }
 
     #[test]
@@ -1070,6 +1234,327 @@ mod tests {
             .execute_rollback_prepared("rollback-gid")
             .expect("rollback prepared");
         assert_eq!(last_tag(&rolled_back), "ROLLBACK PREPARED");
+    }
+
+    #[test]
+    fn released_savepoint_update_full_rollback_drains_family_before_undo_gc() {
+        let mut session = test_session();
+        let relation = ultrasql_core::RelationId::new(90_001);
+        let tid = stage_released_savepoint_update(&mut session, relation);
+
+        session.execute_rollback().expect("ROLLBACK");
+        let trimmed = session
+            .state
+            .heap
+            .vacuum_undo_log(session.state.txn_manager.next_xid())
+            .expect("forced undo GC");
+
+        assert_eq!(trimmed, 0, "abort must drain the released subxid undo");
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch restored row")
+                    .data
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn failed_block_commit_drains_released_subxid_before_undo_gc() {
+        let mut session = test_session();
+        let relation = ultrasql_core::RelationId::new(90_003);
+        let tid = stage_released_savepoint_update(&mut session, relation);
+        let txn = match std::mem::replace(&mut session.txn_state, TxnState::Idle) {
+            TxnState::InTransaction(txn) => txn,
+            other => panic!("expected active transaction, got {other:?}"),
+        };
+        session.txn_state = TxnState::Failed(txn);
+
+        let result = session
+            .execute_commit()
+            .expect("failed-block COMMIT rolls back");
+        assert_eq!(last_tag(&result), "ROLLBACK");
+        let trimmed = session
+            .state
+            .heap
+            .vacuum_undo_log(session.state.txn_manager.next_xid())
+            .expect("forced undo GC");
+
+        assert_eq!(
+            trimmed, 0,
+            "failed-block abort must drain the released subxid undo"
+        );
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch failed-block restored row")
+                    .data
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn serializable_precommit_abort_drains_released_subxid_before_undo_gc() {
+        let session = test_session();
+        let relation = ultrasql_core::RelationId::new(90_004);
+        let base = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::ReadCommitted);
+        let tid = session
+            .state
+            .heap
+            .insert(
+                relation,
+                &int32_pair_payload(1, 100),
+                ultrasql_storage::heap::InsertOptions {
+                    xmin: base.write_xid(),
+                    command_id: base.current_command,
+                    n_atts: 2,
+                    wal: None,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .expect("seed row");
+        session
+            .state
+            .txn_manager
+            .commit(base)
+            .expect("commit seed row");
+
+        let first = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::Serializable);
+        let mut pivot = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::Serializable);
+        let third = session
+            .state
+            .txn_manager
+            .begin(IsolationLevel::Serializable);
+        let savepoint = session
+            .state
+            .txn_manager
+            .begin_savepoint(&mut pivot, "released_writer");
+        let updated = session
+            .state
+            .heap
+            .update_int32_pair_inplace_undo(
+                ultrasql_storage::heap::UpdateInt32PairScan {
+                    rel: relation,
+                    block_count: session.state.heap.block_count(relation),
+                    snapshot: &pivot.snapshot,
+                    oracle: session.state.txn_manager.as_ref(),
+                    predicate: |id, _value| id == 1,
+                },
+                ultrasql_storage::heap::UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: 50,
+                },
+                ultrasql_storage::heap::UpdateInt32PairStamp {
+                    xid: pivot.write_xid(),
+                    command_id: pivot.current_command,
+                },
+                None,
+                None,
+            )
+            .expect("pivot savepoint update");
+        assert_eq!(updated, 1);
+        session
+            .state
+            .txn_manager
+            .release_savepoint(&mut pivot, "released_writer")
+            .expect("release pivot savepoint");
+
+        session
+            .state
+            .txn_manager
+            .record_rw_conflict(first.xid, pivot.xid);
+        session
+            .state
+            .txn_manager
+            .record_rw_conflict(pivot.xid, third.xid);
+        session
+            .state
+            .txn_manager
+            .commit(first)
+            .expect("commit first SSI leg");
+        session
+            .state
+            .txn_manager
+            .commit(third)
+            .expect("commit third SSI leg");
+
+        let error = session
+            .state
+            .commit_transaction(pivot, true, "serializable family cleanup test")
+            .expect_err("pivot must fail before Commit WAL append");
+        assert!(matches!(error, ServerError::SerializationFailure(_)));
+        assert_eq!(
+            session.state.txn_manager.status(savepoint.xid),
+            ultrasql_mvcc::XidStatus::Aborted
+        );
+        let trimmed = session
+            .state
+            .heap
+            .vacuum_undo_log(session.state.txn_manager.next_xid())
+            .expect("forced undo GC");
+
+        assert_eq!(
+            trimmed, 0,
+            "pre-commit abort must drain the released subxid undo"
+        );
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch pre-commit restored row")
+                    .data
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn rollback_prepared_drains_released_subxid_before_undo_gc() {
+        let mut session = test_session();
+        let relation = ultrasql_core::RelationId::new(90_002);
+        let tid = stage_released_savepoint_update(&mut session, relation);
+
+        session
+            .execute_prepare_transaction("abort-family-unit")
+            .expect("PREPARE TRANSACTION");
+        session
+            .execute_rollback_prepared("abort-family-unit")
+            .expect("ROLLBACK PREPARED");
+        let trimmed = session
+            .state
+            .heap
+            .vacuum_undo_log(session.state.txn_manager.next_xid())
+            .expect("forced undo GC");
+
+        assert_eq!(
+            trimmed, 0,
+            "prepared abort must drain the released subxid undo"
+        );
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch restored prepared row")
+                    .data
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn failed_prepare_coordinator_persistence_aborts_full_write_family() {
+        let mut session = test_session();
+        session
+            .state
+            .two_phase
+            .prepare("duplicate-family", ultrasql_core::Xid::new(99_900), &[])
+            .expect("seed duplicate prepared gid");
+        let relation = ultrasql_core::RelationId::new(90_005);
+        let tid = stage_released_savepoint_update(&mut session, relation);
+        let (parent, committed_subxids) = match &session.txn_state {
+            TxnState::InTransaction(txn) => (txn.xid, txn.committed_subxid_family()),
+            other => panic!("expected active transaction, got {other:?}"),
+        };
+
+        let error = session
+            .execute_prepare_transaction("duplicate-family")
+            .expect_err("duplicate GID must fail and abort the transaction");
+        assert!(error.to_string().contains("duplicate"));
+        assert!(matches!(session.txn_state, TxnState::Idle));
+        assert_eq!(
+            session.state.txn_manager.status(parent),
+            ultrasql_mvcc::XidStatus::Aborted
+        );
+        for subxid in committed_subxids {
+            assert_eq!(
+                session.state.txn_manager.status(subxid),
+                ultrasql_mvcc::XidStatus::Aborted
+            );
+        }
+        let trimmed = session
+            .state
+            .heap
+            .vacuum_undo_log(session.state.txn_manager.next_xid())
+            .expect("forced undo GC");
+        assert_eq!(trimmed, 0, "failed PREPARE must drain the whole family");
+        assert_eq!(
+            int32_pair_value(
+                &session
+                    .state
+                    .heap
+                    .fetch(tid)
+                    .expect("fetch failed-PREPARE restored row")
+                    .data
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn prepare_wal_wait_uses_latest_savepoint_family_record() {
+        let data_dir = tempfile::TempDir::new().expect("temp data dir");
+        let server = Server::init(data_dir.path()).expect("persistent server");
+        let wal = server.heap.wal_sink().expect("persistent WAL sink");
+        let parent = ultrasql_core::Xid::new(91_001);
+        let subxid = ultrasql_core::Xid::new(91_002);
+        let parent_lsn = wal
+            .append(
+                ultrasql_wal::WalRecord::new(
+                    ultrasql_wal::RecordType::Nop,
+                    parent,
+                    ultrasql_core::Lsn::ZERO,
+                    0,
+                    vec![1_u8; 16],
+                )
+                .expect("parent WAL record"),
+            )
+            .expect("append parent WAL");
+        let subxid_lsn = wal
+            .append(
+                ultrasql_wal::WalRecord::new(
+                    ultrasql_wal::RecordType::Nop,
+                    subxid,
+                    ultrasql_core::Lsn::ZERO,
+                    0,
+                    vec![2_u8; 64],
+                )
+                .expect("subxid WAL record"),
+            )
+            .expect("append subxid WAL");
+        assert!(subxid_lsn > parent_lsn);
+
+        server
+            .wait_for_txn_data_wal_family_durable([parent, subxid])
+            .expect("wait for whole prepared family");
+        let flushed = server
+            .runtime_wal_flushed_lsn()
+            .expect("persistent writer flush boundary");
+        assert!(
+            flushed > subxid_lsn,
+            "exclusive durability boundary {flushed} must pass latest family record {subxid_lsn}"
+        );
     }
 
     #[test]

@@ -72,8 +72,10 @@ pub enum SavepointError {
 /// `ROLLBACK TO` to the same name — can use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RollbackOutcome {
-    /// Subxids that must be marked `Aborted` in the CLOG: the inner
-    /// savepoints removed from the stack plus the target's *old* subxid.
+    /// Subxids that must be marked `Aborted` in the CLOG and physically
+    /// undone: the inner savepoints removed from the stack, the target's
+    /// *old* subxid, and any already-RELEASEd inner subxids pruned from the
+    /// merged-up family.
     pub aborted: Vec<Xid>,
     /// The fresh subxid allocated for the surviving target savepoint. The
     /// caller must register it in the CLOG (`InProgress`) and the
@@ -257,6 +259,7 @@ impl SubtxnManager {
             merged.retain(|&xid| {
                 if xid >= cutoff {
                     rolled.insert(xid);
+                    aborted.push(xid);
                     false
                 } else {
                     true
@@ -272,6 +275,8 @@ impl SubtxnManager {
                 rolled.insert(xid);
             }
         }
+        aborted.sort_unstable();
+        aborted.dedup();
         Ok(RollbackOutcome {
             aborted,
             new_target_xid,

@@ -738,7 +738,7 @@ where
         // streaming SELECT whose handle lives in `txn_state` — no autocommit XID.
         let mut abort_guard = commit_txn
             .as_ref()
-            .map(|txn| AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid));
+            .map(|txn| AutocommitAbortGuard::arm(Arc::clone(&self.state), txn.xid));
         // Disarm the guard for a normal `commit_txn.take()` site. After this the
         // taken handle's own commit/abort owns the XID's fate.
         macro_rules! disarm_abort_guard {

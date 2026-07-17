@@ -40,8 +40,15 @@ pub struct RecoveryTarget {
     /// Stop before applying records whose end LSN is greater than this value.
     pub target_lsn: Option<Lsn>,
     /// Stop after applying the commit record for this transaction ID.
+    ///
+    /// Recovery returns an error when retained WAL does not contain that
+    /// commit; it never silently treats the current tip as a match.
     pub target_xid: Option<Xid>,
     /// Stop before applying the first commit newer than this Unix timestamp.
+    ///
+    /// This is an upper bound over retained WAL. If no commit is newer,
+    /// recovery reaches the current tip. Once WAL has a recycled floor, callers
+    /// need an external timestamp horizon to prove this target is reachable.
     pub target_time_micros: Option<u64>,
 }
 
@@ -54,6 +61,12 @@ impl RecoveryTarget {
             target_xid: None,
             target_time_micros: None,
         }
+    }
+
+    /// Return `true` when at least one point-in-time stop condition is set.
+    #[must_use]
+    pub const fn is_configured(self) -> bool {
+        self.target_lsn.is_some() || self.target_xid.is_some() || self.target_time_micros.is_some()
     }
 
     /// Recover only records whose end LSN is less than or equal to `target`.
@@ -137,6 +150,27 @@ pub enum RecoveryError {
     /// applier error types.
     #[error("recovery applier error: {0}")]
     Applier(String),
+
+    /// A physical LSN target precedes the oldest retained WAL byte.
+    #[error("recovery target LSN {target} precedes WAL floor {floor}")]
+    TargetBeforeFloor {
+        /// Requested target.
+        target: Lsn,
+        /// Oldest retained LSN.
+        floor: Lsn,
+    },
+
+    /// An XID target's commit record is absent from retained WAL.
+    #[error("recovery target transaction {0} was not found in retained WAL")]
+    TargetXidNotFound(Xid),
+}
+
+fn finish_recovery_at(target: RecoveryTarget, lsn: Lsn) -> Result<Lsn, RecoveryError> {
+    if let Some(target_xid) = target.target_xid {
+        Err(RecoveryError::TargetXidNotFound(target_xid))
+    } else {
+        Ok(lsn)
+    }
 }
 
 /// Replay every record in `wal_dir` to a caller-supplied applier.
@@ -174,13 +208,21 @@ pub fn recover_with_target(
     // superseded and must not be replayed). An absent manifest is the origin
     // (segment 0 / LSN 0) — the historical, unchanged behaviour.
     let floor = crate::manifest::read_floor(dir)?;
+    if let Some(target_lsn) = target.target_lsn
+        && target_lsn < floor.floor_lsn
+    {
+        return Err(RecoveryError::TargetBeforeFloor {
+            target: target_lsn,
+            floor: floor.floor_lsn,
+        });
+    }
     let segments: Vec<_> = list_segments(dir)?
         .into_iter()
         .filter(|(index, _)| *index >= floor.segment_index)
         .collect();
     if segments.is_empty() {
         debug!(?dir, "wal recovery: no segments found");
-        return Ok(floor.floor_lsn);
+        return finish_recovery_at(target, floor.floor_lsn);
     }
 
     let mut stream_pos: u64 = floor.floor_lsn.raw();
@@ -211,7 +253,7 @@ pub fn recover_with_target(
                             last_lsn = last_good_pos,
                             "wal recovery: reached target lsn"
                         );
-                        return Ok(Lsn::new(last_good_pos));
+                        return finish_recovery_at(target, Lsn::new(last_good_pos));
                     }
                     let decision = replay_decision(&record, target)?;
                     if decision == ReplayDecision::StopBeforeRecord {
@@ -220,7 +262,7 @@ pub fn recover_with_target(
                             xid = record.header.xid.raw(),
                             "wal recovery: reached target time"
                         );
-                        return Ok(Lsn::new(last_good_pos));
+                        return finish_recovery_at(target, Lsn::new(last_good_pos));
                     }
                     apply(&record).map_err(|e| match e {
                         RecoveryError::Applier(s) => RecoveryError::Applier(s),
@@ -250,7 +292,7 @@ pub fn recover_with_target(
                         ?path,
                         needed, have, "wal recovery: torn record at tail; stopping cleanly"
                     );
-                    return Ok(Lsn::new(last_good_pos));
+                    return finish_recovery_at(target, Lsn::new(last_good_pos));
                 }
                 Err(WalRecordError::CrcMismatch { expected, actual }) => {
                     if !is_final_segment || !crc_mismatch_is_at_segment_tail(&buf, offset)? {
@@ -265,7 +307,7 @@ pub fn recover_with_target(
                         actual = format!("{actual:08x}"),
                         "wal recovery: crc mismatch at tail; stopping cleanly"
                     );
-                    return Ok(Lsn::new(last_good_pos));
+                    return finish_recovery_at(target, Lsn::new(last_good_pos));
                 }
                 Err(other) => return Err(RecoveryError::Record(other)),
             }
@@ -277,7 +319,7 @@ pub fn recover_with_target(
         last_lsn = last_good_pos,
         "wal recovery complete"
     );
-    Ok(Lsn::new(last_good_pos))
+    finish_recovery_at(target, Lsn::new(last_good_pos))
 }
 
 /// Length of the longest prefix of `buf` that ends exactly on a
@@ -529,6 +571,7 @@ mod tests {
     use tempfile::TempDir;
     use ultrasql_core::Xid;
 
+    use crate::manifest::{WalFloor, write_floor};
     use crate::payload::CommitPayload;
     use crate::{RecordType, WalRecord, WalRecordError};
 
@@ -657,6 +700,48 @@ mod tests {
             recovered,
             Lsn::new(u64::try_from(first_bytes.len()).unwrap())
         );
+    }
+
+    #[test]
+    fn recover_with_xid_target_rejects_absent_commit() {
+        let dir = TempDir::new().unwrap();
+        let present = commit_record(Xid::new(10), 1_000);
+        std::fs::write(dir.path().join("segment_0000000000"), present.encode()).unwrap();
+
+        let error =
+            recover_with_target(dir.path(), RecoveryTarget::up_to_xid(Xid::new(99)), |_| {
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecoveryError::TargetXidNotFound(xid) if xid == Xid::new(99)
+        ));
+    }
+
+    #[test]
+    fn recover_rejects_lsn_target_below_recycled_floor() {
+        let dir = TempDir::new().unwrap();
+        let floor = WalFloor {
+            segment_index: 4,
+            floor_lsn: Lsn::new(8_000),
+        };
+        write_floor(dir.path(), floor).unwrap();
+        std::fs::write(dir.path().join("segment_0000000004"), []).unwrap();
+
+        let error = recover_with_target(
+            dir.path(),
+            RecoveryTarget::up_to_lsn(Lsn::new(7_999)),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecoveryError::TargetBeforeFloor { target, floor: observed }
+                if target == Lsn::new(7_999) && observed == floor.floor_lsn
+        ));
     }
 
     #[test]

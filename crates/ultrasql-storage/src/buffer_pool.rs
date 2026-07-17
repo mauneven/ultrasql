@@ -22,10 +22,11 @@
 //!   the same trait surface so the upgrade is a drop-in.)
 //! - **WAL integration.** An optional `Arc<dyn WalSink>` reference allows
 //!   [`BufferPool::try_flush_dirty`] to gate page flushes on the sink's
-//!   `durable_lsn`: a dirty page whose page-LSN exceeds the durable LSN
-//!   has not yet been durably logged and must not be written to disk (the
-//!   recovery invariant requires that WAL is always ahead of the data
-//!   files). When no sink is present, all dirty unpinned pages are
+//!   exclusive `durable_lsn` end boundary: a dirty page whose record-start
+//!   page-LSN is at or beyond that boundary has not yet been durably logged and
+//!   must not be written to disk, unless the sink explicitly reserves zero as
+//!   dependency-free (the recovery invariant requires that WAL is always ahead
+//!   of the data files). When no sink is present, all dirty unpinned pages are
 //!   eligible for flushing.
 //!
 //! Concurrency
@@ -143,8 +144,9 @@ pub const EVICTION_RELIEF_ROUNDS: usize = 3;
 ///    [`BufferPool::try_flush_dirty`], whose writer callback must not touch the
 ///    pool.
 /// 3. Preserve WAL-before-data: a page is written only when its page-LSN is
-///    `<= durable_lsn`. When the durable LSN must be advanced to unblock a
-///    frame, the force happens *before* the (re-)flush.
+///    strictly below `durable_lsn`, the exclusive durable end boundary, or the
+///    sink explicitly declares zero dependency-free. When the boundary must be
+///    advanced to unblock a frame, the force happens *before* the (re-)flush.
 ///
 /// `relieve` returns `Ok(())` to mean "I attempted relief; retry `get_page`".
 /// Progress is reported out of band via the pool's dirty count. Returning
@@ -215,9 +217,10 @@ pub struct BufferPool<L: PageLoader> {
     /// Optional WAL sink for LSN-gated dirty-page flushing.
     ///
     /// When `Some`, [`BufferPool::try_flush_dirty`] will only flush frames
-    /// whose page-LSN is ≤ the sink's `durable_lsn`. This ensures the WAL
-    /// is always written ahead of the data files, which is the fundamental
-    /// crash-recovery invariant.
+    /// whose page-LSN is strictly below the sink's exclusive `durable_lsn` end
+    /// boundary, or is zero and the sink explicitly declares it
+    /// dependency-free. This ensures the WAL is always written ahead of the
+    /// data files, which is the fundamental crash-recovery invariant.
     ///
     /// When `None`, all unpinned dirty frames are eligible for flushing
     /// regardless of LSN.
@@ -319,6 +322,41 @@ impl Frame {
     }
 }
 
+/// Short-lived pin used by flush scans to keep a frame's identity stable.
+///
+/// Acquisition succeeds only while the frame is unpinned. The regular
+/// pin-then-tag handshake means an evictor either observes this pin and skips
+/// the frame, or completes its identity transition before the flush scan
+/// rechecks `dirty` and `page_id`.
+struct FlushPin<'a> {
+    frame: &'a Frame,
+}
+
+impl<'a> FlushPin<'a> {
+    fn try_acquire(frame: &'a Frame) -> Option<Self> {
+        frame
+            .pin_count
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { frame })
+    }
+}
+
+impl Drop for FlushPin<'_> {
+    fn drop(&mut self) {
+        self.frame.pin_count.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Revalidate a flush scan's tag after it acquires the page read lock.
+///
+/// Callers hold the page lock first, then this helper briefly takes metadata,
+/// matching the buffer-pool's page-before-metadata order.
+fn flush_identity_still_dirty(frame: &Frame, expected: PageId) -> bool {
+    let pid_slot = frame.page_id.lock();
+    frame.dirty.load(Ordering::Acquire) && *pid_slot == Some(expected)
+}
+
 impl<L: PageLoader> BufferPool<L> {
     /// Construct a buffer pool with `capacity` frames and no WAL sink.
     ///
@@ -352,9 +390,9 @@ impl<L: PageLoader> BufferPool<L> {
     ///
     /// The sink's [`WalSink::durable_lsn`] is consulted by
     /// [`Self::try_flush_dirty`] to gate page flushes: a dirty frame
-    /// whose page-LSN exceeds the durable LSN will not be flushed because
-    /// the WAL record that describes the mutation has not yet been made
-    /// durable. This preserves the WAL-ahead-of-data-files invariant
+    /// whose record-start page-LSN is at or beyond the exclusive durable end
+    /// boundary will not be flushed unless the sink explicitly declares zero
+    /// dependency-free. This preserves the WAL-ahead-of-data-files invariant
     /// required for crash recovery.
     ///
     /// Eviction itself does not flush dirty pages regardless of whether a
@@ -485,10 +523,11 @@ impl<L: PageLoader> BufferPool<L> {
     /// callback.
     ///
     /// For each frame that is dirty and has `pin_count == 0`, this method
-    /// checks whether the frame's page-LSN is ≤ the WAL sink's
-    /// `durable_lsn` (or, if no sink is configured, treats all LSNs as
-    /// durable). If the LSN condition is satisfied the `writer` callback
-    /// is invoked with the `PageId` and a shared reference to the `Page`.
+    /// checks whether the frame's page-LSN is strictly below the WAL sink's
+    /// exclusive `durable_lsn` end boundary, or is zero and the sink declares
+    /// it dependency-free (if no sink is configured, all LSNs are durable). If
+    /// the LSN condition is satisfied the `writer` callback is invoked with
+    /// the `PageId` and a shared reference to the `Page`.
     /// On a successful write the dirty bit is cleared so the frame becomes
     /// eligible for eviction.
     ///
@@ -499,9 +538,13 @@ impl<L: PageLoader> BufferPool<L> {
     ///
     /// # Lock order
     ///
-    /// This method acquires per-frame read locks individually in frame-index
-    /// order, never holding two simultaneously. This is consistent with the
-    /// global latch order documented in ARCHITECTURE.md §14.
+    /// This method temporarily pins one frame, snapshots its identity under the
+    /// metadata lock, releases that lock, then acquires the page read lock and
+    /// revalidates the tag (page lock before metadata lock, matching install).
+    /// The pin prevents a new eviction from selecting the frame; revalidation
+    /// rejects an eviction already past its pin check. It never holds two
+    /// frames simultaneously. This is consistent with the global latch order
+    /// documented in ARCHITECTURE.md §14.
     ///
     /// # Errors
     ///
@@ -524,10 +567,12 @@ impl<L: PageLoader> BufferPool<L> {
             ));
         }
 
-        let durable = self
-            .wal_sink
-            .as_ref()
-            .map_or(u64::MAX, |s| s.durable_lsn().raw());
+        let durability = self.wal_sink.as_ref().map(|sink| {
+            (
+                sink.durable_lsn().raw(),
+                sink.zero_lsn_has_no_pending_record(),
+            )
+        });
 
         let mut flushed: usize = 0;
 
@@ -541,47 +586,58 @@ impl<L: PageLoader> BufferPool<L> {
                 continue;
             }
 
-            // Acquire the meta lock to read the page_id and double-check
-            // the pin count atomically.
+            // Reserve this unpinned frame before reading its identity. This is
+            // the same pin-then-tag handshake used by `get_page`: eviction
+            // either sees the pin and skips, or completes first and our
+            // dirty/identity recheck rejects its clean replacement.
+            let Some(_flush_pin) = FlushPin::try_acquire(frame) else {
+                continue;
+            };
             let page_id = {
                 let pid_slot = frame.page_id.lock();
-                if frame.pin_count.load(Ordering::Acquire) != 0 {
+                if !frame.dirty.load(Ordering::Acquire) {
                     continue;
                 }
                 match *pid_slot {
-                    Some(pid) => pid,
+                    Some(page_id) => page_id,
                     None => continue,
                 }
             };
 
-            // Read the page LSN under shared lock.
-            let page_lsn = {
-                let page_guard = frame.page.read();
-                match page_guard.as_ref() {
-                    Some(page) => page.header().lsn,
-                    None => continue,
-                }
+            // Keep one read guard from the page-LSN check through the write and
+            // dirty-bit clear. Releasing it between those steps would let a
+            // concurrent writer install a newer, non-durable page-LSN or set
+            // the dirty bit just before this flusher clears it.
+            let page_guard = frame.page.read();
+            let Some(page) = page_guard.as_ref() else {
+                continue;
             };
+            // A frame replacement that passed its zero-pin recheck just before
+            // our CAS may already be in flight. Revalidate the tag while the
+            // page read guard prevents replacement of the bytes. Page -> meta
+            // follows the install path's lock order and cannot deadlock with
+            // eviction, which releases meta before taking the page lock.
+            if !flush_identity_still_dirty(frame, page_id) {
+                continue;
+            }
+            let page_lsn = page.header().lsn;
 
-            // Gate on WAL durability. A page whose LSN exceeds the
-            // durable WAL position must not be written to disk: the WAL
-            // record describing the mutation is not yet guaranteed to
-            // survive a crash, so writing the page would violate the
-            // WAL-ahead-of-data-files invariant.
-            if page_lsn > durable {
+            // `durable_lsn` is the exclusive end boundary of the fsynced WAL
+            // prefix, while page-LSNs are record starts. Equality means this
+            // page's record begins immediately after that prefix, not that the
+            // record is durable. Zero is dependency-free only for sinks that
+            // explicitly reserve it; direct byte-addressed sinks can assign
+            // their first pending real record start zero.
+            if durability.is_some_and(|(boundary, zero_is_dependency_free)| {
+                page_lsn >= boundary && !(page_lsn == 0 && zero_is_dependency_free)
+            }) {
                 continue;
             }
 
-            // Invoke the writer with shared access to the page.
-            {
-                let page_guard = frame.page.read();
-                match page_guard.as_ref() {
-                    Some(page) => writer(page_id, page)?,
-                    None => continue,
-                }
-            }
+            writer(page_id, page)?;
 
-            // Clear the dirty bit only after a successful write.
+            // Clear while the page read guard is still held. A page writer
+            // queued on this guard will set the bit again after it mutates.
             if frame.dirty.swap(false, Ordering::Release) {
                 self.counters.dirty.fetch_sub(1, Ordering::Relaxed);
             }
@@ -843,35 +899,40 @@ impl<L: PageLoader> BufferPool<L> {
         oldest.map(ultrasql_core::Lsn::new)
     }
 
-    /// Return the lowest page-LSN among dirty, unpinned, resident frames
-    /// whose page-LSN currently *exceeds* the WAL sink's durable LSN.
+    /// Return the lowest page-LSN among dirty, unpinned, resident frames whose
+    /// record starts at or beyond the WAL sink's exclusive durable end
+    /// boundary and is not a dependency-free zero sentinel.
     ///
     /// This is the eviction-relief counterpart to [`Self::oldest_dirty_lsn`].
     /// When [`Self::try_flush_dirty`] flushes nothing because every dirty
-    /// unpinned victim is ahead of the durable WAL position (the gate at the
-    /// `page_lsn > durable` check), the owning layer forces the WAL durable to
-    /// the value returned here so that *at least one* currently-blocked frame
-    /// becomes flushable. Forcing to this minimum guarantees forward progress
-    /// without over-forcing.
+    /// unpinned victim is outside the durable WAL prefix (the gate at the
+    /// `page_lsn >= durable` check), the owning layer forces the WAL record at
+    /// the value returned here durable so that *at least one* currently-blocked
+    /// frame becomes flushable. Forcing to this minimum guarantees forward
+    /// progress without over-forcing.
     ///
     /// Returns `None` when no dirty unpinned frame is blocked by the gate —
-    /// either there are no such frames, or every dirty frame is already at or
-    /// below the durable LSN (in which case [`Self::try_flush_dirty`] can flush
-    /// it directly without a WAL force). When the pool has no WAL sink the
-    /// durable LSN is treated as `u64::MAX`, so this always returns `None`.
+    /// either there are no such frames, or every dirty frame is already inside
+    /// the durable prefix (in which case [`Self::try_flush_dirty`] can flush it
+    /// directly without a WAL force). A zero page-LSN is skipped only when the
+    /// sink declares it dependency-free. When the pool has no WAL sink this
+    /// always returns `None`.
     ///
     /// # Lock order
     ///
-    /// Mirrors [`Self::oldest_dirty_lsn`]: it takes per-frame locks
-    /// individually (the meta lock, then a shared page read lock), never
-    /// holding two frames' locks simultaneously and never calling the WAL
-    /// under a page latch. Consistent with ARCHITECTURE.md §14.
+    /// Mirrors [`Self::try_flush_dirty`]: it temporarily pins one frame,
+    /// snapshots metadata, takes a shared page read lock, then revalidates the
+    /// tag in page-before-metadata order. It never holds two frames' locks
+    /// simultaneously and never calls the WAL under a page latch. Consistent
+    /// with ARCHITECTURE.md §14.
     #[must_use]
     pub fn oldest_unflushable_dirty_lsn(&self) -> Option<ultrasql_core::Lsn> {
-        let durable = self
-            .wal_sink
-            .as_ref()
-            .map_or(u64::MAX, |s| s.durable_lsn().raw());
+        let (durable, zero_is_dependency_free) = self.wal_sink.as_ref().map(|sink| {
+            (
+                sink.durable_lsn().raw(),
+                sink.zero_lsn_has_no_pending_record(),
+            )
+        })?;
         let mut oldest: Option<u64> = None;
         for frame in &self.frames {
             if !frame.dirty.load(Ordering::Acquire) {
@@ -880,27 +941,31 @@ impl<L: PageLoader> BufferPool<L> {
             if frame.pin_count.load(Ordering::Acquire) != 0 {
                 continue;
             }
-            // Meta lock to read page_id and re-check the pin atomically,
-            // matching the `try_flush_dirty` discipline.
-            {
+            let Some(_flush_pin) = FlushPin::try_acquire(frame) else {
+                continue;
+            };
+            let page_id = {
                 let pid_slot = frame.page_id.lock();
-                if frame.pin_count.load(Ordering::Acquire) != 0 {
+                if !frame.dirty.load(Ordering::Acquire) {
                     continue;
                 }
-                if pid_slot.is_none() {
-                    continue;
-                }
-            }
-            let page_lsn = {
-                let page_guard = frame.page.read();
-                match page_guard.as_ref() {
-                    Some(page) => page.header().lsn,
+                match *pid_slot {
+                    Some(page_id) => page_id,
                     None => continue,
                 }
             };
-            // Frames at or below durable are already flushable by Phase A;
-            // they impose no WAL-force requirement.
-            if page_lsn <= durable {
+            let page_guard = frame.page.read();
+            let Some(page) = page_guard.as_ref() else {
+                continue;
+            };
+            if !flush_identity_still_dirty(frame, page_id) {
+                continue;
+            }
+            let page_lsn = page.header().lsn;
+            // Starts strictly below the exclusive boundary are flushable.
+            // Zero at the boundary is also safe only when this sink reserves
+            // it as dependency-free.
+            if page_lsn < durable || (page_lsn == 0 && zero_is_dependency_free) {
                 continue;
             }
             oldest = Some(match oldest {
@@ -1332,6 +1397,7 @@ mod tests {
     /// A `WalSink` stub that reports a fixed durable LSN.
     struct FixedDurableSink {
         durable: Lsn,
+        zero_is_dependency_free: bool,
     }
 
     impl WalSink for FixedDurableSink {
@@ -1346,18 +1412,23 @@ mod tests {
             self.durable
         }
 
+        fn zero_lsn_has_no_pending_record(&self) -> bool {
+            self.zero_is_dependency_free
+        }
+
         fn last_lsn_for(&self, _xid: Xid) -> Lsn {
             Lsn::ZERO
         }
     }
 
-    /// Pool with sink at `durable_lsn=100`, page with `lsn=50` and dirty bit
-    /// set. `try_flush_dirty` should call the writer once and clear the
-    /// dirty bit.
+    /// Pool with exclusive durable boundary 100, page with record-start LSN 50
+    /// and dirty bit set. `try_flush_dirty` should call the writer once and
+    /// clear the dirty bit.
     #[test]
     fn try_flush_dirty_writes_clean_dirty_pages_with_durable_lsn() {
         let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
             durable: Lsn::new(100),
+            zero_is_dependency_free: false,
         });
         let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
 
@@ -1391,6 +1462,106 @@ mod tests {
     }
 
     #[test]
+    fn try_flush_dirty_rejects_page_at_exclusive_durable_boundary() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::new(100),
+            zero_is_dependency_free: false,
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        {
+            let guard = pool.get_page(pid(0)).unwrap();
+            guard.write().set_lsn(100);
+        }
+
+        let flushed = pool.try_flush_dirty(|_, _| Ok(())).unwrap();
+        assert_eq!(flushed, 0);
+        assert_eq!(pool.stats().dirty, 1);
+        assert_eq!(pool.oldest_unflushable_dirty_lsn(), Some(Lsn::new(100)));
+    }
+
+    #[test]
+    fn try_flush_dirty_blocks_zero_when_sink_can_assign_first_record_zero() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::ZERO,
+            zero_is_dependency_free: false,
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        {
+            let guard = pool.get_page(pid(0)).unwrap();
+            let _write = guard.write();
+        }
+
+        assert_eq!(pool.try_flush_dirty(|_, _| Ok(())).unwrap(), 0);
+        assert_eq!(pool.oldest_unflushable_dirty_lsn(), Some(Lsn::ZERO));
+    }
+
+    #[test]
+    fn try_flush_dirty_accepts_reserved_zero_without_wal_dependency() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::ZERO,
+            zero_is_dependency_free: true,
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        {
+            let guard = pool.get_page(pid(0)).unwrap();
+            let _write = guard.write();
+        }
+
+        assert_eq!(pool.try_flush_dirty(|_, _| Ok(())).unwrap(), 1);
+        assert_eq!(pool.oldest_unflushable_dirty_lsn(), None);
+    }
+
+    #[test]
+    fn try_flush_dirty_temporarily_pins_frame_during_callback() {
+        let pool = Arc::new(BufferPool::new(1, BlankLoader));
+        {
+            let guard = pool.get_page(pid(0)).unwrap();
+            guard.write().set_lsn(7);
+        }
+
+        let observed_pin = std::cell::Cell::new(0_usize);
+        let flushed = pool
+            .try_flush_dirty(|page_id, _| {
+                assert_eq!(page_id, pid(0));
+                observed_pin.set(pool.frames[0].pin_count.load(Ordering::Acquire));
+                assert_eq!(*pool.frames[0].page_id.lock(), Some(pid(0)));
+                assert!(
+                    pool.frames[0].page.try_write().is_none(),
+                    "flush callback must retain the page read guard"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(flushed, 1);
+        assert_eq!(observed_pin.get(), 1);
+        assert_eq!(pool.frames[0].pin_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn flush_identity_revalidation_rejects_retagged_frame() {
+        let pool = Arc::new(BufferPool::new(1, BlankLoader));
+        {
+            let guard = pool.get_page(pid(0)).unwrap();
+            guard.write().set_lsn(7);
+        }
+
+        let frame = &pool.frames[0];
+        let _flush_pin = FlushPin::try_acquire(frame).expect("frame is unpinned");
+        let expected = (*frame.page_id.lock()).expect("resident page id");
+        let _page_guard = frame.page.read();
+        assert!(flush_identity_still_dirty(frame, expected));
+
+        // Model an evictor already past its pin check: changing the tag after
+        // the snapshot must make the page-under-read-lock revalidation fail.
+        *frame.page_id.lock() = Some(pid(1));
+        assert!(!flush_identity_still_dirty(frame, expected));
+    }
+
+    #[test]
     fn oldest_dirty_lsn_reports_minimum_dirty_page_lsn() {
         let pool = Arc::new(BufferPool::new(4, BlankLoader));
 
@@ -1417,6 +1588,7 @@ mod tests {
     fn try_flush_dirty_skips_pages_above_durable_lsn() {
         let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
             durable: Lsn::new(10),
+            zero_is_dependency_free: false,
         });
         let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
 
@@ -1448,6 +1620,7 @@ mod tests {
     fn try_flush_dirty_skips_pinned_pages() {
         let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
             durable: Lsn::new(1000),
+            zero_is_dependency_free: false,
         });
         let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
 

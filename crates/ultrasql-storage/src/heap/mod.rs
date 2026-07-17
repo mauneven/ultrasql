@@ -80,6 +80,10 @@ pub enum HeapError {
     #[error("malformed tuple header: {0}")]
     MalformedHeader(&'static str),
 
+    /// A scoped parallel heap worker unwound before returning its result.
+    #[error("parallel heap worker panicked")]
+    ParallelWorkerPanic,
+
     /// Tuple write could not proceed because another transaction's
     /// in-place update is still visible as a pre-image to this snapshot.
     #[error("write conflict: {0}")]
@@ -118,18 +122,19 @@ pub enum HeapError {
 /// count so future tuple decoders can distinguish intentionally-missing
 /// trailing attributes from unknown metadata.
 ///
-/// The optional `wal` sink, when present, receives a fully-formed
-/// `HeapInsert` WAL record after the tuple has been written to the page.
-/// Pass `None` to skip WAL emission (e.g. during recovery or in tests
-/// that do not care about WAL output).
+/// With a `wal` sink, the heap first serializes any required checkpoint FPW
+/// with the page, writes the tuple, then appends `HeapInsert` and raises the
+/// page LSN while retaining the original frame pin. The page latch is released
+/// during ordinary WAL backpressure, so readers remain live, but a checkpointer
+/// cannot flush the post-insert bytes under their previous LSN. Pass `None` to
+/// skip WAL emission (e.g. during recovery or WAL-less tests).
 ///
 /// The optional `fsm` reference, when present, is consulted to locate an
 /// existing block with sufficient free space before allocating a new block,
 /// and is updated after the insert to reflect the page's new free space.
 ///
-/// The optional `vm` reference, when present, has the affected page's VM
-/// bits cleared after each insert to indicate the page is no longer
-/// all-visible.
+/// The optional `vm` reference is cleared under the same exclusive page latch
+/// as the first tuple write, before post-insert bytes can be observed.
 #[derive(Clone, Copy)]
 pub struct InsertOptions<'a> {
     /// XID of the inserting transaction.
@@ -138,15 +143,15 @@ pub struct InsertOptions<'a> {
     pub command_id: CommandId,
     /// Number of attributes physically present in the tuple body.
     pub n_atts: u16,
-    /// Optional WAL sink. When `Some`, the heap appends a
-    /// `RecordType::HeapInsert` record after a successful insert.
+    /// Optional WAL sink. When `Some`, the heap retains the dirty page's
+    /// original pin through `HeapInsert` append and page-LSN publication.
     pub wal: Option<&'a dyn WalSink>,
     /// Optional free-space map. When `Some`, the heap uses the FSM to
     /// locate a target block before the linear scan, and updates the FSM
     /// after a successful insert.
     pub fsm: Option<&'a crate::fsm::FreeSpaceMap>,
     /// Optional visibility map. When `Some`, the heap clears the page's
-    /// all-visible bit after a successful insert.
+    /// all-visible bit atomically with the page mutation.
     pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
@@ -170,14 +175,15 @@ impl std::fmt::Debug for InsertOptions<'_> {
 /// an in-page HOT chain is safe; the heap will try to satisfy that hint when
 /// there is enough room on the same page.
 ///
-/// The optional `wal` sink, when present, receives a fully-formed
-/// `HeapUpdate` WAL record after the new version has been written and the
-/// old tuple's header has been stamped. The record's flags will have
+/// With a `wal` sink, required FPWs precede the page mutations. The heap then
+/// retains the original source/destination frame pins through `HeapUpdate`
+/// append and monotonic page-LSN publication, so neither dirty page is
+/// flushable in the post-mutation/pre-LSN interval. The record's flags have
 /// [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when the update was
 /// performed as HOT.
 ///
-/// The optional `vm` reference, when present, has both the old and new
-/// pages' VM bits cleared after the update.
+/// The optional `vm` reference is cleared on both old and new pages while
+/// their respective mutation latch is still exclusive.
 #[derive(Clone, Copy)]
 pub struct UpdateOptions<'a> {
     /// XID performing the update (stamped as `xmax` on the old version
@@ -187,11 +193,11 @@ pub struct UpdateOptions<'a> {
     pub command_id: CommandId,
     /// `true` if no indexed column changed — a HOT update is allowed.
     pub hot_eligible: bool,
-    /// Optional WAL sink. When `Some`, the heap appends a
-    /// `RecordType::HeapUpdate` record after a successful update.
+    /// Optional WAL sink. When `Some`, the heap keeps every affected frame
+    /// pinned through `HeapUpdate` append and page-LSN publication.
     pub wal: Option<&'a dyn WalSink>,
-    /// Optional visibility map. When `Some`, the heap clears both the old
-    /// and new pages' all-visible bits after a successful update.
+    /// Optional visibility map. When `Some`, the heap clears both affected
+    /// pages' all-visible bits atomically with their mutations.
     pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
@@ -211,30 +217,32 @@ impl std::fmt::Debug for UpdateOptions<'_> {
 ///
 /// The caller supplies the XID and command id of the deleting transaction.
 ///
-/// The optional `wal` sink, when present, receives a fully-formed
-/// `HeapDelete` WAL record after the tuple's header has been stamped.
+/// With a `wal` sink, any checkpoint FPW is serialized first. The heap stamps
+/// the tuple, appends `HeapDelete`, and publishes the monotonic page LSN while
+/// retaining the original frame pin, preventing a checkpointer from flushing
+/// the post-delete page under its previous WAL dependency.
 ///
 /// The optional `fsm` reference, when present, is updated with the page's
 /// new free space after the delete (the space is not immediately reclaimed
 /// until VACUUM, but we optimistically record the dead-tuple size as free
 /// so future inserters see the block as a candidate).
 ///
-/// The optional `vm` reference, when present, has the affected page's VM
-/// bits cleared after a successful delete.
+/// The optional `vm` reference is cleared under the same exclusive page latch
+/// as the delete stamp.
 #[derive(Clone, Copy)]
 pub struct DeleteOptions<'a> {
     /// XID performing the delete (stamped as `xmax` in the tuple header).
     pub xmax: Xid,
     /// Command id within `xmax` that issued the delete.
     pub cmax: CommandId,
-    /// Optional WAL sink. When `Some`, the heap appends a
-    /// `RecordType::HeapDelete` record after a successful delete.
+    /// Optional WAL sink. When `Some`, the heap retains the dirty frame's
+    /// original pin through `HeapDelete` append and page-LSN publication.
     pub wal: Option<&'a dyn WalSink>,
     /// Optional free-space map. When `Some`, the heap records the page's
     /// post-delete free space so future inserters can find the block.
     pub fsm: Option<&'a crate::fsm::FreeSpaceMap>,
     /// Optional visibility map. When `Some`, the heap clears the page's
-    /// all-visible bit after a successful delete.
+    /// all-visible bit atomically with the delete stamp.
     pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
@@ -319,6 +327,32 @@ impl RollbackStampPages {
             self.pages.push(page_id);
         }
     }
+
+    fn extend(&mut self, page_ids: impl IntoIterator<Item = PageId>) {
+        let page_ids = page_ids.into_iter();
+        let (lower_bound, _) = page_ids.size_hint();
+        self.pages.reserve(lower_bound);
+        self.seen.reserve(lower_bound);
+        for page_id in page_ids {
+            self.insert(page_id);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<PageId> {
+        self.pages
+            .iter()
+            .copied()
+            .filter(|page_id| self.seen.contains(page_id))
+            .collect()
+    }
+
+    fn mark_restored(&mut self, page_id: PageId) {
+        self.seen.remove(&page_id);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
 }
 
 /// One [`HeapAccess`] instance is shared across the executor; it does
@@ -382,7 +416,7 @@ pub struct HeapAccess<L: PageLoader> {
     /// VACUUM is responsible for trimming entries whose `writer_xid`
     /// is older than every live snapshot's `xmin` (no live reader
     /// could need that pre-image any more); v0.7+ work.
-    pub undo_log: Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
+    pub undo_log: Arc<DashMap<RelationId, Arc<parking_lot::RwLock<UndoRelationLog>>>>,
     /// Pages whose tuple headers were stamped with `xmax` by a transaction.
     ///
     /// Rollback uses this to clear aborted DELETE/classic-UPDATE stamps without
@@ -396,6 +430,15 @@ pub struct HeapAccess<L: PageLoader> {
     /// invalidate entries for their relation before cached stats can be used to
     /// prove a page-level predicate match.
     pub(crate) int32_pair_payload_stats: Arc<DashMap<PageId, Int32PairPagePayloadStats>>,
+    /// Visibility map shared with online WAL replay.
+    ///
+    /// Crash recovery starts with an empty in-memory VM, but hot-standby
+    /// replay runs while read-only queries are active. When attached, every
+    /// redo mutation clears the affected VM entry under the same exclusive
+    /// page latch as the page write. This recovery-only field stays after the
+    /// OLTP-facing caches so adding it does not displace the fields touched by
+    /// insert, update, and delete operations.
+    replay_visibility_map: parking_lot::RwLock<Option<Arc<crate::vm::VisibilityMap>>>,
 }
 
 /// Payload min/max stats for one heap page containing fixed `(Int32, Int32)` rows.
@@ -428,8 +471,23 @@ pub(crate) struct Int32PairPagePayloadStats {
 ///
 /// Fields are private so every mutation path keeps the indices coherent;
 /// mutate through the methods below.
+#[derive(Clone, Copy, Debug)]
+struct UndoRecordMetadata {
+    sequence: u64,
+    active: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct UndoRelationLog {
+    /// Sequence assigned to the next record appended to either record kind.
+    ///
+    /// A single sequence across both vectors preserves mutation order for
+    /// snapshot reconstruction and rollback.
+    next_sequence: u64,
+    /// Internal ordering/rollback state parallel to `entries`.
+    entry_metadata: Vec<UndoRecordMetadata>,
+    /// Internal ordering/rollback state parallel to `int32_pair_batches`.
+    batch_metadata: Vec<UndoRecordMetadata>,
     /// Full-payload entries in append order (per slot: oldest first).
     entries: Vec<UndoEntry>,
     /// Compact fixed-width in-place UPDATE batches, in append order. These
@@ -445,6 +503,11 @@ pub struct UndoRelationLog {
 impl UndoRelationLog {
     /// Append a full-payload pre-image record.
     pub fn push_entry(&mut self, entry: UndoEntry) {
+        self.entry_metadata.push(UndoRecordMetadata {
+            sequence: self.next_sequence,
+            active: true,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
         self.entries_by_tid
             .entry(entry.tid)
             .or_default()
@@ -454,6 +517,11 @@ impl UndoRelationLog {
 
     /// Append one compact int32-pair batch.
     pub fn push_int32_pair_batch(&mut self, batch: Int32PairUndoBatch) {
+        self.batch_metadata.push(UndoRecordMetadata {
+            sequence: self.next_sequence,
+            active: true,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
         self.batches_by_page
             .entry(batch.page)
             .or_default()
@@ -478,7 +546,30 @@ impl UndoRelationLog {
             .get(&tid)
             .into_iter()
             .flatten()
-            .filter_map(|&idx| self.entries.get(idx))
+            .filter_map(|&index| {
+                self.entry_metadata
+                    .get(index)
+                    .is_some_and(|metadata| metadata.active)
+                    .then(|| self.entries.get(index))
+                    .flatten()
+            })
+    }
+
+    fn ordered_entries_for_tid(
+        &self,
+        tid: TupleId,
+    ) -> impl DoubleEndedIterator<Item = (&UndoEntry, UndoRecordMetadata)> + '_ {
+        self.entries_by_tid
+            .get(&tid)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let metadata = *self.entry_metadata.get(index)?;
+                if !metadata.active {
+                    return None;
+                }
+                Some((self.entries.get(index)?, metadata))
+            })
     }
 
     /// Compact batches recorded for `page`, oldest first.
@@ -490,7 +581,30 @@ impl UndoRelationLog {
             .get(&page)
             .into_iter()
             .flatten()
-            .filter_map(|&idx| self.int32_pair_batches.get(idx))
+            .filter_map(|&index| {
+                self.batch_metadata
+                    .get(index)
+                    .is_some_and(|metadata| metadata.active)
+                    .then(|| self.int32_pair_batches.get(index))
+                    .flatten()
+            })
+    }
+
+    fn ordered_batches_for_page(
+        &self,
+        page: PageId,
+    ) -> impl DoubleEndedIterator<Item = (&Int32PairUndoBatch, UndoRecordMetadata)> + '_ {
+        self.batches_by_page
+            .get(&page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let metadata = *self.batch_metadata.get(index)?;
+                if !metadata.active {
+                    return None;
+                }
+                Some((self.int32_pair_batches.get(index)?, metadata))
+            })
     }
 
     /// All full-payload entries, in append order (vacuum/tests).
@@ -514,13 +628,231 @@ impl UndoRelationLog {
     /// Number of full-payload entries currently retained.
     #[must_use]
     pub fn entries_len(&self) -> usize {
-        self.entries.len()
+        self.entry_metadata
+            .iter()
+            .filter(|metadata| metadata.active)
+            .count()
     }
 
     /// Number of compact batches currently retained.
     #[must_use]
     pub fn int32_pair_batches_len(&self) -> usize {
-        self.int32_pair_batches.len()
+        self.batch_metadata
+            .iter()
+            .filter(|metadata| metadata.active)
+            .count()
+    }
+
+    /// Return every page with active undo written by `xid`.
+    pub(crate) fn pages_written_by(&self, xid: Xid) -> Vec<PageId> {
+        let mut pages = std::collections::HashSet::new();
+        for (tid, indices) in &self.entries_by_tid {
+            if indices.iter().any(|&index| {
+                self.entries
+                    .get(index)
+                    .zip(self.entry_metadata.get(index))
+                    .is_some_and(|(entry, metadata)| entry.writer_xid == xid && metadata.active)
+            }) {
+                pages.insert(tid.page);
+            }
+        }
+        for (page, indices) in &self.batches_by_page {
+            if indices.iter().any(|&index| {
+                self.int32_pair_batches
+                    .get(index)
+                    .zip(self.batch_metadata.get(index))
+                    .is_some_and(|(batch, metadata)| batch.writer_xid == xid && metadata.active)
+            }) {
+                pages.insert(*page);
+            }
+        }
+        let mut pages: Vec<_> = pages.into_iter().collect();
+        pages.sort_unstable_by_key(|page| (page.relation.0.raw(), page.block.raw()));
+        pages
+    }
+
+    /// Clone active full-payload records for `xid` on `page`, oldest first.
+    pub(crate) fn entries_written_by_on_page(
+        &self,
+        xid: Xid,
+        page: PageId,
+    ) -> Vec<(u64, UndoEntry)> {
+        let mut entries = Vec::new();
+        for (tid, indices) in &self.entries_by_tid {
+            if tid.page != page {
+                continue;
+            }
+            for &index in indices {
+                if let Some((entry, metadata)) = self
+                    .entries
+                    .get(index)
+                    .zip(self.entry_metadata.get(index))
+                    .filter(|(entry, metadata)| entry.writer_xid == xid && metadata.active)
+                {
+                    entries.push((index, metadata.sequence, entry.clone()));
+                }
+            }
+        }
+        entries.sort_unstable_by_key(|(index, _, _)| *index);
+        entries
+            .into_iter()
+            .map(|(_, sequence, entry)| (sequence, entry))
+            .collect()
+    }
+
+    /// Clone active compact records for `xid` on `page`, oldest first.
+    pub(crate) fn batches_written_by_on_page(
+        &self,
+        xid: Xid,
+        page: PageId,
+    ) -> Vec<(u64, Int32PairUndoBatch)> {
+        self.batches_by_page
+            .get(&page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let batch = self.int32_pair_batches.get(index)?;
+                let metadata = self.batch_metadata.get(index)?;
+                (batch.writer_xid == xid && metadata.active)
+                    .then(|| (metadata.sequence, batch.clone()))
+            })
+            .collect()
+    }
+
+    /// Return whether `tid` retains active undo written by another
+    /// transaction.
+    ///
+    /// Rollback of the newest in-place writer clears its live
+    /// `UPDATED_IN_PLACE` stamp. If an older writer remains in this log, the
+    /// tuple header must retain `INPLACE_HISTORY` so snapshots predating that
+    /// writer still consult the surviving undo chain.
+    pub(crate) fn has_active_history_for_tid_excluding(&self, tid: TupleId, xid: Xid) -> bool {
+        self.entries_for_tid(tid)
+            .any(|entry| entry.writer_xid != xid)
+            || self
+                .batches_for_page(tid.page)
+                .any(|batch| batch.writer_xid != xid && batch.contains_slot(tid.slot))
+    }
+
+    /// Deactivate `xid`'s records for `page` after rollback restored it.
+    ///
+    /// Walkers snapshot page-scoped undo while holding the page read guard, so
+    /// an older walker retains its private copy while new readers atomically
+    /// observe the restored page and no active global record.
+    pub(crate) fn deactivate_written_by_on_page(&mut self, xid: Xid, page: PageId) {
+        for (tid, indices) in &self.entries_by_tid {
+            if tid.page != page {
+                continue;
+            }
+            for &index in indices {
+                if self
+                    .entries
+                    .get(index)
+                    .is_some_and(|entry| entry.writer_xid == xid)
+                    && let Some(metadata) = self.entry_metadata.get_mut(index)
+                {
+                    metadata.active = false;
+                }
+            }
+        }
+        if let Some(indices) = self.batches_by_page.get(&page) {
+            for &index in indices {
+                if self
+                    .int32_pair_batches
+                    .get(index)
+                    .is_some_and(|batch| batch.writer_xid == xid)
+                    && let Some(metadata) = self.batch_metadata.get_mut(index)
+                {
+                    metadata.active = false;
+                }
+            }
+        }
+    }
+
+    /// Remove deactivated backing records and rebuild indices once.
+    pub(crate) fn compact_inactive_records(&mut self) {
+        let mut kept_entries = Vec::with_capacity(self.entries.len());
+        let mut kept_entry_metadata = Vec::with_capacity(self.entry_metadata.len());
+        for (entry, metadata) in self.entries.drain(..).zip(self.entry_metadata.drain(..)) {
+            if metadata.active {
+                kept_entries.push(entry);
+                kept_entry_metadata.push(metadata);
+            }
+        }
+        self.entries = kept_entries;
+        self.entry_metadata = kept_entry_metadata;
+
+        let mut kept_batches = Vec::with_capacity(self.int32_pair_batches.len());
+        let mut kept_batch_metadata = Vec::with_capacity(self.batch_metadata.len());
+        for (batch, metadata) in self
+            .int32_pair_batches
+            .drain(..)
+            .zip(self.batch_metadata.drain(..))
+        {
+            if metadata.active {
+                kept_batches.push(batch);
+                kept_batch_metadata.push(metadata);
+            }
+        }
+        self.int32_pair_batches = kept_batches;
+        self.batch_metadata = kept_batch_metadata;
+        self.rebuild_indices();
+    }
+
+    /// Clone active undo for `page` into an immutable walker-local log.
+    pub(crate) fn snapshot_page(&self, page: PageId) -> Self {
+        let mut snapshot = Self::default();
+        let mut entries = Vec::new();
+        for (tid, indices) in &self.entries_by_tid {
+            if tid.page != page {
+                continue;
+            }
+            for &index in indices {
+                if let Some((entry, metadata)) = self
+                    .entries
+                    .get(index)
+                    .zip(self.entry_metadata.get(index))
+                    .filter(|(_, metadata)| metadata.active)
+                {
+                    entries.push((metadata.sequence, entry.clone()));
+                }
+            }
+        }
+        entries.sort_unstable_by_key(|(sequence, _)| *sequence);
+
+        let mut batches = self
+            .batches_by_page
+            .get(&page)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let batch = self.int32_pair_batches.get(index)?;
+                let metadata = self.batch_metadata.get(index)?;
+                metadata.active.then(|| (metadata.sequence, batch.clone()))
+            })
+            .collect::<Vec<_>>();
+        batches.sort_unstable_by_key(|(sequence, _)| *sequence);
+
+        let mut entry_index = 0;
+        let mut batch_index = 0;
+        while entry_index < entries.len() || batch_index < batches.len() {
+            let take_entry = match (entries.get(entry_index), batches.get(batch_index)) {
+                (Some((entry_sequence, _)), Some((batch_sequence, _))) => {
+                    entry_sequence < batch_sequence
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_entry {
+                snapshot.push_entry(entries[entry_index].1.clone());
+                entry_index += 1;
+            } else {
+                snapshot.push_int32_pair_batch(batches[batch_index].1.clone());
+                batch_index += 1;
+            }
+        }
+        snapshot
     }
 
     /// Remove and return every record written by `xid` (rollback), keeping
@@ -528,25 +860,35 @@ impl UndoRelationLog {
     pub fn take_written_by(&mut self, xid: Xid) -> (Vec<UndoEntry>, Vec<Int32PairUndoBatch>) {
         let mut taken_entries = Vec::new();
         let mut kept_entries = Vec::with_capacity(self.entries.len());
-        for entry in self.entries.drain(..) {
+        let mut kept_entry_metadata = Vec::with_capacity(self.entry_metadata.len());
+        for (entry, metadata) in self.entries.drain(..).zip(self.entry_metadata.drain(..)) {
             if entry.writer_xid == xid {
                 taken_entries.push(entry);
             } else {
                 kept_entries.push(entry);
+                kept_entry_metadata.push(metadata);
             }
         }
         self.entries = kept_entries;
+        self.entry_metadata = kept_entry_metadata;
 
         let mut taken_batches = Vec::new();
         let mut kept_batches = Vec::with_capacity(self.int32_pair_batches.len());
-        for batch in self.int32_pair_batches.drain(..) {
+        let mut kept_batch_metadata = Vec::with_capacity(self.batch_metadata.len());
+        for (batch, metadata) in self
+            .int32_pair_batches
+            .drain(..)
+            .zip(self.batch_metadata.drain(..))
+        {
             if batch.writer_xid == xid {
                 taken_batches.push(batch);
             } else {
                 kept_batches.push(batch);
+                kept_batch_metadata.push(metadata);
             }
         }
         self.int32_pair_batches = kept_batches;
+        self.batch_metadata = kept_batch_metadata;
 
         self.rebuild_indices();
         (taken_entries, taken_batches)
@@ -557,10 +899,31 @@ impl UndoRelationLog {
     /// possible snapshot). Returns `(entries_trimmed, batches_trimmed)`.
     pub fn trim_below(&mut self, oldest_active_xid: Xid) -> (usize, usize) {
         let entries_before = self.entries.len();
-        self.entries.retain(|e| e.writer_xid >= oldest_active_xid);
+        let mut kept_entries = Vec::with_capacity(self.entries.len());
+        let mut kept_entry_metadata = Vec::with_capacity(self.entry_metadata.len());
+        for (entry, metadata) in self.entries.drain(..).zip(self.entry_metadata.drain(..)) {
+            if metadata.active && entry.writer_xid >= oldest_active_xid {
+                kept_entries.push(entry);
+                kept_entry_metadata.push(metadata);
+            }
+        }
+        self.entries = kept_entries;
+        self.entry_metadata = kept_entry_metadata;
         let batches_before = self.int32_pair_batches.len();
-        self.int32_pair_batches
-            .retain(|b| b.writer_xid >= oldest_active_xid);
+        let mut kept_batches = Vec::with_capacity(self.int32_pair_batches.len());
+        let mut kept_batch_metadata = Vec::with_capacity(self.batch_metadata.len());
+        for (batch, metadata) in self
+            .int32_pair_batches
+            .drain(..)
+            .zip(self.batch_metadata.drain(..))
+        {
+            if metadata.active && batch.writer_xid >= oldest_active_xid {
+                kept_batches.push(batch);
+                kept_batch_metadata.push(metadata);
+            }
+        }
+        self.int32_pair_batches = kept_batches;
+        self.batch_metadata = kept_batch_metadata;
         let trimmed = (
             entries_before - self.entries.len(),
             batches_before - self.int32_pair_batches.len(),
@@ -575,14 +938,26 @@ impl UndoRelationLog {
     fn rebuild_indices(&mut self) {
         self.entries_by_tid.clear();
         for (idx, entry) in self.entries.iter().enumerate() {
-            self.entries_by_tid.entry(entry.tid).or_default().push(idx);
+            if self
+                .entry_metadata
+                .get(idx)
+                .is_some_and(|metadata| metadata.active)
+            {
+                self.entries_by_tid.entry(entry.tid).or_default().push(idx);
+            }
         }
         self.batches_by_page.clear();
         for (idx, batch) in self.int32_pair_batches.iter().enumerate() {
-            self.batches_by_page
-                .entry(batch.page)
-                .or_default()
-                .push(idx);
+            if self
+                .batch_metadata
+                .get(idx)
+                .is_some_and(|metadata| metadata.active)
+            {
+                self.batches_by_page
+                    .entry(batch.page)
+                    .or_default()
+                    .push(idx);
+            }
         }
     }
 }
@@ -598,6 +973,12 @@ pub struct UndoEntry {
     /// update — if not, the pre-image stored in this entry is what
     /// they should observe.
     pub writer_xid: Xid,
+    /// Command within `writer_xid` that wrote the post-image.
+    ///
+    /// Own writes become visible only to later commands, so readers need this
+    /// boundary to reconstruct statement-level snapshots within one
+    /// transaction.
+    pub command_id: CommandId,
     /// The pre-update payload bytes (no tuple header). The current
     /// in-place fast path stores exactly the 9-byte `(null, id, val)`
     /// body for `(Int32, Int32)` rows.
@@ -664,22 +1045,12 @@ impl Int32PairUndoBatch {
 /// snapshot cannot see. Shared by the closure scan (`scan.rs`) and the
 /// free walker (`walker.rs`) so both paths use identical logic.
 ///
-/// Two record kinds coexist for one slot:
-///
-/// - **Full-payload [`UndoEntry`]**: each writer stored the payload as
-///   it stood *before that writer* applied. The state the snapshot
-///   must observe is the value last committed before it took its
-///   snapshot — i.e. the `old_payload` of the **oldest** (smallest
-///   `writer_xid`) invisible writer. Picking the newest would surface
-///   an intermediate version (snapshot-isolation violation).
-/// - **Compact [`Int32PairUndoBatch`]**: each writer stored a signed
-///   `delta` on one `target_col`. Reversing one writer is not enough
-///   when several stacked; we subtract the **sum of all invisible
-///   deltas** for each affected column from the current payload.
-///
-/// A writer the snapshot *can* see is already reflected in the current
-/// payload and is left untouched, so a mix of visible + invisible
-/// writers correctly yields the state after the last visible writer.
+/// Full-payload and compact records share one monotonic
+/// internal sequence. Reconstruction merges both per-slot streams newest-first
+/// and applies each invisible writer's exact inverse in temporal order. This
+/// is required when point and bulk updates alternate: a full pre-image
+/// replaces the payload at its position in history, while a compact record
+/// subtracts its delta.
 pub(crate) fn undo_pre_image_from_log<O>(
     log: &UndoRelationLog,
     tid: TupleId,
@@ -690,68 +1061,69 @@ pub(crate) fn undo_pre_image_from_log<O>(
 where
     O: ultrasql_mvcc::XidStatusOracle + ?Sized,
 {
-    // Full-payload path: select the oldest invisible writer's
-    // pre-image. The per-tid index yields exactly this slot's writers in
-    // append order (oldest first), so the scan is O(writers-per-slot)
-    // regardless of how many other slots hold live undo records.
-    let mut oldest_invisible_full: Option<(Xid, &[u8; 9])> = None;
-    for entry in log.entries_for_tid(tid) {
-        let writer = entry.writer_xid;
-        // Skip writers the snapshot already sees — their change is
-        // baked into `current_payload` and must NOT be reversed.
-        if undo_writer_visible_to_snapshot(writer, snapshot, oracle) {
-            continue;
-        }
-        if oldest_invisible_full.is_none_or(|(best, _)| writer < best) {
-            oldest_invisible_full = Some((writer, &entry.old_payload));
-        }
+    if current_payload.len() < 9 {
+        return None;
     }
 
-    // Compact int32-pair path: accumulate the signed sum of every
-    // invisible writer's delta, per affected column, then apply
-    // `current − sum` once. A visible writer's delta is left in place.
-    let mut sum_delta_col0: i64 = 0;
-    let mut sum_delta_col1: i64 = 0;
-    let mut saw_compact_invisible = false;
-    for batch in log.batches_for_page(tid.page) {
-        if !batch.contains_slot(tid.slot) {
-            continue;
-        }
-        if undo_writer_visible_to_snapshot(batch.writer_xid, snapshot, oracle) {
-            continue;
-        }
-        saw_compact_invisible = true;
-        let delta = i64::from(batch.delta);
-        if batch.target_col == 0 {
-            sum_delta_col0 += delta;
+    let mut full = log.ordered_entries_for_tid(tid).rev().peekable();
+    let mut compact = log
+        .ordered_batches_for_page(tid.page)
+        .rev()
+        .filter(|(batch, _)| batch.contains_slot(tid.slot))
+        .peekable();
+    let mut pre_image: Option<Vec<u8>> = None;
+
+    loop {
+        let take_full = match (full.peek(), compact.peek()) {
+            (Some((_, entry_meta)), Some((_, batch_meta))) => {
+                entry_meta.sequence > batch_meta.sequence
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_full {
+            let (entry, _) = full.next()?;
+            if !undo_writer_visible_to_snapshot(
+                entry.writer_xid,
+                entry.command_id,
+                snapshot,
+                oracle,
+            ) {
+                let payload = pre_image.get_or_insert_with(|| current_payload[..9].to_vec());
+                payload.copy_from_slice(&entry.old_payload);
+            }
         } else {
-            sum_delta_col1 += delta;
+            let (batch, _) = compact.next()?;
+            if !undo_writer_visible_to_snapshot(
+                batch.writer_xid,
+                batch.command_id,
+                snapshot,
+                oracle,
+            ) {
+                let payload = pre_image.get_or_insert_with(|| current_payload[..9].to_vec());
+                reverse_one_compact_delta(payload, batch.target_col, batch.delta)?;
+            }
         }
     }
 
-    // Precedence: if both kinds touched this slot, the full-payload
-    // oldest invisible pre-image already captures the complete
-    // pre-snapshot state, so prefer it.
-    if let Some((_, payload)) = oldest_invisible_full {
-        return Some(payload.to_vec());
-    }
-    if saw_compact_invisible {
-        return compact_int32_pair_reverse_deltas(current_payload, sum_delta_col0, sum_delta_col1);
-    }
-    None
+    pre_image
 }
 
 #[inline]
 fn undo_writer_visible_to_snapshot<O>(
     writer: Xid,
+    command_id: CommandId,
     snapshot: &ultrasql_mvcc::Snapshot,
     oracle: &O,
 ) -> bool
 where
     O: ultrasql_mvcc::XidStatusOracle + ?Sized,
 {
-    if snapshot.is_current_xid(writer) {
-        true
+    if snapshot.own_subxid_rolled_back(writer) {
+        false
+    } else if snapshot.is_current_xid(writer) {
+        command_id < snapshot.current_command
     } else if snapshot.xid_in_progress(writer) {
         false
     } else {
@@ -762,29 +1134,16 @@ where
     }
 }
 
-/// Reverse the accumulated invisible deltas for a 9-byte
-/// `(null, id, val)` int32-pair payload: `out[col] = current − sum`.
-/// Returns `None` on a short payload or if any column would overflow
-/// `i32`.
-fn compact_int32_pair_reverse_deltas(
-    current_payload: &[u8],
-    sum_delta_col0: i64,
-    sum_delta_col1: i64,
-) -> Option<Vec<u8>> {
-    if current_payload.len() < 9 {
-        return None;
-    }
-    let mut out = current_payload[..9].to_vec();
-    for (offset, sum) in [(1_usize, sum_delta_col0), (5_usize, sum_delta_col1)] {
-        if sum == 0 {
-            continue;
-        }
-        let current = i32::from_le_bytes(out[offset..offset + 4].try_into().ok()?);
-        let restored = i64::from(current).checked_sub(sum)?;
-        let restored = i32::try_from(restored).ok()?;
-        out[offset..offset + 4].copy_from_slice(&restored.to_le_bytes());
-    }
-    Some(out)
+/// Reverse one compact delta in-place.
+fn reverse_one_compact_delta(payload: &mut [u8], target_col: u8, delta: i32) -> Option<()> {
+    let offset = if target_col == 0 { 1 } else { 5 };
+    let current = i32::from_le_bytes(payload.get(offset..offset + 4)?.try_into().ok()?);
+    let restored = i64::from(current).checked_sub(i64::from(delta))?;
+    let restored = i32::try_from(restored).ok()?;
+    payload
+        .get_mut(offset..offset + 4)?
+        .copy_from_slice(&restored.to_le_bytes());
+    Some(())
 }
 
 #[inline]
@@ -872,6 +1231,7 @@ impl<L: PageLoader> HeapAccess<L> {
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
             last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
+            replay_visibility_map: parking_lot::RwLock::new(None),
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
             undo_log: Arc::new(DashMap::new()),
             rollback_stamp_pages: Arc::new(DashMap::new()),
@@ -894,6 +1254,7 @@ impl<L: PageLoader> HeapAccess<L> {
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
             last_checkpoint_lsn,
+            replay_visibility_map: parking_lot::RwLock::new(None),
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
             undo_log: Arc::new(DashMap::new()),
             rollback_stamp_pages: Arc::new(DashMap::new()),
@@ -932,6 +1293,49 @@ impl<L: PageLoader> HeapAccess<L> {
             .retain(|page_id, _| page_id.relation != rel);
     }
 
+    /// Invalidate cached fixed-width payload statistics for one mutated page.
+    ///
+    /// Single-row INSERT and UPDATE operations know every page whose payload
+    /// changed. Removing those exact keys avoids a relation-wide `DashMap`
+    /// shard scan on every OLTP mutation while preserving the same cache
+    /// coherence contract.
+    pub(crate) fn invalidate_int32_pair_payload_stats_page(&self, page_id: PageId) {
+        self.int32_pair_payload_stats.remove(&page_id);
+    }
+
+    /// Clone a relation undo handle without retaining a DashMap shard guard.
+    ///
+    /// Callers obtain this before page locking, then follow `page → undo`.
+    pub(crate) fn undo_log_handle(
+        &self,
+        rel: RelationId,
+    ) -> Arc<parking_lot::RwLock<UndoRelationLog>> {
+        let entry = self
+            .undo_log
+            .entry(rel)
+            .or_insert_with(|| Arc::new(parking_lot::RwLock::new(UndoRelationLog::default())));
+        Arc::clone(entry.value())
+    }
+
+    /// Attach the visibility map used by online WAL replay.
+    ///
+    /// The map must be the same instance consulted by visible scans and
+    /// updated by vacuum. Attach it before replay begins; redo then clears a
+    /// page's VM bits while retaining that page's exclusive latch, preventing
+    /// a hot-standby reader from observing replayed bytes through a stale
+    /// all-visible shortcut.
+    pub fn attach_replay_visibility_map(&self, vm: Arc<crate::vm::VisibilityMap>) {
+        *self.replay_visibility_map.write() = Some(vm);
+    }
+
+    /// Clear VM state for a page while the caller retains its write latch.
+    pub(crate) fn clear_replay_visibility(&self, page_id: PageId) {
+        let vm = self.replay_visibility_map.read().as_ref().map(Arc::clone);
+        if let Some(vm) = vm {
+            vm.clear(page_id.relation, page_id.block);
+        }
+    }
+
     /// `true` when every undo writer recorded for `tid` is visible to
     /// `snapshot` — i.e. the slot's current bytes are exactly the payload
     /// this snapshot should observe and a row flagged
@@ -952,7 +1356,11 @@ impl<L: PageLoader> HeapAccess<L> {
     where
         O: ultrasql_mvcc::XidStatusOracle + ?Sized,
     {
-        let Some(log_handle) = self.undo_log.get(&rel) else {
+        let Some(log_handle) = self
+            .undo_log
+            .get(&rel)
+            .map(|handle| Arc::clone(handle.value()))
+        else {
             return true;
         };
         let log = log_handle.read();
@@ -972,10 +1380,70 @@ impl<L: PageLoader> HeapAccess<L> {
         pages.insert(page_id);
     }
 
+    /// Remember a batch of pages stamped by one transaction under one map/lock
+    /// acquisition.
+    ///
+    /// The iterator's first-seen order is preserved and duplicates are ignored,
+    /// matching repeated calls to [`Self::remember_rollback_stamp_page`].
+    pub(crate) fn remember_rollback_stamp_pages(
+        &self,
+        xid: Xid,
+        page_ids: impl IntoIterator<Item = PageId>,
+    ) {
+        let xid_raw = xid.raw();
+        if xid_raw == 0 {
+            return;
+        }
+        let mut page_ids = page_ids.into_iter();
+        let Some(first_page) = page_ids.next() else {
+            return;
+        };
+        let entry = self
+            .rollback_stamp_pages
+            .entry(xid_raw)
+            .or_insert_with(|| parking_lot::Mutex::new(RollbackStampPages::default()));
+        let mut pages = entry.lock();
+        pages.insert(first_page);
+        pages.extend(page_ids);
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_rollback_stamp_pages(&self, xid: Xid) -> Vec<PageId> {
         self.rollback_stamp_pages
             .remove(&xid.raw())
-            .map_or_else(Vec::new, |(_, pages)| pages.into_inner().pages)
+            .map_or_else(Vec::new, |(_, pages)| pages.into_inner().snapshot())
+    }
+
+    /// Snapshot pages still requiring DELETE/classic-UPDATE stamp rollback.
+    ///
+    /// Unlike [`Self::take_rollback_stamp_pages`], this leaves the registry
+    /// intact. Rollback removes one page only after its full validation and
+    /// restoration succeed, making a later retry safe after a page error.
+    pub(crate) fn rollback_stamp_pages_snapshot(&self, xid: Xid) -> Vec<PageId> {
+        self.rollback_stamp_pages
+            .get(&xid.raw())
+            .map_or_else(Vec::new, |pages| pages.lock().snapshot())
+    }
+
+    /// Forget page stamps retained only for possible transaction rollback.
+    ///
+    /// Recovery registers DELETE and classical UPDATE source pages before it
+    /// knows whether their writer committed. Once commit status is rebuilt, a
+    /// committed writer no longer needs physical rollback bookkeeping; its
+    /// MVCC headers remain authoritative on the page.
+    pub fn discard_rollback_stamp_pages(&self, xid: Xid) {
+        self.rollback_stamp_pages.remove(&xid.raw());
+    }
+
+    /// Mark one registered page restored and remove the transaction entry
+    /// atomically when no page remains.
+    pub(crate) fn mark_rollback_stamp_page_restored(&self, xid: Xid, page_id: PageId) {
+        let xid_raw = xid.raw();
+        self.rollback_stamp_pages.remove_if(&xid_raw, |_, pages| {
+            let mut pages = pages.lock();
+            pages.mark_restored(page_id);
+            pages.is_empty()
+        });
     }
 
     /// Borrow the buffer pool's WAL sink, if any.

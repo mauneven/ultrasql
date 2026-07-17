@@ -162,8 +162,7 @@ where
                 // aborts (Err), or hands the XID to `drive_streaming_select`
                 // (streaming Ok, which installs its own guard), so the guard
                 // must only fire on a panic between here and that return.
-                let mut abort_guard =
-                    AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid);
+                let mut abort_guard = AutocommitAbortGuard::arm(Arc::clone(&self.state), txn.xid);
                 let outcome = run_plan_in_txn(RunPlanInTxnArgs {
                     plan,
                     txn: &txn,
@@ -417,6 +416,7 @@ where
         // not actually finish.
         let original_text = original.to_string();
         let xid = txn.xid;
+        let abort_family = txn.abort_write_xid_family();
         // Evict the shared column cache for every table this aborting txn
         // modified. A plain in-txn INSERT/COPY bumps the cache version at
         // physical insert time but is not undone by `rollback_in_place_updates`
@@ -431,8 +431,7 @@ where
         self.invalidate_modified_table_column_caches(xid);
         let rollback_err = self
             .state
-            .heap
-            .rollback_in_place_updates(xid)
+            .rollback_in_place_update_family(abort_family)
             .err()
             .map(|err| err.to_string());
         let abort_err = self

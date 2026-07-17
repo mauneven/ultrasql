@@ -76,7 +76,7 @@ where
                     self.extended.mark_failed();
                     return self.send_error(&e.to_string(), e.sqlstate()).await;
                 }
-                self.send(&msg).await
+                self.queue_extended_response(&msg).await
             }
             Err(e) => {
                 if !e.is_query_scoped() {
@@ -192,7 +192,7 @@ where
             result_formats,
             Some(&combined),
         ) {
-            Ok(msg) => self.send(&msg).await,
+            Ok(msg) => self.queue_extended_response(&msg).await,
             Err(e) => {
                 if !e.is_query_scoped() {
                     return Err(e);
@@ -230,7 +230,7 @@ where
         match result {
             Ok(msgs) => {
                 for m in &msgs {
-                    self.send(m).await?;
+                    self.queue_extended_response(m).await?;
                 }
                 Ok(())
             }
@@ -316,7 +316,7 @@ where
                 match self.execute_txn_control(plan) {
                     Ok(result) => {
                         for m in &result.messages {
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -339,7 +339,7 @@ where
                 match self.execute_pubsub(plan) {
                     Ok(result) => {
                         for m in &result.messages {
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -356,7 +356,7 @@ where
                 match self.execute_set_variable(plan, false) {
                     Ok(result) => {
                         for m in &result.messages {
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -373,7 +373,7 @@ where
                 match self.execute_set_role(plan) {
                     Ok(result) => {
                         for m in &result.messages {
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -390,7 +390,7 @@ where
                 match self.execute_describe(plan, false, &result_formats) {
                     Ok(result) => {
                         for m in &result.messages {
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -418,7 +418,7 @@ where
                             {
                                 continue;
                             }
-                            self.send(m).await?;
+                            self.queue_extended_response(m).await?;
                         }
                         return Ok(());
                     }
@@ -450,6 +450,11 @@ where
                     self.extended.mark_failed();
                     return self.send_error(&err.to_string(), err.sqlstate()).await;
                 }
+                // COPY is interactive and several COPY implementations reuse
+                // `write_buf` directly. Deliver all prior Extended Query
+                // replies before entering that flow so CopyIn/CopyOut bytes
+                // cannot overtake or overwrite Parse/Bind responses.
+                self.flush_extended_responses().await?;
                 return self.handle_copy_statement_extended(plan).await;
             }
         }
@@ -468,7 +473,7 @@ where
             match self.execute_checkpoint(plan) {
                 Ok(result) => {
                     for m in &result.messages {
-                        self.send(m).await?;
+                        self.queue_extended_response(m).await?;
                     }
                     return Ok(());
                 }
@@ -496,7 +501,7 @@ where
             match result {
                 Ok(result) => {
                     for m in &result.messages {
-                        self.send(m).await?;
+                        self.queue_extended_response(m).await?;
                     }
                     return Ok(());
                 }
@@ -560,7 +565,7 @@ where
         match outcome {
             Ok(out) => {
                 for m in &out.messages {
-                    self.send(m).await?;
+                    self.queue_extended_response(m).await?;
                 }
                 if matches!(self.txn_state, TxnState::Idle) {
                     self.run_post_response_maintenance();
@@ -640,8 +645,7 @@ where
                 // `Drop`, so a caught panic would drop `txn` without releasing
                 // its per-tuple locks. The guard aborts the XID on the unwind;
                 // it is disarmed once the normal commit/abort path has run.
-                let mut abort_guard =
-                    AutocommitAbortGuard::arm(Arc::clone(&self.state.txn_manager), txn.xid);
+                let mut abort_guard = AutocommitAbortGuard::arm(Arc::clone(&self.state), txn.xid);
                 if let Some(plan) = portal_plan.as_ref() {
                     record_serializable_predicate_locks(
                         plan,
@@ -733,12 +737,7 @@ where
                 if let Some((name, original)) = restore_plan {
                     self.restore_portal_plan(&name, original);
                 }
-                // `execute_portal` (the panic-prone executor entry) has
-                // returned: from here on the XID is finalised by the normal
-                // commit/abort below, so disarm. A panic INSIDE `execute_portal`
-                // skips this line and the guard releases the leaked locks.
-                abort_guard.disarm();
-                match res {
+                let result = match res {
                     Ok(outcome) => {
                         let is_dml = portal_plan
                             .as_ref()
@@ -778,7 +777,13 @@ where
                         e,
                         "Extended Execute autocommit rollback after statement error",
                     )),
-                }
+                };
+                // Keep the guard armed through deferred-FK validation and the
+                // commit/abort finalizer. A panic in that window must restore
+                // physical post-images before aborting the XID. If finalization
+                // committed first, Drop's CLOG status check makes it a no-op.
+                abort_guard.disarm();
+                result
             }
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);
@@ -933,13 +938,11 @@ where
     /// transaction block, `'E'` in a failed transaction block).
     pub(crate) async fn handle_sync(&mut self) -> Result<(), ServerError> {
         self.extended.reset_on_sync();
-        // Compose the wire payload in a scratch buffer borrowed from the
-        // session: notifications first, then `ReadyForQuery`, then a
-        // single `write_all` + `flush`. Taking the buffer breaks the
-        // mutable-borrow conflict between `self.write_buf` and the
-        // `self.notify_rx.try_recv()` calls below.
-        let mut scratch = std::mem::take(&mut self.write_buf);
-        scratch.clear();
+        // Append notifications and `ReadyForQuery` to the responses already
+        // queued by this pipeline, then ship the remaining window in one
+        // `write_all` + `flush`. Taking the buffer breaks the mutable-borrow
+        // conflict with `self.notify_rx.try_recv()` below.
+        let mut scratch = std::mem::take(&mut self.extended_write_buf);
         // Notifications that arrived while the session was mid-pipeline
         // precede `ReadyForQuery` per the PostgreSQL convention so
         // libpq-style drivers route them via the async notification
@@ -953,7 +956,7 @@ where
         );
         let res = self.io.write_all(&scratch).await;
         scratch.clear();
-        self.write_buf = scratch;
+        self.extended_write_buf = scratch;
         res?;
         self.io.flush().await?;
         Ok(())
@@ -970,13 +973,11 @@ where
             return Ok(());
         }
         let msg = crate::extended::handle_close(&mut self.extended, kind, name);
-        self.send(&msg).await
+        self.queue_extended_response(&msg).await
     }
 
-    /// Handle `Flush`. Flush already happens inside `send`; this is a
-    /// no-op on top of that.
+    /// Handle `Flush` by delivering all successful replies queued so far.
     pub(crate) async fn handle_flush(&mut self) -> Result<(), ServerError> {
-        self.io.flush().await?;
-        Ok(())
+        self.flush_extended_responses().await
     }
 }

@@ -20,10 +20,10 @@ use ultrasql_wal::payload::{
 };
 use ultrasql_wal::record::RecordType;
 
-use crate::buffer_pool::{BufferPool, PageLoader};
+use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::wal_sink::WalSink;
 
-use super::{HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions, UpdateOutcome};
+use super::{HeapAccess, HeapError, InsertOptions, UpdateOptions, UpdateOutcome};
 
 fn contiguous_slot_range(slots: &[u16]) -> Option<(u16, u16)> {
     let (&first, rest) = slots.split_first()?;
@@ -59,24 +59,18 @@ impl<L: PageLoader> HeapAccess<L> {
         }
     }
 
-    /// Stamp the page-LSN field of `page_id` with `lsn`.
+    /// Raise a pinned page's LSN to at least `lsn`.
     ///
-    /// This must be called **after** the WAL append that assigned `lsn` so
-    /// the page's LSN is never ahead of the WAL. Recovery uses the page LSN
-    /// to determine whether a given page on disk already reflects a WAL
-    /// record (redo-skip optimisation).
-    ///
-    /// The stamp takes a fresh pin on the page, modifies the header under an
-    /// exclusive write lock, and releases the pin. The cost is one pin +
-    /// one write lock per WAL append — acceptable for correctness.
-    pub(super) fn stamp_page_lsn(
-        pool: &Arc<BufferPool<L>>,
-        page_id: PageId,
-        lsn: Lsn,
-    ) -> Result<(), HeapError> {
-        let guard = pool.get_page_relieved(page_id)?;
-        guard.write().set_lsn(lsn.raw());
-        Ok(())
+    /// Concurrent heap mutators can finish WAL appends out of page-mutation
+    /// order. A plain assignment would let the later finisher overwrite a
+    /// newer page LSN with an older one, making the checkpointer believe the
+    /// whole page is covered by an older durable prefix. Monotonic stamping
+    /// preserves the newest WAL dependency regardless of completion order.
+    pub(super) fn stamp_pinned_page_lsn(guard: &PageGuard<L>, lsn: Lsn) {
+        let mut page = guard.write();
+        if page.header().lsn < lsn.raw() {
+            page.set_lsn(lsn.raw());
+        }
     }
 
     /// Emit a `RecordType::FullPageWrite` WAL record for `page_id` if the
@@ -93,10 +87,16 @@ impl<L: PageLoader> HeapAccess<L> {
     /// is needed (the page has been modified since the last checkpoint, so a
     /// full copy was already emitted earlier in the current checkpoint cycle).
     ///
-    /// The function pins the page under a **shared** read lock to capture the
-    /// image, appends the FPW record, then releases the pin. No exclusive lock
-    /// is held during WAL I/O, which is consistent with the pattern used by
-    /// `emit_insert_wal` and friends.
+    /// The cheap "already covered" check uses a shared latch. When an image is
+    /// needed, the function rechecks under the exclusive page latch and keeps
+    /// that latch through image capture, WAL append, and LSN stamp. This rare
+    /// checkpoint-boundary path must serialize the image with page mutations:
+    /// releasing the latch between capture and append could place a stale FPW
+    /// after a concurrent mutation record and erase that mutation during redo.
+    ///
+    /// [`WalSink`] implementations may block on their own WAL I/O but must not
+    /// re-enter the heap buffer pool, so appending under this page latch cannot
+    /// create a page/WAL lock cycle.
     pub(super) fn maybe_emit_fpw(
         pool: &Arc<BufferPool<L>>,
         page_id: PageId,
@@ -112,22 +112,23 @@ impl<L: PageLoader> HeapAccess<L> {
             return Ok(());
         }
 
-        // Read the page under a shared lock. Most hot pages have already
-        // been touched in the current checkpoint cycle, so check the cheap
-        // header LSN before copying the 8 KiB image.
-        let page_bytes = {
-            let guard = pool.get_page_relieved(page_id)?;
+        let guard = pool.get_page_relieved(page_id)?;
+        // Most hot pages have already been touched in the current checkpoint
+        // cycle, so avoid an exclusive latch on the common covered-page path.
+        {
             let page = guard.read();
-            let page_lsn = page.header().lsn;
-            if page_lsn >= checkpoint_lsn {
+            if page.header().lsn >= checkpoint_lsn {
                 return Ok(());
             }
-            // Copy the full page image into an owned Vec so we release the
-            // shared pin before appending to the WAL (no pin during WAL I/O).
-            let bytes = page.as_bytes().to_vec();
-            drop(page);
-            bytes
-        };
+        }
+
+        // Recheck after upgrading by release/reacquire: another writer may have
+        // emitted the first FPW while we waited for the exclusive latch.
+        let mut page = guard.write();
+        if page.header().lsn >= checkpoint_lsn {
+            return Ok(());
+        }
+        let page_bytes = page.as_bytes().to_vec();
 
         // Sanity: page_bytes must be exactly PAGE_SIZE.
         if page_bytes.len() != PAGE_SIZE {
@@ -150,56 +151,49 @@ impl<L: PageLoader> HeapAccess<L> {
             payload.encode()?,
         )?;
         // FPW is emitted before the mutation. If the sink rejects it, no page
-        // bytes have changed yet, so normal error propagation is safe.
+        // bytes have changed yet, so normal error propagation is safe. Keep
+        // the exclusive latch through the append so this image cannot be
+        // reordered after a mutation it does not contain.
         let lsn: Lsn = sink.append(record)?;
-        // Stamp the page LSN with the FPW LSN so we don't emit duplicate FPWs
-        // for subsequent mutations in the same checkpoint cycle.
-        Self::stamp_page_lsn(pool, page_id, lsn)?;
+        if page.header().lsn < lsn.raw() {
+            page.set_lsn(lsn.raw());
+        }
         Ok(())
     }
 
     /// Emit a `HeapInsert` WAL record if `opts.wal` is `Some`, then stamp
     /// the page's LSN with the assigned WAL LSN.
     ///
-    /// `fetch_tuple` is a closure that reads the canonical on-page tuple bytes;
-    /// it is called only when the sink is present to avoid a redundant fetch in
-    /// the no-WAL path.
-    ///
-    /// This function must be called **after** the page guard has been dropped
-    /// so no buffer-pool pin is held during WAL I/O. If the sink rejects the
-    /// record after the page has been written, the buffer pool is poisoned and
-    /// [`HeapError::Wal`] is returned; callers must treat that as fatal and
-    /// restart from WAL before accepting more work.
+    /// `guard` is the original pin under which the tuple became dirty. It stays
+    /// alive through append and LSN stamp, so the checkpointer cannot flush the
+    /// post-insert bytes with the page's previous LSN. The page latch itself is
+    /// released while appending; readers are not blocked by a slow sink.
     pub(super) fn emit_insert_wal(
         pool: &Arc<BufferPool<L>>,
         tid: TupleId,
         opts: &InsertOptions<'_>,
-        fetch_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
+        guard: &PageGuard<L>,
     ) -> Result<(), HeapError> {
         if let Some(sink) = opts.wal {
-            let tup = fetch_tuple()?;
-            // Reconstruct full on-page bytes: header || payload.
-            let mut tuple_bytes = Vec::with_capacity(TUPLE_HEADER_SIZE + tup.data.len());
-            tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
-            tup.header.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
-            tuple_bytes.extend_from_slice(&tup.data);
-
-            let prev_lsn = sink.last_lsn_for(opts.xmin);
-            // Encoding is fallible and runs here (post-page-write), but
-            // PayloadError is an internal format invariant violation and
-            // should not occur in practice with a well-formed HeapInsertPayload.
-            let payload_bytes = HeapInsertPayload { tid, tuple_bytes }.encode()?;
-            let record = WalRecord::new(
-                RecordType::HeapInsert,
-                opts.xmin,
-                prev_lsn,
-                0,
-                payload_bytes,
-            )?;
-            let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
-            // Stamp the page LSN now that the WAL record is durable.
-            // WAL append happened before stamp so page LSN is never ahead of WAL.
-            Self::stamp_page_lsn(pool, tid.page, lsn)?;
+            let result: Result<(), HeapError> = (|| {
+                let tuple_bytes = Self::copy_slot_bytes(guard, tid.slot)?;
+                let prev_lsn = sink.last_lsn_for(opts.xmin);
+                let payload_bytes = HeapInsertPayload { tid, tuple_bytes }.encode()?;
+                let record = WalRecord::new(
+                    RecordType::HeapInsert,
+                    opts.xmin,
+                    prev_lsn,
+                    0,
+                    payload_bytes,
+                )?;
+                let lsn = sink.append(record).map_err(HeapError::Wal)?;
+                Self::stamp_pinned_page_lsn(guard, lsn);
+                Ok(())
+            })();
+            if result.is_err() {
+                pool.poison_after_wal_error();
+            }
+            result?;
         }
         Ok(())
     }
@@ -210,8 +204,13 @@ impl<L: PageLoader> HeapAccess<L> {
     /// `rows`, so this avoids re-pinning the page and fetching every tuple
     /// after the page fill. The encoded tuple image is the same canonical
     /// `TupleHeader::fresh(...) || payload` bytes that `batch_fill_page` wrote.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "WAL batch encoding needs the pinned page plus caller-owned row/TID/payload buffers to preserve ordering without allocation"
+    )]
     pub(super) fn emit_insert_batch_wal_from_payloads(
         pool: &Arc<BufferPool<L>>,
+        guard: &PageGuard<L>,
         page_id: PageId,
         tids: &[TupleId],
         rows: &[&[u8]],
@@ -220,42 +219,51 @@ impl<L: PageLoader> HeapAccess<L> {
         payload_buf: &mut Vec<u8>,
     ) -> Result<(), HeapError> {
         if let Some(sink) = opts.wal {
-            if tids.len() != rows.len() {
-                return Err(HeapError::MalformedHeader(
-                    "heap insert batch WAL tids/rows length mismatch",
-                ));
-            }
-            if tids.is_empty() {
-                return Ok(());
-            }
-
-            let prev_lsn = sink.last_lsn_for(opts.xmin);
-            Self::encode_insert_batch_payload_from_rows(
-                page_id,
-                tids,
-                rows,
-                opts.xmin,
-                opts.command_id,
-                n_atts,
-                payload_buf,
-            )?;
-            let mut record = WalRecord::new(
-                RecordType::HeapInsertBatch,
-                opts.xmin,
-                prev_lsn,
-                0,
-                std::mem::take(payload_buf),
-            )?;
-            let lsn: Lsn = match sink.append_ref(&record) {
-                Ok(lsn) => lsn,
-                Err(err) => {
-                    pool.poison_after_wal_error();
-                    *payload_buf = std::mem::take(&mut record.payload);
-                    return Err(HeapError::Wal(err));
+            let result: Result<(), HeapError> = (|| {
+                if tids.len() != rows.len() {
+                    return Err(HeapError::MalformedHeader(
+                        "heap insert batch WAL tids/rows length mismatch",
+                    ));
                 }
-            };
-            *payload_buf = std::mem::take(&mut record.payload);
-            Self::stamp_page_lsn(pool, page_id, lsn)?;
+                if tids.is_empty() {
+                    return Ok(());
+                }
+
+                let prev_lsn = sink.last_lsn_for(opts.xmin);
+                Self::encode_insert_batch_payload_from_rows(
+                    page_id,
+                    tids,
+                    rows,
+                    opts.xmin,
+                    opts.command_id,
+                    n_atts,
+                    payload_buf,
+                )?;
+                let mut record = WalRecord::new(
+                    RecordType::HeapInsertBatch,
+                    opts.xmin,
+                    prev_lsn,
+                    0,
+                    std::mem::take(payload_buf),
+                )?;
+                let lsn = match sink.append_ref(&record) {
+                    Ok(lsn) => lsn,
+                    Err(err) => {
+                        *payload_buf = std::mem::take(&mut record.payload);
+                        return Err(HeapError::Wal(err));
+                    }
+                };
+                *payload_buf = std::mem::take(&mut record.payload);
+                Self::stamp_pinned_page_lsn(guard, lsn);
+                Ok(())
+            })();
+            if result.is_err() {
+                // Every error in this block occurs after the page batch became
+                // dirty, so continuing could expose bytes with no replay
+                // record. Poison before the original pin is released.
+                pool.poison_after_wal_error();
+            }
+            result?;
         }
         Ok(())
     }
@@ -341,14 +349,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// `flags` has [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when
     /// `outcome.hot` is `true`.
     ///
-    /// `fetch_new_tuple` is a closure that reads the new version's on-page
-    /// bytes; it is only called when the sink is present.
-    ///
-    /// This function must be called **after** all page guards have been
-    /// dropped. If the sink rejects the record after both the old and new
-    /// versions have been written, the buffer pool is poisoned and
-    /// [`HeapError::Wal`] is returned (same reasoning as
-    /// [`Self::emit_insert_wal`]).
+    /// `new_guard` and `old_guard` are the original pins under which the two
+    /// page mutations became dirty. They remain pinned through append and LSN
+    /// publication, closing the checkpointer window without holding either
+    /// page latch during WAL backpressure.
     ///
     /// When the old and new pages differ (non-HOT), both pages are stamped
     /// with the same LSN so recovery can skip redo on either if the page is
@@ -357,40 +361,38 @@ impl<L: PageLoader> HeapAccess<L> {
         pool: &Arc<BufferPool<L>>,
         outcome: UpdateOutcome,
         opts: &UpdateOptions<'_>,
-        fetch_new_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
+        new_guard: &PageGuard<L>,
+        old_guard: &PageGuard<L>,
     ) -> Result<(), HeapError> {
         if let Some(sink) = opts.wal {
-            let new_tup = fetch_new_tuple()?;
-            let mut new_tuple_bytes = Vec::with_capacity(TUPLE_HEADER_SIZE + new_tup.data.len());
-            new_tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
-            new_tup
-                .header
-                .encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
-            new_tuple_bytes.extend_from_slice(&new_tup.data);
-
-            let flags = if outcome.hot {
-                ultrasql_wal::payload::HEAP_UPDATE_HOT
-            } else {
-                0
-            };
-            let prev_lsn = sink.last_lsn_for(opts.xid);
-            let payload_bytes = HeapUpdatePayload {
-                old_tid: outcome.old_tid,
-                new_tid: outcome.new_tid,
-                flags,
-                new_tuple_bytes,
+            let result: Result<(), HeapError> = (|| {
+                let new_tuple_bytes = Self::copy_slot_bytes(new_guard, outcome.new_tid.slot)?;
+                let flags = if outcome.hot {
+                    ultrasql_wal::payload::HEAP_UPDATE_HOT
+                } else {
+                    0
+                };
+                let prev_lsn = sink.last_lsn_for(opts.xid);
+                let payload_bytes = HeapUpdatePayload {
+                    old_tid: outcome.old_tid,
+                    new_tid: outcome.new_tid,
+                    flags,
+                    new_tuple_bytes,
+                }
+                .encode()?;
+                let record =
+                    WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes)?;
+                let lsn = sink.append(record).map_err(HeapError::Wal)?;
+                Self::stamp_pinned_page_lsn(new_guard, lsn);
+                if outcome.old_tid.page != outcome.new_tid.page {
+                    Self::stamp_pinned_page_lsn(old_guard, lsn);
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                pool.poison_after_wal_error();
             }
-            .encode()?;
-            let record =
-                WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes)?;
-            let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
-            // Stamp the new page with the WAL LSN.
-            Self::stamp_page_lsn(pool, outcome.new_tid.page, lsn)?;
-            // For non-HOT updates the old and new pages differ; stamp
-            // both so the page LSN reflects the mutation on both sides.
-            if outcome.old_tid.page != outcome.new_tid.page {
-                Self::stamp_page_lsn(pool, outcome.old_tid.page, lsn)?;
-            }
+            result?;
         }
         Ok(())
     }
@@ -404,18 +406,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// in-flight snapshot that pre-dates the writer's commit still
     /// observes the right view through `for_each_visible` / the walker.
     ///
-    /// Returns the assigned LSN; the caller stamps the page LSN with
-    /// it. The caller MUST call this with the page write guard
-    /// dropped (no buffer-pool pin during WAL I/O), exactly like the
-    /// existing `emit_update_wal`. Per-row append rather than
-    /// batched-per-page so a torn write that cuts the WAL mid-batch
-    /// still has every applied row covered up to the cut.
-    ///
-    /// Failure semantics match `emit_update_wal`: a sink rejection
-    /// after the page mutation poisons the buffer pool and returns a
-    /// fatal WAL error so the service can restart from the WAL.
+    /// Returns the assigned LSN. The caller finishes every page-local
+    /// validation first, appends this record, publishes undo, then performs
+    /// only proven-infallible byte writes and stamps the page before releasing
+    /// its guard. A rejection therefore leaves both page and undo unchanged.
     pub(super) fn emit_update_in_place_wal(
-        pool: &Arc<BufferPool<L>>,
         sink: &dyn WalSink,
         tid: TupleId,
         writer_xid: Xid,
@@ -439,63 +434,7 @@ impl<L: PageLoader> HeapAccess<L> {
             0,
             payload_bytes,
         )?;
-        let lsn: Lsn = Self::append_after_page_mutation(pool, sink, record)?;
-        Ok(lsn)
-    }
-
-    /// Emit one compact page-level `(Int32, Int32)` delta UPDATE record.
-    ///
-    /// The fused update path already knows every changed row applied the same
-    /// `target_col += delta` edit, so recovery can reconstruct both the
-    /// post-image and undo pre-image from the page bytes plus slot list.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
-    )]
-    pub(super) fn emit_update_int32_pair_delta_batch_wal_reuse(
-        pool: &Arc<BufferPool<L>>,
-        sink: &dyn WalSink,
-        page_id: PageId,
-        writer_xid: Xid,
-        command_id: CommandId,
-        target_col: u8,
-        delta: i32,
-        slots: &[u16],
-        payload_buf: &mut Vec<u8>,
-    ) -> Result<Lsn, HeapError> {
-        let prev_lsn = sink.last_lsn_for(writer_xid);
-        let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
-            HeapUpdateInt32PairDeltaRangeBatchPayload {
-                page: page_id,
-                writer_xid,
-                command_id,
-                target_col,
-                delta,
-                first_slot,
-                slot_count,
-            }
-            .encode_into(payload_buf)?;
-            RecordType::HeapUpdateInt32PairDeltaRangeBatch
-        } else {
-            HeapUpdateInt32PairDeltaBatchPayload::encode_slots_into(
-                page_id,
-                writer_xid,
-                command_id,
-                target_col,
-                delta,
-                slots,
-                payload_buf,
-            )?;
-            RecordType::HeapUpdateInt32PairDeltaBatch
-        };
-        let lsn = match sink.append_borrowed(record_type, writer_xid, prev_lsn, 0, payload_buf) {
-            Ok(lsn) => lsn,
-            Err(err) => {
-                pool.poison_after_wal_error();
-                return Err(HeapError::Wal(err));
-            }
-        };
-        Ok(lsn)
+        sink.append(record).map_err(HeapError::Wal)
     }
 
     /// Emit a compact `(Int32, Int32)` delta UPDATE record before page bytes
@@ -596,80 +535,6 @@ impl<L: PageLoader> HeapAccess<L> {
         };
         sink.append_borrowed(record_type, writer_xid, prev_lsn, 0, payload_buf)
             .map_err(HeapError::Wal)
-    }
-
-    /// Emit one page-level in-place DELETE record covering every slot
-    /// stamped on `page_id`.
-    ///
-    /// The caller mutates one source page under one write guard, drops
-    /// the guard, appends this WAL record, then stamps the page with
-    /// the returned LSN. This preserves the same FPW + redo-skip
-    /// contract as the per-row record while avoiding one WAL append
-    /// per tuple on bulk deletes.
-    /// Emit one page-level in-place DELETE record, reusing `payload_buf`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
-    )]
-    pub(super) fn emit_delete_in_place_batch_wal_reuse_after(
-        pool: &Arc<BufferPool<L>>,
-        sink: &dyn WalSink,
-        page_id: PageId,
-        xmax: Xid,
-        cmax: CommandId,
-        slots: &[u16],
-        payload_buf: &mut Vec<u8>,
-        prev_lsn: Lsn,
-    ) -> Result<Lsn, HeapError> {
-        Self::emit_delete_in_place_batch_wal_reuse_after_inner(
-            pool,
-            sink,
-            page_id,
-            xmax,
-            cmax,
-            slots,
-            payload_buf,
-            prev_lsn,
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
-    )]
-    pub(super) fn emit_delete_in_place_range_batch_wal_reuse_after(
-        pool: &Arc<BufferPool<L>>,
-        sink: &dyn WalSink,
-        page_id: PageId,
-        xmax: Xid,
-        cmax: CommandId,
-        first_slot: u16,
-        slot_count: u16,
-        payload_buf: &mut Vec<u8>,
-        prev_lsn: Lsn,
-    ) -> Result<Lsn, HeapError> {
-        HeapDeleteInPlaceRangeBatchPayload::encode_range_into(
-            page_id,
-            xmax,
-            cmax,
-            first_slot,
-            slot_count,
-            payload_buf,
-        )?;
-        let lsn = match sink.append_borrowed(
-            RecordType::HeapDeleteInPlaceRangeBatch,
-            xmax,
-            prev_lsn,
-            0,
-            payload_buf,
-        ) {
-            Ok(lsn) => lsn,
-            Err(err) => {
-                pool.poison_after_wal_error();
-                return Err(HeapError::Wal(err));
-            }
-        };
-        Ok(lsn)
     }
 
     /// Emit a compact DELETE record before page bytes are changed.
@@ -821,49 +686,5 @@ impl<L: PageLoader> HeapAccess<L> {
             payload_buf,
         )
         .map_err(HeapError::Wal)
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "WAL emit helper mirrors fixed wire fields and reuses caller scratch"
-    )]
-    fn emit_delete_in_place_batch_wal_reuse_after_inner(
-        pool: &Arc<BufferPool<L>>,
-        sink: &dyn WalSink,
-        page_id: PageId,
-        xmax: Xid,
-        cmax: CommandId,
-        slots: &[u16],
-        payload_buf: &mut Vec<u8>,
-        prev_lsn: Lsn,
-    ) -> Result<Lsn, HeapError> {
-        let record_type = if let Some((first_slot, slot_count)) = contiguous_slot_range(slots) {
-            HeapDeleteInPlaceRangeBatchPayload::encode_range_into(
-                page_id,
-                xmax,
-                cmax,
-                first_slot,
-                slot_count,
-                payload_buf,
-            )?;
-            RecordType::HeapDeleteInPlaceRangeBatch
-        } else {
-            HeapDeleteInPlaceBatchPayload::encode_slots_into(
-                page_id,
-                xmax,
-                cmax,
-                slots,
-                payload_buf,
-            )?;
-            RecordType::HeapDeleteInPlaceBatch
-        };
-        let lsn = match sink.append_borrowed(record_type, xmax, prev_lsn, 0, payload_buf) {
-            Ok(lsn) => lsn,
-            Err(err) => {
-                pool.poison_after_wal_error();
-                return Err(HeapError::Wal(err));
-            }
-        };
-        Ok(lsn)
     }
 }

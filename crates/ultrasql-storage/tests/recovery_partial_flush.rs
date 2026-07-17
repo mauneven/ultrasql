@@ -653,11 +653,12 @@ use ultrasql_storage::buffer_pool::{BufferPoolError, EvictionRelief};
 use ultrasql_storage::wal_sink::{WalSink, WalSinkError};
 
 /// A `WalSink` that records every appended record (for replay) and whose
-/// durable LSN equals the highest assigned LSN — i.e. everything appended is
-/// immediately durable. This makes the relief LSN gate (`page_lsn <= durable`)
-/// pass for any page the workload has mutated, so relief writes are exercised
-/// without a separate force step. Records and per-xid `prev_lsn` chaining are
-/// kept exactly like `InMemoryWalSink`.
+/// exclusive durable end boundary is one past the highest assigned record-start
+/// LSN — i.e. everything appended is immediately durable. This makes the
+/// relief LSN gate (`page_lsn < durable`) pass for any page the workload has
+/// mutated, so relief writes are exercised without a separate force step.
+/// Records and per-xid `prev_lsn` chaining are kept exactly like
+/// `InMemoryWalSink`.
 #[derive(Default)]
 struct RecordingDurableSink {
     inner: parking_lot::Mutex<RecordingInner>,
@@ -697,7 +698,11 @@ impl WalSink for RecordingDurableSink {
     }
     fn durable_lsn(&self) -> Lsn {
         let n = self.inner.lock().next_lsn;
-        if n == 0 { Lsn::ZERO } else { Lsn::new(n) }
+        if n == 0 {
+            Lsn::ZERO
+        } else {
+            Lsn::new(n.saturating_add(1))
+        }
     }
     fn last_lsn_for(&self, xid: Xid) -> Lsn {
         self.inner
@@ -714,7 +719,8 @@ impl WalSink for RecordingDurableSink {
 /// sink's durable LSN by reusing `try_flush_dirty`. It records, for every page
 /// written, the durable LSN at the moment of the write and the on-disk LSN the
 /// page carried, so the test can assert WAL-before-data
-/// (`on_disk_lsn <= durable_at_write`) for every relief write.
+/// (`on_disk_lsn < durable_at_write`, except the zero sentinel) for every
+/// relief write.
 struct ReliefToSegments {
     pool: Arc<BufferPool<SharedSegments>>,
     segments: Arc<SegmentFileManager>,
@@ -747,9 +753,9 @@ impl EvictionRelief for ReliefToSegments {
                         .allocate_block(page_id.relation)
                         .map_err(ultrasql_core::Error::from)?;
                 }
-                // WAL-before-data audit: try_flush_dirty only invokes us for
-                // pages with page_lsn <= durable, so this must always hold.
-                if page.header().lsn > durable_at_write {
+                // WAL-before-data audit: nonzero page-LSNs are record starts
+                // and must be strictly below the exclusive durable boundary.
+                if page.header().lsn != 0 && page.header().lsn >= durable_at_write {
                     violation.store(u64::from(page_id.block.raw()) + 1, Ordering::SeqCst);
                 }
                 segments
@@ -795,9 +801,9 @@ fn relief_heap(
 }
 
 /// Drive eviction through the relief path: a live insert workload on a tiny
-/// pool over real on-disk segments. Assert every page relief wrote satisfies
-/// `on_disk_lsn <= durable_at_write`, then crash, reopen cold, replay the full
-/// WAL, and assert the recovered rows equal a clean full-replay reference.
+/// pool over real on-disk segments. Assert every nonzero page-LSN relief wrote
+/// is strictly below `durable_at_write`, then crash, reopen cold, replay the
+/// full WAL, and assert the recovered rows equal a clean full-replay reference.
 #[test]
 fn evicted_then_written_page_replays_and_never_violates_wal_before_data() {
     const ROWS: usize = 300;
@@ -844,7 +850,7 @@ fn evicted_then_written_page_replays_and_never_violates_wal_before_data() {
         assert_eq!(
             violation.load(Ordering::SeqCst),
             0,
-            "a relief write carried page_lsn > durable (WAL-before-data violated)"
+            "a relief write carried page_lsn outside the durable prefix"
         );
 
         let n_blocks = heap.block_count(rel());

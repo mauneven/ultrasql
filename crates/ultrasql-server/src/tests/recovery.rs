@@ -3,11 +3,14 @@
 use std::fs;
 use std::sync::Arc;
 
-use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, Xid};
+use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, Xid};
 use ultrasql_mvcc::{XidStatus, XidStatusOracle};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{
+    HeapAccess, InsertOptions, UpdateInt32PairEdit, UpdateInt32PairScan, UpdateInt32PairStamp,
+};
 use ultrasql_storage::page::Page;
+use ultrasql_txn::IsolationLevel;
 use ultrasql_wal::payload::{AbortPayload, CommitPayload, SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
@@ -63,6 +66,95 @@ fn recovery_target() -> ServerRecoveryTarget {
     }
 }
 
+fn write_recovery_wal(data_dir: &std::path::Path, records: &[WalRecord]) {
+    let wal_dir = data_dir.join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend_from_slice(&record.encode());
+    }
+    fs::write(wal_dir.join("segment_0000000000"), bytes).unwrap();
+}
+
+#[test]
+fn recovery_preserves_unresolved_prepared_subxid_family() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let parent = Xid::new(40);
+    let subxid = Xid::new(41);
+    let state_dir = data_dir.path().join("pg_twophase");
+    fs::create_dir_all(&state_dir).unwrap();
+    let coordinator = ultrasql_txn::two_phase::TwoPhaseCoordinator::new(state_dir);
+    coordinator.prepare("family", parent, &[subxid]).unwrap();
+    drop(coordinator);
+    write_recovery_wal(
+        data_dir.path(),
+        &[
+            WalRecord::new(RecordType::Nop, parent, Lsn::ZERO, 0, Vec::new()).unwrap(),
+            WalRecord::new(RecordType::Nop, subxid, Lsn::ZERO, 0, Vec::new()).unwrap(),
+        ],
+    );
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let server = Server::init(data_dir.path()).unwrap();
+
+    assert_eq!(server.txn_manager.status(parent), XidStatus::InProgress);
+    assert_eq!(server.txn_manager.status(subxid), XidStatus::InProgress);
+    assert_eq!(server.two_phase.list_prepared().len(), 1);
+}
+
+#[test]
+fn recovery_reconciles_terminal_decision_with_stale_prepared_state() {
+    for committed in [true, false] {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let parent = Xid::new(50);
+        let subxid = Xid::new(51);
+        let state_dir = data_dir.path().join("pg_twophase");
+        fs::create_dir_all(&state_dir).unwrap();
+        let coordinator = ultrasql_txn::two_phase::TwoPhaseCoordinator::new(state_dir);
+        coordinator
+            .prepare("resolved-family", parent, &[subxid])
+            .unwrap();
+        drop(coordinator);
+        let record = if committed {
+            let payload = CommitPayload {
+                commit_lsn: Lsn::new(1),
+                commit_timestamp_micros: 0,
+                committed_subxids: vec![subxid],
+            }
+            .encode()
+            .unwrap();
+            WalRecord::new(RecordType::Commit, parent, Lsn::ZERO, 0, payload).unwrap()
+        } else {
+            WalRecord::new(
+                RecordType::Abort,
+                parent,
+                Lsn::ZERO,
+                0,
+                AbortPayload {
+                    abort_lsn: Lsn::new(1),
+                }
+                .encode(),
+            )
+            .unwrap()
+        };
+        write_recovery_wal(data_dir.path(), &[record]);
+        #[cfg(unix)]
+        make_data_dir_private(data_dir.path());
+
+        let server = Server::init(data_dir.path()).unwrap();
+        let expected = if committed {
+            XidStatus::Committed
+        } else {
+            XidStatus::Aborted
+        };
+
+        assert_eq!(server.txn_manager.status(parent), expected);
+        assert_eq!(server.txn_manager.status(subxid), expected);
+        assert!(server.two_phase.list_prepared().is_empty());
+    }
+}
+
 #[cfg(unix)]
 fn make_data_dir_private(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -106,7 +198,7 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
 
     let appended_lsn = {
         let server = Server::init(data_dir.path()).unwrap();
-        assert_eq!(server.runtime_wal_flushed_lsn(), Some(Lsn::ZERO));
+        assert!(server.runtime_wal_flushed_lsn().is_some());
 
         let pool = server.heap.buffer_pool();
         let sink = pool
@@ -116,18 +208,152 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
             .expect("test WAL record should fit size limits");
         sink.append(record).unwrap()
     };
+    assert!(
+        appended_lsn > Lsn::ZERO,
+        "fresh startup must reserve LSN zero before real records"
+    );
 
-    let mut seen_nop = 0_u64;
+    let mut seen_origin = 0_u64;
+    let mut seen_test_nop = 0_u64;
     let recovered_lsn = ultrasql_wal::recover(&wal_dir, |record| {
-        if record.header.record_type == RecordType::Nop {
-            seen_nop = seen_nop.saturating_add(1);
+        if record.header.record_type == RecordType::Nop
+            && record.payload == b"ULTRASQL_WAL_ORIGIN_V1"
+        {
+            seen_origin = seen_origin.saturating_add(1);
+        }
+        if record.header.record_type == RecordType::Nop && record.header.xid == Xid::FIRST_USER {
+            seen_test_nop = seen_test_nop.saturating_add(1);
         }
         Ok(())
     })
     .unwrap();
 
-    assert_eq!(seen_nop, 1);
+    assert_eq!(seen_origin, 1);
+    assert_eq!(seen_test_nop, 1);
     assert!(recovered_lsn.raw() > appended_lsn.raw());
+}
+
+#[test]
+fn server_reopen_does_not_append_a_second_wal_origin_marker() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+
+    drop(Server::init(data_dir.path()).unwrap());
+    drop(Server::init(data_dir.path()).unwrap());
+
+    let mut seen_origin = 0_u64;
+    ultrasql_wal::recover(&wal_dir, |record| {
+        if record.header.record_type == RecordType::Nop
+            && record.payload == b"ULTRASQL_WAL_ORIGIN_V1"
+        {
+            seen_origin = seen_origin.saturating_add(1);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen_origin, 1);
+}
+
+#[test]
+fn restart_physically_rolls_back_unresolved_inplace_update_before_undo_gc() {
+    fn int32_pair(id: i32, value: i32) -> [u8; 9] {
+        let mut payload = [0_u8; 9];
+        payload[1..5].copy_from_slice(&id.to_le_bytes());
+        payload[5..9].copy_from_slice(&value.to_le_bytes());
+        payload
+    }
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let relation = RelationId::new(49_999);
+    let writer_xid;
+    {
+        let server = Server::init(data_dir.path()).unwrap();
+        server
+            .heap
+            .insert(
+                relation,
+                &int32_pair(1, 10),
+                InsertOptions {
+                    xmin: Xid::FROZEN,
+                    command_id: CommandId::FIRST,
+                    n_atts: 2,
+                    wal: None,
+                    fsm: None,
+                    vm: Some(server.vm.as_ref()),
+                },
+            )
+            .expect("seed frozen row");
+        checkpoint_with_retry(&server);
+
+        let writer = server.txn_manager.begin(IsolationLevel::ReadCommitted);
+        writer_xid = writer.xid;
+        let wal = Arc::clone(server.heap.wal_sink().expect("persistent WAL sink"));
+        let updated = server
+            .heap
+            .update_int32_pair_inplace_undo(
+                UpdateInt32PairScan {
+                    rel: relation,
+                    block_count: server.heap.block_count(relation),
+                    snapshot: &writer.snapshot,
+                    oracle: server.txn_manager.as_ref(),
+                    predicate: |id, _value| id == 1,
+                },
+                UpdateInt32PairEdit {
+                    target_col: 1,
+                    delta: 90,
+                },
+                UpdateInt32PairStamp {
+                    xid: writer.xid,
+                    command_id: writer.current_command,
+                },
+                Some(wal.as_ref()),
+                Some(server.vm.as_ref()),
+            )
+            .expect("write uncommitted in-place post-image");
+        assert_eq!(updated, 1);
+
+        // Make both the page post-image and its data WAL durable, then simulate
+        // a crash before Commit/Abort by dropping the server with `writer`
+        // still unresolved.
+        checkpoint_with_retry(&server);
+        drop(writer);
+    }
+
+    let reopened = Server::init(data_dir.path()).expect("restart rolls back unresolved writer");
+    assert_eq!(reopened.txn_manager.status(writer_xid), XidStatus::Aborted);
+    assert_eq!(
+        reopened.heap.undo_log_len(relation),
+        0,
+        "startup rollback must drain replayed undo before serving"
+    );
+
+    let reader = reopened.txn_manager.begin(IsolationLevel::ReadCommitted);
+    let read_values = || {
+        reopened
+            .heap
+            .scan_visible(
+                relation,
+                reopened.heap.block_count(relation),
+                &reader.snapshot,
+                reopened.txn_manager.as_ref(),
+            )
+            .map(|tuple| {
+                let tuple = tuple.expect("visible tuple");
+                i32::from_le_bytes(tuple.data[5..9].try_into().expect("int32 value"))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read_values(), vec![10]);
+
+    reopened
+        .heap
+        .vacuum_undo_log(reopened.txn_manager.vacuum_horizon())
+        .expect("undo GC after recovery rollback");
+    assert_eq!(
+        read_values(),
+        vec![10],
+        "undo GC must not make the physically restored row disappear"
+    );
 }
 
 #[test]
@@ -323,12 +549,13 @@ fn persistent_server_can_force_commit_marker_durable() {
         .append_commit_record(Xid::FIRST_USER, Vec::new())
         .unwrap()
         .expect("persistent server must append a commit marker");
+    assert!(commit_lsn > Lsn::ZERO);
     server.wait_for_wal_durable(commit_lsn).unwrap();
 
     let flushed_lsn = server
         .runtime_wal_flushed_lsn()
         .expect("persistent server must own a WAL writer");
-    assert!(flushed_lsn.raw() >= commit_lsn.raw());
+    assert!(flushed_lsn > commit_lsn);
 }
 
 #[test]
@@ -473,7 +700,85 @@ fn oversized_recovery_targets_file_is_refused() {
 }
 
 #[test]
-fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
+fn absent_xid_recovery_target_is_not_consumed_or_forked() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+    let present = CommitPayload {
+        commit_lsn: Lsn::new(1),
+        commit_timestamp_micros: 1_000,
+        committed_subxids: Vec::new(),
+    };
+    let record = WalRecord::new(
+        RecordType::Commit,
+        Xid::new(10),
+        Lsn::ZERO,
+        0,
+        present.encode().unwrap(),
+    )
+    .unwrap();
+    let segment_path = wal_dir.join("segment_0000000000");
+    let original = record.encode();
+    fs::write(&segment_path, &original).unwrap();
+    let target_path = data_dir.path().join("recovery.targets");
+    fs::write(&target_path, "recovery_target_xid = '99'\n").unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let error = Server::init(data_dir.path()).expect_err("missing target xid must fail recovery");
+
+    assert!(error.to_string().contains("was not found"), "{error}");
+    assert!(
+        target_path.exists(),
+        "an unsatisfied target must remain durable"
+    );
+    assert_eq!(
+        fs::read(segment_path).unwrap(),
+        original,
+        "an unsatisfied target must not fork the WAL"
+    );
+}
+
+#[test]
+fn timestamp_target_is_rejected_after_wal_recycling() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+    ultrasql_wal::write_floor(
+        &wal_dir,
+        ultrasql_wal::WalFloor {
+            segment_index: 4,
+            floor_lsn: Lsn::new(8_000),
+        },
+    )
+    .unwrap();
+    fs::write(wal_dir.join("segment_0000000004"), []).unwrap();
+    let target_path = data_dir.path().join("recovery.targets");
+    fs::write(
+        &target_path,
+        "recovery_target_time = '1970-01-01T00:00:01Z'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    make_data_dir_private(data_dir.path());
+
+    let error =
+        Server::init(data_dir.path()).expect_err("recycled WAL has no timestamp floor proof");
+
+    assert!(
+        error
+            .to_string()
+            .contains("timestamp recovery target cannot be proven"),
+        "{error}"
+    );
+    assert!(
+        target_path.exists(),
+        "a rejected target must not be consumed"
+    );
+}
+
+#[test]
+fn recovery_target_forks_wal_before_writer_and_restart_sees_one_timeline() {
     let data_dir = tempfile::TempDir::new().unwrap();
     let wal_dir = data_dir.path().join("pg_wal");
     fs::create_dir_all(&wal_dir).unwrap();
@@ -496,6 +801,10 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
     make_data_dir_private(data_dir.path());
 
     let server = Server::init(data_dir.path()).unwrap();
+    assert!(
+        !data_dir.path().join("recovery.targets").exists(),
+        "a successful timeline fork must durably consume the one-shot target"
+    );
     let sink = server
         .heap
         .buffer_pool()
@@ -509,6 +818,45 @@ fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
         .unwrap();
 
     assert_eq!(appended, target);
+    let replacement_len = u64::try_from(
+        WalRecord::new(RecordType::Nop, Xid::new(12), Lsn::ZERO, 0, Vec::new())
+            .unwrap()
+            .encode()
+            .len(),
+    )
+    .unwrap();
+    drop(server);
+
+    let mut first_count = 0_u32;
+    let mut discarded_count = 0_u32;
+    let mut replacement_count = 0_u32;
+    let fork_end = ultrasql_wal::recover(&wal_dir, |record| {
+        match record.header.xid.raw() {
+            10 => first_count += 1,
+            11 => discarded_count += 1,
+            12 => replacement_count += 1,
+            _ => {}
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(first_count, 1);
+    assert_eq!(discarded_count, 0, "the abandoned timeline must be gone");
+    assert_eq!(replacement_count, 1);
+    assert_eq!(fork_end.raw(), target.raw() + replacement_len);
+
+    // With the target consumed, the next startup is unrestricted. It must
+    // recover the forked stream and continue after its exact end rather than
+    // seeing the discarded record or assigning a duplicate LSN.
+    let reopened = Server::init(data_dir.path()).unwrap();
+    let next = reopened
+        .heap
+        .buffer_pool()
+        .wal_sink()
+        .unwrap()
+        .append(WalRecord::new(RecordType::Nop, Xid::new(13), Lsn::ZERO, 0, Vec::new()).unwrap())
+        .unwrap();
+    assert_eq!(next, fork_end);
 }
 
 #[test]

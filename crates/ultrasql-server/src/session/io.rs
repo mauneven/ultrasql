@@ -13,6 +13,12 @@ use ultrasql_protocol::{
 use super::Session;
 use crate::error::{ServerError, split_message_hint};
 
+/// Maximum amount of coalesced Extended Query output retained between writes.
+///
+/// One protocol frame may exceed this limit; in that case the frame is sent as
+/// soon as it has been encoded and the oversized allocation is released.
+const EXTENDED_WRITE_WINDOW_BYTES: usize = 64 * 1024;
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -47,11 +53,50 @@ where
         }
     }
 
-    /// Encode and flush a single backend message.
+    /// Encode and flush a single immediate backend message.
+    ///
+    /// Any successful Extended Query replies queued before this message are
+    /// written first. Error and COPY paths use this method, so interactive
+    /// protocol boundaries cannot overtake earlier Parse/Bind/Execute output.
     pub(crate) async fn send(&mut self, msg: &BackendMessage) -> Result<(), ServerError> {
+        if !self.extended_write_buf.is_empty() {
+            self.io.write_all(&self.extended_write_buf).await?;
+            self.extended_write_buf.clear();
+        }
         self.write_buf.clear();
         encode_backend(msg, &mut self.write_buf);
         self.io.write_all(&self.write_buf).await?;
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    /// Queue one successful Extended Query response.
+    ///
+    /// Responses normally remain buffered until the client sends `Flush` or
+    /// `Sync`. Reaching the bounded write window sends the accumulated bytes
+    /// early, which is permitted by the protocol and prevents large result
+    /// sets from growing the per-session queue without bound.
+    pub(crate) async fn queue_extended_response(
+        &mut self,
+        msg: &BackendMessage,
+    ) -> Result<(), ServerError> {
+        encode_backend(msg, &mut self.extended_write_buf);
+        if self.extended_write_buf.len() >= EXTENDED_WRITE_WINDOW_BYTES {
+            self.flush_extended_responses().await?;
+            if self.extended_write_buf.capacity() > EXTENDED_WRITE_WINDOW_BYTES {
+                self.extended_write_buf =
+                    bytes::BytesMut::with_capacity(EXTENDED_WRITE_WINDOW_BYTES);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write and flush every queued Extended Query response.
+    pub(crate) async fn flush_extended_responses(&mut self) -> Result<(), ServerError> {
+        if !self.extended_write_buf.is_empty() {
+            self.io.write_all(&self.extended_write_buf).await?;
+            self.extended_write_buf.clear();
+        }
         self.io.flush().await?;
         Ok(())
     }

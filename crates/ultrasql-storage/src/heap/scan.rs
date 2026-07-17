@@ -5,7 +5,6 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
-use dashmap::DashMap;
 use std::sync::Arc;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
@@ -47,12 +46,14 @@ impl<L: PageLoader> HeapAccess<L> {
         snapshot: &Snapshot,
         oracle: &O,
     ) -> Result<Option<Vec<u8>>, HeapError> {
-        let tuple = self.fetch(tid)?;
-        Ok(Self::lookup_undo_pre_image(
-            &self.undo_log,
-            tid.page.relation,
+        let undo_log = self.undo_log_handle(tid.page.relation);
+        let guard = self.get_page_relieved(tid.page)?;
+        let page = guard.read();
+        let log = undo_log.read();
+        let tuple = Self::decode_tuple(tid, page.read_tuple(tid.slot)?)?;
+        Ok(undo_pre_image_from_log(
+            &log,
             tid,
-            &tuple.header,
             &tuple.data,
             snapshot,
             oracle,
@@ -105,6 +106,7 @@ impl<L: PageLoader> HeapAccess<L> {
         O: XidStatusOracle + ?Sized,
         F: FnMut(TupleId, &TupleHeader, &[u8]) -> Result<(), HeapError>,
     {
+        let undo_log_handle = self.undo_log_handle(rel);
         // Visibility-cache key: `(xmin, infomask_bits)` → visible.
         // The on-disk tuple-header layout (see [`TupleHeader::encode`])
         // packs xmin at bytes 0..8, xmax at 8..16, infomask at 24..26.
@@ -230,9 +232,8 @@ impl<L: PageLoader> HeapAccess<L> {
                         // missing entry means VACUUM trimmed it after we
                         // lost the right to see the pre-image — treat as
                         // invisible (the safe direction).
-                        if let Some(pre) = Self::lookup_undo_pre_image(
-                            &self.undo_log,
-                            rel,
+                        if let Some(pre) = Self::lookup_undo_pre_image_from_handle(
+                            &undo_log_handle,
                             tid,
                             &header,
                             &slot_bytes[TUPLE_HEADER_SIZE..],
@@ -248,9 +249,8 @@ impl<L: PageLoader> HeapAccess<L> {
                         // substitute the pre-image when some earlier writer
                         // is invisible to this snapshot; otherwise the slot
                         // bytes are exactly current — emit them.
-                        if let Some(pre) = Self::lookup_undo_pre_image(
-                            &self.undo_log,
-                            rel,
+                        if let Some(pre) = Self::lookup_undo_pre_image_from_handle(
+                            &undo_log_handle,
                             tid,
                             &header,
                             &slot_bytes[TUPLE_HEADER_SIZE..],
@@ -271,35 +271,15 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
-    /// Reconstruct the pre-image this `snapshot` must observe for an
-    /// in-place-updated slot, by reversing every undo record whose
-    /// `writer_xid` is invisible to the snapshot.
-    ///
-    /// Full-payload entries store the payload *before* their writer
-    /// applied, so the correct pre-image is the **oldest** invisible
-    /// writer's `old_payload` (the last state committed before the
-    /// snapshot). Compact int32-pair batches store a signed delta per
-    /// writer, so the pre-image is `current − sum(invisible deltas)`
-    /// per affected column. Writers the snapshot *can* see are already
-    /// reflected in the current payload and must NOT be reversed.
-    /// Returns owned bytes so the scan callback can keep its borrow
-    /// across iterations.
-    ///
-    /// Lock order: caller has already dropped (or never acquired)
-    /// the page-write guard; this only takes the per-relation
-    /// `RwLock<UndoRelationLog>` for a read.
-    fn lookup_undo_pre_image<O: XidStatusOracle + ?Sized>(
-        undo_log: &Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
-        rel: RelationId,
+    fn lookup_undo_pre_image_from_handle<O: XidStatusOracle + ?Sized>(
+        undo_log: &parking_lot::RwLock<UndoRelationLog>,
         tid: TupleId,
         _header: &TupleHeader,
         current_payload: &[u8],
         snapshot: &Snapshot,
         oracle: &O,
     ) -> Option<Vec<u8>> {
-        let log = undo_log.get(&rel)?;
-        let log = log.read();
-        undo_pre_image_from_log(&log, tid, current_payload, snapshot, oracle)
+        undo_pre_image_from_log(&undo_log.read(), tid, current_payload, snapshot, oracle)
     }
 
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
@@ -401,7 +381,8 @@ impl<L: PageLoader> HeapAccess<L> {
             snapshot,
             oracle,
             xmin_cache: None,
-            undo_log: Arc::clone(&self.undo_log),
+            undo_log: self.undo_log_handle(rel),
+            page_undo: UndoRelationLog::default(),
             pre_image_scratch: Vec::new(),
         }
     }
@@ -529,32 +510,13 @@ impl<L: PageLoader> Iterator for HeapScan<'_, L> {
 /// caller.  I/O and decode errors are still propagated as
 /// `Err(HeapError)`.
 pub struct VisibleHeapScan<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
-    pub(super) inner: HeapScan<'a, L>,
-    pub(super) undo_log: &'a Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
-    pub(super) snapshot: &'a Snapshot,
-    pub(super) oracle: &'a O,
-    /// One-entry cache of `(xmin, infomask_bits) → visibility` valid
-    /// only when the tuple has `xmax == Xid::INVALID`.
-    ///
-    /// For analytic scans the overwhelmingly common case is a long
-    /// run of tuples sharing the same `xmin` (the preload's
-    /// transaction) with default `infomask` and no deleter. The
-    /// MVCC `is_visible` decision then depends only on whether
-    /// `xmin` committed before the current snapshot — identical
-    /// for every tuple in the run. We cache the boolean answer for
-    /// the most-recent `(xmin, infomask)` key and short-circuit
-    /// the full decision (including the per-tuple oracle.status
-    /// `DashMap` probe) on match. Any deviation (non-invalid
-    /// `xmax`, different infomask) falls through to the slow
-    /// `is_visible` path without consulting the cache, and a fresh
-    /// cache entry is recorded after the slow path completes.
-    pub(super) xmin_cache: Option<(Xid, u16, bool)>,
+    pub(super) walker: VisibleHeapWalker<'a, L, O>,
 }
 
 impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeapScan<'_, L, O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VisibleHeapScan")
-            .field("inner", &self.inner)
+            .field("walker", &self.walker)
             .finish_non_exhaustive()
     }
 }
@@ -567,95 +529,14 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_
     type Item = Result<HeapTuple, HeapError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.inner.next()? {
-                Err(e) => return Some(Err(e)),
-                Ok(tup) => {
-                    // Fast path: same `(xmin, infomask)` as the last
-                    // visibility decision *and* the tuple has no
-                    // deleter (`xmax == Xid::INVALID`). On a hit we
-                    // reuse the cached verdict and skip the
-                    // oracle.status `DashMap` probe entirely. For
-                    // the `select_avg_1m` / `filter_sum_1m` bench
-                    // shape (one preload transaction, no deletes)
-                    // this turns ~1 M oracle probes into one.
-                    if tup.header.xmax.is_invalid() {
-                        let infomask_bits = tup.header.infomask.bits();
-                        if let Some((cached_xmin, cached_infomask, cached_visible)) =
-                            self.xmin_cache
-                        {
-                            if cached_xmin == tup.header.xmin && cached_infomask == infomask_bits {
-                                if cached_visible {
-                                    return Some(Ok(tup));
-                                }
-                                continue;
-                            }
-                        }
-                        // Cache miss: compute the full visibility
-                        // decision once and stash the verdict for
-                        // subsequent matching tuples.
-                        let visible = matches!(
-                            is_visible(&tup.header, self.snapshot, self.oracle),
-                            Visibility::Visible,
-                        );
-                        self.xmin_cache = Some((tup.header.xmin, infomask_bits, visible));
-                        if visible {
-                            return Some(Ok(tup));
-                        }
-                        continue;
-                    }
-                    // Slow path for tuples with a non-invalid
-                    // `xmax`: the visibility verdict depends on
-                    // both `xmin` and `xmax` status; the
-                    // single-key cache cannot model that without
-                    // false positives, so we go through the full
-                    // `is_visible` rules without touching the
-                    // cache.
-                    match is_visible(&tup.header, self.snapshot, self.oracle) {
-                        Visibility::Visible => return Some(Ok(tup)),
-                        Visibility::VisiblePreImage => {
-                            let rel = tup.tid.page.relation;
-                            if let Some(pre) = HeapAccess::<L>::lookup_undo_pre_image(
-                                self.undo_log,
-                                rel,
-                                tup.tid,
-                                &tup.header,
-                                &tup.data,
-                                self.snapshot,
-                                self.oracle,
-                            ) {
-                                let mut tup = tup;
-                                tup.data = pre;
-                                return Some(Ok(tup));
-                            }
-                        }
-                        Visibility::VisibleMaybePreImage => {
-                            // Visible with in-place undo history: pre-image
-                            // when an earlier writer is invisible to this
-                            // snapshot, slot bytes otherwise.
-                            let rel = tup.tid.page.relation;
-                            if let Some(pre) = HeapAccess::<L>::lookup_undo_pre_image(
-                                self.undo_log,
-                                rel,
-                                tup.tid,
-                                &tup.header,
-                                &tup.data,
-                                self.snapshot,
-                                self.oracle,
-                            ) {
-                                let mut tup = tup;
-                                tup.data = pre;
-                                return Some(Ok(tup));
-                            }
-                            return Some(Ok(tup));
-                        }
-                        Visibility::Invisible | Visibility::DeletedByOwn => {}
-                    }
-                    // Invisible (other txn in-progress, aborted, deleted
-                    // before our snapshot) or DeletedByOwn — skip and
-                    // continue the loop.
-                }
-            }
+        match self.walker.try_next() {
+            Ok(Some((tid, header, payload))) => Some(Ok(HeapTuple {
+                tid,
+                header,
+                data: payload.to_vec(),
+            })),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         }
     }
 }

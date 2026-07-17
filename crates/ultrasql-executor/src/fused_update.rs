@@ -394,6 +394,9 @@ fn heap_update_error_to_exec_error(error: HeapError) -> ExecError {
         // serialization failure (SQLSTATE 40001) instead of swallowing it
         // in the generic catch-all, so retry-aware clients can classify it.
         HeapError::WriteConflict(reason) => ExecError::SerializationFailure(reason.to_owned()),
+        HeapError::ParallelWorkerPanic => {
+            ExecError::Internal("parallel heap UPDATE worker panicked")
+        }
         other => ExecError::TypeMismatch(other.to_string()),
     }
 }
@@ -410,18 +413,21 @@ mod tests {
     };
     use ultrasql_mvcc::Snapshot;
     use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-    use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+    use ultrasql_storage::heap::{HeapAccess, HeapError, InsertOptions};
     use ultrasql_storage::page::Page;
     use ultrasql_txn::TransactionManager;
     use ultrasql_vec::column::Column;
 
-    use super::{FusedCmp, FusedPredicate, FusedUpdateInt32Add, FusedUpdateInt32AddConfig};
-    use crate::Operator;
+    use super::{
+        FusedCmp, FusedPredicate, FusedUpdateInt32Add, FusedUpdateInt32AddConfig,
+        heap_update_error_to_exec_error,
+    };
     use crate::filter_op::batch_to_rows;
     use crate::fused_delete::{FusedDeleteInt32Pair, FusedDeleteInt32PairConfig};
     use crate::fused_insert::FusedInsertInt32Pair;
     use crate::row_codec::RowCodec;
     use crate::seq_scan::SeqScan;
+    use crate::{ExecError, Operator};
 
     #[derive(Default, Debug)]
     struct MapLoader {
@@ -685,5 +691,13 @@ mod tests {
         for (op, lhs, rhs, expected) in cases {
             assert_eq!(op.check(lhs, rhs), expected, "{op:?} {lhs} {rhs}");
         }
+    }
+
+    #[test]
+    fn parallel_worker_panic_maps_to_internal_error() {
+        assert!(matches!(
+            heap_update_error_to_exec_error(HeapError::ParallelWorkerPanic),
+            ExecError::Internal("parallel heap UPDATE worker panicked")
+        ));
     }
 }

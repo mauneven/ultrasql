@@ -76,8 +76,10 @@ def workload_family(workload: str) -> str | None:
 
 
 def canonical_engine(engine: str) -> str:
-    if engine == "postgres17":
+    if engine in {"postgres17", "postgresql"}:
         return "postgres"
+    if engine == "sqlite":
+        return "sqlite3"
     return engine
 
 
@@ -102,7 +104,20 @@ def format_slower(value_us: float, fastest_us: float | None) -> str:
     return f" ({text}% slower)"
 
 
-def load_raw(raw_dir: Path) -> list[dict]:
+def artifact_relative_path(path: Path, artifact_dir: Path) -> str:
+    """Return a stable path rooted at the rendered artifact directory."""
+    resolved_artifact_dir = artifact_dir.resolve()
+    resolved_path = path.resolve()
+    try:
+        return resolved_path.relative_to(resolved_artifact_dir).as_posix()
+    except ValueError as exc:
+        raise SystemExit(
+            f"raw benchmark path must be inside artifact directory "
+            f"{resolved_artifact_dir}: {resolved_path}"
+        ) from exc
+
+
+def load_raw(raw_dir: Path, artifact_dir: Path) -> list[dict]:
     records = []
     for path in sorted(raw_dir.glob("*.json")):
         try:
@@ -126,7 +141,7 @@ def load_raw(raw_dir: Path) -> list[dict]:
                 "samples": int(doc.get("samples", 0)),
                 "server_mode": doc.get("server_mode"),
                 "answer_sha256": doc.get("answer_sha256"),
-                "path": str(path),
+                "path": artifact_relative_path(path, artifact_dir),
             }
         )
     return records
@@ -136,7 +151,16 @@ def normalize(records: list[dict]) -> list[dict]:
     by_key: dict[tuple[str, int], dict[str, dict]] = {}
     for record in records:
         key = (record["family"], record["n_rows"])
-        by_key.setdefault(key, {})[record["engine"]] = record
+        engines = by_key.setdefault(key, {})
+        engine = record["engine"]
+        previous = engines.get(engine)
+        if previous is not None:
+            raise SystemExit(
+                "duplicate raw benchmark evidence for "
+                f"{record['family']} rows={record['n_rows']} engine={engine}: "
+                f"{previous['path']}, {record['path']}"
+            )
+        engines[engine] = record
 
     rows = []
     order = {name: index for index, name in enumerate(WORKLOAD_ORDER)}
@@ -220,11 +244,18 @@ def render_markdown(title: str, note: str, rows: list[dict]) -> str:
 
 def main() -> None:
     args = parse_args()
-    records = load_raw(args.raw_dir)
+    artifact_dir = args.output_json.parent
+    raw_dir = artifact_relative_path(args.raw_dir, artifact_dir)
+    if raw_dir != "raw":
+        raise SystemExit(
+            "raw benchmark directory must be the artifact's 'raw' directory: "
+            f"{artifact_dir / 'raw'}"
+        )
+    records = load_raw(args.raw_dir, artifact_dir)
     rows = normalize(records)
     payload = {
         "schema_version": 1,
-        "raw_dir": str(args.raw_dir),
+        "raw_dir": raw_dir,
         "engine_order": ENGINE_ORDER,
         "engine_labels": ENGINE_LABELS,
         "rows": rows,

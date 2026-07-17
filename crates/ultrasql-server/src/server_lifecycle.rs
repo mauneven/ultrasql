@@ -163,6 +163,7 @@ impl Server {
         Server::install_eviction_relief(&pool, &page_loader, None);
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
         let vm = Arc::new(VisibilityMap::new());
+        heap.attach_replay_visibility_map(Arc::clone(&vm));
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
             Ok(stats) => {
                 tracing::info!(?stats, "persistent catalog bootstrapped");
@@ -262,7 +263,7 @@ impl Server {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// LSN through which the runtime WAL writer has fsynced.
+    /// Exclusive end boundary of the WAL prefix the runtime writer has fsynced.
     ///
     /// Returns `None` for in-memory sample servers because those instances do
     /// not own an on-disk WAL writer.
@@ -557,11 +558,11 @@ impl Server {
         }
     }
 
-    /// Wait until the runtime WAL writer has fsynced at least `lsn`.
+    /// Wait until the complete WAL record starting at `lsn` is fsynced.
     ///
     /// A merely *slow* fsync (a busy or sluggish disk) is NOT a failure: the
     /// writer thread is alive and will eventually advance `flushed_lsn`, so we
-    /// keep polling. A 5-second timeout that abandoned a still-pending durable
+    /// wait for its durability notification. Abandoning a still-pending durable
     /// write would be wrong on the commit path — the Commit record may yet flush
     /// — so this wait does not give up on slowness alone.
     ///
@@ -579,9 +580,6 @@ impl Server {
         let Some(writer) = &self.wal_writer else {
             return Ok(());
         };
-        if lsn == Lsn::ZERO {
-            return Ok(());
-        }
 
         // A generous last-resort bound: a healthy writer fsyncs within
         // milliseconds, so any wait approaching this is a writer that is wedged
@@ -589,36 +587,28 @@ impl Server {
         // plausible fsync latency, it exists only so a waiter cannot hang
         // forever; normal slow-disk commits resolve long before it.
         const WAL_DURABILITY_HARD_CAP: std::time::Duration = std::time::Duration::from_secs(120);
-        const WAL_DURABILITY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
-
-        let started = std::time::Instant::now();
-        loop {
-            let flushed = writer.flushed_lsn();
-            if flushed.raw() >= lsn.raw() {
-                return Ok(());
-            }
-            // Dead writer: it will never advance again. Surface a hard error so
-            // the caller can escalate (the commit path turns this fatal).
-            if writer.has_fatal_error() {
-                return Err(ServerError::Io(std::io::Error::other(format!(
+        match writer.wait_for_record_durable(lsn, WAL_DURABILITY_HARD_CAP) {
+            ultrasql_wal::WalDurabilityWait::Durable => Ok(()),
+            ultrasql_wal::WalDurabilityWait::Fatal => {
+                let flushed = writer.flushed_lsn();
+                Err(ServerError::Io(std::io::Error::other(format!(
                     "WAL writer terminated with a hard error before reaching durability: \
                      flushed_lsn={} target_lsn={}",
                     flushed.raw(),
                     lsn.raw()
-                ))));
+                ))))
             }
-            if started.elapsed() >= WAL_DURABILITY_HARD_CAP {
-                return Err(ServerError::Io(std::io::Error::new(
+            ultrasql_wal::WalDurabilityWait::TimedOut => {
+                let flushed = writer.flushed_lsn();
+                Err(ServerError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
                         "WAL durability wait exceeded hard cap at flushed_lsn={} target_lsn={}",
                         flushed.raw(),
                         lsn.raw()
                     ),
-                )));
+                )))
             }
-            writer.notify();
-            std::thread::sleep(WAL_DURABILITY_POLL);
         }
     }
 
@@ -633,15 +623,35 @@ impl Server {
     /// mark it committed but replay nothing, silently losing an acknowledged
     /// transaction.
     ///
-    /// Captures the txn's last appended data WAL LSN via the sink's per-xid
-    /// `last_lsn_for` and waits until it is flushed. A no-WAL sink, or an xid
+    /// Captures the XID's last appended data WAL LSN via the sink's per-xid
+    /// `last_lsn_for` and waits until it is flushed. A no-WAL sink, or an XID
     /// that appended no data records, resolves to `Lsn::ZERO` and returns
     /// immediately.
+    #[cfg(test)]
     pub(crate) fn wait_for_txn_data_wal_durable(&self, xid: Xid) -> Result<(), ServerError> {
+        self.wait_for_txn_data_wal_family_durable(std::iter::once(xid))
+    }
+
+    /// Force the latest data WAL record from a transaction XID family durable.
+    ///
+    /// Savepoint writes carry subtransaction XIDs and therefore maintain
+    /// independent `last_lsn_for` chains. Waiting only for the parent can
+    /// acknowledge `PREPARE TRANSACTION` while a released savepoint's later
+    /// data record is still volatile. WAL is a single ordered stream, so
+    /// waiting for the maximum family LSN makes every earlier family record
+    /// durable as well.
+    pub(crate) fn wait_for_txn_data_wal_family_durable(
+        &self,
+        xids: impl IntoIterator<Item = Xid>,
+    ) -> Result<(), ServerError> {
         let Some(wal) = self.heap.wal_sink() else {
             return Ok(());
         };
-        let last_lsn = wal.last_lsn_for(xid);
+        let last_lsn = xids
+            .into_iter()
+            .map(|xid| wal.last_lsn_for(xid))
+            .max()
+            .unwrap_or(Lsn::ZERO);
         self.wait_for_wal_durable(last_lsn)
     }
 
@@ -788,6 +798,11 @@ impl Server {
             return Ok(());
         }
 
+        // Capture this before any error branch consumes `txn`. Savepoint DML is
+        // stamped with subxids, so aborting only the parent would leave their
+        // in-place post-images on the page after undo GC trims the pre-images.
+        let abort_family = txn.abort_write_xid_family();
+
         // Phase 1: run the serializable check and compute the committed-subxid
         // family WITHOUT making the txn visible. On a serialization anomaly the
         // txn is still InProgress and invisible; abort it and surface the error.
@@ -796,12 +811,12 @@ impl Server {
             Err(TxnError::SerializationFailure { detail, .. }) => {
                 // The CLOG was never flipped; abort to release locks and mark
                 // the txn Aborted, then report the serialization failure.
-                let _ = self.txn_manager.abort(txn);
-                return Err(ServerError::SerializationFailure(detail));
+                let original = ServerError::SerializationFailure(detail);
+                return Err(self.abort_before_commit_record(txn, abort_family, original, context));
             }
             Err(other) => {
-                let _ = self.txn_manager.abort(txn);
-                return Err(ServerError::ddl(format!("{context} commit: {other}")));
+                let original = ServerError::ddl(format!("{context} commit: {other}"));
+                return Err(self.abort_before_commit_record(txn, abort_family, original, context));
             }
         };
 
@@ -820,8 +835,7 @@ impl Server {
             Err(e) => {
                 // Append failed BEFORE the record entered the pipeline: safe to
                 // abort in memory and surface the error.
-                let _ = self.txn_manager.abort(txn);
-                return Err(e);
+                return Err(self.abort_before_commit_record(txn, abort_family, e, context));
             }
         };
 
@@ -842,6 +856,70 @@ impl Server {
                 self.fatal_commit_durability_failure(xid, context, &reason)
             }
         }
+    }
+
+    /// Restore and abort a transaction before a Commit record enters WAL.
+    ///
+    /// Once this helper is called, returning the original commit error is safe:
+    /// no commit record can become durable later. Physical cleanup is attempted
+    /// for every family member before CLOG termination, and cleanup failures are
+    /// attached to the original error instead of being silently discarded.
+    fn abort_before_commit_record(
+        &self,
+        txn: ultrasql_txn::Transaction,
+        abort_family: Vec<Xid>,
+        original: ServerError,
+        context: &str,
+    ) -> ServerError {
+        let original_text = original.to_string();
+        let rollback_error = self
+            .rollback_in_place_update_family(abort_family)
+            .err()
+            .map(|error| error.to_string());
+        let abort_error = self
+            .txn_manager
+            .abort(txn)
+            .err()
+            .map(|error| error.to_string());
+
+        match (rollback_error, abort_error) {
+            (None, None) => original,
+            (Some(rollback), None) => ServerError::ddl(format!(
+                "{context}: {original_text}; in-place update rollback failed: {rollback}"
+            )),
+            (None, Some(abort)) => ServerError::ddl(format!(
+                "{context}: {original_text}; transaction abort failed: {abort}"
+            )),
+            (Some(rollback), Some(abort)) => ServerError::ddl(format!(
+                "{context}: {original_text}; in-place update rollback failed: {rollback}; \
+                 transaction abort failed: {abort}"
+            )),
+        }
+    }
+
+    /// Restore every in-place update or delete stamp owned by an XID family.
+    ///
+    /// Inputs are sorted newest-XID-first and deduplicated as defense in depth
+    /// for durable prepared-state files. Reverse allocation order is required
+    /// when a parent and a later savepoint updated the same tuple: restoring the
+    /// savepoint pre-image must precede restoring the parent's pre-image. Every
+    /// Cleanup stops at the first error so an older pre-image cannot overwrite
+    /// a newer layer whose restoration did not complete. Stateful callers can
+    /// then retry the whole idempotent cleanup before terminating CLOG.
+    pub(crate) fn rollback_in_place_update_family(
+        &self,
+        xids: impl IntoIterator<Item = Xid>,
+    ) -> Result<usize, ultrasql_storage::heap::HeapError> {
+        let mut family = xids.into_iter().collect::<Vec<_>>();
+        family.sort_unstable_by(|left, right| right.cmp(left));
+        family.dedup();
+
+        let mut restored = 0_usize;
+        for xid in family {
+            let count = self.heap.rollback_in_place_updates(xid)?;
+            restored = restored.saturating_add(count);
+        }
+        Ok(restored)
     }
 
     /// Phase 3 of the durable commit: flip the CLOG to `Committed` and release
@@ -1041,8 +1119,9 @@ impl Server {
     }
 }
 
-/// Busy-poll `durability` until it has fsynced through `lsn`, forcing fsyncs
-/// with `notify`. Mirrors [`Server::wait_for_wal_durable`] but operates on a
+/// Wait until the complete WAL record starting at `lsn` is fsynced, forcing
+/// an fsync and sleeping on the writer's durability notification. Mirrors
+/// [`Server::wait_for_wal_durable`] but operates on a
 /// cloneable [`WalDurabilityHandle`](ultrasql_wal::WalDurabilityHandle) so it
 /// can run inside the eviction-relief closure (no `&Server` needed, no latch
 /// held).
@@ -1051,30 +1130,33 @@ fn force_wal_durable_to(
     lsn: Lsn,
 ) -> std::io::Result<()> {
     if lsn == Lsn::ZERO {
+        // Server startup reserves zero with a bootstrap NOP, so a page LSN of
+        // zero means the page has no WAL dependency.
         return Ok(());
     }
 
     const WAL_DURABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const WAL_DURABILITY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
-
-    let started = std::time::Instant::now();
-    loop {
-        let flushed = durability.flushed_lsn();
-        if flushed.raw() >= lsn.raw() {
-            return Ok(());
+    match durability.wait_for_record_durable(lsn, WAL_DURABILITY_TIMEOUT) {
+        ultrasql_wal::WalDurabilityWait::Durable => Ok(()),
+        ultrasql_wal::WalDurabilityWait::Fatal => {
+            let flushed = durability.flushed_lsn();
+            Err(std::io::Error::other(format!(
+                "eviction-relief WAL writer terminated at flushed_lsn={} target_lsn={}",
+                flushed.raw(),
+                lsn.raw()
+            )))
         }
-        if started.elapsed() >= WAL_DURABILITY_TIMEOUT {
-            return Err(std::io::Error::new(
+        ultrasql_wal::WalDurabilityWait::TimedOut => {
+            let flushed = durability.flushed_lsn();
+            Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "eviction-relief WAL durability wait timed out at flushed_lsn={} target_lsn={}",
                     flushed.raw(),
                     lsn.raw()
                 ),
-            ));
+            ))
         }
-        durability.notify();
-        std::thread::sleep(WAL_DURABILITY_POLL);
     }
 }
 

@@ -6,7 +6,7 @@ and must document the break here.
 
 ## Unreleased
 
-### Integrity (2026-07-01 truthfulness pass)
+### Integrity (2026-07-17 truthfulness pass)
 
 - **Removed the TPC-H answer-cache fast paths and withdrew every TPC-H
   claim.** The server contained 21 per-query TPC-H shape-matching pipelines
@@ -20,22 +20,68 @@ and must document the break here.
   result-replay fast paths; the release scale sweep runs with replay
   disabled so scoreboard rows compare real compute (BENCHMARKS.md "Result
   caches").
-- **Benchmark harness fairness fixes**: DuckDB/SQLite INSERT rows now run on
+- **Benchmark harness methodology fixes**: DuckDB/SQLite INSERT rows now run on
   persistent in-process driver connections instead of timing a CLI process
-  per sample; warmup counts are symmetric across engines; mixed OLTP is one
-  autocommitted operation per round trip for every engine (UltraSQL's
+  per sample; the sweep requests a common warmup count (not every competitor
+  workload currently consumes it); mixed OLTP is one autocommitted driver call
+  per operation (UltraSQL's
   20-op wire batching and PostgreSQL's one-transaction-per-window shapes are
-  both gone); PostgreSQL's timed regions no longer include BEGIN/ROLLBACK
-  round trips or table-reset work, and aborted-version bloat is vacuumed
-  between samples. Scoreboard numbers published before these fixes are
-  withdrawn; the fresh honest result (median of three full sweeps, cache off)
-  is UltraSQL fastest on 21 of 24 workloads, with the 1M bulk UPDATE/DELETE
-  (columnar engines) and point-op Mixed OLTP as the three reported losses.
+  both gone); mutation timers cover the UPDATE/DELETE statement inside
+  `BEGIN`, while the outer `ROLLBACK`, table reset, and PostgreSQL cleanup
+  `VACUUM` are outside the timer. Those rows are not durable commit/fsync
+  measurements. Scoreboard numbers published before these fixes are withdrawn.
+  The one committed cache-off sweep pinned to `a6a97af1` records UltraSQL as
+  the lowest median in 21 of 24 rows, with the 1M bulk UPDATE/DELETE and
+  point-op Mixed OLTP as the three reported losses. It does not support a
+  median-of-sweeps, two-of-three, or symmetric-methodology claim.
 - The docs CI gate no longer fails when the scale sweep contains rows where
   UltraSQL is not the fastest engine — losses are reported as data. It also
   audits git-tracked docs only.
 - Removed `DONE.md`, `GOVERNANCE.md`, and `RFC_PROCESS.md` (stale claims and
   process fiction for a single-maintainer project).
+
+### Correctness, durability, protocol, and benchmark evidence
+
+- WAL durability waits are notification-driven instead of sleep-polled.
+  Record LSNs name the first byte, the durable boundary is the exclusive end of
+  the persisted prefix, and LSN zero is reserved as the dependency-free page
+  sentinel. Buffer-pool flushes retain a frame pin and content latch while
+  validating the page identity, WAL boundary, and dirty-state transition.
+- Heap INSERT/UPDATE/DELETE retains the mutated frame pin through logical WAL
+  append and monotonic page-LSN publication. Full-page images and visibility-map
+  clears are ordered under the page latch; recovery applies the same VM-clear
+  rule. This closes windows where a checkpointer could persist tuple bytes
+  before the page's WAL dependency was published.
+- In-place undo now uses one coherent per-relation log for full and compact
+  records. Every full `UndoEntry` carries `command_id`, reconstruction observes
+  statement boundaries, and page-scoped rollback retires undo only after the
+  physical page restore succeeds.
+- Writable point-in-time recovery now validates an exact record boundary,
+  durably truncates the boundary segment and removes later segments before the
+  writer opens, and consumes the one-shot target only after the fork succeeds.
+  Historical recovery still requires a base backup no newer than the target;
+  the WAL fork does not rewind newer heap pages.
+- Extended-protocol success responses are coalesced in a bounded output buffer
+  until `Flush` or `Sync`, while errors and COPY transitions preserve ordering.
+  Prepared statements reuse the structural plan hash captured at Parse instead
+  of formatting and hashing the bound plan at each Bind.
+- Fixed-width `(Int32, Int32)` heap pages can be recognized once and traversed
+  with derived slot offsets on the dense UPDATE/DELETE paths. This change has
+  no published cross-engine performance claim until a fresh release-ship A/B
+  sweep is committed.
+- The benchmark-certification validator now binds rendered rows to contained
+  raw artifacts, rejects duplicate/canonical engine aliases and duplicate row
+  keys, recomputes finite positive medians and sample counts, validates
+  mixed-correctness hashes, and checks `not_available` records and manifest
+  row sizes. `ready` certifies artifact integrity and provenance, not fair or
+  symmetric methodology.
+- Physical heap compaction remains disabled on WAL-backed heaps until slot
+  reclamation has a crash-safe WAL record. UPDATE redirect-chain members and
+  their index entries are retained. This correctness-first policy can cause
+  persistent heap and index bloat.
+- Pre-1.0 API notes: `UndoEntry` adds `command_id`; relation undo-map values
+  are shared `Arc<RwLock<UndoRelationLog>>` handles; and `scan_visible` is no
+  longer a `const fn`.
 
 ### Added
 
@@ -129,16 +175,17 @@ and must document the break here.
   mid-stream cancel emits `57014` then `ReadyForQuery`). Streaming is gated to
   the single-statement network path.
 - Under buffer-pool pressure the pool can now relieve eviction by flushing
-  dirty pages, but only once a page's page-LSN is at or below the WAL's durable
-  LSN (the write-ahead-log rule is preserved); when every dirty page is blocked
-  it forces the WAL durable to the oldest unflushable dirty LSN to make
-  progress. Pinned frames are never evicted or flushed.
+  dirty pages, but only when the page's nonzero record-start LSN is strictly
+  below the WAL's exclusive durable-end boundary (the write-ahead-log rule is
+  preserved); when every dirty page is blocked it forces the oldest required
+  record durable to make progress. Pinned frames are never evicted or flushed.
 - Exact vector top-k fallback now uses bounded `TopK` instead of physical
   Sort and exposes exact kernel/fallback state in `EXPLAIN ANALYZE`.
 - Same-host AI/vector certification runner now requires measured UltraSQL and
   pgvector exact top-k artifacts before passing.
-- Same-host TPC-H SF1 PostgreSQL 17 certification now runs complete q1..q22
-  raw artifacts and records the geometric-mean pass/fail decision.
+- The same-host TPC-H SF1 PostgreSQL 17 runner can execute q1..q22 and record
+  raw artifacts plus a geometric-mean decision. No valid TPC-H result is
+  currently committed; all prior TPC-H performance claims remain withdrawn.
 - HNSW/IVFFlat durability certification covers torn ANN WAL tails,
   crash/restart rebuild after DML, and typed WAL payload fuzz/property tests.
 - SQLLogicTest runner and documented external-test import policy.
@@ -222,8 +269,8 @@ and must document the break here.
   evidence, and `target_ratio_ultrasql_vs_firebolt <= 1.0`.
 - Homebrew packaging builds from source with Cargo instead of installing macOS
   binary archives, keeping the tap closer to `homebrew/core` expectations.
-- Roadmap now tracks only open production gates; completed milestones moved to
-  `DONE.md`.
+- The open-work tracker links completed milestones directly to changelog
+  entries, tests, or committed artifacts.
 
 ### Security
 

@@ -46,8 +46,10 @@ pub enum WalSinkError {
 ///
 /// 1. `append` is called at most once per heap mutation.
 /// 2. The returned `Lsn` is the assigned position of the record in the log.
-/// 3. `durable_lsn` returns the highest LSN that has been flushed to durable
-///    storage. Callers may use this to decide whether a page is safe to evict.
+/// 3. `durable_lsn` returns the exclusive end boundary of the WAL prefix
+///    flushed to durable storage. A record-start LSN is durable only when it
+///    is strictly below that boundary. Callers use this to decide whether a
+///    page is safe to evict.
 /// 4. `last_lsn_for` returns the LSN of the most recently appended record for
 ///    `xid`, or [`Lsn::ZERO`] if none.  Heap callers use this to fill the
 ///    `prev_lsn` field so records form a per-transaction linked list.
@@ -65,7 +67,12 @@ pub enum WalSinkError {
 /// # Thread safety
 ///
 /// `WalSink` requires `Send + Sync` so it can be stored behind an `Arc` and
-/// shared across concurrent heap calls.
+/// shared across concurrent heap calls. Append methods may block on WAL-owned
+/// buffering or filesystem I/O, but they MUST NOT re-enter the heap buffer
+/// pool, acquire a heap page latch, or call back into a storage mutation. Heap
+/// first-modification FPWs are appended while holding the affected page's
+/// exclusive latch so the captured image cannot be reordered after a mutation
+/// it does not contain; re-entry would create a page/WAL lock cycle.
 pub trait WalSink: Send + Sync {
     /// Append `record` to the WAL and return the assigned LSN.
     fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError>;
@@ -108,8 +115,8 @@ pub trait WalSink: Send + Sync {
     /// transaction (the parallel bulk-mutation paths) MUST override this so
     /// the read-link/append/store-link step is atomic with the append —
     /// otherwise two appenders can read the same link and fork the chain.
-    /// The default performs the three steps non-atomically, which is correct
-    /// for every single-threaded caller and test sink.
+    /// The default performs the three steps non-atomically and is therefore
+    /// suitable only for callers that serialize linked appends externally.
     fn append_borrowed_linked(
         &self,
         record_type: RecordType,
@@ -122,6 +129,17 @@ pub trait WalSink: Send + Sync {
         let lsn = self.append_borrowed(record_type, xid, prev, flags, payload)?;
         link.store(lsn.raw(), std::sync::atomic::Ordering::Release);
         Ok(lsn)
+    }
+
+    /// Return `true` when [`Self::append_borrowed_linked`] atomically resolves
+    /// a shared transaction-chain link with LSN assignment.
+    ///
+    /// Parallel heap mutators require this in addition to
+    /// [`Self::appends_without_blocking_io`]. The default linked append is
+    /// correct only for externally serialized callers, so sinks must opt in
+    /// after providing an atomic override.
+    fn supports_concurrent_linked_appends(&self) -> bool {
+        false
     }
 
     /// Return `true` when [`Self::append_ref`] performs no blocking filesystem
@@ -143,11 +161,26 @@ pub trait WalSink: Send + Sync {
         false
     }
 
-    /// Return the highest LSN that has been made durable (flushed). Heap
-    /// callers use this to decide whether they need to flush before evicting
-    /// a dirty page. A value of [`Lsn::ZERO`] means nothing has been flushed
-    /// yet.
+    /// Return the exclusive end boundary of the WAL prefix made durable.
+    ///
+    /// Heap page-LSNs are record starts, so a page-LSN is safe to persist only
+    /// when it is strictly below this boundary, unless
+    /// [`Self::zero_lsn_has_no_pending_record`] explicitly declares zero to be
+    /// dependency-free.
     fn durable_lsn(&self) -> Lsn;
+
+    /// Return `true` when a page-LSN of zero cannot name a pending WAL record.
+    ///
+    /// The default is conservative because a byte-addressed WAL can assign its
+    /// first real record start LSN zero. Sinks may opt in when they reserve zero
+    /// (for example with an origin record), never emit records, or assign real
+    /// records from a nonzero start. Buffer-pool flushes then treat page-LSN
+    /// zero as "no WAL dependency" even while the durable boundary is zero.
+    /// Once an implementation returns `true`, it must never admit a pending
+    /// real record at start LSN zero.
+    fn zero_lsn_has_no_pending_record(&self) -> bool {
+        false
+    }
 
     /// Return the LSN of the most recent record appended for `xid`, or
     /// [`Lsn::ZERO`] if no records have been appended for `xid` yet.
@@ -198,8 +231,16 @@ impl WalSink for NullWalSink {
         true
     }
 
+    fn supports_concurrent_linked_appends(&self) -> bool {
+        true
+    }
+
     fn durable_lsn(&self) -> Lsn {
         Lsn::ZERO
+    }
+
+    fn zero_lsn_has_no_pending_record(&self) -> bool {
+        true
     }
 
     fn last_lsn_for(&self, _xid: Xid) -> Lsn {
@@ -231,10 +272,11 @@ impl WalSink for NullWalSink {
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use parking_lot::Mutex;
     use ultrasql_core::{Lsn, Xid};
-    use ultrasql_wal::WalRecord;
+    use ultrasql_wal::{RecordType, WalRecord};
 
     use super::{WalSink, WalSinkError};
 
@@ -264,6 +306,7 @@ pub mod test_support {
             let next = self
                 .next_lsn
                 .checked_add(1)
+                .filter(|next| *next != u64::MAX)
                 .ok_or_else(|| WalSinkError::Rejected("in-memory WAL LSN overflow".to_owned()))?;
             self.next_lsn = next;
             Ok(Lsn::new(next))
@@ -307,18 +350,47 @@ pub mod test_support {
             Ok(lsn)
         }
 
+        fn append_borrowed_linked(
+            &self,
+            record_type: RecordType,
+            xid: Xid,
+            flags: u8,
+            payload: &[u8],
+            link: &AtomicU64,
+        ) -> Result<Lsn, WalSinkError> {
+            let mut inner = self.inner.lock();
+            let prev_lsn = Lsn::new(link.load(Ordering::Acquire));
+            let record = WalRecord::new(record_type, xid, prev_lsn, flags, payload.to_vec())
+                .map_err(|err| WalSinkError::Rejected(format!("WAL record rejected: {err}")))?;
+            let lsn = inner.next()?;
+            inner.last_lsn.insert(xid.raw(), lsn);
+            inner.records.push((lsn, record));
+            link.store(lsn.raw(), Ordering::Release);
+            Ok(lsn)
+        }
+
         fn appends_without_blocking_io(&self) -> bool {
             true
         }
 
+        fn supports_concurrent_linked_appends(&self) -> bool {
+            true
+        }
+
         fn durable_lsn(&self) -> Lsn {
-            // All records in this mock are immediately "durable".
-            let next_lsn = self.inner.lock().next_lsn;
-            if next_lsn == 0 {
+            // All records in this mock are immediately durable. Synthetic
+            // records occupy one LSN unit, so the boundary is one past the
+            // highest assigned record start.
+            let last_assigned = self.inner.lock().next_lsn;
+            if last_assigned == 0 {
                 Lsn::ZERO
             } else {
-                Lsn::new(next_lsn)
+                Lsn::new(last_assigned.saturating_add(1))
             }
+        }
+
+        fn zero_lsn_has_no_pending_record(&self) -> bool {
+            true
         }
 
         fn last_lsn_for(&self, xid: Xid) -> Lsn {
@@ -331,16 +403,16 @@ pub mod test_support {
         }
     }
 
-    /// In-memory sink whose durable LSN *lags* the appended LSN until the test
-    /// explicitly advances it.
+    /// In-memory sink whose durable end boundary lags appended record starts
+    /// until the test explicitly advances it.
     ///
     /// Unlike [`InMemoryWalSink`] (where everything appended is immediately
     /// durable), this sink assigns LSNs monotonically from 1 but reports a
     /// `durable_lsn` that the test controls via [`Self::set_durable_lsn`]. It
     /// models a WAL writer that has accepted records into its buffer but not
     /// yet fsynced them — exactly the state the eviction-relief LSN gate must
-    /// respect (a dirty page whose page-LSN exceeds `durable_lsn` must not be
-    /// written).
+    /// respect (a dirty page whose nonzero page-LSN is at or beyond
+    /// `durable_lsn` must not be written).
     #[derive(Debug, Default)]
     pub struct LaggingWalSink {
         inner: Mutex<LaggingInner>,
@@ -360,8 +432,8 @@ pub mod test_support {
             Self::default()
         }
 
-        /// Advance the reported durable LSN to `lsn` (monotonically; a lower
-        /// value is ignored). Tests call this to "fsync" the WAL up to `lsn`.
+        /// Advance the reported exclusive durable end boundary to `lsn`
+        /// (monotonically; a lower value is ignored).
         pub fn set_durable_lsn(&self, lsn: Lsn) {
             let mut inner = self.inner.lock();
             if lsn.raw() > inner.durable {
@@ -383,6 +455,7 @@ pub mod test_support {
             let next = inner
                 .next_lsn
                 .checked_add(1)
+                .filter(|next| *next != u64::MAX)
                 .ok_or_else(|| WalSinkError::Rejected("lagging WAL LSN overflow".to_owned()))?;
             inner.next_lsn = next;
             let lsn = Lsn::new(next);
@@ -396,6 +469,10 @@ pub mod test_support {
 
         fn durable_lsn(&self) -> Lsn {
             Lsn::new(self.inner.lock().durable)
+        }
+
+        fn zero_lsn_has_no_pending_record(&self) -> bool {
+            true
         }
 
         fn last_lsn_for(&self, xid: Xid) -> Lsn {
@@ -413,7 +490,7 @@ pub mod test_support {
         use ultrasql_core::{Lsn, Xid};
         use ultrasql_wal::{RecordType, WalRecord};
 
-        use super::{InMemoryWalSink, Inner};
+        use super::{InMemoryWalSink, Inner, LaggingInner, LaggingWalSink};
         use crate::WalSink;
 
         fn nop_record() -> WalRecord {
@@ -422,17 +499,17 @@ pub mod test_support {
         }
 
         #[test]
-        fn append_rejects_lsn_overflow_without_recording_duplicate() {
+        fn append_rejects_lsn_without_representable_durable_end() {
             let sink = InMemoryWalSink {
                 inner: parking_lot::Mutex::new(Inner {
-                    next_lsn: u64::MAX,
+                    next_lsn: u64::MAX - 1,
                     ..Inner::default()
                 }),
             };
 
             let err = sink
                 .append(nop_record())
-                .expect_err("LSN overflow must not saturate");
+                .expect_err("record start without an exclusive end must be rejected");
             assert!(matches!(err, super::WalSinkError::Rejected(_)), "{err:?}");
             assert!(
                 sink.records().is_empty(),
@@ -444,6 +521,23 @@ pub mod test_support {
         fn in_memory_sink_declares_buffered_append() {
             let sink = InMemoryWalSink::new();
             assert!(sink.appends_without_blocking_io());
+            assert!(sink.supports_concurrent_linked_appends());
+        }
+
+        #[test]
+        fn lagging_sink_rejects_lsn_without_representable_durable_end() {
+            let sink = LaggingWalSink {
+                inner: parking_lot::Mutex::new(LaggingInner {
+                    next_lsn: u64::MAX - 1,
+                    ..LaggingInner::default()
+                }),
+            };
+
+            let err = sink
+                .append(nop_record())
+                .expect_err("record start without an exclusive end must be rejected");
+            assert!(matches!(err, super::WalSinkError::Rejected(_)), "{err:?}");
+            assert_eq!(sink.assigned_lsn(), Lsn::new(u64::MAX - 1));
         }
     }
 }

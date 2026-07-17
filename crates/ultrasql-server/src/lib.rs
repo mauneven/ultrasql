@@ -360,7 +360,7 @@ pub struct Server {
     /// [`Server::note_commit_for_gc`], which bumps this counter and,
     /// every [`UNDO_GC_INTERVAL_COMMITS`] commits, fires
     /// [`HeapAccess::vacuum_undo_log`] with the txn manager's current
-    /// `oldest_in_progress()`. Trimming on a counter rather than per
+    /// snapshot-aware `vacuum_horizon()`. Trimming on a counter rather than per
     /// commit keeps the hot path cheap (one atomic add) and amortises
     /// the GC walk across many small transactions.
     pub vacuum_commit_counter: std::sync::atomic::AtomicU64,

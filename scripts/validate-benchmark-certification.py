@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import re
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +24,7 @@ ENGINE_VERSION_KEYS = {
     "postgres": "postgres",
 }
 GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+MEDIAN_SERIALIZATION_ABS_TOLERANCE_US = 0.0005
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,8 +94,17 @@ def parse_time(value: str | None) -> str:
 
 
 def load_json(path: Path) -> tuple[Any | None, list[str]]:
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number {value} is not allowed")
+
     try:
-        return json.loads(path.read_text(encoding="utf-8")), []
+        return (
+            json.loads(
+                path.read_text(encoding="utf-8"),
+                parse_constant=reject_non_finite,
+            ),
+            [],
+        )
     except Exception as err:  # noqa: BLE001 - validation reports parse/read errors.
         return None, [f"cannot parse {path}: {err}"]
 
@@ -120,18 +133,32 @@ def require_positive_int(
 
 def require_positive_number(doc: dict[str, Any], field: str, errors: list[str]) -> float | None:
     value = doc.get(field)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
         errors.append(f"{field} must be a positive number")
         return None
     return float(value)
 
 
 def canonical_engine(engine: str) -> str:
-    if engine == "postgres17":
+    if engine in {"postgres17", "postgresql"}:
         return "postgres"
     if engine == "sqlite":
         return "sqlite3"
     return engine
+
+
+def canonical_answer_sha256(answer: Any) -> str:
+    encoded = json.dumps(
+        answer,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 # Workload families, longest-prefix first, used to map a full raw workload id
@@ -149,6 +176,15 @@ WORKLOAD_FAMILIES = [
     "mixed_correctness",
     "window_row_number",
 ]
+SCALED_WORKLOAD_FAMILIES = {
+    "insert_throughput",
+    "select_scan",
+    "select_sum",
+    "select_avg",
+    "filter_sum",
+    "update_throughput",
+    "delete_throughput",
+}
 
 
 def workload_family(workload: str) -> str | None:
@@ -158,7 +194,12 @@ def workload_family(workload: str) -> str | None:
     return None
 
 
-def scan_not_available(raw_dir: Path) -> dict[tuple[str, str, int], str]:
+def scan_not_available(
+    artifact_dir: Path,
+    raw_dir: Path,
+    *,
+    required_storage_mode: str,
+) -> tuple[dict[tuple[str, str, int], str], list[str]]:
     """Map (engine, family, n_rows) -> reason for every not_available raw file.
 
     An engine that explicitly records `status="not_available"` with a reason is
@@ -166,42 +207,101 @@ def scan_not_available(raw_dir: Path) -> dict[tuple[str, str, int], str]:
     must not be treated as a silently missing measurement.
     """
     statuses: dict[tuple[str, str, int], str] = {}
+    errors: list[str] = []
     if not raw_dir.is_dir():
-        return statuses
+        return statuses, errors
+    try:
+        artifact_root = artifact_dir.resolve()
+        raw_root = raw_dir.resolve()
+    except (OSError, RuntimeError, ValueError) as err:
+        return statuses, [f"cannot resolve raw artifact directory {raw_dir}: {err}"]
+    if not raw_root.is_relative_to(artifact_root):
+        return statuses, [f"raw dir must be inside artifact directory: {raw_root}"]
+
     for path in sorted(raw_dir.glob("*.json")):
-        doc, _ = load_json(path)
+        try:
+            resolved_path = path.resolve()
+        except (OSError, RuntimeError, ValueError) as err:
+            errors.append(f"cannot resolve raw artifact {path}: {err}")
+            continue
+        if not resolved_path.is_relative_to(raw_root) or not resolved_path.is_file():
+            errors.append(f"raw artifact path escapes raw directory: {path}")
+            continue
+
+        doc, load_errors = load_json(resolved_path)
+        errors.extend(load_errors)
         if not isinstance(doc, dict) or doc.get("status") != "not_available":
             continue
-        engine = doc.get("engine")
-        workload = doc.get("workload")
-        n_rows = doc.get("n_rows")
+
+        validated, raw_errors = validate_raw_file(
+            resolved_path,
+            required_storage_mode=required_storage_mode,
+        )
+        errors.extend(raw_errors)
+        if validated is None:
+            continue
+
+        engine = validated.get("engine")
+        workload = validated.get("workload")
+        n_rows = validated.get("n_rows")
         if not isinstance(engine, str) or not isinstance(workload, str):
             continue
         if isinstance(n_rows, bool) or not isinstance(n_rows, int):
             continue
         family = workload_family(workload)
         if family is None:
+            errors.append(f"{resolved_path}: unsupported workload {workload!r}")
             continue
-        reason = doc.get("reason")
-        statuses[(canonical_engine(engine), family, n_rows)] = (
-            reason if isinstance(reason, str) and reason.strip() else "not_available"
-        )
-    return statuses
+        reason = validated.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            continue
+        key = (canonical_engine(engine), family, n_rows)
+        if key in statuses:
+            errors.append(
+                f"{resolved_path}: duplicate not_available artifact for "
+                f"{key[0]} {family} rows={n_rows}"
+            )
+            continue
+        statuses[key] = reason.strip()
+    return statuses, errors
 
 
 def resolve_artifact_path(artifact_dir: Path, raw_dir: Path, text: Any) -> Path | None:
+    """Resolve current and legacy raw paths within the local artifact tree.
+
+    Current renderers store paths relative to ``artifact_dir``. Older renderers
+    stored absolute or repository-relative paths; for those, the raw filename
+    is resolved beneath this artifact's ``raw`` directory. External paths and
+    symlinks that escape the artifact tree are never followed.
+    """
     if not isinstance(text, str) or not text.strip():
         return None
     path = Path(text)
-    if path.is_absolute() or path.exists():
-        return path
-    candidate = artifact_dir / path
-    if candidate.exists():
-        return candidate
-    candidate = raw_dir / path.name
-    if candidate.exists():
-        return candidate
-    return path
+    try:
+        artifact_root = artifact_dir.resolve()
+        raw_root = raw_dir.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not raw_root.is_relative_to(artifact_root):
+        return None
+
+    if not path.is_absolute():
+        try:
+            candidate = (artifact_dir / path).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if candidate.is_relative_to(raw_root) and candidate.is_file():
+            return candidate
+
+    if not path.name:
+        return None
+    try:
+        legacy_candidate = (raw_dir / path.name).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if legacy_candidate.is_relative_to(raw_root):
+        return legacy_candidate
+    return None
 
 
 def validate_manifest(
@@ -210,19 +310,36 @@ def validate_manifest(
     expected_commit: str | None,
     required_engines: list[str],
     required_storage_mode: str,
-) -> tuple[str | None, str | None, list[str]]:
+) -> tuple[str | None, str | None, set[int], int | None, list[str]]:
     errors: list[str] = []
     if not isinstance(manifest, dict):
-        return None, None, ["scale_sweep_manifest.json must be a JSON object"]
+        return (
+            None,
+            None,
+            set(),
+            None,
+            ["scale_sweep_manifest.json must be a JSON object"],
+        )
 
     if manifest.get("schema_version") != 1:
         errors.append("manifest schema_version must be 1")
     for field in ["mode", "ultrasql_version", "ultrasql_install_source", "methodology"]:
         require_text(manifest, field, errors)
-    for field in ["iters", "warmup"]:
-        require_positive_int(manifest, field, errors)
-    if not isinstance(manifest.get("rows"), list) or not manifest["rows"]:
+    iterations = require_positive_int(manifest, "iters", errors)
+    require_positive_int(manifest, "warmup", errors)
+    manifest_rows: set[int] = set()
+    rows = manifest.get("rows")
+    if not isinstance(rows, list) or not rows:
         errors.append("rows must be a non-empty list")
+    else:
+        for index, value in enumerate(rows):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                errors.append(f"rows[{index}] must be a positive integer")
+                continue
+            if value in manifest_rows:
+                errors.append(f"rows contains duplicate scale {value}")
+                continue
+            manifest_rows.add(value)
 
     storage_mode = manifest.get("ultrasql_storage_mode")
     if required_storage_mode != "any" and storage_mode != required_storage_mode:
@@ -258,7 +375,13 @@ def validate_manifest(
             if not isinstance(version, str) or not version.strip():
                 errors.append(f"engine_versions.{version_key} must be recorded")
 
-    return release_commit, storage_mode if isinstance(storage_mode, str) else None, errors
+    return (
+        release_commit,
+        storage_mode if isinstance(storage_mode, str) else None,
+        manifest_rows,
+        iterations,
+        errors,
+    )
 
 
 def validate_raw_file(
@@ -275,16 +398,62 @@ def validate_raw_file(
     status = raw.get("status")
     if status not in {"measured", "not_available"}:
         local_errors.append(f"{path}: status must be measured or not_available")
-    require_text(raw, "engine", local_errors)
-    require_text(raw, "workload", local_errors)
-    require_positive_int(raw, "n_rows", local_errors)
+    require_text(raw, "engine", local_errors, label=f"{path}: engine")
+    workload = require_text(raw, "workload", local_errors, label=f"{path}: workload")
+    require_positive_int(raw, "n_rows", local_errors, label=f"{path}: n_rows")
     engine = canonical_engine(str(raw.get("engine"))) if isinstance(raw.get("engine"), str) else None
     if status == "measured":
-        require_positive_number(raw, "median_us", local_errors)
-        require_positive_int(raw, "samples", local_errors)
+        median = require_positive_number(raw, "median_us", local_errors)
+        samples = require_positive_int(raw, "samples", local_errors)
         iterations = raw.get("iterations_us")
         if not isinstance(iterations, list) or not iterations:
             local_errors.append(f"{path}: iterations_us must be a non-empty list")
+        else:
+            valid_iterations: list[float] = []
+            for index, value in enumerate(iterations):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0.0
+                ):
+                    local_errors.append(
+                        f"{path}: iterations_us[{index}] must be a finite positive number"
+                    )
+                    continue
+                valid_iterations.append(float(value))
+            if samples is not None and samples != len(iterations):
+                local_errors.append(
+                    f"{path}: samples={samples} does not match "
+                    f"iterations_us length {len(iterations)}"
+                )
+            if median is not None and len(valid_iterations) == len(iterations):
+                derived_median = float(statistics.median(valid_iterations))
+                fp_epsilon = max(math.ulp(median), math.ulp(derived_median))
+                if (
+                    abs(median - derived_median)
+                    > MEDIAN_SERIALIZATION_ABS_TOLERANCE_US + fp_epsilon
+                ):
+                    local_errors.append(
+                        f"{path}: median_us={median} does not match "
+                        f"iterations_us median {derived_median} within "
+                        f"{MEDIAN_SERIALIZATION_ABS_TOLERANCE_US} us"
+                    )
+        if workload is not None and workload_family(workload) == "mixed_correctness":
+            answer_hash = raw.get("answer_sha256")
+            if not isinstance(answer_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", answer_hash):
+                local_errors.append(
+                    f"{path}: mixed_correctness requires a lowercase 64-hex answer_sha256"
+                )
+            if "answer" not in raw:
+                local_errors.append(f"{path}: mixed_correctness requires an answer")
+            elif isinstance(answer_hash, str) and re.fullmatch(r"[0-9a-f]{64}", answer_hash):
+                derived_hash = canonical_answer_sha256(raw["answer"])
+                if answer_hash != derived_hash:
+                    local_errors.append(
+                        f"{path}: answer_sha256 does not match canonical answer "
+                        f"(expected {derived_hash})"
+                    )
         storage_mode = require_text(
             raw,
             "storage_mode",
@@ -307,7 +476,7 @@ def validate_raw_file(
                     f"{engine}: raw durability_mode expected durable, got {durability_mode}"
                 )
     if status == "not_available":
-        require_text(raw, "reason", local_errors)
+        require_text(raw, "reason", local_errors, label=f"{path}: reason")
     if local_errors:
         return None, local_errors
     return raw, []
@@ -317,7 +486,12 @@ def measured_median(entry: Any) -> float | None:
     if not isinstance(entry, dict):
         return None
     value = entry.get("median_us")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
         return None
     return float(value)
 
@@ -331,6 +505,8 @@ def validate_rendered_rows(
     required_storage_mode: str,
     min_comparable_rows: int,
     not_available: dict[tuple[str, str, int], str],
+    manifest_rows: set[int],
+    expected_samples: int | None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     if not isinstance(rendered, dict):
@@ -352,6 +528,8 @@ def validate_rendered_rows(
     ultrasql_loss_count = 0
     ultrasql_not_available_count = 0
     total_rendered = 0
+    seen_row_keys: set[tuple[str, int]] = set()
+    rendered_scale_rows: set[int] = set()
 
     for index, row in enumerate(rows):
         total_rendered += 1
@@ -366,15 +544,93 @@ def validate_rendered_rows(
         if isinstance(n_rows, bool) or not isinstance(n_rows, int) or n_rows <= 0:
             errors.append(f"rows[{index}].n_rows must be a positive integer")
             n_rows = 0
+        row_key = (workload, n_rows)
+        if n_rows > 0 and row_key in seen_row_keys:
+            errors.append(
+                f"rows[{index}] duplicates rendered row {workload} rows={n_rows}"
+            )
+            continue
+        if n_rows > 0:
+            seen_row_keys.add(row_key)
+            if workload in SCALED_WORKLOAD_FAMILIES:
+                rendered_scale_rows.add(n_rows)
         engines = row.get("engines")
         if not isinstance(engines, dict):
             errors.append(f"rows[{index}].engines must be a JSON object")
             continue
 
-        normalized_engines = {
-            canonical_engine(str(engine)): entry for engine, entry in engines.items()
-        }
+        normalized_engines: dict[str, Any] = {}
+        rendered_samples: dict[str, int] = {}
+        for rendered_engine, entry in engines.items():
+            engine = canonical_engine(str(rendered_engine))
+            if engine in normalized_engines:
+                errors.append(
+                    f"{workload} rows={n_rows}: duplicate rendered engine {engine}"
+                )
+                continue
+            if not isinstance(entry, dict):
+                errors.append(
+                    f"{workload} rows={n_rows} {engine}: rendered entry must be a JSON object"
+                )
+                continue
+            normalized_engines[engine] = entry
+
+            entry_engine = require_text(
+                entry,
+                "engine",
+                errors,
+                label=f"{workload} rows={n_rows} {engine}: rendered engine",
+            )
+            if entry_engine is not None and canonical_engine(entry_engine) != engine:
+                errors.append(
+                    f"{workload} rows={n_rows} {engine}: "
+                    f"entry engine is {canonical_engine(entry_engine)}"
+                )
+
+            entry_workload = require_text(
+                entry,
+                "workload",
+                errors,
+                label=f"{workload} rows={n_rows} {engine}: rendered workload",
+            )
+            if (
+                entry_workload is not None
+                and workload_family(entry_workload) != workload
+            ):
+                errors.append(
+                    f"{workload} rows={n_rows} {engine}: rendered workload "
+                    f"{entry_workload!r} does not belong to row family {workload!r}"
+                )
+
+            if "n_rows" in entry:
+                entry_n_rows = require_positive_int(
+                    entry,
+                    "n_rows",
+                    errors,
+                    label=f"{workload} rows={n_rows} {engine}: rendered n_rows",
+                )
+                if entry_n_rows is not None and entry_n_rows != n_rows:
+                    errors.append(
+                        f"{workload} rows={n_rows} {engine}: "
+                        f"rendered n_rows is {entry_n_rows}"
+                    )
+
+            entry_samples = require_positive_int(
+                entry,
+                "samples",
+                errors,
+                label=f"{workload} rows={n_rows} {engine}: rendered samples",
+            )
+            if entry_samples is not None:
+                rendered_samples[engine] = entry_samples
+                if expected_samples is not None and entry_samples != expected_samples:
+                    errors.append(
+                        f"{workload} rows={n_rows} {engine}: rendered samples "
+                        f"{entry_samples} do not match manifest iters {expected_samples}"
+                    )
+
         measured: dict[str, float] = {}
+        measured_raw: dict[str, dict[str, Any]] = {}
         for engine, entry in normalized_engines.items():
             median = measured_median(entry)
             if median is not None:
@@ -389,6 +645,13 @@ def validate_rendered_rows(
                 errors.extend(raw_errors)
                 if raw is None:
                     continue
+                if raw.get("status") != "measured":
+                    errors.append(
+                        f"{workload} rows={n_rows} {engine}: rendered measurement "
+                        "must reference raw status=measured"
+                    )
+                    continue
+                measured_raw[engine] = raw
                 raw_engine = canonical_engine(str(raw.get("engine")))
                 if raw_engine != engine:
                     errors.append(
@@ -400,7 +663,19 @@ def validate_rendered_rows(
                     )
                 if raw.get("n_rows") != n_rows:
                     errors.append(f"{workload} rows={n_rows} {engine}: raw n_rows mismatch")
-                if abs(float(raw.get("median_us")) - median) > 0.000001:
+                if raw.get("samples") != rendered_samples.get(engine):
+                    errors.append(
+                        f"{workload} rows={n_rows} {engine}: raw samples mismatch"
+                    )
+                if (
+                    expected_samples is not None
+                    and raw.get("samples") != expected_samples
+                ):
+                    errors.append(
+                        f"{workload} rows={n_rows} {engine}: raw samples "
+                        f"do not match manifest iters {expected_samples}"
+                    )
+                if abs(float(raw["median_us"]) - median) > 0.000001:
                     errors.append(
                         f"{workload} rows={n_rows} {engine}: raw median_us mismatch"
                     )
@@ -492,8 +767,16 @@ def validate_rendered_rows(
             answer_hash = row.get("answer_sha256")
             if row.get("correctness_status") != "verified":
                 errors.append("mixed_correctness must have correctness_status=verified")
-            if not isinstance(answer_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", answer_hash):
-                errors.append("mixed_correctness must have a 64-hex answer_sha256")
+            if not isinstance(answer_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", answer_hash):
+                errors.append("mixed_correctness must have a lowercase 64-hex answer_sha256")
+            else:
+                for engine, raw in measured_raw.items():
+                    raw_hash = raw.get("answer_sha256")
+                    if raw_hash != answer_hash:
+                        errors.append(
+                            f"mixed_correctness rows={n_rows} {engine}: "
+                            "raw answer_sha256 does not match rendered answer_sha256"
+                        )
 
         row_summaries.append(
             {
@@ -504,11 +787,18 @@ def validate_rendered_rows(
             }
         )
 
-    # "ready" requires complete coverage (every required engine measured or
-    # explicitly not_available), NOT that UltraSQL wins every row.
-    if complete_count < min_comparable_rows:
+    if rendered_scale_rows != manifest_rows:
         errors.append(
-            f"complete_row_count {complete_count} below minimum {min_comparable_rows}"
+            "manifest rows do not match rendered scalable row set: "
+            f"manifest={sorted(manifest_rows)}, rendered={sorted(rendered_scale_rows)}"
+        )
+
+    # "ready" requires the configured number of fully comparable rows. Explicit
+    # not_available artifacts make additional rows complete and honest, but they
+    # do not turn those rows into cross-engine comparisons.
+    if comparable_count < min_comparable_rows:
+        errors.append(
+            f"comparable_row_count {comparable_count} below minimum {min_comparable_rows}"
         )
 
     scoreboard = {
@@ -556,7 +846,13 @@ def build_status(
     errors.extend(manifest_load_errors)
     errors.extend(rendered_load_errors)
 
-    release_commit, storage_mode, manifest_errors = validate_manifest(
+    (
+        release_commit,
+        storage_mode,
+        manifest_rows,
+        manifest_iterations,
+        manifest_errors,
+    ) = validate_manifest(
         manifest,
         expected_commit=expected_commit,
         required_engines=required_engines,
@@ -564,7 +860,12 @@ def build_status(
     )
     errors.extend(manifest_errors)
 
-    not_available = scan_not_available(raw_dir)
+    not_available, not_available_errors = scan_not_available(
+        artifact_dir,
+        raw_dir,
+        required_storage_mode=required_storage_mode,
+    )
+    errors.extend(not_available_errors)
     rendered_result = validate_rendered_rows(
         rendered,
         artifact_dir=artifact_dir,
@@ -573,6 +874,8 @@ def build_status(
         required_storage_mode=required_storage_mode,
         min_comparable_rows=min_comparable_rows,
         not_available=not_available,
+        manifest_rows=manifest_rows,
+        expected_samples=manifest_iterations,
     )
     rows = rendered_result.get("row_summaries", [])
     total_rendered = rendered_result.get("total_rendered", 0)
@@ -583,11 +886,11 @@ def build_status(
     scoreboard = rendered_result.get("scoreboard", {})
     errors.extend(rendered_result.get("errors", []))
 
-    # "ready" rewards honest, fair methodology: valid artifacts, all required
-    # engines measured or explicitly not_available, data-dir storage, a pinned
-    # release commit, and a host descriptor. It does NOT require UltraSQL to be
-    # fastest on every row; per-row wins and losses are reported in the
-    # scoreboard.
+    # "ready" verifies artifact completeness and provenance, not workload
+    # symmetry: enough fully measured comparable rows, valid raw evidence,
+    # explicit reasons for any additional not_available rows, data-dir labels,
+    # a pinned release commit, and a host descriptor. Driver differences are
+    # documented in BENCHMARKS.md.
     ready = not errors and not missing_required_rows
     reasons = []
     if not ready:
@@ -629,10 +932,12 @@ def build_status(
         "errors": errors,
         "reasons": reasons,
         "policy": (
-            "ready means fair symmetric methodology, schema-valid artifacts, all "
-            "required engines measured or explicitly not_available with a reason, "
-            "data-dir storage, a pinned release commit, and a host descriptor. "
-            "Per-row wins and losses are reported in the scoreboard, not gated."
+            "ready means the configured minimum fully comparable rows, "
+            "schema-valid self-contained raw evidence, complete coverage for "
+            "additional rendered rows, data-dir labels, a pinned release commit, "
+            "and a host descriptor. It does not prove workload symmetry or "
+            "universal performance leadership; per-row results are reported, "
+            "not gated."
         ),
     }
 

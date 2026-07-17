@@ -56,6 +56,12 @@ pub(crate) struct Session<RW> {
     pub(super) io: crate::tls::MaybeTlsStream<RW>,
     pub(super) read_buf: BytesMut,
     pub(super) write_buf: BytesMut,
+    /// Successful Extended Query replies waiting for `Flush` or `Sync`.
+    ///
+    /// This is separate from `write_buf`: Simple Query and COPY reuse that
+    /// buffer as scratch storage, while Extended Query must retain already
+    /// encoded replies across multiple frontend messages.
+    pub(super) extended_write_buf: BytesMut,
     pub(super) state: Arc<Server>,
     /// Startup `user` parameter, folded as the stable `session_user`.
     pub(super) auth_user: String,
@@ -256,6 +262,7 @@ where
             io: crate::tls::MaybeTlsStream::Plain(io),
             read_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
+            extended_write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             state,
             auth_user: "tester".to_owned(),
             current_user: "tester".to_owned(),
@@ -348,6 +355,16 @@ impl<RW> Drop for Session<RW> {
         // rollback, matching PostgreSQL.
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
+                let xid = txn.xid;
+                let abort_family = txn.abort_write_xid_family();
+                if let Err(e) = self.state.rollback_in_place_update_family(abort_family) {
+                    tracing::warn!(
+                        pid = self.pid,
+                        xid = %xid,
+                        error = %e,
+                        "failed to physically roll back open transaction family on session drop"
+                    );
+                }
                 if let Err(e) = self.state.abort_transaction(
                     txn,
                     false,

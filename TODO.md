@@ -4,13 +4,15 @@ This file is the single, comprehensive, **honest** list of everything still need
 production-grade, PostgreSQL-faithful "perfect database". It **replaces ROADMAP.md** as the
 authoritative open-work tracker.
 
-**Status: pre-1.0, NOT production-ready.** UltraSQL is a fast alpha. Do not claim production
+**Status: pre-1.0, NOT production-ready.** UltraSQL is alpha. Do not claim production
 readiness, "best in every aspect", or write/OLTP leadership. Do not expose the server on an
 untrusted network without a soak-tested deployment.
 
 - For **current shipped limitations** (what is true of the code today), see
   [`docs/known-limitations.md`](docs/known-limitations.md).
-- For **completed work with evidence**, see [`DONE.md`](DONE.md).
+- For notable completed work and compatibility notes, see
+  [`CHANGELOG.md`](CHANGELOG.md); benchmark evidence lives under
+  [`benchmarks/results/latest/`](benchmarks/results/latest/).
 
 Every item below is traceable to concrete evidence (file:line or committed artifact). Items use
 `- [ ] <title> — <description> (criticality; evidence)`. Reverted work (e.g. the SAVEPOINT
@@ -35,11 +37,10 @@ The top items by criticality and blast radius. These are the things that block a
    the §5 adversarial battery plus two independent adversarial re-reviews — which caught and fixed a
    unique-index liveness bug (aborted-deleter double-live-key) and a recovery data-loss bug
    (released/open subxid) **before any push**.
-   **Remaining follow-ups** (tracked in `docs/known-limitations.md`): two-phase commit does not yet
-   carry the subxid family, so `COMMIT PREPARED` recovery can lose a savepoint row (pre-existing); the
-   fused fast-path `DELETE` stays gated onto the general MVCC path under an open savepoint (perf, not
-   correctness); `COPY FROM STDIN` and `ALTER TABLE` heap-rewrite DDL under a savepoint stamp the
-   parent xid.
+   Two-phase commit now persists the subxid family and uses it for both
+   `COMMIT PREPARED` and physical rollback. **Remaining follow-ups** (tracked in
+   `docs/known-limitations.md`) include secondary-index/constraint maintenance
+   for `COPY FROM` and active-subxid stamping for `ALTER TABLE` heap rewrites.
 2. **Predicate-precise SSI / serializable correctness** — column-range SSI degrades to relation-wide
    locks for most types and is not page/tuple/gap-precise; blocks any serializable-correctness claim
    (high).
@@ -52,21 +53,22 @@ The top items by criticality and blast radius. These are the things that block a
    EvalPlanQual / the lost-delete, general arbitrary-qual ModifyTable EvalPlanQual, and
    ctid-chain following for the version-creating heap.update path). See
    [`docs/evalplanqual-design.md`](docs/evalplanqual-design.md) (high).
-4. **Continuous networked + synchronous physical replication** — replication is offline WAL-file
-   copying only; no walsender/walreceiver wire protocol, no streaming hot-standby apply, no sync
-   commit, no failover/promotion. Blocks HA/DR (critical). Phased plan designed in
-   [`docs/streaming-replication-design.md`](docs/streaming-replication-design.md) (Phase 0 landed;
-   walsender handshake + physical-slot retention is the first implementation increment).
-5. **CLOG persistence + transactional DDL** — in-memory DashMap commit log and DDL hard-rejected
-   inside explicit transaction blocks; both are atomicity/durability correctness gaps and block
-   ORM/migration certification beyond autocommit. **Increment B landed**: the DDL-in-transaction
-   rejection now returns SQLSTATE `0A000` (`feature_not_supported`) with an autocommit `HINT`
-   (deterministic failure for ORM/migration tooling; no semantics change). The dedicated effort
-   — per-transaction catalog overlay + a prerequisite commit-aware bootstrap recovery re-order —
-   is designed in [`docs/transactional-ddl-design.md`](docs/transactional-ddl-design.md) (high).
+4. **Synchronous physical replication and failover maturity** — continuous
+   single-follower WAL streaming, online apply, and read-only standby queries
+   are implemented. Synchronous commit, promotion/failover tooling, timelines,
+   cascading replication, and replication-slot WAL retention remain open and
+   block an HA/DR claim (critical; see
+   [`docs/known-limitations.md`](docs/known-limitations.md)).
+5. **CLOG persistence + transactional-DDL breadth** — the commit log remains
+   an in-memory DashMap rebuilt from WAL. A per-transaction catalog overlay now
+   supports the documented CREATE TABLE/INDEX, catalog-only ALTER, and plain
+   DROP TABLE subset; out-of-subset DDL is rejected with SQLSTATE `0A000`.
+   Persistent CLOG, commit-aware bootstrap hardening, heap-rewrite actions,
+   dependency-heavy DROP, and 2PC for DDL remain open (high; see
+   [`docs/transactional-ddl-design.md`](docs/transactional-ddl-design.md)).
 
 > **Most critical next: predicate-precise SSI / serializable correctness (#2).** SAVEPOINT (#1)
-> landed as a gated safe increment; the remaining 2PC/perf/DDL follow-ups are tracked in
+> landed as a gated safe increment; the remaining COPY/DDL follow-ups are tracked in
 > `docs/known-limitations.md`.
 
 ---
@@ -87,7 +89,15 @@ The top items by criticality and blast radius. These are the things that block a
 
 ## SQL surface & types
 
-- [ ] Transactional DDL inside explicit transaction blocks — all DDL inside `BEGIN…COMMIT` is hard-rejected; covers CREATE/DROP/ALTER TABLE, views/matviews, types/domains/operators, indexes, roles/privileges/schemas/sequences, COMMENT, CHECKPOINT, TRUNCATE, EXPORT/IMPORT. Blocks atomic multi-statement migrations and limits ORM cert to autocommit/nontransactional mode. **Increment B LANDED**: the rejection now returns a dedicated `ServerError::DdlInTransaction` → SQLSTATE `0A000` (`feature_not_supported`) with an autocommit `HINT` (txn→Failed `25P02`); deterministic, classifiable failure for ORM/migration tooling, no semantics change (`crates/ultrasql-server/src/error.rs`, `crates/ultrasql-server/src/session/execute/query.rs:302`, `crates/ultrasql-server/src/session/ext.rs:464`, test `ddl_in_explicit_transaction_is_feature_not_supported_with_hint` in `crates/ultrasql-server/tests/txn_round_trip.rs`). The real feature is a SAVEPOINT-class dedicated effort designed in [`docs/transactional-ddl-design.md`](docs/transactional-ddl-design.md); see the two split-out items below (high; `crates/ultrasql-server/src/session/execute/query.rs:302`, `docs/known-limitations.md`).
+- [ ] Broaden transactional DDL inside explicit transaction blocks — a
+  per-transaction catalog overlay supports the documented CREATE TABLE/INDEX,
+  catalog-only ALTER TABLE, and plain DROP TABLE subset. Remaining DDL
+  (heap rewrites, dependency-heavy DROP/CASCADE, views/types/roles/privileges,
+  sequences, TRUNCATE, and DDL under SAVEPOINT or PREPARE TRANSACTION) is
+  rejected with SQLSTATE `0A000` and an autocommit hint. Implement the remaining
+  milestones in [`docs/transactional-ddl-design.md`](docs/transactional-ddl-design.md)
+  behind the adversarial rollback/crash/isolation battery (high;
+  `docs/known-limitations.md`).
 - [ ] Increment A — commit-aware catalog bootstrap (recovery re-order) — **prerequisite for transactional DDL AND an independent crash-recovery corruption fix**. `bootstrap_from_heap` uses a raw, non-visibility `heap.scan` (`crates/ultrasql-catalog/src/persistent/bootstrap_heap.rs:276`), so an autocommit DDL that crashes between its catalog rows becoming durable and its commit marker becoming durable resurrects uncommitted schema on restart. The fix (switch to `scan_visible` + `XidStatusOracle`, `crates/ultrasql-storage/src/heap/update.rs:538`) is gated on re-ordering recovery so commit status is rebuilt before bootstrap (`recover_commit_status_from_wal` at `crates/ultrasql-server/src/server_wal_recovery.rs:536` must run before `bootstrap_from_heap` at `:421`) and a bootstrap snapshot defined. ~1–2 days; recommended first step (high; `docs/transactional-ddl-design.md` §3).
 - [ ] Transactional DDL overlay feature (the dedicated effort) — per-transaction catalog overlay (reads resolve overlay-first for the issuing session, committed snapshot for others; COMMIT merges, ROLLBACK discards); retarget durable catalog rows onto the user xid (stop the self-committing `ddl_txn` in `crates/ultrasql-server/src/session/ddl/create_table.rs:342-404`); commit/rollback hooks in `execute_commit`/`execute_rollback` (`crates/ultrasql-server/src/session/txn.rs:365-471,:474-509`); `AccessExclusive` locking; scoped to TABLE/INDEX/CONSTRAINT/TYPE DDL (keep GRANT/ROLE/COMMENT rejected until the `metadata_io.rs` sidecars become typed MVCC rows). Gated behind the §6 adversarial battery — no push if any rollback/crash/isolation case is red. Multi-day, SAVEPOINT-class (high; `docs/transactional-ddl-design.md` §4–6).
 - [ ] DDL via Extended Query (Parse/Bind/Execute) — DDL through the extended protocol is rejected ("DDL via Extended Query is not yet wired; use Simple Query"); drivers that prepare DDL must fall back to Simple Query (medium; `crates/ultrasql-server/src/extended/execute.rs:86-90`).
@@ -120,8 +130,9 @@ The top items by criticality and blast radius. These are the things that block a
 
 ## Durability, Recovery, Replication & Backup
 
-- [ ] Continuous networked physical replication (walsender/walreceiver wire protocol) — replication is offline WAL-file copying between dirs; no START_REPLICATION / IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT / BASE_BACKUP / primary_conninfo. A real standby cannot stream WAL over libpq (critical; `crates/ultrasql-server/src/replication.rs:897-995`, `docs/known-limitations.md:100-102`).
-- [ ] Streaming hot-standby apply (online replay loop) — a standby only replays WAL at startup; running standby never sees primary changes until restarted. Add an online apply loop, replication-lag tracking, and apply feedback (critical; `crates/ultrasql-server/src/session/execute/query.rs:50-52`, `crates/ultrasql-cli/src/cli_support/wal_ship.rs:65-102`).
+Continuous single-follower physical streaming and online standby apply are
+implemented. The remaining replication and durability gaps are:
+
 - [ ] Synchronous replication modes — `synchronous_commit` is accepted but inert; no `synchronous_standby_names`, no quorum/priority set, commit never waits for standby ack. No cross-node RPO=0 (high; `crates/ultrasql-server/src/session/execute/describe.rs:344-346,423`).
 - [ ] Replication failover / promotion / timelines / slot WAL retention — no `pg_promote`/trigger-file promotion, no timeline-ID or `.history` files; replication slots don't pin WAL retention on a live primary, so the checkpoint truncation floor can recycle segments a lagging standby still needs. No automated HA failover (high; `crates/ultrasql-server/src/replication.rs:802-895`, `crates/ultrasql-wal/src/truncate.rs:122-145`).
 - [ ] True cascading replication — `receive_once_cascading` is file copying with the same restart-required, non-streaming limits; no chained streaming standby, no timeline/promotion handling (medium; `crates/ultrasql-server/src/replication.rs:974-994`).
@@ -130,6 +141,14 @@ The top items by criticality and blast radius. These are the things that block a
 - [ ] Non-blocking online backup window — `/backup/start` flips the whole server read-only ("hot standby is read-only") instead of allowing concurrent writes with full-page-image torn-page safety + a backup_label LSN range bounding WAL replay (high; `crates/ultrasql-server/src/main_support/ops.rs:31-55`).
 - [ ] pg_dump/restore completeness + per-workload round-trip validation — `--pg-dump`/`--pg-restore` is an UltraSQL-native data-dir archive (not pg_dump-compatible), smoke-verified only on a 3-row single-table fixture. Validate broad schema/type/constraint round-trip across realistic workloads (high; `docs/backup-restore.md:18-47`, `docs/known-limitations.md:104`).
 - [ ] WAL recycling robustness — recycling is disabled outright when a required vector-index snapshot isn't durable (unbounded WAL growth + full replay); the floor excludes physical replication slots. Add fuzzing/soak for the recycle+restart path (the prior block-count-undercount bug shows fragility) (medium; `crates/ultrasql-wal/src/truncate.rs:142-206`).
+- [ ] WAL-log physical heap VACUUM — WAL-backed heaps currently defer slot
+  reclamation and compaction because recovery could otherwise mistake a
+  post-vacuum slot reuse for an already-applied insert. UPDATE redirect-chain
+  members are retained so existing index TIDs remain reachable. Add a
+  crash-safe vacuum/compaction WAL record and index-entry retargeting before
+  enabling physical reclamation; until then persistent tables can accumulate
+  heap and index bloat (high; `crates/ultrasql-storage/src/heap/vacuum.rs`,
+  `crates/ultrasql-server/src/session/execute/maintenance.rs`).
 - [x] Same-durability sync primitive — `--wal-sync-method` (default `fsync`, matching PostgreSQL's and SQLite's default durability class per platform; `fsync_writethrough` = opt-in `F_FULLFSYNC`) closed the F_FULLFSYNC-vs-fsync gap that made insert_throughput_10k / mixed_oltp "honest losses": measured same-host mixed_oltp 362→182 µs/op and insert 10k 5.37→1.70 ms at durable data-dir settings (`crates/ultrasql-core/src/fsync.rs`). Group commit across concurrent committers already existed (`crates/ultrasql-wal/src/writer.rs` fsync window/batch/notify).
 
 ## Security & Admin
@@ -144,9 +163,30 @@ The top items by criticality and blast radius. These are the things that block a
 
 ## Performance & Benchmark release gates
 
-- [ ] Record a durable bulk-INSERT 1M-row measurement — committed `insert_throughput_1m-ultrasql.json` is `not_available` ("wal buffer full: 8386518 of 8388608 bytes"); the per-record backpressure + over-capacity admission fix is in code but the `--data-dir` scale sweep must be re-run to record a measurement (currently 23, not 24, comparable measured rows) (critical; `benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json`).
-- [ ] Fresh data-dir scale-sweep certification on the release commit — aggregate benchmark gate is not_ready: "expected release commit is required", "ultrasql_storage_mode expected data-dir, got None", many raw artifacts fail strict schema ("schema_version must be 1", "status must be measured or not_available"). The README sweep is the stale same-host fastest-table run pinned to 77a92d7c, not a fresh WAL-backed data-dir cert (high; `benchmarks/results/latest/release_gate_status.json`, `docs/known-limitations.md:113-115`).
-- [ ] Close the 3 honest scale-sweep losses — UltraSQL leads 21/24 (2026-07-02 committed run, median of 3 full sweeps, result cache disabled, symmetric warmups, per-op mixed OLTP). select_scan_1m is a ~2% run-to-run tie with ClickHouse (UltraSQL wins 2 of 3 runs); residual is Python-drain asymmetry helping ClickHouse's C driver plus columnar scan — revisit after same-driver drain lands. Real losses and MEASURED-AND-SCOPED paths: (1) update_throughput_1m 3.13 vs DuckDB 2.63ms and (2) delete_throughput_1m 3.64 vs ClickHouse 2.75ms — per-row profile shows the residual is per-slot header work; the scoped fix is a page-regular vectorized stamp path (validate fixed itemid stride once per page, then unrolled fixed-offset stamping; per-K-page WAL append batching was TRIED and REVERTED — the two-phase latch pattern loses L1 locality and measured SLOWER: delete_1m 3.4->5.1ms — do not retry that shape) and, beyond it, a WAL reservation ring (lock-free LSN reservation + out-of-order completion) to cut the append mutex. (3) mixed_oltp_pgbench_like 130.2us/op vs SQLite 16.3us and PostgreSQL 34.2us — THE REAL WEAK SPOT, now honestly measured at one op per round trip (the prior 28.8us "within 2% of PG" was a 20-op batching artifact, removed). NOTE (2026-07-02 diagnosis): this is NOT a missing-index problem — EXPLAIN ANALYZE confirms both point SELECT and point UPDATE select the secondary index (`Index Decision: selected <idx>`, Actual Rows: 1, ~45us server-side execution). The ~90us gap vs PostgreSQL is diffuse per-statement overhead in the extended-protocol message cycle and, in data-dir mode, the commit durability wait (`wait_for_wal_durable` sleep-polls in 50us increments, so every autocommit write floors at ~50us even when the group-commit fsync already completed). Scoped, HIGH-CARE next steps (must not regress commit durability semantics): (a) replace the wait_for_wal_durable 50us sleep-poll with a condvar/watch on flushed_lsn keeping append->fsync->finalize ordering unchanged — validate with the WAL/durability suite + loom before trusting; (b) trim per-op extended-protocol allocation/snapshot setup; (c) point-DML fast lane. Exit: a committed sweep where each row either leads or the loss is re-accepted with a fresh profile attached (high; `benchmarks/results/latest/scale-sweep/scale_sweep.md`).
+- [x] Record the 1M-row data-dir INSERT measurement — the pinned raw artifact
+  is `status=measured` with 32 samples and a 110,110.2085 µs median. The prior
+  `wal buffer full` result is obsolete (evidence:
+  `benchmarks/results/latest/scale-sweep/raw/insert_throughput_1m-ultrasql.json`).
+- [ ] Fresh data-dir scale-sweep certification on the eventual release commit —
+  the benchmark sub-certification is `ready` for pinned artifact commit
+  `a6a97af18d3e78fa73b9e6541df4398c7f255b39`, with 24 comparable rows. It is not
+  a certification of current HEAD or a substitute for the aggregate release
+  gate, which remains `not_ready`. Re-run and commit the sweep for the selected
+  release commit (high; `benchmarks/results/latest/benchmark_certification_status.json`,
+  `benchmarks/results/latest/release_gate_status.json`).
+- [ ] Re-measure the three scale-sweep losses after the current hot-path changes —
+  the one committed sweep at `a6a97af1` records 1M UPDATE at 3.13 ms versus
+  DuckDB 2.63 ms, 1M DELETE at 3.64 ms versus ClickHouse 2.75 ms, and point-op
+  Mixed OLTP at 130.2 µs/op versus embedded SQLite 16.3 µs/op and PostgreSQL
+  34.2 µs/op. It does not support median-of-sweeps, two-of-three, or symmetric
+  warmup claims. Dense fixed-layout mutation recognition, notification-driven
+  WAL durability waits, extended-response coalescing, and prepared-plan hash
+  reuse are implemented but have no fresh release-ship sweep yet; do not claim
+  that they closed any loss until a committed same-host A/B run proves it.
+  The UPDATE/DELETE timers cover the statement inside `BEGIN`, with outer
+  `ROLLBACK` outside the timer, so they are not commit/fsync measurements.
+  Same-driver result draining and a point-DML fast lane remain candidates
+  after profiling (high; `benchmarks/results/latest/scale-sweep/scale_sweep.md`).
 - [ ] TPC-B / TPC-C / Sysbench / ClickBench gates passing — tpcb/tpcc = target_not_met, sysbench = failed/target_not_met, clickbench = partial/missing_required_engine_results. No throughput-leadership or p99<5ms claim until these pass same-host PostgreSQL 17 (+ ClickHouse/Firebolt where applicable). TPC-H SF1/SF10 results were **withdrawn** (2026-07-01): they measured per-query answer-cache fast paths (since removed from the engine), not query execution; re-certification against the real executor is open. pgvector passes (high; `benchmarks/results/latest/{tpcb,tpcc,sysbench,clickbench}_certification.json`).
 - [ ] Firebolt sparse primary-index pruning gate — pass `target_ratio_ultrasql_vs_firebolt <= 1.0` and require `Firebolt primary-index pruning evidence`. Today the honest state is `local Firebolt Core smoke measured`, but `Firebolt is not_available` when Core EXPLAIN does not expose pruning; Firebolt comparisons use local Firebolt Core only (medium; `benchmarks/results/latest/clickbench_certification.json`, `docs/known-limitations.md`).
 - [ ] SIFT1M ANN recall/latency gate — no committed SIFT1M server-wire artifact giving absolute recall@10 + latency at 1M scale (build ~45 min extrapolated, not pgvector-competitive "minutes"); the in-memory fallback HnswIndex is still single-layer O(N) and not persisted (high; `docs/known-limitations.md:56-61`).
@@ -155,7 +195,7 @@ The top items by criticality and blast radius. These are the things that block a
 
 ## Operations & Soak gates
 
-- [ ] Three independent 30-day operator soaks (0 of 3) — `operator_soak_status.json` not_ready: 0 valid release reports, 0 independent operators, 0 valid release commits. Hard v1.0 gate via `.github/workflows/operator-soak.yml`. The final release needs the operator soak reports plus the `latest green CI workflow run id`, the `release workflow run id`, and the GitHub release notes recorded in the release checklist (critical; `benchmarks/results/latest/operator_soak_status.json`, `DONE.md`).
+- [ ] Three independent 30-day operator soaks (0 of 3) — `operator_soak_status.json` not_ready: 0 valid release reports, 0 independent operators, 0 valid release commits. Hard v1.0 gate via `.github/workflows/operator-soak.yml`. The final release needs the operator soak reports plus the `latest green CI workflow run id`, the `release workflow run id`, and the GitHub release notes recorded in the release checklist (critical; `benchmarks/results/latest/operator_soak_status.json`, `docs/release-checklist.md`).
 - [ ] Two independent external security + correctness audits (0 of 2) — `external_audit_status.json` not_ready: 0 valid reports, 0 independent auditors, missing both required audit types; valid reports must cover the expected release commit and pass `scripts/validate-external-audits.py` --strict (critical; `benchmarks/results/latest/external_audit_status.json`).
 - [ ] Incident drills in production mode: backup_restore, wal_recovery, disk_full (0 of 3) — `incident_drill_status.json` not_ready: 0 valid drill reports, all three required types missing, 0 valid release commits. Needs `mode:production` reports with RTO/RPO, postmortem, monitoring-alerted, zero unresolved sev0/sev1, generated/validated via `scripts/run-incident-drills.py` + `scripts/validate-incident-drills.py` --strict (critical; `benchmarks/results/latest/incident_drill_status.json`, `docs/incident-drills.md:6-35`).
 - [ ] PITR production drill end-to-end — PITR primitives exist (up_to_lsn/xid/time, recovery.targets, restore_command) but no committed production drill proving base-backup + WAL-archive + restore_command + recovery-target replay on a real workload (high; `crates/ultrasql-wal/src/recovery.rs:37-88`, `crates/ultrasql-server/src/snapshots.rs:231-419`).
@@ -164,22 +204,25 @@ The top items by criticality and blast radius. These are the things that block a
 
 ## Licensing & Release plumbing
 
-- [ ] Provision release-signing / publication material — NPM_TOKEN, HOMEBREW_TAP_TOKEN, AUR_SSH_PRIVATE_KEY, CHOCOLATEY_API_KEY, package signing, Windows code-signing. (NOTE: the older "currently unlicensed / unsuitable for production" gap is STALE — repo is dual-licensed Apache-2.0 OR MIT with LICENSE-APACHE/LICENSE-MIT/NOTICE present; only signing/publication remains.) (low; `Cargo.toml:34`, `DONE.md`).
+- [ ] Provision release-signing / publication material — NPM_TOKEN, HOMEBREW_TAP_TOKEN, AUR_SSH_PRIVATE_KEY, CHOCOLATEY_API_KEY, package signing, Windows code-signing. (NOTE: the older "currently unlicensed / unsuitable for production" gap is STALE — repo is dual-licensed Apache-2.0 OR MIT with LICENSE-APACHE/LICENSE-MIT/NOTICE present; only signing/publication remains.) (low; `Cargo.toml:34`, `docs/packaging.md`).
 - [ ] Promote package publication evidence from the release workflow — `docs.ultrasql.org`, `ghcr.io/mauneven/ultrasql` (a clean GHCR platform list), `packages/npm` + `npm publish`, the Windows setup EXE, Chocolatey, AUR (`yay -S ultrasql-bin`), the Homebrew tap, plus Debian/RPM. Open until each channel publishes from a tagged release (low; `.github/workflows/release.yml`, `docs/packaging.md`).
 
 ## AI / Strategic surface
 
-- [ ] Persistent, multi-layer vector index from the server wire path — the in-memory fallback `HnswIndex` is single-layer O(N) and not persisted; HNSW build-scaling and hierarchical layers are DONE in code but the SIFT1M 1M-scale server-wire artifact (recall@10 + latency, competitive build time) is the open release-blocking deliverable for any published 1M-scale ANN claim (high; `DONE.md`, `docs/known-limitations.md:56-61`).
-- [ ] Production ANN certification for Page-backed HNSW and Page-backed IVFFlat — both need large-scale recovery certification, page-level torn-write handling, deeper VACUUM/rebuild stress, `CREATE INDEX CONCURRENTLY`, filtered-query fallback policy, larger recall/latency artifacts, and WAL replay fuzz/property tests before any production ANN claim (high; `DONE.md`, `docs/known-limitations.md:56-61`).
+- [ ] Persistent, multi-layer vector index from the server wire path — the in-memory fallback `HnswIndex` is single-layer O(N) and not persisted; HNSW build-scaling and hierarchical layers are implemented, but the SIFT1M 1M-scale server-wire artifact (recall@10 + latency, competitive build time) is the open release-blocking deliverable for any published 1M-scale ANN claim (high; `CHANGELOG.md`, `docs/known-limitations.md:56-61`).
+- [ ] Production ANN certification for Page-backed HNSW and Page-backed IVFFlat — both need large-scale recovery certification, page-level torn-write handling, deeper VACUUM/rebuild stress, `CREATE INDEX CONCURRENTLY`, filtered-query fallback policy, larger recall/latency artifacts, and WAL replay fuzz/property tests before any production ANN claim (high; `CHANGELOG.md`, `docs/known-limitations.md:56-61`).
 - [ ] Broaden AI gauntlet measured artifacts into competitor comparisons — keep the AI gauntlet measured artifacts expanding across exact top-k, HNSW ANN recall/latency, hybrid search latency, filtered vector search, RAG retrieval quality, memory per million vectors, ingestion throughput, and cold-start index load, then add same-host DuckDB/ClickHouse/PostgreSQL+pgvector legs with answer/recall gates before publishing (medium; `docs/vector-benchmarks.md`).
 
 ---
 
 ## Release verdict (do not remove)
 
-UltraSQL is **not production ready for v1.0**. Allowed claims are narrow (fastest measured engine on
-21 of 24 workloads on the pinned same-host Apple M4 run, result cache disabled). "Production ready",
-"best in every aspect", and "fastest writes / OLTP leadership" are forbidden until the gates above
-close with committed evidence for the release commit, validated via
-`scripts/validate-release-evidence.py --strict`. In particular, point-op Mixed OLTP is an honest
-loss (UltraSQL third behind SQLite and PostgreSQL) — no OLTP-latency claim.
+UltraSQL is **not production ready for v1.0**. Allowed benchmark claims are
+row-scoped: the single committed Apple M4 sweep pinned to `a6a97af1`, with
+result cache disabled, records UltraSQL as the lowest median in 21 of 24 rows
+and reports all three losses. "Production ready", "best in every aspect", and
+"fastest writes / OLTP leadership" are forbidden until the gates above close
+with committed evidence for the release commit, validated via
+`scripts/validate-release-evidence.py --strict`. In particular, point-op Mixed
+OLTP records UltraSQL third behind embedded SQLite and PostgreSQL; it supports
+no OLTP-latency leadership claim.

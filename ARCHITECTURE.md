@@ -120,26 +120,43 @@ batches for clients that speak Arrow Flight.
 - **Free-space map (FSM).** Per-relation summary of free space per
   page used by inserters to find a target page in O(log N).
 - **Visibility map (VM).** Per-relation bitmap recording all-visible
-  pages used by index-only scans to skip heap fetches.
+  pages used by index-only scans to skip heap fetches. Heap writers clear a
+  page's bit while holding that page's exclusive content latch immediately
+  before publishing tuple changes; vacuum holds the shared content latch
+  through both its visibility check and VM publication. Online WAL replay is
+  attached to the same VM and follows the writer rule.
 
 **Contracts.**
 
 - Page checksums are xxh3-64 truncated to 32 bits, stored in the
   header. A page with a bad checksum is a hard error; the buffer pool
   refuses to hand it out and surfaces `Error::Corruption`.
-- The buffer pool obeys the [latch order](#latch-order): per-page
-  content latch, then page-table partition lock, in that direction
-  only.
+- The buffer pool obeys the [latch order](#latch-order): page-table partition
+  lock, then per-page content latch, in that direction only.
 - Frame allocation never sleeps with a buffer-pool lock held; eviction
   uses try-locks and falls back to the CLOCK hand if the candidate is
   pinned.
+- A WAL-backed heap writer retains the original frame pin from tuple mutation
+  through logical WAL append and monotonic page-LSN publication. The content
+  latch may be released while appending, but the pin prevents eviction or
+  checkpointer flush of tuple bytes whose WAL dependency has not yet been
+  stamped. Full-page-image capture and visibility-map clearing remain under the
+  exclusive content latch.
 - On buffer-pool exhaustion the pool invokes an owning-service
   `EvictionRelief` hook (installed at startup, run only after all frame/miss
-  latches are released) that flushes dirty frames whose page-LSN is at or below
-  the WAL's `durable_lsn` — forcing the WAL durable to the oldest unflushable
-  dirty LSN first when every dirty frame is blocked — then retries, up to a
-  bounded round count before surfacing `Exhausted`. Write-ahead-log ordering is
-  preserved (WAL before data) and relief never runs under a frame/miss latch.
+  latches are released) that flushes dirty frames whose page-LSN is below the
+  WAL's exclusive `durable_lsn` end boundary. In exact terms, a nonzero
+  record-start page-LSN must be strictly below that boundary; the server
+  reserves LSN zero as a dependency-free sentinel. Relief forces the WAL record
+  at the oldest unflushable dirty LSN durable first when every dirty frame is
+  blocked, then retries up to a bounded round count before surfacing
+  `Exhausted`. Write-ahead-log ordering is preserved (WAL before data) and
+  relief never runs under a frame/miss latch.
+- Physical slot reclamation and page compaction are deferred for WAL-backed
+  heaps until vacuum has a dedicated crash-safe WAL record. UPDATE redirect
+  chain members are retained, and index vacuum preserves their leaf entries,
+  until entries can be retargeted safely. The tradeoff is persistent heap and
+  index bloat rather than recovery-time slot-reuse ambiguity.
 
 **Rationale.** A compact slotted-page format keeps OLTP updates cheap while
 remaining inspectable by tooling. Classic CLOCK approximates LRU at a fraction
@@ -206,8 +223,9 @@ is a known bottleneck and an open performance RFC.
 
 **Group commit.** Writers append to an in-memory ring; a single fsync
 thread batches outstanding records into one WAL segment write per fsync
-window. The window is the smaller of (a) wall-clock 200 µs or (b) the
-batch size at which the next write would exceed 256 KiB. Both are
+window. Committers use a notification-driven force-and-wait path rather than a
+fixed polling interval. The window is the smaller of (a) wall-clock 200 µs or
+(b) the batch size at which the next write would exceed 256 KiB. Both are
 tunable. The fsync at the end of each window is `durability_sync`
 (`crates/ultrasql-core/src/fsync.rs`), which issues the configured
 `--wal-sync-method` primitive: `fsync` (the default — `fsync(2)`, the
@@ -223,11 +241,23 @@ one consistent, configured primitive.
 
 **Contracts.**
 
-- A record is durable when its LSN is ≤ `flushed_lsn` and
-  `flushed_lsn` has been observed under acquire ordering.
+- A record LSN names its first byte. `durable_lsn` is the exclusive end of the
+  durable byte prefix, so a record is durable only when its start LSN is
+  strictly below `durable_lsn`; the boundary is observed under acquire
+  ordering.
 - Recovery replays records in LSN order. Truncation or CRC mismatch is
   treated as torn-write residue only at the final segment tail; corruption
   before later bytes or later segments is fatal.
+- A writable point-in-time recovery durably removes every WAL byte after the
+  selected record boundary before opening the writer, then consumes the
+  one-shot recovery target. An interrupted fork leaves the target in place and
+  is retried idempotently on the next startup. An absent XID target and an LSN
+  before the retained floor are hard errors; timestamp targeting is rejected
+  after recycling unless an external timestamp horizon can prove reachability.
+  This operation forks the WAL timeline; it does not physically undo heap pages
+  already flushed after the target. Operators must start from a base backup
+  whose data files are no newer than the target, then replay retained/archive
+  WAL to that boundary.
 - WAL segments are 16 MiB and roll over inline when full. Checkpoint-driven
   segment recycling is implemented: `ultrasql_wal::truncate_below` removes whole
   segments below a crash-safe floor (min of the redo point, the oldest
@@ -239,8 +269,9 @@ one consistent, configured primitive.
 
 **Rationale.** Group commit is the single largest OLTP throughput
 multiplier on rotational storage and on NVMe under bursty write
-patterns. The implementation batches flush requests through lock-free channels
-rather than condition variables.
+patterns. The ring keeps append allocation bounded; condition-variable
+notifications wake the fsync thread and durability waiters without adding a
+polling quantum to commit latency.
 
 **Tradeoffs.** A bounded fsync window adds at most one window of
 latency to single-transaction commits. We default to 200 µs because
@@ -279,6 +310,14 @@ struct TupleHeader {
 The rules implement snapshot visibility for committed rows and own writes.
 Serializable isolation layers additional predicate locking on top; see the txn
 section.
+
+Fixed-width in-place updates retain page-scoped pre-images in an undo log.
+Full and compact-delta records share one monotonic sequence, and each record
+stores both writer XID and command ID so reconstruction respects same-
+transaction statement boundaries. Writers publish undo while holding the page
+write latch before changing tuple bytes; readers copy the page, VM state, and
+page-local undo while holding the page read latch. Rollback restores one page
+at a time and retires only that page's undo after restoration succeeds.
 
 **Rationale.** Snapshot semantics must be predictable for application code
 that depends on visibility of own writes in the same statement and
@@ -514,16 +553,22 @@ per-connection task, and the lifecycle of the storage stack.
 runtime. CPU-bound query execution offloads to a `rayon`-style worker
 pool sized to (cores − 2) by default.
 
-**Lifecycle.** `start` → load config → recover storage → initialize
-catalog cache → start WAL writer → start checkpointer → bind listener
-→ accept → on `SIGTERM`, drain → checkpoint → flush WAL → exit.
+**Lifecycle.** `start` → load config → recover storage → if targeted, durably
+fork WAL and consume the recovery marker → initialize catalog cache → reserve
+the zero-LSN sentinel on a fresh stream → start WAL writer → start checkpointer
+→ bind listener → accept → on `SIGTERM`, drain → checkpoint → flush WAL →
+exit.
 
 **Result path.** A large top-level Simple-Query `SELECT` whose encoded body
 exceeds the streaming high-water mark is streamed to the socket in bounded
 memory windows (carrying an autocommit transaction clone) rather than fully
-buffered, so peak wire-buffer memory is bounded by result size. Streaming is
-gated to the single-statement network path; the batch/embedded path always
-fully buffers.
+buffered, so peak wire-buffer memory is bounded by the configured streaming
+window independently of result cardinality. Streaming is gated to the
+single-statement network path; the batch/embedded path always fully buffers.
+Extended-protocol success frames are coalesced in a separate bounded buffer
+until `Flush` or `Sync`; errors and COPY state transitions preserve response
+ordering, and `Sync` appends notifications plus `ReadyForQuery` before the
+single write/flush.
 
 **Per-session transaction state.** Each connection owns a
 `TxnState` machine with three variants — `Idle`, `InTransaction(txn)`,
@@ -550,8 +595,9 @@ target.
 3. Lock-manager partition lock.
 4. Buffer-pool page-table partition lock.
 5. Per-page content latch (shared or exclusive).
-6. WAL insert lock.
-7. Per-segment file lock.
+6. In-place-undo relation lock.
+7. WAL insert lock.
+8. Per-segment file lock.
 
 Helpers that acquire multiple latches document the order in their
 contract.

@@ -283,6 +283,18 @@ where
                     let Ok(tuple) = self.state.heap.fetch(tid) else {
                         return true;
                     };
+                    let infomask = tuple.header.infomask;
+                    if infomask.contains(ultrasql_mvcc::tuple_header::InfoMask::UPDATED_IN_PLACE)
+                        || infomask.bits()
+                            & (ultrasql_mvcc::tuple_header::InfoMask::UPDATED
+                                | ultrasql_mvcc::tuple_header::InfoMask::HOT_UPDATED)
+                            != 0
+                    {
+                        // Keep current in-place versions and UPDATE-chain TIDs.
+                        // The B-tree may still point at a predecessor and rely
+                        // on its ctid chain to reach the visible terminal row.
+                        return false;
+                    }
                     let xmax = tuple.header.xmax;
                     !xmax.is_invalid() && xmax < oldest && self.state.txn_manager.is_committed(xmax)
                 })

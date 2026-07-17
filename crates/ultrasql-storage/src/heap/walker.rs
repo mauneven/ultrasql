@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
@@ -67,11 +66,16 @@ pub struct VisibleHeapWalker<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     pub(super) oracle: &'a O,
     /// Same `(xmin, infomask, visibility)` cache as `VisibleHeapScan`.
     pub(super) xmin_cache: Option<(Xid, u16, bool)>,
-    /// Per-relation undo log, shared with the heap. Consulted when
-    /// the visibility predicate returns
-    /// [`Visibility::VisiblePreImage`] for an `UPDATED_IN_PLACE`
-    /// tuple whose writer xmax is not visible to this snapshot.
-    pub(super) undo_log: Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
+    /// Per-relation undo handle cloned before any page lock is acquired.
+    pub(super) undo_log: Arc<parking_lot::RwLock<UndoRelationLog>>,
+    /// Page-scoped undo copied under the same page-read guard as
+    /// [`Self::page_scratch`].
+    ///
+    /// Writers and rollback both transition under `page write → undo write`;
+    /// taking `page read → undo read` here therefore snapshots one coherent
+    /// page+undo state and prevents later publications/removals from changing
+    /// how the copied page bytes are interpreted.
+    pub(super) page_undo: UndoRelationLog,
     /// Scratch buffer the walker copies a pre-image payload into
     /// when [`Visibility::VisiblePreImage`] fires. The returned
     /// `&[u8]` borrows from here; the borrow is invalidated by the
@@ -134,10 +138,15 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                     self.page_scratch.clear();
                     self.page_scratch
                         .extend_from_slice(page.as_bytes().as_slice());
+                    self.current_block_all_visible = self
+                        .vm
+                        .is_some_and(|vm| vm.is_all_visible(self.rel, page_id.block));
+                    if self.current_block_all_visible {
+                        self.page_undo = UndoRelationLog::default();
+                    } else {
+                        self.page_undo = self.undo_log.read().snapshot_page(page_id);
+                    }
                 }
-                self.current_block_all_visible = self
-                    .vm
-                    .is_some_and(|vm| vm.is_all_visible(self.rel, page_id.block));
                 drop(guard);
             }
 
@@ -236,8 +245,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                     // direction).
                     self.pre_image_scratch.clear();
                     if let Some(payload) = lookup_undo_pre_image_owned(
-                        &self.undo_log,
-                        self.rel,
+                        &self.page_undo,
                         tid,
                         &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length],
                         self.snapshot,
@@ -254,8 +262,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                     // bytes otherwise.
                     self.pre_image_scratch.clear();
                     if let Some(payload) = lookup_undo_pre_image_owned(
-                        &self.undo_log,
-                        self.rel,
+                        &self.page_undo,
                         tid,
                         &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length],
                         self.snapshot,
@@ -277,16 +284,13 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
 /// [`super::HeapAccess::lookup_undo_pre_image`] but accessible to the
 /// free walker struct without borrowing `self`.
 fn lookup_undo_pre_image_owned<O: XidStatusOracle + ?Sized>(
-    undo_log: &DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>,
-    rel: RelationId,
+    undo_log: &UndoRelationLog,
     tid: TupleId,
     current_payload: &[u8],
     snapshot: &Snapshot,
     oracle: &O,
 ) -> Option<Vec<u8>> {
-    let log_handle = undo_log.get(&rel)?;
-    let log = log_handle.read();
-    undo_pre_image_from_log(&log, tid, current_payload, snapshot, oracle)
+    undo_pre_image_from_log(undo_log, tid, current_payload, snapshot, oracle)
 }
 
 /// `PAGE_HEADER_SIZE + slot * ITEMID_SIZE` — mirrors

@@ -45,11 +45,43 @@ use ultrasql_core::{BlockNumber, RelationId};
 const BIT_VISIBLE: u8 = 0b01;
 const BIT_FROZEN: u8 = 0b10;
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MarkAllVisibleHook {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl MarkAllVisibleHook {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+
+    fn before_mark(&self) {
+        self.entered.wait();
+        self.release.wait();
+    }
+
+    pub(crate) fn wait_until_mark_attempt(&self) {
+        self.entered.wait();
+    }
+
+    pub(crate) fn release_mark(&self) {
+        self.release.wait();
+    }
+}
+
 /// Per-relation, in-memory visibility map.
 #[derive(Debug, Default)]
 pub struct VisibilityMap {
     /// `relation → bit-packed Vec<u8>`, 2 bits per block.
     inner: DashMap<RelationId, RwLock<Vec<u8>>>,
+    #[cfg(test)]
+    mark_all_visible_hook: RwLock<Option<std::sync::Arc<MarkAllVisibleHook>>>,
 }
 
 impl VisibilityMap {
@@ -86,7 +118,16 @@ impl VisibilityMap {
     /// Called by vacuum after verifying that all live tuples on the page
     /// are visible to the oldest active snapshot.
     pub fn mark_all_visible(&self, rel: RelationId, block: BlockNumber) {
+        #[cfg(test)]
+        if let Some(hook) = self.mark_all_visible_hook.write().take() {
+            hook.before_mark();
+        }
         self.set_bits(rel, block, BIT_VISIBLE, true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_mark_all_visible_hook(&self, hook: std::sync::Arc<MarkAllVisibleHook>) {
+        *self.mark_all_visible_hook.write() = Some(hook);
     }
 
     /// Mark a page as all-frozen.

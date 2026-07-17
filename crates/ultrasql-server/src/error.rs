@@ -730,6 +730,15 @@ mod tests {
     }
 
     #[test]
+    fn executor_internal_error_maps_to_internal_sqlstate() {
+        let err = ServerError::Execute(ultrasql_executor::ExecError::Internal(
+            "parallel heap worker panicked",
+        ));
+        assert!(err.is_query_scoped());
+        assert_eq!(err.sqlstate(), "XX000");
+    }
+
+    #[test]
     fn cursor_errors_map_to_postgres_cursor_sqlstates() {
         // PG: 34000 invalid_cursor_name for FETCH/CLOSE on a missing
         // cursor; 42P03 duplicate_cursor for a second DECLARE.

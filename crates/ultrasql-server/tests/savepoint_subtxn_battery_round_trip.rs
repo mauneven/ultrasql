@@ -673,6 +673,103 @@ async fn g_stamping_matrix_in_place_fused_update_int32_pair() {
     shutdown(running).await;
 }
 
+/// A released savepoint remains a distinct physical writer XID until the
+/// top-level transaction resolves. Full abort must therefore drain the
+/// released subxid's undo records, not just the parent XID. Forcing undo GC
+/// immediately after ROLLBACK makes the historical failure deterministic:
+/// without family cleanup GC removes the only pre-image and the original row
+/// disappears from subsequent scans.
+#[tokio::test]
+async fn g_released_savepoint_update_full_rollback_survives_forced_undo_gc() {
+    let running = start_sample_server("sp_battery_g_abort_family").await;
+    let client = &running.client;
+    Shape::NoIndex.create(client).await;
+    Shape::NoIndex.insert(client, 1, 100).await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT released_writer")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("UPDATE t_pair SET val = val + 50 WHERE id = 1")
+        .await
+        .expect("in-place update under savepoint");
+    assert_eq!(val_of(client, Shape::NoIndex, 1).await, Some(150));
+    client
+        .batch_execute("RELEASE SAVEPOINT released_writer")
+        .await
+        .expect("RELEASE");
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    let trimmed = running
+        .server
+        .heap
+        .vacuum_undo_log(running.server.txn_manager.next_xid())
+        .expect("forced undo GC");
+    assert_eq!(
+        trimmed, 0,
+        "full rollback must drain the released subxid pre-image before undo GC"
+    );
+    assert_eq!(
+        val_of(client, Shape::NoIndex, 1).await,
+        Some(100),
+        "released-savepoint UPDATE must be physically restored after parent rollback"
+    );
+
+    shutdown(running).await;
+}
+
+/// `ROLLBACK PREPARED` resolves the same released-subxid family from durable
+/// prepared state. Its physical undo must cover that family before CLOG is
+/// finalized, or forced undo GC can expose the prepared post-image.
+#[tokio::test]
+async fn g_rollback_prepared_released_update_survives_forced_undo_gc() {
+    let running = start_sample_server("sp_battery_g_prepared_abort_family").await;
+    let client = &running.client;
+    Shape::NoIndex.create(client).await;
+    Shape::NoIndex.insert(client, 1, 100).await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SAVEPOINT prepared_writer")
+        .await
+        .expect("SAVEPOINT");
+    client
+        .batch_execute("UPDATE t_pair SET val = val + 50 WHERE id = 1")
+        .await
+        .expect("in-place update under savepoint");
+    client
+        .batch_execute("RELEASE SAVEPOINT prepared_writer")
+        .await
+        .expect("RELEASE");
+    client
+        .batch_execute("PREPARE TRANSACTION 'abort-family-gid'")
+        .await
+        .expect("PREPARE TRANSACTION");
+    client
+        .batch_execute("ROLLBACK PREPARED 'abort-family-gid'")
+        .await
+        .expect("ROLLBACK PREPARED");
+
+    let trimmed = running
+        .server
+        .heap
+        .vacuum_undo_log(running.server.txn_manager.next_xid())
+        .expect("forced undo GC");
+    assert_eq!(
+        trimmed, 0,
+        "ROLLBACK PREPARED must drain every released-subxid pre-image"
+    );
+    assert_eq!(
+        val_of(client, Shape::NoIndex, 1).await,
+        Some(100),
+        "prepared savepoint UPDATE must be physically restored"
+    );
+
+    shutdown(running).await;
+}
+
 // Note: COPY FROM stdin runs in its own autocommit transaction in this
 // server (copy/stdio.rs begins a fresh txn), so it is intentionally not part
 // of the savepoint-rollback stamping matrix — the stamp itself is already

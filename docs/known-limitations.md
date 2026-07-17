@@ -144,8 +144,9 @@ tracks shipped work.
   `COMMIT PREPARED` re-embeds that family in its single Commit WAL record (just
   as single-phase `COMMIT` does), so a row written under a released or still-open
   `SAVEPOINT` inside a two-phase-committed transaction survives crash recovery
-  after the prepared commit. (`ROLLBACK PREPARED` carries no family, so those
-  savepoint rows correctly stay aborted.)
+  after the prepared commit. `ROLLBACK PREPARED` uses the persisted family to
+  restore every in-place pre-image before marking the parent and subxids
+  aborted.
 - Broader aggregate coverage remains open beyond the covered `STDDEV`,
   `VARIANCE`, `CORR`, `PERCENTILE_CONT`, and
   `PERCENTILE_DISC` surfaces, including hypothetical-set aggregates,
@@ -182,6 +183,19 @@ tracks shipped work.
   treated identically, since a dropped constraint has no dependent objects
   beyond its own backing index, which is always removed.
 
+## Storage maintenance
+
+- Physical heap reclamation is deferred for WAL-backed relations. VACUUM can
+  perform visibility, undo, and index maintenance, but it does not compact heap
+  pages or make dead slots reusable until those physical changes have a
+  dedicated crash-safe WAL record. Reusing a slot without such a record could
+  make recovery mistake a later insert for an already-replayed tuple.
+- UPDATE redirect-chain tuples are retained, and index VACUUM preserves their
+  leaf entries, until index entries can be retargeted safely to the terminal
+  tuple. This prevents an index lookup from being stranded at a reclaimed TID,
+  at the cost of persistent heap and index bloat. Monitor relation growth and
+  plan for rebuild/export-import maintenance on write-heavy persistent tables.
+
 ## Security and administration
 
 - Connection authentication supports `Trust` (the default — no authentication),
@@ -217,23 +231,34 @@ tracks shipped work.
   metadata, not WAL), and online backup fencing remains coarse.
 - Logical decoding and `pgoutput` are not complete.
 - Archive dump/restore is partial and must be validated per workload.
+- Recovery targets fork the retained WAL at a record boundary but do not undo
+  later tuple versions already present in data files. Historical PITR therefore
+  requires restoring a base backup from at or before the target before placing
+  `recovery.targets`; applying a historical target directly to a newer live
+  data directory is unsupported.
 
 ## Performance certification
 
 - README performance notes must come from SQL-surface scripts and recorded
   artifacts.
-- Current TPC-H SF1/SF10 certification artifacts pass their recorded
-  PostgreSQL/DuckDB targets. TPC-B, TPC-C, Sysbench, and ClickBench release
-  gates remain open in the latest committed artifacts.
-- The README release-artifact scale sweep is a same-host fastest-table result,
-  not full benchmark release certification. Full sign-off still needs the
-  full benchmark profile and WAL-backed data-dir scale-sweep evidence.
+- No valid TPC-H SF1 or SF10 certification result is currently committed. The
+  earlier results measured removed answer-cache fast paths and were withdrawn;
+  the real executor must be re-measured before any TPC-H number is published.
+  TPC-B, TPC-C, Sysbench, and ClickBench release gates also remain open in the
+  latest committed artifacts.
+- The README table is one same-host, data-dir scale sweep pinned to artifact
+  commit `a6a97af1`, not a universal ranking or full release certification.
+  The benchmark sub-certification is `ready` for that pinned artifact commit
+  and 24 comparable rows; the aggregate release gate remains `not_ready`, and
+  current HEAD needs a fresh release-ship sweep before making new claims.
+  Smoke benchmark evidence is not full release benchmark certification.
 - Firebolt comparisons use local Firebolt Core only, not hosted Firebolt URLs.
-- Durable bulk `INSERT` at 1M rows completes (the old `wal buffer full`
-  failure is fixed by per-record backpressure); the committed scoreboard
-  reflects whatever the latest full sweep run recorded — read
-  `benchmarks/results/latest/scale-sweep/` rather than this sentence for
-  current numbers. Checkpoint-driven WAL segment recycling is now
+- The pinned 1M-row UltraSQL INSERT artifact is `status=measured` with 32
+  samples and a 110,110.2085 µs median; the old `wal buffer full`
+  `not_available` record is obsolete. Read
+  `benchmarks/results/latest/scale-sweep/` for the raw evidence rather than
+  generalizing that row to other hosts or durability configurations.
+  Checkpoint-driven WAL segment recycling is now
   implemented: at each checkpoint the WAL is truncated below a crash-safe floor
   (the minimum of the redo point, the oldest in-progress transaction's first
   written LSN, and each vector-index snapshot LSN) via

@@ -1,6 +1,6 @@
 # Documentation Status Audit
 
-Last audited: 2026-07-01 (full re-audit; supersedes the 2026-06 audits).
+Last audited: 2026-07-17 (full re-audit; supersedes the 2026-06 audits).
 
 UltraSQL is alpha. It is not production ready until the release gates in
 `TODO.md` close with committed evidence, and no document in this repository
@@ -24,9 +24,10 @@ allowed to say:
   repeated withdrawn claims, the latter two described a multi-maintainer
   process this single-maintainer project does not run.
 - The scale-sweep scoreboard and its prose were re-measured with the
-  result-cache-off + harness-fairness fixes (median of three full sweeps);
-  the committed result is 21 of 24 workloads led by UltraSQL, cert `ready`
-  for the measured commit.
+  result cache disabled and the committed result is one full sweep: UltraSQL
+  records the lowest median in 21 of 24 rows. The artifact is cert `ready`
+  for its measured commit; `BENCHMARKS.md` records the remaining methodology
+  asymmetries.
 
 ## Ledger
 

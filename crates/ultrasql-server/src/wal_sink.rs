@@ -15,7 +15,7 @@
 //! Lsn>` for the purpose.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -27,6 +27,9 @@ use ultrasql_wal::{RECORD_HEADER_SIZE, RecordType, WalBuffer, WalRecord};
 /// storage layer can chain WAL records into a per-transaction log.
 pub struct WalBufferSink {
     buffer: Arc<WalBuffer>,
+    /// Set after startup has either recovered a nonempty durable prefix or
+    /// appended the origin NOP at zero.
+    zero_lsn_reserved: AtomicBool,
     /// Last LSN assigned to each XID, updated on every successful append.
     last_lsn: DashMap<u64, AtomicU64>,
     /// First LSN ever assigned to each *normal* (user) XID. Used at checkpoint
@@ -80,6 +83,7 @@ impl WalBufferSink {
     pub fn new(buffer: Arc<WalBuffer>) -> Self {
         Self {
             buffer,
+            zero_lsn_reserved: AtomicBool::new(false),
             last_lsn: DashMap::new(),
             first_lsn: DashMap::new(),
             last_lsn_cache: LastLsnCache::new(),
@@ -88,6 +92,14 @@ impl WalBufferSink {
             wal_fpi: AtomicU64::new(0),
             wal_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Declare that LSN zero cannot name a pending page WAL record.
+    ///
+    /// Startup calls this only after recovery establishes a nonempty durable
+    /// prefix or appends the origin NOP that reserves zero.
+    pub(crate) fn mark_zero_lsn_reserved(&self) {
+        self.zero_lsn_reserved.store(true, Ordering::Release);
     }
 
     /// Record the earliest LSN seen for a normal (user) transaction. `fetch_min`
@@ -264,8 +276,16 @@ impl WalSink for WalBufferSink {
         true
     }
 
+    fn supports_concurrent_linked_appends(&self) -> bool {
+        true
+    }
+
     fn durable_lsn(&self) -> Lsn {
         self.buffer.durable_lsn()
+    }
+
+    fn zero_lsn_has_no_pending_record(&self) -> bool {
+        self.zero_lsn_reserved.load(Ordering::Acquire)
     }
 
     fn last_lsn_for(&self, xid: Xid) -> Lsn {
@@ -329,6 +349,16 @@ mod tests {
                 wal_write: 2,
             }
         );
+    }
+
+    #[test]
+    fn zero_lsn_requires_explicit_startup_reservation() {
+        let buffer = Arc::new(WalBuffer::new(4096, Lsn::ZERO));
+        let sink = WalBufferSink::new(buffer);
+
+        assert!(!sink.zero_lsn_has_no_pending_record());
+        sink.mark_zero_lsn_reserved();
+        assert!(sink.zero_lsn_has_no_pending_record());
     }
 
     #[test]

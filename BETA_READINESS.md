@@ -1,16 +1,16 @@
-# UltraSQL Public Beta Readiness
+# UltraSQL Public-Beta Readiness Assessment
 
-This document says exactly what the public beta covers, what it does not,
-and how to try it in two minutes. Every claim here is backed by a committed
-artifact or a test in this repository; where evidence is still missing, this
-document says so instead of claiming.
+This document describes the proposed public-beta scope, what the current alpha
+does not cover, and how to try it in two minutes. Every claim here is backed by
+a committed artifact or a test in this repository; where evidence is still
+missing, this document says so instead of claiming.
 
-**Status: PUBLIC BETA (single node).** Not production-ready and not v1.0:
-the GA release gate honestly reports `not_ready` until two external audits,
-three executed incident drills, and three independent 30-day operator soaks
-exist (see `benchmarks/results/latest/release_gate_status.json`). Those are
-evidence-gathering gates that only time and third parties can close; nothing
-in this repo fakes them.
+**Status: ALPHA; public-beta readiness is under assessment.** UltraSQL is not
+production-ready and not v1.0. The aggregate release gate reports `not_ready`;
+among its open requirements are two external audits, three executed incident
+drills, and three independent 30-day operator soaks (see
+`benchmarks/results/latest/release_gate_status.json`). Those evidence gates
+cannot be closed by implementation claims in this repository.
 
 ## Quickstart (the boot smoke test exercises exactly this)
 
@@ -34,10 +34,11 @@ explicit unsafe opt-out). Data persists in `/var/lib/ultrasql`.
 `crates/ultrasql-server/tests/default_boot_smoke_round_trip.rs` gate these
 entry points in CI; `docs/install.md` carries the tagged-release pull line.
 
-## What the beta covers
+## Proposed public-beta scope already implemented
 
 - **PostgreSQL wire protocol v3**: simple + extended query protocols, TLS,
-  SCRAM/MD5/pg_hba auth, cancel requests, LISTEN/NOTIFY, structured
+  per-role SCRAM, the legacy global MD5 credential, `pg_hba` Trust/Reject/SCRAM
+  routing, cancel requests, LISTEN/NOTIFY, and structured
   ErrorResponse fields (S, V, C, M, and D/H where a detail or hint exists).
   The driver certification suite runs real libpq, psycopg2/3, SQLAlchemy,
   Django, Rails ActiveRecord, node-postgres, Go lib/pq + pgx + GORM, JDBC,
@@ -69,32 +70,35 @@ entry points in CI; `docs/install.md` carries the tagged-release pull line.
 
 The committed scale-sweep artifacts under
 `benchmarks/results/latest/scale-sweep/` are regenerated from real runs of
-`benchmarks/run_scale_sweep.sh` (durable data-dir mode, equal-durability
-settings per engine, symmetric warmups, UltraSQL's result-replay cache
-disabled, methodology in `BENCHMARKS.md`). In the committed 2026-07-02 run
-(median of three full sweeps), UltraSQL is the fastest measured engine on 21
-of 24 workloads against DuckDB, ClickHouse, SQLite, and a tuned PostgreSQL 17
-on the same host; the three losses (1M bulk UPDATE — DuckDB, 1M bulk DELETE —
-ClickHouse, point-op Mixed OLTP — in-process SQLite then PostgreSQL) are
-reported in the same artifact. The 1M sequential scan is a ~2% run-to-run tie
-with ClickHouse (parity, not a decisive lead). Point-op Mixed OLTP is
-UltraSQL's real weak spot: ~130 µs/op vs SQLite's 16 µs and PostgreSQL's
-34 µs, its true per-statement wire+dispatch cost with no batching. Do not
-quote numbers that are not in those artifacts. The benchmark-fairness contract — same host, same
-durability class per engine, symmetric warmups, result cache disabled,
-failures recorded as `not_available`, no winner claims over unmeasured
-engines — is enforced by `benchmarks/scripts/check_supremacy.py` and the
-benchmark certification gate.
+`benchmarks/run_scale_sweep.sh` (data-dir mode, UltraSQL's result-replay cache
+disabled, implementation and durability differences disclosed in
+`BENCHMARKS.md`). In the one committed 2026-07-02 sweep, pinned to artifact
+commit `a6a97af1`, UltraSQL has the lowest median in 21 of 24 rows against
+DuckDB, ClickHouse, SQLite, and a tuned PostgreSQL 17 on that host. The same
+artifact reports the three losses: 1M bulk UPDATE to DuckDB, 1M bulk DELETE to
+ClickHouse, and point-op Mixed OLTP to in-process SQLite (with PostgreSQL
+second). The 1M sequential-scan medians differ by about 2% in this one sweep;
+repeat-run parity is not established. Point-op Mixed OLTP records about
+130 µs/op for UltraSQL, 16 µs/op for embedded SQLite, and 34 µs/op for
+PostgreSQL. It is an end-to-end driver comparison, not an isolated engine
+dispatch measurement. The UPDATE/DELETE rows time the statement inside a
+transaction while the outer `ROLLBACK` is outside the timer, so they do not
+measure commit/fsync latency. Do not quote numbers that are not in those
+artifacts. The certification gate enforces artifact provenance, finite raw
+samples, raw/rendered consistency, explicit `not_available` reasons, and no
+winner claims over unmeasured engines. It does not certify driver, schema,
+warmup, or durability symmetry; those residual differences are part of the
+interpretation of every row.
 
 ## Known limitations (read before deploying)
 
 The authoritative list is [docs/known-limitations.md](docs/known-limitations.md).
-Highlights a beta user will actually hit:
+Highlights an alpha evaluator will actually hit:
 
 - **HA/DR maturity**: streaming hot standby works (see above) but there is
   no synchronous commit mode, no promotion/failover tooling, no cascading
   replication; authorization changes (roles/GRANT/RLS) reach a standby only
-  via a new base backup. Full HA/DR is coming, not a beta blocker.
+  via a new base backup. Full HA/DR remains open.
 - **Cursor holdability**: server-side cursors are forward-only and
   `WITHOUT HOLD` only; `WITH HOLD` and `SCROLL` are rejected with `0A000`.
 - **Transactional DDL** covers a documented subset; out-of-subset DDL inside
@@ -108,7 +112,12 @@ Highlights a beta user will actually hit:
   a sudden power loss (not an OS crash) can lose drive-cached writes. Use
   `--wal-sync-method fsync_writethrough` for full power-loss durability on
   Apple hardware (see docs/configuration.md).
-- **Single node**: no multi-node consensus, no sharding.
+- **Persistent VACUUM bloat**: physical heap compaction is deferred on
+  WAL-backed heaps until slot reclamation has its own crash-safe WAL record.
+  UPDATE redirect-chain members are retained so existing index entries remain
+  reachable. This preserves correctness but permits heap and index bloat.
+- **Single writer**: the physical standby is asynchronous; there is no
+  multi-node consensus or sharding.
 
 ## GA gate (honest)
 
@@ -120,5 +129,5 @@ stays that way until real external evidence exists:
 - three executed incident drills — `docs/incident-drills.md`;
 - three independent 30-day operator soak reports — `docs/OPERATOR_SOAK.md`.
 
-None of these can be closed by code in this repository, and this beta does
-not claim them.
+None of these can be closed by code in this repository, and this alpha
+readiness assessment does not claim them.

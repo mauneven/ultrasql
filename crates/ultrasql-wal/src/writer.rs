@@ -14,7 +14,7 @@
 //!
 //! Upon a successful fsync the writer publishes the new durable LSN
 //! through [`WalBuffer::publish_durable_lsn`], unblocking committers
-//! that are polling `durable_lsn`.
+//! that are waiting for `durable_lsn`.
 //!
 //! Segment rollover is handled inline: when the active segment's size
 //! reaches `segment_size_bytes`, the writer fsyncs the segment, closes
@@ -118,6 +118,17 @@ pub struct WalWriterStats {
     pub fsync_last_us: u64,
 }
 
+/// Outcome of waiting for a requested WAL position to become durable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalDurabilityWait {
+    /// The writer fsynced the complete record starting at the requested LSN.
+    Durable,
+    /// The writer terminated with a hard error before reaching the target.
+    Fatal,
+    /// The caller-provided upper bound elapsed before the target was durable.
+    TimedOut,
+}
+
 impl Default for WalWriterConfig {
     fn default() -> Self {
         Self {
@@ -144,12 +155,35 @@ struct WakeState {
     epoch: u64,
 }
 
+impl WakeState {
+    /// Consume a force request only when this iteration has bytes to flush.
+    ///
+    /// A record can be appended after the writer's drain but before it
+    /// observes the request. Retaining the request while no bytes are pending
+    /// makes the next drain inherit the force instead of waiting for the full
+    /// group-commit window.
+    fn take_force_fsync_if_work_pending(&mut self, work_pending: bool) -> bool {
+        let force_fsync = self.force_fsync;
+        if force_fsync && work_pending {
+            self.force_fsync = false;
+        }
+        force_fsync
+    }
+}
+
 /// State the writer thread owns and the public handle borrows
 /// transparently via `Arc`.
 #[derive(Debug)]
 struct Shared {
+    /// Lock order: when both mutexes are needed, acquire `durable_mutex`
+    /// before `wake_mutex`. The writer releases `wake_mutex` before it
+    /// publishes durability, so publication never takes the reverse order.
     wake_mutex: Mutex<WakeState>,
     wake_cv: Condvar,
+    /// Serializes durability waiters' check-then-sleep transition.
+    durable_mutex: Mutex<()>,
+    /// Wakes every waiter whose target may now be durable.
+    durable_cv: Condvar,
     /// Most recently published durable LSN, mirrored from the buffer
     /// so [`WalWriter::flushed_lsn`] is a lock-free atomic read.
     durable_lsn: AtomicU64,
@@ -183,6 +217,57 @@ struct Shared {
 }
 
 impl Shared {
+    fn request_fsync(&self) {
+        {
+            let mut state = self.wake_mutex.lock();
+            state.force_fsync = true;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        self.wake_cv.notify_one();
+    }
+
+    fn wait_for_record_durable(&self, record_start: Lsn, timeout: Duration) -> WalDurabilityWait {
+        let started = Instant::now();
+        let mut guard = self.durable_mutex.lock();
+        loop {
+            // Append returns a record's start LSN, while the writer publishes
+            // the durable end boundary of each complete drained prefix. The
+            // record is durable only once that boundary is strictly past its
+            // start; equality means the record begins exactly where the prior
+            // durable prefix ended and has not been fsynced yet.
+            if self.durable_lsn.load(Ordering::Acquire) > record_start.raw() {
+                return WalDurabilityWait::Durable;
+            }
+            if self.fatal.load(Ordering::Acquire) {
+                return WalDurabilityWait::Fatal;
+            }
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return WalDurabilityWait::TimedOut;
+            };
+            if remaining.is_zero() {
+                return WalDurabilityWait::TimedOut;
+            }
+
+            // `wait_for` atomically releases `durable_mutex`. Publishers take
+            // the same mutex before notifying, so publication cannot land in
+            // the gap between this predicate check and sleeping.
+            self.request_fsync();
+            self.durable_cv.wait_for(&mut guard, remaining);
+        }
+    }
+
+    fn publish_durable_lsn(&self, lsn: Lsn) {
+        let _guard = self.durable_mutex.lock();
+        self.durable_lsn.store(lsn.raw(), Ordering::Release);
+        self.durable_cv.notify_all();
+    }
+
+    fn publish_fatal(&self) {
+        let _guard = self.durable_mutex.lock();
+        self.fatal.store(true, Ordering::Release);
+        self.durable_cv.notify_all();
+    }
+
     fn record_fsync_latency(&self, elapsed_us: u64) {
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         self.fsync_total_us.fetch_add(elapsed_us, Ordering::Relaxed);
@@ -236,6 +321,42 @@ impl Drop for DrainCloser {
     }
 }
 
+/// Publishes a fatal writer state if the writer thread unwinds unexpectedly.
+///
+/// The writer thread instantiates this after [`DrainCloser`] so Rust's reverse
+/// local drop order wakes durability waiters before parked appenders observe
+/// the closed buffer.
+struct FatalOnDrop {
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl FatalOnDrop {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    fn publish(&mut self) {
+        if self.armed {
+            self.shared.publish_fatal();
+            self.armed = false;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FatalOnDrop {
+    fn drop(&mut self) {
+        self.publish();
+    }
+}
+
 /// Owning handle to the background WAL writer thread.
 #[derive(Debug)]
 pub struct WalWriter {
@@ -245,15 +366,14 @@ pub struct WalWriter {
 
 /// Cloneable, non-owning durability handle for the WAL writer.
 ///
-/// Carries exactly the two operations a force-and-wait needs — [`Self::notify`]
-/// (wake the writer to fsync the drained prefix now, bypassing the group-commit
-/// window) and [`Self::flushed_lsn`] (the LSN through which the writer has
-/// fsynced) — without the owning [`WalWriter`]'s join handle. It can be cloned
-/// and moved into a closure (e.g. an eviction-relief WAL force) while the
-/// owning `WalWriter` retains responsibility for shutdown.
+/// Exposes [`Self::wait_for_record_durable`] for an atomic force-and-wait, plus
+/// [`Self::notify`] and [`Self::flushed_lsn`] for callers that only need one
+/// half of that operation, without the owning [`WalWriter`]'s join handle. It
+/// can be cloned and moved into a closure (e.g. an eviction-relief WAL force)
+/// while the owning `WalWriter` retains responsibility for shutdown.
 ///
 /// The handle shares the writer's internal state by `Arc`, so it observes the
-/// live durable LSN and its `notify` reaches the same writer thread.
+/// live durable LSN and its notifications reach the same writer thread.
 #[derive(Clone, Debug)]
 pub struct WalDurabilityHandle {
     shared: Arc<Shared>,
@@ -264,15 +384,10 @@ impl WalDurabilityHandle {
     ///
     /// Equivalent to [`WalWriter::notify`]; see its docs.
     pub fn notify(&self) {
-        {
-            let mut state = self.shared.wake_mutex.lock();
-            state.force_fsync = true;
-            state.epoch = state.epoch.wrapping_add(1);
-        }
-        self.shared.wake_cv.notify_one();
+        self.shared.request_fsync();
     }
 
-    /// LSN through which the writer thread has fsynced.
+    /// Exclusive end boundary of the WAL prefix the writer has fsynced.
     ///
     /// Equivalent to [`WalWriter::flushed_lsn`].
     #[must_use]
@@ -286,6 +401,20 @@ impl WalDurabilityHandle {
     #[must_use]
     pub fn has_fatal_error(&self) -> bool {
         self.shared.fatal.load(Ordering::Acquire)
+    }
+
+    /// Force pending WAL and wait until the record at `record_start` is durable.
+    ///
+    /// This notification-driven wait adds no polling quantum to commit
+    /// latency. The outcome distinguishes a dead writer from a live writer
+    /// that exceeded the caller's last-resort upper bound.
+    #[must_use]
+    pub fn wait_for_record_durable(
+        &self,
+        record_start: Lsn,
+        timeout: Duration,
+    ) -> WalDurabilityWait {
+        self.shared.wait_for_record_durable(record_start, timeout)
     }
 }
 
@@ -327,6 +456,8 @@ impl WalWriter {
         let shared = Arc::new(Shared {
             wake_mutex: Mutex::new(WakeState::default()),
             wake_cv: Condvar::new(),
+            durable_mutex: Mutex::new(()),
+            durable_cv: Condvar::new(),
             durable_lsn: AtomicU64::new(initial_durable),
             fsync_count: AtomicU64::new(0),
             fsync_total_us: AtomicU64::new(0),
@@ -347,18 +478,23 @@ impl WalWriter {
                 // Release any backpressured appenders if this thread ever exits
                 // (clean return, error, or panic) so they cannot wait forever.
                 let _closer = DrainCloser(Arc::clone(&thread_buffer));
+                let mut fatal_on_drop = FatalOnDrop::new(thread_shared_for_fatal);
                 let mut driver =
                     WriterDriver::new(thread_dir, thread_buffer, thread_shared, config, next_index);
                 let result = driver.run();
-                if let Err(ref e) = result {
-                    // Publish the hard-failure signal BEFORE `_closer` releases
-                    // any backpressured appenders, so a durability waiter that
-                    // wakes on the closed buffer also observes `fatal == true`
-                    // and can distinguish this dead writer from a slow one.
-                    thread_shared_for_fatal.fatal.store(true, Ordering::Release);
-                    error!(error = %e, "wal writer thread terminated with error");
+                match result {
+                    Ok(()) => {
+                        fatal_on_drop.disarm();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Publish BEFORE `_closer` releases any backpressured
+                        // appenders so all observers see the fatal state.
+                        fatal_on_drop.publish();
+                        error!(error = %e, "wal writer thread terminated with error");
+                        Err(e)
+                    }
                 }
-                result
             })?;
 
         // Arm backpressure: a full append now waits for this writer to drain
@@ -376,19 +512,14 @@ impl WalWriter {
 
     /// Wake the writer thread and force pending WAL durable.
     ///
-    /// Commit and checkpoint waiters call this before polling
+    /// Commit and checkpoint waiters call this before waiting on
     /// [`Self::flushed_lsn`], so notify must bypass the background
     /// group-commit window for bytes that are already in the buffer.
     pub fn notify(&self) {
-        {
-            let mut state = self.shared.wake_mutex.lock();
-            state.force_fsync = true;
-            state.epoch = state.epoch.wrapping_add(1);
-        }
-        self.shared.wake_cv.notify_one();
+        self.shared.request_fsync();
     }
 
-    /// LSN through which the writer thread has fsynced.
+    /// Exclusive end boundary of the WAL prefix the writer has fsynced.
     pub fn flushed_lsn(&self) -> Lsn {
         Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
     }
@@ -405,6 +536,18 @@ impl WalWriter {
         self.shared.fatal.load(Ordering::Acquire)
     }
 
+    /// Force pending WAL and wait until the record at `record_start` is durable.
+    ///
+    /// See [`WalDurabilityHandle::wait_for_record_durable`].
+    #[must_use]
+    pub fn wait_for_record_durable(
+        &self,
+        record_start: Lsn,
+        timeout: Duration,
+    ) -> WalDurabilityWait {
+        self.shared.wait_for_record_durable(record_start, timeout)
+    }
+
     /// Test-only: simulate the writer thread having terminated with a hard
     /// error, so a durability waiter observes a dead writer deterministically
     /// without provoking a real filesystem fault.
@@ -416,14 +559,14 @@ impl WalWriter {
     #[cfg(any(test, feature = "test-fault-injection"))]
     pub fn force_fatal_for_test(&self) {
         self.shared.freeze_durable.store(true, Ordering::Release);
-        self.shared.fatal.store(true, Ordering::Release);
+        self.shared.publish_fatal();
     }
 
     /// Return a cloneable [`WalDurabilityHandle`] sharing this writer's
     /// durability state.
     ///
     /// The handle can be moved into a closure (e.g. the eviction-relief WAL
-    /// force) and used to `notify` + poll `flushed_lsn` independently of the
+    /// force) and used to request and await durability independently of the
     /// owning `WalWriter`, which keeps sole responsibility for shutdown.
     #[must_use]
     pub fn durability_handle(&self) -> WalDurabilityHandle {
@@ -484,6 +627,8 @@ mod stats_tests {
         let shared = Arc::new(Shared {
             wake_mutex: Mutex::new(WakeState::default()),
             wake_cv: Condvar::new(),
+            durable_mutex: Mutex::new(()),
+            durable_cv: Condvar::new(),
             durable_lsn: AtomicU64::new(0),
             fsync_count: AtomicU64::new(0),
             fsync_total_us: AtomicU64::new(0),
@@ -499,6 +644,55 @@ mod stats_tests {
         };
 
         assert_eq!(writer.stats(), WalWriterStats::default());
+    }
+
+    #[test]
+    fn durability_wait_distinguishes_timeout_from_fatal_writer() {
+        let shared = Arc::new(Shared {
+            wake_mutex: Mutex::new(WakeState::default()),
+            wake_cv: Condvar::new(),
+            durable_mutex: Mutex::new(()),
+            durable_cv: Condvar::new(),
+            durable_lsn: AtomicU64::new(0),
+            fsync_count: AtomicU64::new(0),
+            fsync_total_us: AtomicU64::new(0),
+            fsync_max_us: AtomicU64::new(0),
+            fsync_last_us: AtomicU64::new(0),
+            fatal: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-fault-injection"))]
+            freeze_durable: AtomicBool::new(false),
+        });
+        let handle = WalDurabilityHandle {
+            shared: Arc::clone(&shared),
+        };
+
+        assert_eq!(
+            handle.wait_for_record_durable(Lsn::new(1), Duration::from_millis(1)),
+            WalDurabilityWait::TimedOut
+        );
+        {
+            let _fatal_on_drop = FatalOnDrop::new(Arc::clone(&shared));
+        }
+        assert_eq!(
+            handle.wait_for_record_durable(Lsn::new(1), Duration::from_secs(1)),
+            WalDurabilityWait::Fatal
+        );
+    }
+
+    #[test]
+    fn force_fsync_request_survives_an_empty_drain() {
+        let mut state = WakeState {
+            force_fsync: true,
+            ..WakeState::default()
+        };
+
+        assert!(state.take_force_fsync_if_work_pending(false));
+        assert!(
+            state.force_fsync,
+            "a record can arrive after this iteration's empty drain"
+        );
+        assert!(state.take_force_fsync_if_work_pending(true));
+        assert!(!state.force_fsync, "the iteration with bytes consumes it");
     }
 }
 
@@ -569,8 +763,7 @@ impl WriterDriver {
             let elapsed = last_fsync.elapsed();
             let (stopping, force_fsync) = {
                 let mut state = self.shared.wake_mutex.lock();
-                let force_fsync = state.force_fsync;
-                state.force_fsync = false;
+                let force_fsync = state.take_force_fsync_if_work_pending(self.unflushed_bytes > 0);
                 (state.stopping, force_fsync)
             };
             let need_fsync = self.unflushed_bytes > 0
@@ -729,9 +922,8 @@ impl WriterDriver {
             return Ok(());
         }
         self.durable_lsn = self.pending_lsn;
-        let raw = self.durable_lsn.raw();
-        self.shared.durable_lsn.store(raw, Ordering::Release);
         self.buffer.publish_durable_lsn(self.durable_lsn);
+        self.shared.publish_durable_lsn(self.durable_lsn);
         Ok(())
     }
 }
@@ -1029,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_forces_pending_wal_durable_before_window_elapsed() {
+    fn durability_wait_forces_pending_wal_before_window_elapsed() {
         let dir = TempDir::new().unwrap();
         let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));
         let writer = WalWriter::open(
@@ -1043,15 +1235,55 @@ mod tests {
         )
         .unwrap();
 
-        buffer.append(&rec(b"notify")).unwrap();
+        let record_lsn = buffer.append(&rec(b"notify")).unwrap();
         let next_lsn = buffer.next_lsn();
-        writer.notify();
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while buffer.durable_lsn() < next_lsn && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        let waiters = (0..4)
+            .map(|_| {
+                let durability = writer.durability_handle();
+                std::thread::spawn(move || {
+                    durability.wait_for_record_durable(record_lsn, Duration::from_secs(1))
+                })
+            })
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            assert_eq!(waiter.join().unwrap(), WalDurabilityWait::Durable);
         }
         assert!(buffer.durable_lsn() >= next_lsn);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn durability_wait_does_not_treat_prior_end_boundary_as_new_record_durable() {
+        let dir = TempDir::new().unwrap();
+        let buffer = Arc::new(WalBuffer::new(64 * 1024, Lsn::ZERO));
+        let writer = WalWriter::open(
+            dir.path(),
+            Arc::clone(&buffer),
+            WalWriterConfig {
+                segment_size_bytes: 1024 * 1024,
+                fsync_window_us: 60_000_000,
+                fsync_batch_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+
+        let first_start = buffer.append(&rec(b"first")).unwrap();
+        assert_eq!(
+            writer.wait_for_record_durable(first_start, Duration::from_secs(1)),
+            WalDurabilityWait::Durable
+        );
+
+        let second_start = buffer.append(&rec(b"second")).unwrap();
+        assert_eq!(
+            writer.flushed_lsn(),
+            second_start,
+            "the first record's durable end is the second record's start"
+        );
+        assert_eq!(
+            writer.wait_for_record_durable(second_start, Duration::from_secs(1)),
+            WalDurabilityWait::Durable
+        );
+        assert!(writer.flushed_lsn() > second_start);
         writer.shutdown().unwrap();
     }
 

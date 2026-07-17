@@ -184,6 +184,9 @@ impl<L: PageLoader> HeapAccess<L> {
             let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
             Self::tuple_header_bytes_mut(page_bytes, old_off, "old header outside page")?
                 .copy_from_slice(&old_hdr_bytes);
+            if let Some(vm) = opts.vm {
+                vm.clear(old_tid.page.relation, old_tid.page.block);
+            }
 
             new_tid
         };
@@ -282,6 +285,9 @@ impl<L: PageLoader> HeapAccess<L> {
         }
         Self::write_infomask(page_bytes, old_off, new_infomask)?;
         Self::write_ctid(page_bytes, old_off, new_tid)?;
+        if let Some(vm) = opts.vm {
+            vm.clear(old_tid.page.relation, old_tid.page.block);
+        }
 
         Ok(Some(new_tid))
     }
@@ -400,6 +406,9 @@ impl<L: PageLoader> HeapAccess<L> {
         }
         Self::tuple_header_bytes_mut(page_bytes, slot_offset, "slot header outside page")?
             .copy_from_slice(&hdr_bytes);
+        if let Some(vm) = opts.vm {
+            vm.clear(old_tid.page.relation, old_tid.page.block);
+        }
         Ok(())
     }
 
@@ -438,13 +447,14 @@ impl<L: PageLoader> HeapAccess<L> {
         })
     }
 
-    /// Update FSM and clear VM bits after a successful insert.
+    /// Update the advisory FSM after a successful insert.
     ///
     /// Called after the WAL record has been appended (if any) and the page
-    /// guard has been dropped.  Both hooks are best-effort: a failure to pin
-    /// the page for the FSM read is treated as "no free space known" (the FSM
-    /// records 0, which is conservative).
-    pub(super) fn post_insert_fsm_vm(
+    /// guard has been dropped. A failure to pin the page for the FSM read is
+    /// treated as "no free space known" (the FSM records 0, which is
+    /// conservative). The visibility-map bit is cleared by the mutation
+    /// helper while it still holds the page write latch.
+    pub(super) fn post_insert_fsm(
         pool: &Arc<BufferPool<L>>,
         page_id: PageId,
         opts: InsertOptions<'_>,
@@ -453,18 +463,20 @@ impl<L: PageLoader> HeapAccess<L> {
             let free = Self::page_free_space(pool, page_id);
             fsm.record_free_space(page_id.relation, page_id.block, free);
         }
-        if let Some(vm) = opts.vm {
-            vm.clear(page_id.relation, page_id.block);
-        }
     }
 
-    /// Update FSM and clear VM bits after a successful delete.
+    /// Update FSM after a successful delete.
     ///
     /// The FSM update is optimistic: we record the dead tuple's space as free
     /// immediately so future inserters see the block as a candidate. Vacuum
     /// will eventually reclaim the space; until then the insert will discover
     /// (via `NoSpace`) that the category was too optimistic and fall back.
-    pub(super) fn post_delete_fsm_vm(
+    ///
+    /// DELETE clears VM while holding the page write latch immediately before
+    /// its first header mutation; doing it here after dropping the latch would
+    /// let a coherent walker observe new tuple bytes with stale all-visible
+    /// state.
+    pub(super) fn post_delete_fsm(
         pool: &Arc<BufferPool<L>>,
         page_id: PageId,
         opts: DeleteOptions<'_>,
@@ -472,9 +484,6 @@ impl<L: PageLoader> HeapAccess<L> {
         if let Some(fsm) = opts.fsm {
             let free = Self::page_free_space(pool, page_id);
             fsm.record_free_space(page_id.relation, page_id.block, free);
-        }
-        if let Some(vm) = opts.vm {
-            vm.clear(page_id.relation, page_id.block);
         }
     }
 

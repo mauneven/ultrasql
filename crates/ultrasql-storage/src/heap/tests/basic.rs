@@ -13,6 +13,67 @@ use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use super::*;
 use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
 
+fn test_payload_stats() -> Int32PairPagePayloadStats {
+    Int32PairPagePayloadStats {
+        slot_count: 1,
+        normal_slots: 1,
+        min0: 0,
+        max0: 0,
+        min1: 0,
+        max1: 0,
+    }
+}
+
+#[test]
+fn single_row_insert_invalidates_only_its_destination_page_stats() {
+    let heap = make_heap(8);
+    let destination = PageId::new(rel(), BlockNumber::new(0));
+    let untouched = PageId::new(rel(), BlockNumber::new(1));
+    heap.int32_pair_payload_stats
+        .insert(destination, test_payload_stats());
+    heap.int32_pair_payload_stats
+        .insert(untouched, test_payload_stats());
+
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    assert_eq!(tid.page, destination);
+    assert!(!heap.int32_pair_payload_stats.contains_key(&destination));
+    assert!(heap.int32_pair_payload_stats.contains_key(&untouched));
+}
+
+#[test]
+fn single_row_hot_update_invalidates_only_its_mutated_page_stats() {
+    let heap = make_heap(8);
+    let tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    let untouched = PageId::new(rel(), BlockNumber::new(1));
+    heap.int32_pair_payload_stats
+        .insert(tid.page, test_payload_stats());
+    heap.int32_pair_payload_stats
+        .insert(untouched, test_payload_stats());
+
+    let outcome = heap
+        .update(
+            tid,
+            &int32_pair_payload(1, 11),
+            UpdateOptions {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+                hot_eligible: true,
+                wal: None,
+                vm: None,
+            },
+        )
+        .unwrap();
+
+    assert!(outcome.hot);
+    assert!(!heap.int32_pair_payload_stats.contains_key(&tid.page));
+    assert!(heap.int32_pair_payload_stats.contains_key(&untouched));
+}
+
 #[test]
 fn rollback_stamp_pages_dedupe_and_preserve_first_touch_order() {
     let heap = make_heap(8);
@@ -20,11 +81,11 @@ fn rollback_stamp_pages_dedupe_and_preserve_first_touch_order() {
     let xid = Xid::new(77);
     let page = |block: u32| ultrasql_core::PageId::new(rel, BlockNumber::new(block));
 
-    // Interleaved duplicates: each page must be remembered exactly once,
-    // in first-touch order, regardless of how often the walker reports it.
-    for block in [3_u32, 1, 3, 2, 1, 3, 2] {
-        heap.remember_rollback_stamp_page(xid, page(block));
-    }
+    // Interleave single and bulk registration with duplicates. The batch must
+    // behave exactly like repeated single-page calls.
+    heap.remember_rollback_stamp_page(xid, page(3));
+    heap.remember_rollback_stamp_pages(xid, [page(1), page(3), page(2), page(1), page(3), page(2)]);
+    heap.remember_rollback_stamp_page(xid, page(2));
     assert_eq!(
         heap.take_rollback_stamp_pages(xid),
         vec![page(3), page(1), page(2)]
@@ -35,7 +96,289 @@ fn rollback_stamp_pages_dedupe_and_preserve_first_touch_order() {
 
     // The invalid xid is never recorded.
     heap.remember_rollback_stamp_page(Xid::INVALID, page(1));
+    heap.remember_rollback_stamp_pages(Xid::INVALID, [page(2), page(3)]);
     assert!(heap.take_rollback_stamp_pages(Xid::INVALID).is_empty());
+
+    // Empty batches do not create a transaction entry.
+    heap.remember_rollback_stamp_pages(xid, std::iter::empty());
+    assert!(heap.take_rollback_stamp_pages(xid).is_empty());
+}
+
+#[test]
+fn bulk_rollback_stamp_pages_restore_every_registered_page() {
+    let heap = make_heap(8);
+    let payload = [0xA5_u8; 7_000];
+    let first = heap.insert(rel(), &payload, opts(10)).unwrap();
+    let second = heap.insert(rel(), &payload, opts(10)).unwrap();
+    let xid = Xid::new(20);
+
+    heap.delete(first, del_opts(xid.raw(), 0)).unwrap();
+    heap.delete(second, del_opts(xid.raw(), 0)).unwrap();
+    assert_eq!(heap.fetch(first).unwrap().header.xmax, xid);
+    assert_eq!(heap.fetch(second).unwrap().header.xmax, xid);
+
+    // Drain the single-page registrations made by `delete`, then prove the
+    // bulk API alone supplies rollback with both unique pages.
+    assert_eq!(
+        heap.take_rollback_stamp_pages(xid),
+        vec![first.page, second.page]
+    );
+    heap.remember_rollback_stamp_pages(xid, [second.page, first.page, second.page, first.page]);
+
+    assert_eq!(heap.rollback_in_place_updates(xid).unwrap(), 2);
+    assert_eq!(heap.fetch(first).unwrap().header.xmax, Xid::INVALID);
+    assert_eq!(heap.fetch(second).unwrap().header.xmax, Xid::INVALID);
+    assert_eq!(heap.fetch(first).unwrap().data, payload);
+    assert_eq!(heap.fetch(second).unwrap().data, payload);
+    assert_eq!(heap.rollback_in_place_updates(xid).unwrap(), 0);
+}
+
+#[test]
+fn rollback_delete_page_error_keeps_registry_for_full_abort_retry() {
+    let heap = make_heap(16);
+    let first = heap
+        .insert(rel(), &int32_pair_payload(0, 10), opts(10))
+        .unwrap();
+    let second_page_tid = (1_i32..)
+        .find_map(|id| {
+            let tid = heap
+                .insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap();
+            (tid.page.block == BlockNumber::new(1)).then_some(tid)
+        })
+        .unwrap();
+
+    let xid = Xid::new(20);
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        xid,
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    assert_eq!(
+        heap.update_int32_pair_inplace_undo(
+            update_int32_scan(
+                rel(),
+                heap.block_count(rel()),
+                &snapshot,
+                &oracle,
+                |id, _val| id == 0,
+            ),
+            update_int32_edit(1, 5),
+            UpdateInt32PairStamp {
+                xid,
+                command_id: CommandId::FIRST,
+            },
+            None,
+            None,
+        )
+        .unwrap(),
+        1
+    );
+    heap.delete(second_page_tid, del_opts(xid.raw(), 0))
+        .unwrap();
+
+    let item_offset = Page::item_id_offset(second_page_tid.slot);
+    let original_item_id = {
+        let guard = heap.get_page_relieved(second_page_tid.page).unwrap();
+        let mut page = guard.write();
+        let bytes = page.as_bytes_mut();
+        let original: [u8; ITEMID_SIZE] = bytes[item_offset..item_offset + ITEMID_SIZE]
+            .try_into()
+            .unwrap();
+        let malformed = ItemId::new(8_000, 500, ItemIdFlags::Normal);
+        bytes[item_offset..item_offset + ITEMID_SIZE]
+            .copy_from_slice(&malformed.into_raw().to_le_bytes());
+        original
+    };
+
+    let error = heap.rollback_in_place_updates(xid).unwrap_err();
+    assert!(matches!(error, HeapError::MalformedHeader(_)));
+    assert_eq!(
+        heap.fetch(first).unwrap().data,
+        int32_pair_payload(0, 10),
+        "the in-place portion completed before delete-stamp rollback failed"
+    );
+    assert_eq!(heap.int32_pair_undo_batch_len(rel()), 0);
+
+    {
+        let guard = heap.get_page_relieved(second_page_tid.page).unwrap();
+        let mut page = guard.write();
+        page.as_bytes_mut()[item_offset..item_offset + ITEMID_SIZE]
+            .copy_from_slice(&original_item_id);
+    }
+    assert_eq!(heap.fetch(second_page_tid).unwrap().header.xmax, xid);
+    assert_eq!(heap.rollback_in_place_updates(xid).unwrap(), 1);
+    assert_eq!(
+        heap.fetch(second_page_tid).unwrap().header.xmax,
+        Xid::INVALID
+    );
+    assert_eq!(heap.rollback_in_place_updates(xid).unwrap(), 0);
+}
+
+#[test]
+fn parallel_no_wal_delete_registers_pages_for_rollback() {
+    let heap = make_heap(2_048);
+    let tids = (0_i32..4)
+        .map(|id| {
+            heap.insert(rel(), &int32_pair_payload(id, id * 10), opts(10))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let deleted = heap
+        .delete_int32_pair_inplace_parallel_no_wal(
+            DeleteInt32PairScan {
+                rel: rel(),
+                // Force the parallel branch on multi-core test hosts; the
+                // loader materializes the remaining blocks as empty pages.
+                block_count: 2_048,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: Int32PairPredicate::All,
+            },
+            DeleteInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(deleted, tids.len());
+    assert_eq!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap(),
+        tids.len()
+    );
+    for tid in tids {
+        assert_eq!(heap.fetch(tid).unwrap().header.xmax, Xid::INVALID);
+    }
+}
+
+#[test]
+fn parallel_delete_worker_panic_keeps_completed_pages_rollbackable() {
+    if std::thread::available_parallelism().map_or(1, |workers| workers.get()) <= 1 {
+        return;
+    }
+
+    let heap = make_heap(2_048);
+    let mut first_page_tids = Vec::new();
+    let mut row_id = 0_i32;
+    let (panic_id, second_page_tid) = loop {
+        let tid = heap
+            .insert(rel(), &int32_pair_payload(row_id, row_id * 10), opts(10))
+            .unwrap();
+        if tid.page.block == BlockNumber::new(0) {
+            first_page_tids.push(tid);
+            row_id += 1;
+            continue;
+        }
+        break (row_id, tid);
+    };
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let err = heap
+        .delete_int32_pair_inplace_parallel_no_wal(
+            DeleteInt32PairScan {
+                rel: rel(),
+                block_count: 2_048,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: move |id, _val| {
+                    assert_ne!(id, panic_id, "injected parallel delete worker panic");
+                    true
+                },
+            },
+            DeleteInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, HeapError::ParallelWorkerPanic));
+    assert_eq!(
+        heap.rollback_in_place_updates(Xid::new(20)).unwrap(),
+        first_page_tids.len()
+    );
+    for tid in first_page_tids {
+        assert_eq!(heap.fetch(tid).unwrap().header.xmax, Xid::INVALID);
+    }
+    assert_eq!(
+        heap.fetch(second_page_tid).unwrap().header.xmax,
+        Xid::INVALID
+    );
+}
+
+#[test]
+fn parallel_no_wal_delete_late_same_page_panic_leaves_page_unchanged() {
+    if std::thread::available_parallelism().map_or(1, |workers| workers.get()) <= 1 {
+        return;
+    }
+
+    let heap = make_heap(2_048);
+    let first = heap
+        .insert(rel(), &int32_pair_payload(0, 0), opts(10))
+        .unwrap();
+    let panic_tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    assert_eq!(first.page, panic_tid.page);
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    let snapshot = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let err = heap
+        .delete_int32_pair_inplace_parallel_no_wal(
+            DeleteInt32PairScan {
+                rel: rel(),
+                block_count: 2_048,
+                snapshot: &snapshot,
+                oracle: &oracle,
+                predicate: |id, _val| {
+                    assert_ne!(id, 1, "injected late same-page delete panic");
+                    true
+                },
+            },
+            DeleteInt32PairStamp {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+            },
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, HeapError::ParallelWorkerPanic));
+    assert_eq!(heap.fetch(first).unwrap().header.xmax, Xid::INVALID);
+    assert_eq!(heap.fetch(panic_tid).unwrap().header.xmax, Xid::INVALID);
+    assert_eq!(heap.rollback_in_place_updates(Xid::new(20)).unwrap(), 0);
 }
 
 #[test]
@@ -458,4 +801,37 @@ fn insert_and_update_preserve_attribute_count() {
         .expect("full page should fall back to non-HOT");
     assert!(!non_hot.hot);
     assert_eq!(full_heap.fetch(non_hot.new_tid).unwrap().header.n_atts, 4);
+}
+
+#[test]
+fn bulk_load_does_not_publish_uncommitted_pages_all_visible() {
+    let heap = make_heap(16);
+    let vm = crate::vm::VisibilityMap::new();
+    let rows = vec![b"uncommitted".to_vec()];
+    let mut written_block = None;
+
+    let inserted = heap
+        .bulk_load_encoded_batch(
+            rel(),
+            &rows,
+            InsertOptions {
+                xmin: Xid::new(100),
+                command_id: CommandId::FIRST,
+                n_atts: 0,
+                wal: None,
+                fsm: None,
+                vm: Some(&vm),
+            },
+            |page_id, _page| {
+                written_block = Some(page_id.block);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(inserted, 1);
+    assert!(
+        !vm.is_all_visible(rel(), written_block.unwrap()),
+        "the caller's transaction has not committed or been certified"
+    );
 }

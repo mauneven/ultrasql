@@ -4,19 +4,20 @@
 //! ([`BufferPool::get_page_relieved`], [`BufferPool::set_eviction_relief`],
 //! [`BufferPool::oldest_unflushable_dirty_lsn`]) through a test
 //! [`EvictionRelief`] implementation that mirrors the production
-//! `ServerEvictionRelief`: Phase A flushes pages already at/below the durable
-//! WAL position via [`BufferPool::try_flush_dirty`]; Phase B forces the WAL
-//! durable (here, advancing a [`LaggingWalSink`]'s durable LSN) to
-//! `oldest_unflushable_dirty_lsn` and re-flushes.
+//! `ServerEvictionRelief`: Phase A flushes pages inside the exclusive durable
+//! WAL boundary via [`BufferPool::try_flush_dirty`]; Phase B forces the WAL
+//! record at `oldest_unflushable_dirty_lsn` durable (here, advancing a
+//! [`LaggingWalSink`]'s boundary past it) and re-flushes.
 //!
 //! What each test proves:
 //! - `relief_lets_eviction_succeed_under_all_dirty_pressure` — the core
 //!   availability fix: a dirty working set larger than the pool no longer
 //!   hard-fails with `Exhausted`.
 //! - `relief_respects_lsn_gate_with_sink` — WAL-before-data: a page whose
-//!   page-LSN exceeds the durable LSN is NEVER written; Phase A flushes 0,
-//!   `oldest_unflushable_dirty_lsn` reports the min blocked LSN, and only after
-//!   the durable LSN advances does the gated frame reach the writer.
+//!   nonzero page-LSN is at or beyond the exclusive durable boundary is NEVER
+//!   written; Phase A flushes 0, `oldest_unflushable_dirty_lsn` reports the min
+//!   blocked start, and only after the boundary advances past it does the gated
+//!   frame reach the writer.
 //! - `pinned_frames_never_evicted_or_flushed` — pinned frames are never passed
 //!   to the writer and keep their bytes.
 //! - `relief_bounded_returns_exhausted_when_only_pinned` — the bounded loop
@@ -66,7 +67,7 @@ struct TestRelief {
 }
 
 impl TestRelief {
-    /// Phase A: flush every dirty unpinned frame already at/below durable.
+    /// Phase A: flush dirty unpinned frames inside the durable prefix.
     fn flush_durable(&self) -> std::result::Result<usize, BufferPoolError> {
         let writer = Arc::clone(&self.writer);
         self.pool
@@ -89,10 +90,15 @@ impl EvictionRelief for TestRelief {
         if self.flush_durable()? > 0 {
             return Ok(());
         }
-        // Phase B: advance durable to the lowest blocked LSN, then re-flush.
+        // Phase B: advance the exclusive boundary past the lowest blocked
+        // record start, then re-flush.
         if let Some(target) = self.pool.oldest_unflushable_dirty_lsn() {
             if let Some(sink) = self.sink.as_ref() {
-                sink.set_durable_lsn(target);
+                sink.set_durable_lsn(
+                    target
+                        .checked_advance(1)
+                        .expect("test page LSN must have a representable end boundary"),
+                );
                 let _ = self.flush_durable()?;
             }
         }
@@ -199,24 +205,24 @@ fn relief_respects_lsn_gate_with_sink() {
         "must report the lowest blocked page-LSN"
     );
 
-    // (c) Drive relief: it advances durable to 10 (the min) and flushes only
-    // the frame(s) now <= durable. The relief loop re-reports the new min on
-    // each round, so a full get_page_relieved eventually frees a victim.
+    // (c) Drive relief: it advances the boundary past 10 (the min record
+    // start) and flushes only the frame(s) now inside the durable prefix. The
+    // relief loop re-reports the new min on each round, so a full
+    // get_page_relieved eventually frees a victim.
     let guard = pool
         .get_page_relieved(pid(N))
         .expect("relief must succeed after advancing durable");
     drop(guard);
 
-    // The decisive invariant: NO page with page_lsn > the durable LSN AT THE
-    // TIME OF WRITE ever reached the writer. We advanced durable in min-LSN
-    // steps, so assert every written page's LSN was <= the final durable LSN
-    // and, more strongly, that the writer only ever saw pages whose LSN had
-    // already become durable.
+    // The decisive invariant: no nonzero page-LSN outside the durable prefix
+    // reaches the writer. We advanced the exclusive boundary in
+    // min-record-start steps, so every written nonzero page-LSN must be
+    // strictly below the final boundary.
     let final_durable = sink.durable_lsn().raw();
     for (page_id, page_lsn) in &writer.lock().seen {
         assert!(
-            *page_lsn <= final_durable,
-            "page {page_id} written at LSN {page_lsn} exceeds durable {final_durable} (WAL-before-data violated)"
+            *page_lsn == 0 || *page_lsn < final_durable,
+            "page {page_id} written at LSN {page_lsn} is outside durable boundary {final_durable} (WAL-before-data violated)"
         );
     }
     assert!(

@@ -125,28 +125,34 @@ impl Server {
         if n % UNDO_GC_INTERVAL_COMMITS != 0 {
             return;
         }
-        let oldest = self.txn_manager.oldest_in_progress();
-        match self.heap.vacuum_undo_log(oldest) {
+        // A repeatable-read/serializable snapshot can remain live after every
+        // transaction visible to `oldest_in_progress()` has finished.  Undo
+        // trimming and heap/VM vacuum must therefore use the snapshot-aware
+        // horizon or they can discard a version that the live snapshot still
+        // needs.
+        let vacuum_horizon = self.txn_manager.vacuum_horizon();
+        match self.heap.vacuum_undo_log(vacuum_horizon) {
             Ok(trimmed) => {
                 if trimmed > 0 {
                     tracing::debug!(
                         trimmed,
-                        oldest_xid = oldest.raw(),
+                        vacuum_horizon_xid = vacuum_horizon.raw(),
                         "undo-log GC trimmed entries"
                     );
                 }
             }
             Err(e) => tracing::warn!(error = %e, "undo-log GC failed"),
         }
-        self.vacuum_mark_visible_pages(oldest);
+        self.vacuum_mark_visible_pages(vacuum_horizon);
         // Retire committed SSI entries whose concurrent transactions have all
         // finished. Bounds the rw-conflict map and prevents long-committed
         // serializable transactions from fabricating spurious 40001 failures.
-        let ssi_retired = self.txn_manager.collect_ssi_garbage(oldest);
+        let oldest_in_progress = self.txn_manager.oldest_in_progress();
+        let ssi_retired = self.txn_manager.collect_ssi_garbage(oldest_in_progress);
         if ssi_retired > 0 {
             tracing::debug!(
                 retired = ssi_retired,
-                oldest_xid = oldest.raw(),
+                oldest_xid = oldest_in_progress.raw(),
                 "SSI committed-entry GC retired entries"
             );
         }
@@ -156,8 +162,8 @@ impl Server {
     /// Run one background autovacuum cycle across tables that crossed
     /// modification thresholds.
     pub fn run_autovacuum_cycle(&self) {
-        let oldest = self.txn_manager.oldest_in_progress();
-        if let Err(e) = self.heap.vacuum_undo_log(oldest) {
+        let vacuum_horizon = self.txn_manager.vacuum_horizon();
+        if let Err(e) = self.heap.vacuum_undo_log(vacuum_horizon) {
             tracing::warn!(error = %e, "autovacuum undo-log GC failed");
         }
         let snapshot = self.catalog_snapshot();
@@ -178,10 +184,11 @@ impl Server {
             if modified < threshold {
                 continue;
             }
-            match self
-                .heap
-                .vacuum_heap(RelationId(entry.oid), oldest, self.txn_manager.as_ref())
-            {
+            match self.heap.vacuum_heap(
+                RelationId(entry.oid),
+                vacuum_horizon,
+                self.txn_manager.as_ref(),
+            ) {
                 Ok(stats) => {
                     self.workload_recorder
                         .record_table_autovacuum(entry.oid.raw());
@@ -198,7 +205,7 @@ impl Server {
             self.pending_analyze_tables.insert(table_name.clone(), ());
             self.table_modifications.insert(table_name, 0);
         }
-        self.vacuum_mark_visible_pages(oldest);
+        self.vacuum_mark_visible_pages(vacuum_horizon);
         self.run_one_pending_analyze();
         self.run_one_pending_columnarization();
     }
@@ -325,6 +332,7 @@ impl Server {
             Arc::clone(&last_checkpoint_lsn),
         ));
         let vm = Arc::new(VisibilityMap::new());
+        heap.attach_replay_visibility_map(Arc::clone(&vm));
         let sequences = Arc::new(dashmap::DashMap::new());
         let sequence_owners = Arc::new(dashmap::DashMap::new());
         let sequence_namespaces = Arc::new(dashmap::DashMap::new());
@@ -344,6 +352,35 @@ impl Server {
         // the LSNs they reconstruct agree. An absent manifest is LSN 0.
         let recovery_floor = ultrasql_wal::read_floor(&wal_dir)
             .map_err(|e| ServerError::Ddl(format!("read WAL recovery floor: {e}")))?;
+        if recovery_replay_target
+            .target_lsn
+            .is_some_and(|target| target < recovery_floor.floor_lsn)
+        {
+            return Err(ServerError::Ddl(format!(
+                "recovery target LSN precedes recycled WAL floor: target={} floor={}",
+                recovery_replay_target
+                    .target_lsn
+                    .map_or(0, ultrasql_core::Lsn::raw),
+                recovery_floor.floor_lsn.raw()
+            )));
+        }
+        if recovery_replay_target.target_time_micros.is_some()
+            && recovery_floor != ultrasql_wal::WalFloor::ORIGIN
+        {
+            return Err(ServerError::Ddl(format!(
+                "timestamp recovery target cannot be proven against recycled WAL floor {}",
+                recovery_floor.floor_lsn.raw()
+            )));
+        }
+        // An XID target is satisfied only by that transaction's retained
+        // Commit record. Preflight it without an applier so a missing target
+        // cannot speculatively mutate recovery pages in memory before startup
+        // fails. Targeted recovery is a cold, one-shot path, so the extra scan
+        // is preferable to weakening failure atomicity.
+        if recovery_replay_target.target_xid.is_some() {
+            ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |_| Ok(()))
+                .map_err(|e| ServerError::Ddl(format!("validate WAL recovery target: {e}")))?;
+        }
         // WAL has been recycled iff the surviving stream no longer starts at the
         // origin. Only then is replay-from-floor missing early relation-extend
         // records and block counts must be re-seeded from the durable heap; with
@@ -352,6 +389,7 @@ impl Server {
         // never-committed DDL row that the truncated WAL leaves uncommitted).
         let wal_was_recycled = recovery_floor.floor_lsn != ultrasql_core::Lsn::ZERO;
         let mut record_lsn = recovery_floor.floor_lsn;
+        let mut replayed_xids = std::collections::BTreeSet::new();
         let recovered_lsn =
             ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
                 let current_lsn = record_lsn;
@@ -360,12 +398,59 @@ impl Server {
                     .ok_or(ultrasql_wal::RecoveryError::Record(
                         ultrasql_wal::WalRecordError::Malformed("replay lsn overflow"),
                     ))?;
+                if record.header.xid != Xid::INVALID {
+                    replayed_xids.insert(record.header.xid);
+                }
                 ultrasql_wal::dispatch_record_at_lsn(&recovery_apply_target, record, current_lsn)
                     .map_err(|e| ultrasql_wal::RecoveryError::Applier(e.to_string()))
             })
             .map_err(|e| ServerError::Ddl(format!("WAL recovery: {e}")))?;
+        if recovery_replay_target.is_configured() {
+            let outcome = ultrasql_wal::fork_wal_at(&wal_dir, recovered_lsn)
+                .map_err(|e| ServerError::Ddl(format!("fork WAL at recovery target: {e}")))?;
+            consume_recovery_replay_target(data_dir)?;
+            tracing::info!(
+                boundary_lsn = outcome.boundary_lsn.raw(),
+                boundary_segment = outcome.boundary_segment,
+                boundary_segment_len = outcome.boundary_segment_len,
+                removed_segments = outcome.removed_segments.len(),
+                "forked WAL timeline and consumed recovery target"
+            );
+        }
         wal_buffer.advance_to_lsn(recovered_lsn);
         tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
+
+        // Reserve LSN zero as the unambiguous "no record / no page WAL
+        // dependency" sentinel. Append returns record-start LSNs while the
+        // writer publishes durable end boundaries; without this bootstrap the
+        // first real record would start at zero and be indistinguishable from
+        // an absent chain/page LSN. Reopen skips the bootstrap because recovery
+        // returns the existing stream's nonzero end boundary.
+        if recovered_lsn == ultrasql_core::Lsn::ZERO {
+            let bootstrap = ultrasql_wal::WalRecord::new(
+                ultrasql_wal::RecordType::Nop,
+                Xid::INVALID,
+                ultrasql_core::Lsn::ZERO,
+                0,
+                b"ULTRASQL_WAL_ORIGIN_V1".to_vec(),
+            )
+            .map_err(|e| ServerError::Ddl(format!("bootstrap WAL record encode: {e}")))?;
+            let bootstrap_lsn = sink
+                .append(bootstrap)
+                .map_err(|e| ServerError::Ddl(format!("bootstrap WAL append: {e}")))?;
+            if bootstrap_lsn != ultrasql_core::Lsn::ZERO {
+                return Err(ServerError::Ddl(format!(
+                    "bootstrap WAL origin expected LSN 0, got {}",
+                    bootstrap_lsn.raw()
+                )));
+            }
+        }
+        // From this point forward zero is either the origin NOP or belongs to
+        // the already-recovered durable prefix, never to a pending page record.
+        // This opt-in lets the generic buffer-pool gate distinguish the
+        // server's zero sentinel from a direct WAL sink whose first real record
+        // can still start at zero.
+        buffer_sink.mark_zero_lsn_reserved();
 
         // Seed relation block counts from the durable on-disk heap. WAL replay
         // alone rebuilds these counters, but once low WAL segments are recycled
@@ -439,30 +524,16 @@ impl Server {
         let recovered_state_files = two_phase_coord
             .recover_from_disk()
             .map_err(|e| ServerError::Ddl(format!("2PC recovery: {e}")))?;
-        let mut recovered_prepared = 0usize;
-        let mut cleaned_resolved = 0usize;
-        for prepared in two_phase_coord.list_prepared() {
-            match txn_manager.recover_prepared(prepared.xid) {
-                Ok(()) => recovered_prepared += 1,
-                Err(TxnError::AlreadyTerminated {
-                    status: ultrasql_mvcc::XidStatus::Committed | ultrasql_mvcc::XidStatus::Aborted,
-                    ..
-                }) => {
-                    two_phase_coord.finish_resolution(&prepared).map_err(|e| {
-                        ServerError::Ddl(format!("2PC resolved state cleanup: {e}"))
-                    })?;
-                    cleaned_resolved += 1;
-                }
-                Err(e) => return Err(ServerError::Ddl(format!("2PC CLOG recovery: {e}"))),
+        let prepared_state = two_phase_coord.list_prepared();
+        for prepared in &prepared_state {
+            for xid in
+                std::iter::once(prepared.xid).chain(prepared.committed_subxids.iter().copied())
+            {
+                txn_manager
+                    .recover_prepared(xid)
+                    .map_err(|e| ServerError::Ddl(format!("2PC CLOG recovery: {e}")))?;
             }
         }
-        tracing::info!(
-            state_files = recovered_state_files,
-            prepared = recovered_prepared,
-            cleaned_resolved,
-            "2PC state recovery complete"
-        );
-        let two_phase = Arc::new(two_phase_coord);
 
         // Restore the commit log from a durable snapshot before scanning the
         // WAL, so transactions whose Commit/Abort records were recycled keep
@@ -494,6 +565,90 @@ impl Server {
             txn_manager.as_ref(),
             data_dir,
         )?;
+
+        // Reconcile state files only after the authoritative WAL status pass.
+        // A crash can leave a durable Commit/Abort decision while the older
+        // in-doubt file still exists. Seeding the complete family above
+        // protects genuinely unresolved subxids from the default-abort sweep;
+        // this pass then applies any terminal parent decision to that family
+        // and removes the stale file.
+        let mut recovered_prepared = 0_usize;
+        let mut cleaned_resolved = 0_usize;
+        for prepared in &prepared_state {
+            match ultrasql_mvcc::XidStatusOracle::status(txn_manager.as_ref(), prepared.xid) {
+                ultrasql_mvcc::XidStatus::InProgress => {
+                    recovered_prepared = recovered_prepared.saturating_add(1);
+                }
+                ultrasql_mvcc::XidStatus::Committed | ultrasql_mvcc::XidStatus::Frozen => {
+                    for subxid in &prepared.committed_subxids {
+                        txn_manager.recover_committed(*subxid);
+                    }
+                    two_phase_coord.finish_resolution(prepared).map_err(|e| {
+                        ServerError::Ddl(format!("2PC resolved state cleanup: {e}"))
+                    })?;
+                    cleaned_resolved = cleaned_resolved.saturating_add(1);
+                }
+                ultrasql_mvcc::XidStatus::Aborted => {
+                    for subxid in &prepared.committed_subxids {
+                        txn_manager.recover_aborted(*subxid);
+                    }
+                    two_phase_coord.finish_resolution(prepared).map_err(|e| {
+                        ServerError::Ddl(format!("2PC resolved state cleanup: {e}"))
+                    })?;
+                    cleaned_resolved = cleaned_resolved.saturating_add(1);
+                }
+            }
+        }
+        tracing::info!(
+            state_files = recovered_state_files,
+            prepared = recovered_prepared,
+            cleaned_resolved,
+            "2PC state recovery complete"
+        );
+        let two_phase = Arc::new(two_phase_coord);
+
+        // Heap redo intentionally applies records before transaction status is
+        // known. Physically reverse every replayed writer that the complete
+        // CLOG pass resolved as aborted before any catalog/user scan can
+        // observe it. In-place UPDATE redo otherwise leaves a post-image plus
+        // undo on the page; merely marking the XID aborted lets a later undo-GC
+        // pass discard the only pre-image and make the row disappear.
+        //
+        // DELETE and classical UPDATE source pages are registered by redo even
+        // when their page LSN already covers the record, so this also clears
+        // already-flushed aborted xmax/ctid stamps.
+        let mut recovery_rollback_count = 0_usize;
+        for xid in replayed_xids {
+            match ultrasql_mvcc::XidStatusOracle::status(txn_manager.as_ref(), xid) {
+                ultrasql_mvcc::XidStatus::Aborted => {
+                    let restored = heap.rollback_in_place_updates(xid).map_err(|e| {
+                        ServerError::Ddl(format!(
+                            "rollback replayed aborted transaction {}: {e}",
+                            xid.raw()
+                        ))
+                    })?;
+                    recovery_rollback_count = recovery_rollback_count
+                        .checked_add(restored)
+                        .ok_or_else(|| {
+                            ServerError::Ddl("recovery rollback tuple count overflow".to_owned())
+                        })?;
+                }
+                ultrasql_mvcc::XidStatus::Committed | ultrasql_mvcc::XidStatus::Frozen => {
+                    heap.discard_rollback_stamp_pages(xid);
+                }
+                ultrasql_mvcc::XidStatus::InProgress => {
+                    // A durable 2PC state file can keep a replayed writer
+                    // prepared. Retain its undo/stamp registry so a later
+                    // ROLLBACK PREPARED can physically reverse the family.
+                }
+            }
+        }
+        if recovery_rollback_count > 0 {
+            tracing::info!(
+                restored = recovery_rollback_count,
+                "rolled back replayed aborted heap mutations"
+            );
+        }
 
         // Bootstrap snapshot: a "committed-as-of-recovery" snapshot under which
         // NO real transaction is in progress (`xmin == xmax == next_xid`, empty

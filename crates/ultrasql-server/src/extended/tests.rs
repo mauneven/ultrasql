@@ -381,6 +381,47 @@ fn explicit_cast_parameter_infers_text_oid_for_binary_bind() {
 }
 
 #[test]
+fn bind_reuses_prepared_plan_hash_across_parameter_values() {
+    let catalog = fixture_catalog();
+    let mut state = ExtendedConnState::new();
+    handle_parse(
+        &mut state,
+        "s".to_string(),
+        "SELECT id FROM users WHERE id = $1".to_string(),
+        vec![PG_OID_INT4],
+        &catalog,
+    )
+    .expect("parse ok");
+    let prepared_hash = state.statements.get("s").expect("statement").plan_hash;
+
+    handle_bind(
+        &mut state,
+        "p1".to_string(),
+        "s",
+        &[1],
+        &[Some(1_i32.to_be_bytes().to_vec())],
+        vec![],
+        Some(&catalog as &dyn ultrasql_planner::Catalog),
+    )
+    .expect("first bind ok");
+    handle_bind(
+        &mut state,
+        "p2".to_string(),
+        "s",
+        &[1],
+        &[Some(2_i32.to_be_bytes().to_vec())],
+        vec![],
+        Some(&catalog as &dyn ultrasql_planner::Catalog),
+    )
+    .expect("second bind ok");
+
+    let first_hash = state.portals.get("p1").expect("first portal").plan_hash;
+    let second_hash = state.portals.get("p2").expect("second portal").plan_hash;
+    assert_eq!(first_hash, prepared_hash);
+    assert_eq!(second_hash, prepared_hash);
+}
+
+#[test]
 fn describe_portal_for_select_returns_row_description() {
     let catalog = fixture_catalog();
     let mut state = ExtendedConnState::new();

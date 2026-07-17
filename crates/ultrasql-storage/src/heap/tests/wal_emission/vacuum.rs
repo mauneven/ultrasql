@@ -1,15 +1,19 @@
 //! `vacuum_heap` behavior: reclaiming committed dead tuples, keeping
 //! committed in-place-update slots, and skipping in-progress/alive rows.
 
+use std::sync::Arc;
+
 use ultrasql_core::{CommandId, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_mvcc::status::test_support::MapOracle;
 
-use super::rel;
-use crate::heap::UpdateInt32PairTid;
+use super::{MapLoader, rel};
+use crate::buffer_pool::BufferPool;
 use crate::heap::tests::{
     del_opts, int32_pair_payload, make_heap, opts, update_int32_edit, update_int32_stamp,
 };
+use crate::heap::{UpdateInt32PairTid, UpdateOptions};
+use crate::wal_sink::{WalSink, test_support::InMemoryWalSink};
 
 // ------------------------------------------------------------------
 // vacuum_heap tests
@@ -85,6 +89,58 @@ fn vacuum_heap_keeps_committed_in_place_update_slot() {
     assert_eq!(stats.tuples_reclaimed, 0);
     assert_eq!(stats.pages_compacted, 0);
     assert_eq!(heap.fetch(tid).unwrap().data, int32_pair_payload(1, 15));
+}
+
+#[test]
+fn vacuum_heap_keeps_classic_update_redirect_chain() {
+    let heap = make_heap(16);
+    let r = rel();
+    let old_tid = heap.insert(r, b"before", opts(10)).unwrap();
+    let outcome = heap
+        .update(
+            old_tid,
+            b"after",
+            UpdateOptions {
+                xid: Xid::new(20),
+                command_id: CommandId::FIRST,
+                hot_eligible: true,
+                wal: None,
+                vm: None,
+            },
+        )
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(20));
+    let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
+
+    assert_eq!(stats.tuples_reclaimed, 0);
+    assert_eq!(heap.fetch(old_tid).unwrap().header.ctid, outcome.new_tid);
+    assert_eq!(heap.fetch(outcome.new_tid).unwrap().data, b"after");
+}
+
+#[test]
+fn wal_backed_vacuum_defers_physical_reclamation() {
+    let sink = Arc::new(InMemoryWalSink::new());
+    let pool = Arc::new(BufferPool::with_wal(
+        16,
+        MapLoader::new(),
+        Arc::clone(&sink) as Arc<dyn WalSink>,
+    ));
+    let heap = crate::heap::HeapAccess::new(pool);
+    let r = rel();
+    let tid = heap.insert(r, b"dead", opts(10)).unwrap();
+    heap.delete(tid, del_opts(20, 0)).unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_committed(Xid::new(20));
+    let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
+
+    assert_eq!(stats.tuples_reclaimed, 0);
+    assert_eq!(stats.pages_compacted, 0);
+    assert_eq!(heap.fetch(tid).unwrap().data, b"dead");
 }
 
 #[test]

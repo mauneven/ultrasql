@@ -109,7 +109,7 @@ class StorageStyleTests(unittest.TestCase):
         start = text.index("pub(super) fn maybe_emit_fpw")
         body = text[start : text.index("/// Emit a `HeapInsert`", start)]
 
-        skip = body.index("if page_lsn >= checkpoint_lsn")
+        skip = body.index("if page.header().lsn >= checkpoint_lsn")
         copy = body.index("to_vec()")
 
         self.assertLess(skip, copy)

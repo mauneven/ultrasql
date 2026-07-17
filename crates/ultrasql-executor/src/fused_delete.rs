@@ -194,6 +194,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             // mirroring the fused UPDATE path, so retry-aware clients classify
             // it rather than silently losing the delete (double-stamped xmax).
             HeapError::WriteConflict(reason) => ExecError::SerializationFailure(reason.to_owned()),
+            HeapError::ParallelWorkerPanic => {
+                ExecError::Internal("parallel heap DELETE worker panicked")
+            }
             other => ExecError::TypeMismatch(other.to_string()),
         })?;
 

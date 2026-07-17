@@ -23,6 +23,7 @@
 
 pub mod applier;
 pub mod buffer;
+pub mod fork;
 pub mod manifest;
 pub mod payload;
 pub mod reader;
@@ -35,6 +36,7 @@ pub mod writer;
 
 pub use applier::{ApplyError, HeapTarget, dispatch_record, dispatch_record_at_lsn, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
+pub use fork::{WalForkOutcome, fork_wal_at};
 pub use manifest::{WalFloor, read_floor, write_floor};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
@@ -51,4 +53,7 @@ pub use recovery::{
     RecoveryError, RecoveryTarget, recover, recover_with_target, repair_final_segment_tail,
 };
 pub use truncate::{TruncationOutcome, truncate_below};
-pub use writer::{WalDurabilityHandle, WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};
+pub use writer::{
+    WalDurabilityHandle, WalDurabilityWait, WalWriter, WalWriterConfig, WalWriterError,
+    WalWriterStats,
+};

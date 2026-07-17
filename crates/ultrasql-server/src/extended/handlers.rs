@@ -431,9 +431,13 @@ pub fn handle_bind(
         Some(substitute_parameters_in_plan(&plan, &values))
     };
 
-    let plan_hash = bound_plan
-        .as_ref()
-        .map_or(stmt.plan_hash, plan_hash_for_plan);
+    // A plan hash identifies the prepared statement's structure, not one
+    // portal's concrete bind values. `Parse` already computed that stable
+    // fingerprint before substitution, so reuse it here instead of walking,
+    // debug-formatting, allocating, and hashing the full bound plan on every
+    // Bind. Besides removing hot-path work, this keeps executions of `$1 = 1`
+    // and `$1 = 2` grouped under the same workload-statistics entry.
+    let plan_hash = stmt.plan_hash;
 
     state.portals.insert(
         portal_name,

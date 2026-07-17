@@ -259,6 +259,21 @@ pub(crate) fn recovery_replay_target_from_data_dir(
     Ok(target)
 }
 
+/// Durably consume the one-shot point-in-time recovery target.
+///
+/// The WAL tail must already have been forked at the recovered boundary before
+/// this is called. Removing the marker and fsyncing the data directory makes a
+/// successful recovery target one-shot; an interruption before the directory
+/// sync can only cause the same idempotent fork to run again.
+pub(crate) fn consume_recovery_replay_target(data_dir: &Path) -> Result<(), ServerError> {
+    let path = data_dir.join("recovery.targets");
+    match std::fs::remove_file(&path) {
+        Ok(()) => sync_runtime_metadata_parent(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
 pub(crate) fn prepare_secure_data_dir(data_dir: &Path) -> Result<PathBuf, ServerError> {
     reject_data_dir_symlink(data_dir)?;
     let existed = data_dir.try_exists().map_err(ServerError::Io)?;

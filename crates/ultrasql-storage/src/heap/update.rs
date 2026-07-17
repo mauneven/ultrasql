@@ -74,13 +74,8 @@ impl<L: PageLoader> HeapAccess<L> {
                     opts.xid,
                 )?;
             }
-            let hot_tid: Option<TupleId> = {
-                let guard = self.get_page_relieved(old_tid.page)?;
-                let result =
-                    Self::try_hot_update(&guard, old_tid, new_payload, opts, new_tuple_size)?;
-                // guard drops here — pin released before WAL I/O
-                result
-            };
+            let guard = self.get_page_relieved(old_tid.page)?;
+            let hot_tid = Self::try_hot_update(&guard, old_tid, new_payload, opts, new_tuple_size)?;
             if let Some(new_tid) = hot_tid {
                 let outcome = UpdateOutcome {
                     old_tid,
@@ -88,17 +83,15 @@ impl<L: PageLoader> HeapAccess<L> {
                     hot: true,
                 };
                 self.remember_rollback_stamp_page(opts.xid, old_tid.page);
-                // WAL append is outside any pin scope.
-                Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
-                // HOT update: both versions on the same page; clear VM once.
-                if let Some(vm) = opts.vm {
-                    vm.clear(new_tid.page.relation, new_tid.page.block);
-                }
-                self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
+                // Keep the original pin through WAL append and the monotonic
+                // page-LSN stamp; only the page write latch is released.
+                Self::emit_update_wal(&self.pool, outcome, &opts, &guard, &guard)?;
+                self.invalidate_int32_pair_payload_stats_page(old_tid.page);
                 self.column_cache
                     .bump_version(old_tid.page.relation, opts.xid);
                 return Ok(outcome);
             }
+            drop(guard);
             // Page had no room; fall through to non-HOT path.
         }
 
@@ -115,9 +108,10 @@ impl<L: PageLoader> HeapAccess<L> {
             n_atts,
             wal: None,
             fsm: None,
-            vm: None,
+            vm: opts.vm,
         };
-        let new_tid = self.insert(old_tid.page.relation, new_payload, insert_opts)?;
+        let (new_tid, new_guard) =
+            self.insert_inner_pinned(old_tid.page.relation, new_payload, insert_opts, opts.wal)?;
 
         // Emit FPW for the old page before stamping it. The new page FPW
         // would be emitted by the internal insert's WAL path, but since
@@ -125,39 +119,52 @@ impl<L: PageLoader> HeapAccess<L> {
         // new page via emit_update_wal. The HeapUpdate record already carries
         // the new tuple bytes so recovery can redo both pages.
         if let Some(sink) = opts.wal {
-            Self::maybe_emit_fpw(
+            if let Err(err) = Self::maybe_emit_fpw(
                 &self.pool,
                 old_tid.page,
                 sink,
                 &self.last_checkpoint_lsn,
                 opts.xid,
-            )?;
+            ) {
+                // The destination tuple is already dirty but has no logical
+                // HeapUpdate record yet. Poison before releasing its original
+                // pin so no checkpointer can persist that WAL-less version.
+                self.pool.poison_after_wal_error();
+                return Err(err);
+            }
         }
 
         // Stamp the old tuple with xmax and redirect ctid. Pin the page,
         // apply the stamp, then drop the guard before WAL I/O.
-        {
-            let old_guard = self.get_page_relieved(old_tid.page)?;
-            Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
-            self.remember_rollback_stamp_page(opts.xid, old_tid.page);
-            // old_guard drops here — pin released before WAL append
+        let old_guard = match self.get_page_relieved(old_tid.page) {
+            Ok(guard) => guard,
+            Err(err) => {
+                if opts.wal.is_some() {
+                    self.pool.poison_after_wal_error();
+                }
+                return Err(err);
+            }
+        };
+        if let Err(err) = Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts) {
+            if opts.wal.is_some() {
+                self.pool.poison_after_wal_error();
+            }
+            return Err(err);
         }
+        self.remember_rollback_stamp_page(opts.xid, old_tid.page);
 
         let outcome = UpdateOutcome {
             old_tid,
             new_tid,
             hot: false,
         };
-        // WAL append is outside any pin scope.
-        Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
-        // Non-HOT: old and new may be on different pages — clear VM on both.
-        if let Some(vm) = opts.vm {
-            vm.clear(old_tid.page.relation, old_tid.page.block);
-            if old_tid.page != new_tid.page {
-                vm.clear(new_tid.page.relation, new_tid.page.block);
-            }
+        Self::emit_update_wal(&self.pool, outcome, &opts, &new_guard, &old_guard)?;
+        drop(old_guard);
+        drop(new_guard);
+        self.invalidate_int32_pair_payload_stats_page(old_tid.page);
+        if new_tid.page != old_tid.page {
+            self.invalidate_int32_pair_payload_stats_page(new_tid.page);
         }
-        self.invalidate_int32_pair_payload_stats_relation(old_tid.page.relation);
         self.column_cache
             .bump_version(old_tid.page.relation, opts.xid);
         Ok(outcome)
@@ -198,11 +205,11 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// # Concurrency
     ///
-    /// At most one [`crate::buffer_pool::PageGuard`] is held at any instant for the HOT
-    /// batch on a given page. The guard is dropped before WAL I/O.
-    /// The non-HOT fallback re-enters [`Self::update`] for each
-    /// affected tuple — same locking discipline as the single-tuple
-    /// path.
+    /// At most one [`crate::buffer_pool::PageGuard`] is held for a HOT page
+    /// run. Its page latch is released during WAL append, while its frame pin
+    /// remains until the final page LSN is published. WAL-backed non-HOT
+    /// fallback re-enters [`Self::update`] per tuple so both source and
+    /// destination pins span the logical update record.
     pub fn update_many<I>(&self, edits: I, opts: UpdateOptions<'_>) -> Result<usize, HeapError>
     where
         I: IntoIterator<Item = (TupleId, UpdatePayload)>,
@@ -335,9 +342,15 @@ impl<L: PageLoader> HeapAccess<L> {
                 };
                 let mut hot_count: usize = 0;
                 let mut scratch: Vec<u8> = Vec::with_capacity(64);
+                let guard = self.get_page_relieved(page_id)?;
                 {
-                    let guard = self.get_page_relieved(page_id)?;
                     let mut page = guard.write();
+                    // Register before the first page-local attempt. The helper
+                    // performs several proven-invariant writes after slot
+                    // allocation; if a corrupted page violates one of those
+                    // invariants, rollback must still know this page even
+                    // though the helper returns before `Some(new_tid)`.
+                    self.remember_rollback_stamp_page(opts.xid, page_id);
                     for k in i..j {
                         let new_tuple_size = TUPLE_HEADER_SIZE
                             .checked_add(edits_vec[k].1.len())
@@ -366,8 +379,8 @@ impl<L: PageLoader> HeapAccess<L> {
                             }
                         }
                     }
-                    // page + guard drop here — pin and write lock
-                    // released before WAL I/O.
+                    // The write latch drops here; the original frame pin stays
+                    // live through every page-local WAL append below.
                 }
 
                 // Per-HOT-success: emit WAL, clear VM. When
@@ -381,10 +394,7 @@ impl<L: PageLoader> HeapAccess<L> {
                         new_tid,
                         hot: true,
                     };
-                    Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
-                    if let Some(vm) = opts.vm {
-                        vm.clear(new_tid.page.relation, new_tid.page.block);
-                    }
+                    Self::emit_update_wal(&self.pool, outcome, &opts, &guard, &guard)?;
                     if collect_update_outcomes {
                         outcomes.push(outcome);
                     }
@@ -394,6 +404,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     self.remember_rollback_stamp_page(opts.xid, page_id);
                     hot_touched_relation = Some(page_id.relation);
                 }
+                drop(guard);
             } else {
                 // Caller disabled HOT for every entry in the run —
                 // funnel them straight to the non-HOT fallback.
@@ -442,6 +453,26 @@ impl<L: PageLoader> HeapAccess<L> {
         // logical UPDATE record (emitted by callers wiring up WAL
         // sinks) is not duplicated; the bench path passes
         // `opts.wal == None` so this is moot in practice today.
+        // The two-phase bulk fallback below intentionally suppresses WAL on
+        // its internal inserts. When WAL is configured, route each rare
+        // non-HOT fallback through the single-row path instead: it retains
+        // both original page pins and emits one logical HeapUpdate record
+        // covering source and destination. The benchmark hot path is
+        // unaffected (`fallback` is empty for fixed-width in-page updates).
+        if !fallback.is_empty() && opts.wal.is_some() {
+            let non_hot_opts = UpdateOptions {
+                hot_eligible: false,
+                ..opts
+            };
+            for (old_tid, payload) in std::mem::take(&mut fallback) {
+                let outcome = self.update(old_tid, &payload, non_hot_opts)?;
+                total = checked_heap_count_add(total, 1, "updated tuple count overflow")?;
+                if collect_update_outcomes {
+                    outcomes.push(outcome);
+                }
+            }
+        }
+
         if !fallback.is_empty() {
             let payloads: Vec<&[u8]> = fallback.iter().map(|(_, p)| p.as_slice()).collect();
             let insert_opts = InsertOptions {
@@ -474,6 +505,9 @@ impl<L: PageLoader> HeapAccess<L> {
                 // [k, m) is one source-page run.
                 let guard = self.get_page_relieved(page_id)?;
                 let mut page = guard.write();
+                // As above, register before the first inline stamp so an error
+                // from a later slot cannot strand earlier page mutations.
+                self.remember_rollback_stamp_page(opts.xid, page_id);
                 let page_bytes = page.as_bytes_mut();
                 for idx in k..m {
                     Self::stamp_updated_old_inline(
@@ -484,12 +518,12 @@ impl<L: PageLoader> HeapAccess<L> {
                         opts.command_id,
                     )?;
                 }
-                drop(page);
-                drop(guard);
-                self.remember_rollback_stamp_page(opts.xid, page_id);
                 if let Some(vm) = opts.vm {
                     vm.clear(page_id.relation, page_id.block);
                 }
+                drop(page);
+                drop(guard);
+                self.remember_rollback_stamp_page(opts.xid, page_id);
                 k = m;
             }
             if collect_update_outcomes {
@@ -535,7 +569,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// [`Self::scan`] for executor code that holds a snapshot; the
     /// original `scan` is kept for tools that genuinely want every
     /// slot regardless of visibility.
-    pub const fn scan_visible<'a, O: XidStatusOracle + ?Sized>(
+    pub fn scan_visible<'a, O: XidStatusOracle + ?Sized>(
         &'a self,
         rel: RelationId,
         block_count: u32,
@@ -543,11 +577,7 @@ impl<L: PageLoader> HeapAccess<L> {
         oracle: &'a O,
     ) -> VisibleHeapScan<'a, L, O> {
         VisibleHeapScan {
-            inner: self.scan(rel, block_count),
-            undo_log: &self.undo_log,
-            snapshot,
-            oracle,
-            xmin_cache: None,
+            walker: self.scan_visible_walker(rel, block_count, snapshot, oracle),
         }
     }
 }

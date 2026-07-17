@@ -43,6 +43,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// separately via `BTree::vacuum`; this function handles only the
     /// heap side.
     ///
+    /// Physical reclamation is currently deferred for WAL-backed heaps:
+    /// compaction and slot reuse need a dedicated WAL record before they are
+    /// crash-safe. UPDATE redirect-chain members are also retained until index
+    /// vacuum can retarget their entries to the terminal tuple.
+    ///
     /// The caller supplies `oldest_active_xid` — the lowest XID still
     /// in-progress, as reported by
     /// `ultrasql_txn::TransactionManager::oldest_in_progress`. Every
@@ -57,6 +62,15 @@ impl<L: PageLoader> HeapAccess<L> {
     where
         O: XidStatusOracle + ?Sized,
     {
+        // Heap compaction changes slot occupancy and tuple bytes. Until those
+        // changes have their own WAL record, a WAL-backed heap must not reuse
+        // the slot: recovery could otherwise see the pre-vacuum tuple and
+        // mistake the later insert into the same slot for an already-replayed
+        // record. Index and undo maintenance may still run independently.
+        if self.wal_sink().is_some() {
+            return Ok(VacuumStats::default());
+        }
+
         let block_count = self.block_count(rel);
         let mut stats = VacuumStats::default();
 
@@ -64,11 +78,13 @@ impl<L: PageLoader> HeapAccess<L> {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             let guard = self.get_page_relieved(page_id)?;
 
-            // Read pass: collect slots eligible for reclamation.
-            // We decode only xmax (bytes 8..16) from the raw page to
-            // avoid paying a full TupleHeader::decode per slot.
+            // Certification and reclamation share one exclusive page latch.
+            // A former two-pass implementation dropped a read latch after
+            // collecting slot numbers, then reacquired a write latch; a
+            // concurrent updater/compactor could change those slots in the
+            // gap and make vacuum reclaim a different tuple.
+            let mut page = guard.write();
             let dead_slots: Vec<u16> = {
-                let page = guard.read();
                 let page_bytes = page.as_bytes();
                 let slot_count = page.header().slot_count();
                 let mut dead = Vec::new();
@@ -145,6 +161,12 @@ impl<L: PageLoader> HeapAccess<L> {
                         // that the slot is a dead predecessor.
                         continue;
                     }
+                    if hdr.infomask.bits() & (InfoMask::UPDATED | InfoMask::HOT_UPDATED) != 0 {
+                        // This slot is an index-visible redirect-chain member.
+                        // Reclaiming it before index entries are retargeted
+                        // would strand an entry at a now-unused TID.
+                        continue;
+                    }
                     if !hdr.is_alive() {
                         dead.push(slot);
                     }
@@ -156,26 +178,25 @@ impl<L: PageLoader> HeapAccess<L> {
                 continue;
             }
 
-            // Write pass: mark each dead slot and compact.
-            {
-                let mut page = guard.write();
-                for slot in &dead_slots {
-                    // delete_tuple errors only if the slot is already dead/out-of-range.
-                    // Both are benign (concurrent vacuum or shrinkage); ignore.
-                    let _ = page.delete_tuple(*slot);
-                }
-                page.compact()?;
-            }
-
             let reclaimed = u32::try_from(dead_slots.len())
                 .map_err(|_| HeapError::MalformedHeader("vacuum stat overflow"))?;
-            stats.tuples_reclaimed = checked_heap_u32_count_add(
+            let next_tuples_reclaimed = checked_heap_u32_count_add(
                 stats.tuples_reclaimed,
                 reclaimed,
                 "vacuum stat overflow",
             )?;
-            stats.pages_compacted =
+            let next_pages_compacted =
                 checked_heap_u32_count_add(stats.pages_compacted, 1, "vacuum stat overflow")?;
+
+            // With the same latch still held, every candidate remains the
+            // exact normal slot certified above. Complete count fallibility
+            // before the first page write.
+            for slot in &dead_slots {
+                page.delete_tuple(*slot)?;
+            }
+            page.compact()?;
+            stats.tuples_reclaimed = next_tuples_reclaimed;
+            stats.pages_compacted = next_pages_compacted;
         }
 
         Ok(stats)
@@ -213,59 +234,62 @@ impl<L: PageLoader> HeapAccess<L> {
             let block_number = BlockNumber::new(block);
             let page_id = PageId::new(rel, block_number);
             let guard = self.get_page_relieved(page_id)?;
-            let all_visible = {
-                let page = guard.read();
-                let page_bytes = page.as_bytes();
-                let slot_count = page.header().slot_count();
-                let mut ok = true;
-                for slot in 0..slot_count {
-                    let item_id_off = crate::page::PAGE_HEADER_SIZE
-                        + usize::from(slot) * crate::page::ITEMID_SIZE;
-                    let raw = u32::from_le_bytes([
-                        page_bytes[item_id_off],
-                        page_bytes[item_id_off + 1],
-                        page_bytes[item_id_off + 2],
-                        page_bytes[item_id_off + 3],
-                    ]);
-                    if raw & 0b11 != 1 {
-                        continue;
-                    }
-                    let Ok(length) = usize::try_from((raw >> 2) & 0x7FFF) else {
-                        ok = false;
-                        break;
-                    };
-                    let Ok(offset) = usize::try_from((raw >> 17) & 0x7FFF) else {
-                        ok = false;
-                        break;
-                    };
-                    if length < TUPLE_HEADER_SIZE
-                        || offset
-                            .checked_add(length)
-                            .is_none_or(|end| end > page_bytes.len())
-                    {
-                        ok = false;
-                        break;
-                    }
-                    let slot_bytes = &page_bytes[offset..offset + length];
-                    let Some((header, _)) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
-                    else {
-                        ok = false;
-                        break;
-                    };
-                    if !xmin_all_visible(header.xmin, oldest_active_xid, oracle)
-                        || !xmax_all_visible(header.xmax, oldest_active_xid, oracle)
-                    {
-                        ok = false;
-                        break;
-                    }
+            let page = guard.read();
+            let page_bytes = page.as_bytes();
+            let slot_count = page.header().slot_count();
+            let mut all_visible = true;
+            for slot in 0..slot_count {
+                let item_id_off =
+                    crate::page::PAGE_HEADER_SIZE + usize::from(slot) * crate::page::ITEMID_SIZE;
+                let raw = u32::from_le_bytes([
+                    page_bytes[item_id_off],
+                    page_bytes[item_id_off + 1],
+                    page_bytes[item_id_off + 2],
+                    page_bytes[item_id_off + 3],
+                ]);
+                if raw & 0b11 != 1 {
+                    continue;
                 }
-                ok
-            };
-            drop(guard);
+                let Ok(length) = usize::try_from((raw >> 2) & 0x7FFF) else {
+                    all_visible = false;
+                    break;
+                };
+                let Ok(offset) = usize::try_from((raw >> 17) & 0x7FFF) else {
+                    all_visible = false;
+                    break;
+                };
+                if length < TUPLE_HEADER_SIZE
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > page_bytes.len())
+                {
+                    all_visible = false;
+                    break;
+                }
+                let slot_bytes = &page_bytes[offset..offset + length];
+                let Some((header, _)) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
+                else {
+                    all_visible = false;
+                    break;
+                };
+                if !xmin_all_visible(header.xmin, oldest_active_xid, oracle)
+                    || !xmax_all_visible(header.xmax, header.infomask, oldest_active_xid, oracle)
+                {
+                    all_visible = false;
+                    break;
+                }
+            }
 
+            // Certification and VM publication share the page read latch.
+            // Every writer clears the VM under the exclusive page latch
+            // immediately before mutation, so the two transitions have one
+            // total order: either vacuum marks first and the writer clears
+            // afterward, or vacuum observes the writer's new tuple header.
             if all_visible {
+                let next_marked =
+                    checked_heap_u32_count_add(marked, 1, "visibility mark count overflow")?;
                 vm.mark_all_visible(rel, block_number);
-                marked = checked_heap_u32_count_add(marked, 1, "visibility mark count overflow")?;
+                marked = next_marked;
             } else {
                 vm.clear(rel, block_number);
             }
@@ -349,7 +373,7 @@ impl<L: PageLoader> HeapAccess<L> {
     pub fn int32_pair_undo_batch_len(&self, rel: RelationId) -> usize {
         self.undo_log
             .get(&rel)
-            .map_or(0, |h| h.read().int32_pair_batches.len())
+            .map_or(0, |h| h.read().int32_pair_batches_len())
     }
 
     /// Number of row pre-images represented by compact int32-pair undo
@@ -357,9 +381,12 @@ impl<L: PageLoader> HeapAccess<L> {
     #[must_use]
     pub fn int32_pair_undo_slot_len(&self, rel: RelationId) -> usize {
         self.undo_log.get(&rel).map_or(0, |h| {
-            h.read()
-                .int32_pair_batches
+            let log = h.read();
+            log.int32_pair_batches
                 .iter()
+                .zip(log.batch_metadata.iter())
+                .filter(|(_, metadata)| metadata.active)
+                .map(|(batch, _)| batch)
                 .map(super::Int32PairUndoBatch::slot_len)
                 .sum()
         })
@@ -373,9 +400,12 @@ where
     xmin == Xid::FROZEN || (xmin < oldest_active_xid && oracle.is_committed(xmin))
 }
 
-fn xmax_all_visible<O>(xmax: Xid, oldest_active_xid: Xid, oracle: &O) -> bool
+fn xmax_all_visible<O>(xmax: Xid, infomask: InfoMask, oldest_active_xid: Xid, oracle: &O) -> bool
 where
     O: XidStatusOracle + ?Sized,
 {
-    xmax.is_invalid() || (xmax < oldest_active_xid && oracle.is_aborted(xmax))
+    xmax.is_invalid()
+        || (xmax < oldest_active_xid
+            && (oracle.is_aborted(xmax)
+                || (infomask.contains(InfoMask::UPDATED_IN_PLACE) && oracle.is_committed(xmax))))
 }

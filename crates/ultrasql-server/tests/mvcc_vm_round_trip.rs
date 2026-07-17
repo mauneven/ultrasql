@@ -16,6 +16,7 @@ use ultrasql_server::{Server, UNDO_GC_INTERVAL_COMMITS, bind_listener, serve_lis
 async fn start_server_and_connect() -> (
     Arc<Server>,
     tokio_postgres::Client,
+    String,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
@@ -36,7 +37,7 @@ async fn start_server_and_connect() -> (
             eprintln!("connection error: {e}");
         }
     });
-    (server, client, conn_handle, server_handle)
+    (server, client, conn_str, conn_handle, server_handle)
 }
 
 async fn shutdown(
@@ -65,7 +66,7 @@ fn force_maintenance(server: &Server) {
 
 #[tokio::test]
 async fn server_vm_certifies_scan_and_mutation_clears() {
-    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+    let (server, client, _conn_str, _conn, server_handle) = start_server_and_connect().await;
 
     client
         .batch_execute("CREATE TABLE vm_t (id INT NOT NULL, val INT NOT NULL)")
@@ -94,4 +95,93 @@ async fn server_vm_certifies_scan_and_mutation_clears() {
     assert!(!server.vm.is_all_visible(rel, BlockNumber::new(0)));
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn maintenance_preserves_versions_for_live_repeatable_read_snapshot() {
+    let (server, writer, conn_str, _writer_conn, server_handle) = start_server_and_connect().await;
+    let (reader, reader_connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("reader connect");
+    let _reader_conn = tokio::spawn(async move {
+        if let Err(e) = reader_connection.await {
+            eprintln!("reader connection error: {e}");
+        }
+    });
+
+    writer
+        .batch_execute(
+            "CREATE TABLE snapshot_t (id INT NOT NULL, val INT NOT NULL); \
+             INSERT INTO snapshot_t VALUES (1, 10), (2, 20)",
+        )
+        .await
+        .expect("create and seed snapshot table");
+
+    // The writer deliberately gets the lower XID and remains in progress when
+    // the reader captures its repeatable-read snapshot.
+    writer.batch_execute("BEGIN").await.expect("begin writer");
+    writer
+        .batch_execute(
+            "UPDATE snapshot_t SET val = 11 WHERE id = 1; \
+             DELETE FROM snapshot_t WHERE id = 2",
+        )
+        .await
+        .expect("mutate rows before reader snapshot");
+    reader
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin repeatable-read reader");
+
+    let before_commit = reader
+        .query("SELECT id, val FROM snapshot_t ORDER BY id", &[])
+        .await
+        .expect("reader sees pre-update versions");
+    assert_eq!(
+        before_commit
+            .iter()
+            .map(|row| (row.get::<_, i32>(0), row.get::<_, i32>(1)))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (2, 20)]
+    );
+
+    writer.batch_execute("COMMIT").await.expect("commit writer");
+
+    // Exercise both periodic undo/VM maintenance and heap autovacuum while the
+    // snapshot that observed the writer as in-progress remains registered.
+    force_maintenance(&server);
+    server
+        .table_modifications
+        .insert("snapshot_t".to_owned(), u64::MAX);
+    server.run_autovacuum_cycle();
+
+    let after_maintenance = reader
+        .query("SELECT id, val FROM snapshot_t ORDER BY id", &[])
+        .await
+        .expect("maintenance preserves snapshot versions");
+    assert_eq!(
+        after_maintenance
+            .iter()
+            .map(|row| (row.get::<_, i32>(0), row.get::<_, i32>(1)))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (2, 20)]
+    );
+
+    reader
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit repeatable-read reader");
+    let current = reader
+        .query("SELECT id, val FROM snapshot_t ORDER BY id", &[])
+        .await
+        .expect("new snapshot sees committed mutations");
+    assert_eq!(
+        current
+            .iter()
+            .map(|row| (row.get::<_, i32>(0), row.get::<_, i32>(1)))
+            .collect::<Vec<_>>(),
+        vec![(1, 11)]
+    );
+
+    drop(writer);
+    shutdown(reader, server_handle).await;
 }

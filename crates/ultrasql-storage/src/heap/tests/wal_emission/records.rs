@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use ultrasql_core::{BlockNumber, CommandId, PageId, Xid};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
+use ultrasql_wal::applier::dispatch_record_at_lsn;
 use ultrasql_wal::payload::{
     HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertBatchPayload, HeapInsertPayload,
     HeapUpdatePayload,
@@ -13,7 +14,7 @@ use ultrasql_wal::record::RecordType;
 
 use super::{make_heap_with_sink, rel};
 use crate::heap::tests::make_heap;
-use crate::heap::{DeleteOptions, InsertOptions, UpdateOptions};
+use crate::heap::{DeleteOptions, InsertOptions, UpdateOptions, UpdatePayload};
 use crate::wal_sink::{NullWalSink, test_support::InMemoryWalSink};
 
 // -------------------------------------------------------------------
@@ -230,6 +231,52 @@ fn update_emits_heap_update_record_without_hot_flag_when_falling_back() {
         0,
         "HOT flag must NOT be set"
     );
+}
+
+#[test]
+fn update_many_non_hot_fallback_is_wal_logged_and_replayable() {
+    let (heap, sink) = make_heap_with_sink(32);
+    let big = [0xA5_u8; 7000];
+    let insert_opts = |xid| InsertOptions {
+        xmin: Xid::new(xid),
+        command_id: CommandId::FIRST,
+        n_atts: 0,
+        fsm: None,
+        vm: None,
+        wal: Some(sink.as_ref()),
+    };
+    let old_tid = heap.insert(rel(), &big, insert_opts(1)).unwrap();
+    // Fill a second page so the replacement must allocate a third.
+    heap.insert(rel(), &big, insert_opts(1)).unwrap();
+
+    let payload: UpdatePayload = big.iter().copied().collect();
+    let count = heap
+        .update_many(
+            [(old_tid, payload)],
+            UpdateOptions {
+                xid: Xid::new(2),
+                command_id: CommandId::FIRST,
+                hot_eligible: true,
+                wal: Some(sink.as_ref()),
+                vm: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let records = sink.records();
+    let (_, update_record) = records.last().unwrap();
+    assert_eq!(update_record.header.record_type, RecordType::HeapUpdate);
+    let update = HeapUpdatePayload::decode(&update_record.payload).unwrap();
+    assert_eq!(update.old_tid, old_tid);
+    assert_eq!(update.flags & HEAP_UPDATE_HOT, 0);
+
+    let recovered = make_heap(32);
+    for (lsn, record) in &records {
+        dispatch_record_at_lsn(&recovered, record, *lsn).unwrap();
+    }
+    assert_eq!(recovered.fetch(update.new_tid).unwrap().data, big);
+    assert_eq!(recovered.fetch(old_tid).unwrap().header.xmax, Xid::new(2));
 }
 
 // -------------------------------------------------------------------

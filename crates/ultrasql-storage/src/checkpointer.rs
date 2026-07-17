@@ -97,9 +97,11 @@ impl Checkpointer {
     /// The thread periodically flushes dirty pages from `pool` via `writer`.
     /// If the OS refuses to spawn the thread, this returns an inert handle;
     /// [`Self::shutdown`] then returns `Ok(0)`.
-    /// When a WAL `sink` is supplied, only pages whose page-LSN is ≤
-    /// `sink.durable_lsn()` are flushed; this preserves the WAL-ahead-of-data
-    /// invariant. Pass `None` to flush all dirty pages regardless of LSN.
+    /// When a WAL `sink` is supplied, only pages whose page-LSN is strictly
+    /// below the exclusive `sink.durable_lsn()` boundary (or a zero sentinel
+    /// the sink declares dependency-free) are flushed; this preserves the
+    /// WAL-ahead-of-data invariant. Pass `None` to flush all dirty pages
+    /// regardless of LSN.
     /// When `last_checkpoint_lsn` is supplied with a `sink`, each successful
     /// flush cycle publishes the sink's durable LSN into that atomic. The heap
     /// uses the value to decide when a full-page-write record is required.
