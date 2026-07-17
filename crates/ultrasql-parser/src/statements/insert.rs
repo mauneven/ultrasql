@@ -536,7 +536,7 @@ mod tests {
                     // Non-negative: directly a literal.
                     let Expr::Literal(Literal::Integer { text, .. }) = &rows[0][i] else {
                         return Err(proptest::test_runner::TestCaseError::fail(
-                            format!("expected integer literal at position {i}, got {:?}", &rows[0][i])
+                            format!("expected integer literal at position {i}, got {:?}", rows[0][i])
                         ));
                     };
                     let expected = v.to_string();
@@ -545,7 +545,7 @@ mod tests {
                     // Negative: parsed as Unary(Neg, Literal(Integer)).
                     let Expr::Unary { op: crate::ast::UnaryOp::Neg, expr, .. } = &rows[0][i] else {
                         return Err(proptest::test_runner::TestCaseError::fail(
-                            format!("expected Unary(Neg, integer) at position {i}, got {:?}", &rows[0][i])
+                            format!("expected Unary(Neg, integer) at position {i}, got {:?}", rows[0][i])
                         ));
                     };
                     let Expr::Literal(Literal::Integer { text, .. }) = expr.as_ref() else {
