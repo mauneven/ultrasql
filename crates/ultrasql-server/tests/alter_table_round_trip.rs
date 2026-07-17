@@ -558,15 +558,21 @@ async fn alter_column_drop_default_yields_null_or_violates_not_null() {
         .expect("select row");
     assert_eq!(row[0].get::<_, Option<i32>>(0), None);
 
+    // Both fused DELETE execution routes must handle a short NULL payload.
+    client
+        .batch_execute("BEGIN; DELETE FROM t; ROLLBACK")
+        .await
+        .expect("explicit DELETE over a NULL payload rolls back cleanly");
+
     // With a NOT NULL column and no default, omitting it violates 23502.
     client
         .batch_execute("ALTER TABLE t ALTER COLUMN v SET DEFAULT 5")
         .await
         .expect("restore default");
     client
-        .batch_execute("DELETE FROM t")
+        .batch_execute("DELETE FROM t WHERE id = 1")
         .await
-        .expect("clear rows so SET NOT NULL succeeds");
+        .expect("delete a NULL payload through an id predicate");
     client
         .batch_execute("ALTER TABLE t ALTER COLUMN v SET NOT NULL")
         .await

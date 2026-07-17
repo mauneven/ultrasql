@@ -285,54 +285,134 @@ fn int32_pair_delete_predicate_matches_planned<P: Int32PairPredicateEval + ?Size
     let payload_end = payload_off
         .checked_add(9)
         .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-    if payload_end > tuple_end {
-        return Err(HeapError::MalformedHeader(
-            "payload shorter than (Int32, Int32)",
-        ));
+    if payload_end <= tuple_end && bytes[payload_off] == 0 {
+        return match plan {
+            DeletePredicatePlan::All => unreachable!("handled before payload validation"),
+            DeletePredicatePlan::ColumnCmp {
+                col_index: 0,
+                op,
+                literal,
+            } => {
+                let id = read_i32_at(bytes, payload_off + 1);
+                Ok(op.check(id, literal))
+            }
+            DeletePredicatePlan::ColumnCmp {
+                col_index: 1,
+                op,
+                literal,
+            } => {
+                let val = read_i32_at(bytes, payload_off + 5);
+                Ok(op.check(val, literal))
+            }
+            DeletePredicatePlan::ColumnCmp { .. } => {
+                unreachable!("predicate column validated before scan")
+            }
+            DeletePredicatePlan::Pair {
+                required_col: Some(0),
+            } => {
+                let id = read_i32_at(bytes, payload_off + 1);
+                Ok(predicate.matches_column(0, id))
+            }
+            DeletePredicatePlan::Pair {
+                required_col: Some(1),
+            } => {
+                let val = read_i32_at(bytes, payload_off + 5);
+                Ok(predicate.matches_column(1, val))
+            }
+            DeletePredicatePlan::Pair {
+                required_col: Some(_),
+            } => unreachable!("predicate column validated before scan"),
+            DeletePredicatePlan::Pair { required_col: None } => {
+                let id = read_i32_at(bytes, payload_off + 1);
+                let val = read_i32_at(bytes, payload_off + 5);
+                Ok(predicate.matches_pair(id, val))
+            }
+        };
     }
 
-    match plan {
+    let (id, val) = int32_pair_nullable_payload_values(bytes, payload_off, tuple_end)?;
+    Ok(match plan {
         DeletePredicatePlan::All => unreachable!("handled before payload validation"),
         DeletePredicatePlan::ColumnCmp {
             col_index: 0,
             op,
             literal,
-        } => {
-            let id = read_i32_at(bytes, payload_off + 1);
-            Ok(op.check(id, literal))
-        }
+        } => id.is_some_and(|id| op.check(id, literal)),
         DeletePredicatePlan::ColumnCmp {
             col_index: 1,
             op,
             literal,
-        } => {
-            let val = read_i32_at(bytes, payload_off + 5);
-            Ok(op.check(val, literal))
-        }
+        } => val.is_some_and(|val| op.check(val, literal)),
         DeletePredicatePlan::ColumnCmp { .. } => {
             unreachable!("predicate column validated before scan")
         }
         DeletePredicatePlan::Pair {
             required_col: Some(0),
-        } => {
-            let id = read_i32_at(bytes, payload_off + 1);
-            Ok(predicate.matches_column(0, id))
-        }
+        } => id.is_some_and(|id| predicate.matches_column(0, id)),
         DeletePredicatePlan::Pair {
             required_col: Some(1),
-        } => {
-            let val = read_i32_at(bytes, payload_off + 5);
-            Ok(predicate.matches_column(1, val))
-        }
+        } => val.is_some_and(|val| predicate.matches_column(1, val)),
         DeletePredicatePlan::Pair {
             required_col: Some(_),
         } => unreachable!("predicate column validated before scan"),
-        DeletePredicatePlan::Pair { required_col: None } => {
-            let id = read_i32_at(bytes, payload_off + 1);
-            let val = read_i32_at(bytes, payload_off + 5);
-            Ok(predicate.matches_pair(id, val))
-        }
+        DeletePredicatePlan::Pair { required_col: None } => id
+            .zip(val)
+            .is_some_and(|(id, val)| predicate.matches_pair(id, val)),
+    })
+}
+
+#[inline]
+fn int32_pair_nullable_payload_values(
+    bytes: &[u8],
+    payload_off: usize,
+    tuple_end: usize,
+) -> Result<(Option<i32>, Option<i32>), HeapError> {
+    if payload_off >= tuple_end || tuple_end > bytes.len() {
+        return Err(HeapError::MalformedHeader(
+            "int32 pair payload is missing its null bitmap",
+        ));
     }
+    let null_bitmap = bytes[payload_off];
+    let id_null = null_bitmap & 1 != 0;
+    let val_null = null_bitmap & 2 != 0;
+    let id_off = payload_off
+        .checked_add(1)
+        .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
+    let id = if id_null {
+        None
+    } else {
+        Some(read_i32_payload_value(bytes, id_off, tuple_end)?)
+    };
+    let val_off = if id_null {
+        id_off
+    } else {
+        id_off
+            .checked_add(4)
+            .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?
+    };
+    let val = if val_null {
+        None
+    } else {
+        Some(read_i32_payload_value(bytes, val_off, tuple_end)?)
+    };
+    Ok((id, val))
+}
+
+#[inline]
+fn read_i32_payload_value(
+    bytes: &[u8],
+    value_off: usize,
+    tuple_end: usize,
+) -> Result<i32, HeapError> {
+    let value_end = value_off
+        .checked_add(4)
+        .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
+    if value_end > tuple_end || value_end > bytes.len() {
+        return Err(HeapError::MalformedHeader(
+            "int32 pair payload is truncated",
+        ));
+    }
+    Ok(read_i32_at(bytes, value_off))
 }
 
 fn delete_visibility_allows_current_mutation<O, P>(
@@ -1238,31 +1318,21 @@ impl<L: PageLoader> HeapAccess<L> {
                     let payload_end = payload_off
                         .checked_add(9)
                         .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-                    if payload_end > tuple_end {
-                        return Err(HeapError::MalformedHeader(
-                            "payload shorter than (Int32, Int32)",
-                        ));
-                    }
                     if !delete_visibility_allows_current_mutation(
                         visibility,
                         &undo_log_handle,
                         TupleId::new(src_page_id, src_slot),
-                        &src_bytes[payload_off..payload_end],
+                        &src_bytes[payload_off..tuple_end],
                         (snapshot, oracle),
                         predicate_plan,
                         &predicate,
                     )? {
                         continue;
                     }
-                    if let Some(builder) = stats_builder.as_mut() {
-                        let payload_end = payload_off
-                            .checked_add(9)
-                            .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-                        if payload_end > tuple_end {
-                            return Err(HeapError::MalformedHeader(
-                                "payload shorter than (Int32, Int32)",
-                            ));
-                        }
+                    if let Some(builder) = stats_builder.as_mut()
+                        && payload_end <= tuple_end
+                        && src_bytes[payload_off] == 0
+                    {
                         let id = read_i32_at(src_bytes, payload_off + 1);
                         let val = read_i32_at(src_bytes, payload_off + 5);
                         builder.observe(id, val)?;
@@ -1792,31 +1862,21 @@ impl<L: PageLoader> HeapAccess<L> {
                     let payload_end = payload_off
                         .checked_add(9)
                         .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-                    if payload_end > tuple_end {
-                        return Err(HeapError::MalformedHeader(
-                            "payload shorter than (Int32, Int32)",
-                        ));
-                    }
                     if !delete_visibility_allows_current_mutation(
                         visibility,
                         &undo_log_handle,
                         TupleId::new(src_page_id, src_slot),
-                        &src_bytes[payload_off..payload_end],
+                        &src_bytes[payload_off..tuple_end],
                         (snapshot, oracle),
                         predicate_plan,
                         predicate,
                     )? {
                         continue;
                     }
-                    if let Some(builder) = stats_builder.as_mut() {
-                        let payload_end = payload_off
-                            .checked_add(9)
-                            .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-                        if payload_end > tuple_end {
-                            return Err(HeapError::MalformedHeader(
-                                "payload shorter than (Int32, Int32)",
-                            ));
-                        }
+                    if let Some(builder) = stats_builder.as_mut()
+                        && payload_end <= tuple_end
+                        && src_bytes[payload_off] == 0
+                    {
                         let id = read_i32_at(src_bytes, payload_off + 1);
                         let val = read_i32_at(src_bytes, payload_off + 5);
                         builder.observe(id, val)?;
@@ -2004,19 +2064,11 @@ impl<L: PageLoader> HeapAccess<L> {
                     }
                 };
                 let payload_off = offset + TUPLE_HEADER_SIZE;
-                let payload_end = payload_off
-                    .checked_add(9)
-                    .ok_or(HeapError::MalformedHeader("int32 pair payload overflow"))?;
-                if payload_end > tuple_end {
-                    return Err(HeapError::MalformedHeader(
-                        "payload shorter than (Int32, Int32)",
-                    ));
-                }
                 if !delete_visibility_allows_current_mutation(
                     visibility,
                     &undo_log_handle,
                     TupleId::new(src_page_id, src_slot),
-                    &src_bytes[payload_off..payload_end],
+                    &src_bytes[payload_off..tuple_end],
                     (snapshot, oracle),
                     predicate_plan,
                     predicate,
