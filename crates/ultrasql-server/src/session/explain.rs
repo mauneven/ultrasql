@@ -37,7 +37,6 @@ use super::Session;
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
 use crate::result_encoder::SelectResult;
-use crate::{RunPlanInTxnArgs, run_plan_in_txn};
 
 impl<RW> Session<RW>
 where
@@ -47,7 +46,16 @@ where
     /// plan's tree shape into the wire `RowDescription` + `DataRow` +
     /// `CommandComplete` sequence the client expects.
     pub(crate) fn execute_explain(
-        &self,
+        &mut self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<SelectResult, ServerError> {
+        self.execute_explain_inner(plan, catalog_snapshot)
+            .map_err(|err| self.fail_if_in_transaction(err))
+    }
+
+    fn execute_explain_inner(
+        &mut self,
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<SelectResult, ServerError> {
@@ -75,16 +83,31 @@ where
             self.current_role_is_superuser(),
         )?;
 
+        if *analyze
+            && self.state.is_standby_mode()
+            && let Some(command) = Self::read_only_violation_command(input)
+        {
+            return Err(ServerError::ReadOnlyTransaction(command));
+        }
+
+        // The explained statement's own checks apply, as in PostgreSQL:
+        // privileges even without ANALYZE, and row-level security shapes the
+        // plan that is shown and run.
+        let secured =
+            self.apply_row_security(input, catalog_snapshot, crate::RuntimeRlsCommand::Select)?;
+        let shown = secured.as_ref().unwrap_or(input.as_ref());
+        self.enforce_column_privileges(shown, catalog_snapshot)?;
+
         // ANALYZE: execute the inner plan, count rows, measure wall-time.
         let actuals = if *analyze {
-            Some(self.run_explain_analyze(input, catalog_snapshot)?)
+            Some(self.run_explain_analyze(input, shown, catalog_snapshot)?)
         } else {
             None
         };
 
         let body = match format {
-            ExplainFormat::Text => render_text(input, actuals.as_ref()),
-            ExplainFormat::Json => render_json(input, actuals.as_ref()),
+            ExplainFormat::Text => render_text(shown, actuals.as_ref()),
+            ExplainFormat::Json => render_json(shown, actuals.as_ref()),
         };
 
         let row_count = body.lines().count();
@@ -121,18 +144,22 @@ where
 
     /// Execute the wrapped plan to completion, collecting root runtime
     /// evidence plus planner/lowerer decision notes.
+    ///
+    /// `statement` is the plan as bound; `secured` is the same plan with
+    /// row-level security applied. A data-modifying statement runs through
+    /// the regular DML path (read-only, privilege, and RLS checks; the
+    /// session's transaction, or an autocommit transaction with a durable
+    /// commit), exactly as it would without EXPLAIN.
     fn run_explain_analyze(
-        &self,
-        inner: &LogicalPlan,
+        &mut self,
+        statement: &LogicalPlan,
+        secured: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<ExplainActuals, ServerError> {
         let started = Instant::now();
-        if !matches!(
-            inner,
-            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
-        ) {
-            let scan = self.run_explain_select_analyze(inner, catalog_snapshot)?;
-            let notes = self.explain_notes(inner, catalog_snapshot);
+        if Self::read_only_violation_command(statement).is_none() {
+            let scan = self.run_explain_select_analyze(secured, catalog_snapshot)?;
+            let notes = self.explain_notes(secured, catalog_snapshot);
             return Ok(ExplainActuals {
                 rows: scan.rows,
                 batches: scan.batches,
@@ -151,63 +178,10 @@ where
             });
         }
 
-        let notes = self.explain_notes(inner, catalog_snapshot);
-        let txn = self
-            .state
-            .txn_manager
-            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
-        let mut stream_buf = bytes::BytesMut::new();
-        let outcome = run_plan_in_txn(RunPlanInTxnArgs {
-            plan: inner,
-            txn: &txn,
-            catalog_snapshot: Arc::clone(catalog_snapshot),
-            table_constraints: Arc::clone(&self.state.table_constraints),
-            sequences: Arc::clone(&self.state.sequences),
-            sequence_owners: Arc::clone(&self.state.sequence_owners),
-            sequence_namespaces: Arc::clone(&self.state.sequence_namespaces),
-            schemas: Arc::clone(&self.state.schemas),
-            operators: Arc::clone(&self.state.operators),
-            role_catalog: Arc::clone(&self.state.role_catalog),
-            privilege_catalog: Arc::clone(&self.state.privilege_catalog),
-            row_security: Arc::clone(&self.state.row_security),
-            session_settings: Arc::new(self.session_settings.clone()),
-            current_user: self.current_user.clone(),
-            session_user: self.auth_user.clone(),
-            persistent_catalog: Arc::clone(&self.state.persistent_catalog),
-            time_partitions: Arc::clone(&self.state.time_partitions),
-            workload_recorder: Arc::clone(&self.state.workload_recorder),
-            autovacuum_config: self.state.autovacuum_config(),
-            logging_config: self.state.logging_config(),
-            wal_archive_config: self.state.wal_archive_config(),
-            data_dir: self.state.data_dir.clone(),
-            logical_replication: Arc::clone(&self.state.logical_replication),
-            sequence_state: Some(self.sequence_state.clone()),
-            advisory_state: Some(self.advisory_state.clone()),
-            tables: &self.state.tables,
-            heap: Arc::clone(&self.state.heap),
-            vm: Arc::clone(&self.state.vm),
-            oracle: Arc::clone(&self.state.txn_manager),
-            jit: self.jit_config(),
-            cancel_flag: Some(self.cancel_flag.clone()),
-            work_mem_cap_bytes: self.state.memory_admission.per_statement_cap_bytes(),
-            stream_buf: &mut stream_buf,
-            // EXPLAIN ANALYZE only reads `result.rows`; never stream.
-            allow_streaming: false,
-            streaming_commit_txn: None,
-        });
-        // Always commit the read-only ANALYZE txn — we don't surface
-        // its results, only the row count buried in the `SelectResult`.
-        let rows = match outcome {
-            Ok(result) => result.rows,
-            Err(e) => {
-                return Err(self.rollback_explain_analyze_transaction_after_error(
-                    txn,
-                    e,
-                    "EXPLAIN ANALYZE rollback after execution error",
-                ));
-            }
-        };
-        self.finalise_read_transaction(txn, "EXPLAIN ANALYZE commit")?;
+        let notes = self.explain_notes(secured, catalog_snapshot);
+        let rows = self
+            .run_dml_or_select(statement, catalog_snapshot, None, false)?
+            .rows;
         Ok(ExplainActuals {
             rows,
             batches: 0,

@@ -1,5 +1,6 @@
 //! Unit tests for the `session::execute` submodule, split across files.
 
+mod explain_privileges;
 mod parsers;
 mod plan_txn;
 mod privilege_fast_paths;
