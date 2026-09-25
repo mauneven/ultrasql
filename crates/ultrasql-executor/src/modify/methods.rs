@@ -152,9 +152,15 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             return Ok(rows);
         };
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            if let Some(rebuilt) = self.epq_recheck_row(epq, row)? {
-                out.push(rebuilt);
+        for row in rows {
+            let (base_tid, _) = extract_tid_and_row(&row, self.relation)?;
+            match epq.lock_and_recheck_scanned(base_tid)? {
+                None => out.push(row),
+                Some(decision) => {
+                    if let Some(rebuilt) = self.rebuild_after_recheck(decision, &row)? {
+                        out.push(rebuilt);
+                    }
+                }
             }
         }
         Ok(out)
@@ -177,9 +183,23 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         epq: &super::eval_plan_qual::EvalPlanQual,
         row: &[Value],
     ) -> Result<Option<Vec<Value>>, ExecError> {
+        let (base_tid, _) = extract_tid_and_row(row, self.relation)?;
+        match epq.lock_and_recheck_scanned(base_tid)? {
+            None => Ok(Some(row.to_vec())),
+            Some(decision) => self.rebuild_after_recheck(decision, row),
+        }
+    }
+
+    /// Apply an EvalPlanQual `decision` to the scanned `row`: drop it, or
+    /// rebuild it at the latest version's TID and relation columns.
+    fn rebuild_after_recheck(
+        &self,
+        decision: EpqDecision,
+        row: &[Value],
+    ) -> Result<Option<Vec<Value>>, ExecError> {
         let relation_cols = self.codec.schema().len();
-        let (base_tid, orig_row) = extract_tid_and_row(row, self.relation)?;
-        match epq.lock_and_recheck(base_tid)? {
+        let (_, orig_row) = extract_tid_and_row(row, self.relation)?;
+        match decision {
             EpqDecision::Skip => Ok(None),
             EpqDecision::Apply { tid, latest_row } => {
                 if latest_row.len() != relation_cols {

@@ -216,13 +216,44 @@ impl EvalPlanQual {
         //    just changed. Always following the latest-version path closes
         //    that stale-snapshot lost-update window.
         (self.lock)(tid)?;
+        self.recheck_locked(tid)
+    }
 
+    /// [`Self::lock_and_recheck`] for a row this statement's own scan read at
+    /// `tid` under the statement snapshot. Returns `None` when the locked
+    /// version is still exactly that version, so the scanned row stands and
+    /// is not fetched, decoded or re-checked again. This is the common,
+    /// uncontended case; PostgreSQL likewise re-evaluates only after a
+    /// concurrent update.
+    pub fn lock_and_recheck_scanned(&self, tid: TupleId) -> Result<Option<EpqDecision>, ExecError> {
+        (self.lock)(tid)?;
+        let tuple = (self.fetch)(tid)?;
+        if self.unchanged_since_snapshot(&tuple.header) {
+            return Ok(None);
+        }
+        self.recheck_locked(tid).map(Some)
+    }
+
+    fn recheck_locked(&self, tid: TupleId) -> Result<EpqDecision, ExecError> {
         match self.isolation {
             IsolationLevel::ReadCommitted => self.recheck_read_committed(tid),
             IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
                 self.recheck_repeatable_read(tid)
             }
         }
+    }
+
+    /// `true` when `header` is a version the statement snapshot sees as its
+    /// own current image (not a pre-image) and no transaction other than an
+    /// aborted one has updated, deleted or locked it for update.
+    fn unchanged_since_snapshot(&self, header: &TupleHeader) -> bool {
+        let xmax_free = header.xmax.is_invalid()
+            || matches!(self.oracle.status(header.xmax), XidStatus::Aborted);
+        xmax_free
+            && matches!(
+                is_visible(header, &self.snapshot, &*self.oracle),
+                Visibility::Visible
+            )
     }
 
     /// READ COMMITTED EvalPlanQual: re-read the latest committed version of
@@ -422,4 +453,97 @@ pub fn make_epq_fetch<L: PageLoader + Send + Sync + 'static>(
         heap.fetch(tid)
             .map_err(|e| ExecError::TypeMismatch(format!("EvalPlanQual fetch: {e}")))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ultrasql_core::{BlockNumber, CommandId, DataType, Field, PageId, RelationId, Schema, Xid};
+    use ultrasql_mvcc::status::test_support::MapOracle;
+
+    use super::*;
+
+    fn tid() -> TupleId {
+        TupleId::new(PageId::new(RelationId::new(1), BlockNumber::new(0)), 1)
+    }
+
+    /// An EvalPlanQual whose fetch always returns a tuple with `header`,
+    /// with the number of fetches it served.
+    fn epq_over(header: TupleHeader, oracle: Arc<MapOracle>) -> (EvalPlanQual, Arc<AtomicUsize>) {
+        let schema = Schema::new([Field::required("v", DataType::Int64)]).expect("schema");
+        let codec = RowCodec::new(schema);
+        let data = codec.encode(&[Value::Int64(7)]).expect("encode");
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fetches);
+        let snapshot = Snapshot::new(
+            Xid::new(10),
+            Xid::new(20),
+            Xid::new(15),
+            CommandId::FIRST,
+            [],
+        );
+        let fresh = snapshot.clone();
+        let epq = EvalPlanQual::new(EvalPlanQualConfig {
+            lock: Arc::new(|_| Ok(false)),
+            fresh_snapshot: Arc::new(move || fresh.clone()),
+            fetch: Arc::new(move |tid| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(HeapTuple {
+                    tid,
+                    header,
+                    data: data.clone(),
+                })
+            }),
+            oracle,
+            snapshot,
+            isolation: IsolationLevel::ReadCommitted,
+            predicate: None,
+            codec,
+        });
+        (epq, fetches)
+    }
+
+    fn header(xmin: u64, xmax: Option<u64>) -> TupleHeader {
+        let mut header = TupleHeader::fresh(Xid::new(xmin), CommandId::FIRST, tid(), 1);
+        if let Some(xmax) = xmax {
+            header.xmax = Xid::new(xmax);
+        }
+        header
+    }
+
+    #[test]
+    fn a_scanned_version_nobody_touched_is_kept_without_a_recheck() {
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(5));
+        oracle.set_aborted(Xid::new(7));
+
+        for xmax in [None, Some(7)] {
+            let (epq, fetches) = epq_over(header(5, xmax), Arc::clone(&oracle));
+            assert!(
+                epq.lock_and_recheck_scanned(tid()).unwrap().is_none(),
+                "xmax {xmax:?}"
+            );
+            assert_eq!(fetches.load(Ordering::Relaxed), 1, "xmax {xmax:?}");
+        }
+    }
+
+    #[test]
+    fn a_scanned_version_changed_since_the_snapshot_is_rechecked() {
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(5));
+        oracle.set_committed(Xid::new(12));
+        oracle.set_committed(Xid::new(25));
+
+        let deleted_by_committed_writer = header(5, Some(12));
+        let written_after_the_snapshot = header(25, None);
+        for header in [deleted_by_committed_writer, written_after_the_snapshot] {
+            let (epq, fetches) = epq_over(header, Arc::clone(&oracle));
+            assert!(
+                epq.lock_and_recheck_scanned(tid()).unwrap().is_some(),
+                "{header:?}"
+            );
+            assert!(fetches.load(Ordering::Relaxed) >= 2, "{header:?}");
+        }
+    }
 }
