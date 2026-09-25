@@ -1027,8 +1027,11 @@ type WalForceFn = Arc<dyn Fn(Lsn) -> std::io::Result<()> + Send + Sync>;
 /// pool's loader stays read-only and the WAL-before-data gate is enforced
 /// entirely by `try_flush_dirty`.
 struct ServerEvictionRelief {
-    /// The buffer pool whose dirty pages this hook flushes.
-    pool: Arc<BufferPool<BlankPageLoader>>,
+    /// The buffer pool whose dirty pages this hook flushes. Held weakly: the
+    /// pool owns this hook, so a strong reference would form a cycle and
+    /// leak the pool (frames, page table, resident pages) of every dropped
+    /// `Server`.
+    pool: std::sync::Weak<BufferPool<BlankPageLoader>>,
     /// Writer side-channel: persists a page so its frame becomes evictable.
     page_loader: BlankPageLoader,
     /// Force-and-wait the WAL durable to a target LSN. `None` in WAL-less /
@@ -1040,23 +1043,28 @@ struct ServerEvictionRelief {
 impl ServerEvictionRelief {
     /// Phase A flush: write back every dirty, unpinned frame that is already
     /// at or below the durable WAL position. Returns the number flushed.
-    fn flush_durable(&self) -> Result<usize, BufferPoolError> {
+    fn flush_durable(&self, pool: &BufferPool<BlankPageLoader>) -> Result<usize, BufferPoolError> {
         let loader = self.page_loader.clone();
-        self.pool
-            .try_flush_dirty(move |page_id, page| loader.store(page_id, page))
+        pool.try_flush_dirty(move |page_id, page| loader.store(page_id, page))
             .map_err(BufferPoolError::Loader)
     }
 }
 
 impl EvictionRelief for ServerEvictionRelief {
     fn relieve(&self) -> Result<(), BufferPoolError> {
+        // The pool calls this hook, so it is alive; a failed upgrade only
+        // happens while the pool is being torn down, when there is nothing
+        // left to relieve.
+        let Some(pool) = self.pool.upgrade() else {
+            return Ok(());
+        };
         // A poisoned pool must not be flushed; surface it like get_page would.
-        if self.pool.is_poisoned() {
+        if pool.is_poisoned() {
             return Err(BufferPoolError::Poisoned);
         }
 
         // Phase A — flush what is already durable. No WAL force, no latch.
-        let flushed = self.flush_durable()?;
+        let flushed = self.flush_durable(&pool)?;
         if flushed > 0 {
             return Ok(());
         }
@@ -1064,14 +1072,14 @@ impl EvictionRelief for ServerEvictionRelief {
         // Phase B — every dirty unpinned victim is ahead of the durable WAL.
         // Force the WAL durable to the lowest such page-LSN (the minimum that
         // unblocks at least one frame) WITH NO LATCH HELD, then re-flush.
-        if let Some(target) = self.pool.oldest_unflushable_dirty_lsn() {
+        if let Some(target) = pool.oldest_unflushable_dirty_lsn() {
             if let Some(force) = self.force_wal_durable.as_ref() {
                 warn!(
                     target_lsn = target.raw(),
                     "eviction relief forcing WAL durable (buffer pool too small for dirty working set)"
                 );
                 force(target).map_err(|e| BufferPoolError::Loader(ultrasql_core::Error::Io(e)))?;
-                let flushed = self.flush_durable()?;
+                let flushed = self.flush_durable(&pool)?;
                 if flushed == 0 {
                     // Phase C — made no progress this round (e.g. frames got
                     // re-dirtied above the new durable LSN by a concurrent
@@ -1112,7 +1120,7 @@ impl Server {
             force
         });
         let relief = Arc::new(ServerEvictionRelief {
-            pool: Arc::clone(pool),
+            pool: Arc::downgrade(pool),
             page_loader: page_loader.clone(),
             force_wal_durable,
         });

@@ -355,3 +355,26 @@ fn txn_state_ready_for_query_status_matches_postgres() {
     assert_eq!(TxnState::InTransaction(txn1).ready_for_query_status(), b'T');
     assert_eq!(TxnState::Failed(txn2).ready_for_query_status(), b'E');
 }
+
+#[test]
+fn dropping_in_memory_server_releases_buffer_pool() {
+    let server = Server::with_sample_database();
+    let pool = Arc::downgrade(server.heap.buffer_pool());
+    drop(server);
+    assert!(
+        pool.upgrade().is_none(),
+        "the buffer pool must be freed with its server (eviction-relief cycle)"
+    );
+}
+
+#[test]
+fn dropping_persistent_server_releases_buffer_pool() {
+    let data_dir = tempfile::TempDir::new().expect("temp data dir");
+    let server = Server::init(data_dir.path()).expect("init persistent server");
+    let pool = Arc::downgrade(server.heap.buffer_pool());
+    drop(server);
+    assert!(
+        pool.upgrade().is_none(),
+        "the buffer pool must be freed with its server (eviction-relief cycle)"
+    );
+}
