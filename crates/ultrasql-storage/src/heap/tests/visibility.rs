@@ -434,6 +434,48 @@ fn vacuum_mark_all_visible_certifies_only_old_committed_pages() {
 }
 
 #[test]
+fn update_many_non_hot_fallback_clears_destination_page_vm() {
+    let heap = make_heap(16);
+    let payload = [3_u8; 1000];
+    let mut tids = Vec::new();
+    while heap.block_count(rel()) < 2 {
+        tids.push(heap.insert(rel(), &payload, opts(100)).unwrap());
+    }
+    let old_tid = tids[0];
+    assert_eq!(old_tid.page.block, BlockNumber::new(0));
+
+    let vm = crate::vm::VisibilityMap::new();
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(100));
+    let marked = heap
+        .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(200), &oracle, &vm)
+        .unwrap();
+    assert_eq!(marked, 2);
+
+    let new_payload: UpdatePayload = payload.iter().copied().collect();
+    let outcomes = heap
+        .update_many_with_outcomes(
+            [(old_tid, new_payload)],
+            UpdateOptions {
+                xid: Xid::new(300),
+                command_id: CommandId::FIRST,
+                hot_eligible: false,
+                wal: None,
+                vm: Some(&vm),
+            },
+        )
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let new_tid = outcomes[0].new_tid;
+    assert_ne!(new_tid.page, old_tid.page);
+    assert!(!vm.is_all_visible(rel(), old_tid.page.block));
+    assert!(
+        !vm.is_all_visible(rel(), new_tid.page.block),
+        "the page that received the uncommitted new version must lose its all-visible bit"
+    );
+}
+
+#[test]
 fn vacuum_marks_old_committed_in_place_update_all_visible() {
     let heap = make_heap(16);
     let tid = heap

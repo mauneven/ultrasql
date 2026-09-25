@@ -481,7 +481,9 @@ impl<L: PageLoader> HeapAccess<L> {
                 n_atts: self.fetch(fallback[0].0)?.header.n_atts,
                 wal: None,
                 fsm: None,
-                vm: None,
+                // The destination page may be certified all-visible; the new
+                // version is uncommitted, so its VM bits must be cleared.
+                vm: opts.vm,
             };
             let rel = fallback[0].0.page.relation;
             let new_tids = self.insert_batch(rel, &payloads, insert_opts)?;
