@@ -275,6 +275,11 @@ struct LockEntryState {
     grants: Vec<Grant>,
     /// FIFO wait queue.
     waiters: VecDeque<(Xid, LockMode)>,
+    /// Set under this mutex when the entry is pruned from the table. An
+    /// acquirer that looked the entry up before the prune must not grant on
+    /// it (the table would no longer see that grant); it looks the tag up
+    /// again instead.
+    detached: bool,
 }
 
 /// Per-`LockTag` entry in the central table.
@@ -291,6 +296,7 @@ impl LockEntry {
             inner: Mutex::new(LockEntryState {
                 grants: Vec::new(),
                 waiters: VecDeque::new(),
+                detached: false,
             }),
             waiters_changed: Condvar::new(),
         })
@@ -590,98 +596,107 @@ impl LockManager {
         // Register the XID's deadlock state if not already present.
         let xid_state = self.ensure_xid_state(req.xid);
 
-        let entry = self
-            .table
-            .entry(req.tag)
-            .or_insert_with(LockEntry::new)
-            .clone();
-
-        let mut state = entry.inner.lock();
-
-        if !has_conflict(&state.grants, req.xid, req.mode) {
-            // Fast path: no conflict — grant immediately.
-            state.grants.push(Grant {
-                xid: req.xid,
-                mode: req.mode,
-                owner,
-            });
-            xid_state.held.lock().push(req.tag);
-            // Clear any stale victim flag from a previous false-positive
-            // detection run.
-            self.clear_victim(req.xid);
-            return Ok(());
-        }
-
-        // A statement already cancelled must not enqueue at all.
-        if wait.is_cancelled() {
-            return Err(LockError::Cancelled);
-        }
-        // The timeout deadline starts when the blocking wait starts.
-        let deadline = wait.timeout.map(|t| Instant::now() + t);
-
-        // Slow path: enqueue and wait.
-        state.waiters.push_back((req.xid, req.mode));
-
         loop {
-            // Check victim flag *before* sleeping to avoid a wake-up race.
-            // The check runs while holding the entry mutex, so it is
-            // atomic with respect to the detector's notify (see module
-            // doc for the full liveness argument).
-            if self.is_victim(req.xid) {
-                remove_waiter(&mut state.waiters, req.xid, req.mode);
-                return Err(LockError::Deadlock { victim: req.xid });
+            let entry = self
+                .table
+                .entry(req.tag)
+                .or_insert_with(LockEntry::new)
+                .clone();
+            #[cfg(test)]
+            Self::acquire_window_hook();
+            let mut state = entry.inner.lock();
+            // A prune that ran between the lookup and the lock detached this
+            // entry from the table; granting on it would hide the grant from
+            // every later acquirer. Look the tag up again.
+            if state.detached {
+                continue;
             }
 
-            if wait.is_unbounded() {
-                // `wait` atomically releases the mutex and parks the thread.
-                entry.waiters_changed.wait(&mut state);
-            } else {
-                // Bounded sleep: wake at the next cancellation poll tick or
-                // at the timeout deadline, whichever comes first, so both
-                // are observed even if no notification ever arrives.
-                let mut wake_at = Instant::now() + LockWait::POLL_INTERVAL;
-                if let Some(deadline) = deadline {
-                    wake_at = wake_at.min(deadline);
-                }
-                let _ = entry.waiters_changed.wait_until(&mut state, wake_at);
-            }
-
-            // Re-check victim flag after waking.
-            if self.is_victim(req.xid) {
-                remove_waiter(&mut state.waiters, req.xid, req.mode);
-                return Err(LockError::Deadlock { victim: req.xid });
-            }
-
-            // A grantable lock wins over a timeout/cancel observed on the
-            // same wakeup: the lock was available before the error would
-            // have been raised (PostgreSQL behaves the same way).
             if !has_conflict(&state.grants, req.xid, req.mode) {
-                remove_waiter(&mut state.waiters, req.xid, req.mode);
+                // Fast path: no conflict — grant immediately.
                 state.grants.push(Grant {
                     xid: req.xid,
                     mode: req.mode,
                     owner,
                 });
                 xid_state.held.lock().push(req.tag);
-                // Clear any stale victim flag (false positive from a
-                // detection run that resolved itself by the time we woke).
+                // Clear any stale victim flag from a previous false-positive
+                // detection run.
                 self.clear_victim(req.xid);
                 return Ok(());
             }
 
-            // CRITICAL: both early exits remove this waiter under the entry
-            // mutex, exactly like the deadlock-victim path above — a waiter
-            // is never leaked in the queue. Nothing else needs waking:
-            // grant eligibility is computed from `grants` alone (FIFO order
-            // never gates a grant), so removing a waiter cannot unblock or
-            // starve another waiter.
+            // A statement already cancelled must not enqueue at all.
             if wait.is_cancelled() {
-                remove_waiter(&mut state.waiters, req.xid, req.mode);
                 return Err(LockError::Cancelled);
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                remove_waiter(&mut state.waiters, req.xid, req.mode);
-                return Err(LockError::Timeout);
+            // The timeout deadline starts when the blocking wait starts.
+            let deadline = wait.timeout.map(|t| Instant::now() + t);
+
+            // Slow path: enqueue and wait.
+            state.waiters.push_back((req.xid, req.mode));
+
+            loop {
+                // Check victim flag *before* sleeping to avoid a wake-up race.
+                // The check runs while holding the entry mutex, so it is
+                // atomic with respect to the detector's notify (see module
+                // doc for the full liveness argument).
+                if self.is_victim(req.xid) {
+                    remove_waiter(&mut state.waiters, req.xid, req.mode);
+                    return Err(LockError::Deadlock { victim: req.xid });
+                }
+
+                if wait.is_unbounded() {
+                    // `wait` atomically releases the mutex and parks the thread.
+                    entry.waiters_changed.wait(&mut state);
+                } else {
+                    // Bounded sleep: wake at the next cancellation poll tick or
+                    // at the timeout deadline, whichever comes first, so both
+                    // are observed even if no notification ever arrives.
+                    let mut wake_at = Instant::now() + LockWait::POLL_INTERVAL;
+                    if let Some(deadline) = deadline {
+                        wake_at = wake_at.min(deadline);
+                    }
+                    let _ = entry.waiters_changed.wait_until(&mut state, wake_at);
+                }
+
+                // Re-check victim flag after waking.
+                if self.is_victim(req.xid) {
+                    remove_waiter(&mut state.waiters, req.xid, req.mode);
+                    return Err(LockError::Deadlock { victim: req.xid });
+                }
+
+                // A grantable lock wins over a timeout/cancel observed on the
+                // same wakeup: the lock was available before the error would
+                // have been raised (PostgreSQL behaves the same way).
+                if !has_conflict(&state.grants, req.xid, req.mode) {
+                    remove_waiter(&mut state.waiters, req.xid, req.mode);
+                    state.grants.push(Grant {
+                        xid: req.xid,
+                        mode: req.mode,
+                        owner,
+                    });
+                    xid_state.held.lock().push(req.tag);
+                    // Clear any stale victim flag (false positive from a
+                    // detection run that resolved itself by the time we woke).
+                    self.clear_victim(req.xid);
+                    return Ok(());
+                }
+
+                // CRITICAL: both early exits remove this waiter under the entry
+                // mutex, exactly like the deadlock-victim path above — a waiter
+                // is never leaked in the queue. Nothing else needs waking:
+                // grant eligibility is computed from `grants` alone (FIFO order
+                // never gates a grant), so removing a waiter cannot unblock or
+                // starve another waiter.
+                if wait.is_cancelled() {
+                    remove_waiter(&mut state.waiters, req.xid, req.mode);
+                    return Err(LockError::Cancelled);
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    remove_waiter(&mut state.waiters, req.xid, req.mode);
+                    return Err(LockError::Timeout);
+                }
             }
         }
     }
@@ -710,26 +725,35 @@ impl LockManager {
             return Err(LockError::Deadlock { victim: req.xid });
         }
 
-        let entry = self
-            .table
-            .entry(req.tag)
-            .or_insert_with(LockEntry::new)
-            .clone();
+        loop {
+            let entry = self
+                .table
+                .entry(req.tag)
+                .or_insert_with(LockEntry::new)
+                .clone();
+            #[cfg(test)]
+            Self::acquire_window_hook();
+            let mut state = entry.inner.lock();
+            // A prune that ran between the lookup and the lock detached this
+            // entry from the table; granting on it would hide the grant from
+            // every later acquirer. Look the tag up again.
+            if state.detached {
+                continue;
+            }
 
-        let mut state = entry.inner.lock();
+            if has_conflict(&state.grants, req.xid, req.mode) {
+                return Ok(false);
+            }
 
-        if has_conflict(&state.grants, req.xid, req.mode) {
-            return Ok(false);
+            state.grants.push(Grant {
+                xid: req.xid,
+                mode: req.mode,
+                owner,
+            });
+            drop(state);
+            xid_state.held.lock().push(req.tag);
+            return Ok(true);
         }
-
-        state.grants.push(Grant {
-            xid: req.xid,
-            mode: req.mode,
-            owner,
-        });
-        drop(state);
-        xid_state.held.lock().push(req.tag);
-        Ok(true)
     }
 
     /// Release one grant of (`xid`, `tag`, `mode`) from the central
@@ -920,9 +944,23 @@ impl LockManager {
         Self::prune_window_hook();
 
         self.table.remove_if(&tag, |_, entry| {
-            let state = entry.inner.lock();
-            state.grants.is_empty() && state.waiters.is_empty()
+            let mut state = entry.inner.lock();
+            let empty = state.grants.is_empty() && state.waiters.is_empty();
+            if empty {
+                state.detached = true;
+            }
+            empty
         });
+    }
+
+    /// Test seam invoked by the acquire paths between looking an entry up
+    /// and locking it, where a concurrent prune can detach the entry.
+    #[cfg(test)]
+    fn acquire_window_hook() {
+        let hook = ACQUIRE_WINDOW_HOOK.with(|cell| cell.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Test seam invoked inside [`Self::prune_entry_if_empty`] at the prune
@@ -943,6 +981,18 @@ thread_local! {
     /// Per-thread prune-window callback for the prune/acquire race test.
     static PRUNE_WINDOW_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`LockManager::acquire_window_hook`].
+    static ACQUIRE_WINDOW_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_acquire_window_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    ACQUIRE_WINDOW_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
 #[cfg(test)]
@@ -1806,6 +1856,49 @@ mod tests {
         assert_eq!(snap.grants.len(), 1);
         assert_eq!(snap.grants[0].0, xid(3));
         assert!(snap.waiters.is_empty());
+    }
+
+    /// A prune that detaches an entry after an acquirer looked it up, but
+    /// before the acquirer locked it, must not let the grant land on the
+    /// detached entry: the next acquirer would create a fresh entry, see no
+    /// grants, and take a second conflicting lock.
+    #[test]
+    fn grant_never_lands_on_an_entry_pruned_after_lookup() {
+        for try_path in [false, true] {
+            let mgr = Arc::new(LockManager::new());
+            let tag = tup(501, 1, 0);
+            mgr.acquire(req(1, tag, LockMode::AccessExclusive)).unwrap();
+
+            let mgr_in_hook = Arc::clone(&mgr);
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired_in_hook = Arc::clone(&fired);
+            set_acquire_window_hook(Some(Arc::new(move || {
+                if fired_in_hook.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    return;
+                }
+                // Transaction 1 ends between transaction 2's lookup and lock;
+                // its release prunes the now-empty entry.
+                mgr_in_hook.release_all(xid(1));
+            })));
+            if try_path {
+                assert!(
+                    mgr.try_acquire(req(2, tag, LockMode::AccessExclusive))
+                        .unwrap()
+                );
+            } else {
+                mgr.acquire(req(2, tag, LockMode::AccessExclusive)).unwrap();
+            }
+            set_acquire_window_hook(None);
+            assert!(fired.load(std::sync::atomic::Ordering::Acquire));
+
+            let granted = mgr
+                .try_acquire(req(3, tag, LockMode::AccessExclusive))
+                .unwrap();
+            assert!(
+                !granted,
+                "transactions 2 and 3 would both hold AccessExclusive (try_path={try_path})"
+            );
+        }
     }
 
     /// Deterministic prune/acquire race regression.
