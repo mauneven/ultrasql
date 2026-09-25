@@ -412,6 +412,9 @@ pub struct Server {
     /// Tables that crossed the autovacuum ANALYZE threshold and are
     /// waiting for the next maintenance pass.
     pub pending_analyze_tables: dashmap::DashMap<String, ()>,
+    /// When each table's last automatic ANALYZE started, keyed by folded
+    /// name. Enforces [`AUTO_ANALYZE_MIN_INTERVAL`] between automatic runs.
+    pub auto_analyze_last_run: dashmap::DashMap<String, std::time::Instant>,
     /// Runtime autovacuum thresholds used by the launcher and `pg_settings`.
     pub autovacuum_config: AutovacuumConfig,
     /// Runtime statement logging knobs used by SQL execution and `pg_settings`.

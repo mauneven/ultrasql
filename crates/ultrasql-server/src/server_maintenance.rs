@@ -350,15 +350,24 @@ impl Server {
             .analyze_threshold_for_rows(estimated_rows)
     }
 
+    /// Run the automatic ANALYZE of one pending table, skipping tables that
+    /// were auto-analyzed less than [`AUTO_ANALYZE_MIN_INTERVAL`] ago. A
+    /// skipped table stays pending for a later pass.
     pub(crate) fn run_one_pending_analyze(&self) {
+        let now = std::time::Instant::now();
         let Some(table) = self
             .pending_analyze_tables
             .iter()
-            .next()
             .map(|entry| entry.key().clone())
+            .find(|table| {
+                self.auto_analyze_last_run
+                    .get(table)
+                    .is_none_or(|last| now.duration_since(*last) >= AUTO_ANALYZE_MIN_INTERVAL)
+            })
         else {
             return;
         };
+        self.auto_analyze_last_run.insert(table.clone(), now);
 
         match self.analyze_table(&table) {
             Ok(true) => {

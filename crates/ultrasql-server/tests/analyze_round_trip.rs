@@ -355,3 +355,62 @@ async fn dropped_table_statistics_do_not_survive_restart() {
     );
     graceful_shutdown(running).await;
 }
+
+#[tokio::test]
+async fn automatic_analyze_is_rate_limited_per_table() {
+    let (client, server, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE auto_rate_t (id INT NOT NULL); \
+             INSERT INTO auto_rate_t VALUES (1), (2)",
+        )
+        .await
+        .expect("create and seed table");
+
+    server
+        .pending_analyze_tables
+        .insert("auto_rate_t".to_owned(), ());
+    server.run_commit_maintenance();
+    let first = server
+        .lookup_relation_stats("auto_rate_t")
+        .expect("first automatic analyze runs immediately");
+    assert_eq!(first.row_count, 2);
+
+    client
+        .batch_execute("INSERT INTO auto_rate_t VALUES (3), (4), (5)")
+        .await
+        .expect("insert more rows");
+    server
+        .pending_analyze_tables
+        .insert("auto_rate_t".to_owned(), ());
+    server.run_commit_maintenance();
+    assert!(
+        server.pending_analyze_tables.contains_key("auto_rate_t"),
+        "a second automatic analyze inside the interval stays pending"
+    );
+    assert_eq!(
+        server
+            .lookup_relation_stats("auto_rate_t")
+            .expect("stats still present")
+            .row_count,
+        2
+    );
+
+    let long_ago = std::time::Instant::now()
+        .checked_sub(ultrasql_server::AUTO_ANALYZE_MIN_INTERVAL + Duration::from_secs(1))
+        .expect("monotonic clock is past the interval");
+    server
+        .auto_analyze_last_run
+        .insert("auto_rate_t".to_owned(), long_ago);
+    server.run_commit_maintenance();
+    assert!(!server.pending_analyze_tables.contains_key("auto_rate_t"));
+    assert_eq!(
+        server
+            .lookup_relation_stats("auto_rate_t")
+            .expect("stats refreshed")
+            .row_count,
+        5
+    );
+
+    shutdown(client, server_handle).await;
+}

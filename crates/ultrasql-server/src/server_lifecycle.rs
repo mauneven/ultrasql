@@ -219,6 +219,7 @@ impl Server {
             table_modifications: dashmap::DashMap::new(),
             table_analyze_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
+            auto_analyze_last_run: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
             logging_config: LoggingConfig::default(),
             idle_session_timeout_ms: 0,

@@ -326,6 +326,7 @@ where
                     .remove_statistic_ext_for_relation(entry.oid);
                 self.state.table_modifications.remove(&folded_name);
                 self.state.pending_analyze_tables.remove(&folded_name);
+                self.state.auto_analyze_last_run.remove(&folded_name);
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
                     for seq_name in constraints.sequence_defaults.iter().flatten() {
                         if let Some(seq) = self.state.sequences.get(seq_name).map(|seq| seq.clone())

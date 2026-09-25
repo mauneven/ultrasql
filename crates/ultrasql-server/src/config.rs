@@ -47,6 +47,15 @@ pub enum AuthConfig {
 /// keep it out of the per-commit critical path.
 pub const UNDO_GC_INTERVAL_COMMITS: u64 = 64;
 
+/// Minimum time between two automatic ANALYZE runs of the same table.
+///
+/// A table's first auto-analyze runs as soon as it crosses the threshold, so
+/// a freshly loaded table gets statistics right away. After that, a table that
+/// keeps crossing the threshold under steady write load is re-analyzed at most
+/// this often (PostgreSQL's autovacuum visits a table at most once per
+/// `autovacuum_naptime`, 60 s by default). Manual `ANALYZE` is not limited.
+pub const AUTO_ANALYZE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Fixed-point denominator used by autovacuum scale-factor settings.
 pub const AUTOVACUUM_SCALE_DENOMINATOR: u64 = 1_000_000;
 
