@@ -825,46 +825,67 @@ impl WriterDriver {
     /// straddle a segment boundary. If a single record is larger than
     /// `segment_size_bytes` the writer puts it alone in its own
     /// (oversized) segment, since splitting a record is not allowed.
+    /// Consecutive records that land in the same segment go out in one
+    /// `write` call.
     fn write_drained(&mut self, bytes: &[u8], end_lsn: Lsn) -> Result<(), WalWriterError> {
         let mut cursor = 0;
         while cursor < bytes.len() {
-            let record_len = peek_record_length(&bytes[cursor..])?;
             self.ensure_segment_open()?;
-            let remaining_capacity = self
-                .config
-                .segment_size_bytes
-                .saturating_sub(self.current_size);
-            // If this record doesn't fit *and* the segment isn't fresh
-            // (current_size > 0), rotate first. A fresh segment that's
-            // still too small simply gets the oversized record alone.
-            if remaining_capacity < record_len && self.current_size > 0 {
+            let (run_end, run_size) = self.segment_run_end(bytes, cursor)?;
+            if run_end == cursor {
                 self.rotate_segment()?;
                 continue;
             }
-            let record_len_usize = usize::try_from(record_len).map_err(|_| {
-                WalWriterError::Io(std::io::Error::other("record length exceeds usize"))
-            })?;
-            let next_cursor = checked_writer_usize_add(cursor, record_len_usize, "drain cursor")?;
-            let chunk = bytes.get(cursor..next_cursor).ok_or_else(|| {
+            let chunk = bytes.get(cursor..run_end).ok_or_else(|| {
                 WalWriterError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "wal drain ended before record length",
                 ))
             })?;
-            let next_current_size =
-                checked_writer_u64_add(self.current_size, record_len, "segment size")?;
             let next_unflushed_bytes =
                 checked_writer_usize_add(self.unflushed_bytes, chunk.len(), "unflushed bytes")?;
             let file = self.current_file.as_mut().ok_or_else(|| {
                 WalWriterError::Io(std::io::Error::other("segment file unexpectedly closed"))
             })?;
             file.write_all(chunk)?;
-            self.current_size = next_current_size;
+            self.current_size = run_size;
             self.unflushed_bytes = next_unflushed_bytes;
-            cursor = next_cursor;
+            cursor = run_end;
         }
         self.pending_lsn = end_lsn;
         Ok(())
+    }
+
+    /// Find the longest run of whole records starting at `start` that fits
+    /// in the current segment. Returns the run's end offset in `bytes` and
+    /// the segment size after writing it; an empty run means the segment
+    /// must rotate first.
+    fn segment_run_end(&self, bytes: &[u8], start: usize) -> Result<(usize, u64), WalWriterError> {
+        let mut end = start;
+        let mut size = self.current_size;
+        while end < bytes.len() {
+            let record_len = peek_record_length(&bytes[end..])?;
+            let remaining_capacity = self.config.segment_size_bytes.saturating_sub(size);
+            // A record that doesn't fit in a non-fresh segment starts the
+            // next segment. A fresh segment that is still too small simply
+            // gets the oversized record alone.
+            if remaining_capacity < record_len && size > 0 {
+                break;
+            }
+            let record_len_usize = usize::try_from(record_len).map_err(|_| {
+                WalWriterError::Io(std::io::Error::other("record length exceeds usize"))
+            })?;
+            let next_end = checked_writer_usize_add(end, record_len_usize, "drain cursor")?;
+            if next_end > bytes.len() {
+                return Err(WalWriterError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "wal drain ended before record length",
+                )));
+            }
+            size = checked_writer_u64_add(size, record_len, "segment size")?;
+            end = next_end;
+        }
+        Ok((end, size))
     }
 
     fn ensure_segment_open(&mut self) -> Result<(), WalWriterError> {
