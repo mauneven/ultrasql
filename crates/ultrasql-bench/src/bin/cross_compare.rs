@@ -340,7 +340,7 @@ fn run_min(args: &Args) -> Result<String> {
         n,
         args.effective_warmup(),
         args.effective_iters(),
-        || min_i64(&col).map_or(0_i64, |v| v),
+        || min_i64(&col).unwrap_or(0_i64),
         &[],
     )
 }
@@ -354,7 +354,7 @@ fn run_max(args: &Args) -> Result<String> {
         n,
         args.effective_warmup(),
         args.effective_iters(),
-        || max_i64(&col).map_or(0_i64, |v| v),
+        || max_i64(&col).unwrap_or(0_i64),
         &[],
     )
 }
