@@ -428,7 +428,10 @@ mod tests {
         assert_eq!(stats.row_count, 1_000_000);
         assert_eq!(stats.page_count, 12_208);
         let nf = stats.columns[0].null_frac;
-        assert!((nf - 0.5).abs() < 1e-9, "null_frac comes from the sample, got {nf}");
+        assert!(
+            (nf - 0.5).abs() < 1e-9,
+            "null_frac comes from the sample, got {nf}"
+        );
     }
 
     /// Null values are counted correctly in `null_frac`.

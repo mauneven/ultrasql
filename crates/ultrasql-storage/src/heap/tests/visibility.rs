@@ -470,7 +470,10 @@ fn vacuum_mark_all_visible_recertifies_only_pages_written_since_last_pass() {
     let marked = heap
         .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(400), &oracle, &vm)
         .unwrap();
-    assert_eq!(marked, 1, "only the page written since the last pass is re-certified");
+    assert_eq!(
+        marked, 1,
+        "only the page written since the last pass is re-certified"
+    );
     assert!(vm.is_all_visible(rel(), BlockNumber::new(0)));
     assert!(vm.is_all_visible(rel(), BlockNumber::new(1)));
 }

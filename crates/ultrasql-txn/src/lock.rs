@@ -879,7 +879,12 @@ impl LockManager {
         if let Some(state) = self.xid_states.get(&xid) {
             return Arc::clone(&state);
         }
-        Arc::clone(&self.xid_states.entry(xid).or_insert_with(DeadlockState::new))
+        Arc::clone(
+            &self
+                .xid_states
+                .entry(xid)
+                .or_insert_with(DeadlockState::new),
+        )
     }
 
     fn is_victim(&self, xid: Xid) -> bool {
@@ -962,12 +967,7 @@ impl Drop for LockManager {
 ///
 /// Loops at `interval` until `stop` is set, calling `detect_and_resolve`
 /// on each iteration.
-fn detector_loop(
-    table: &LockTable,
-    xid_states: &XidStates,
-    stop: &AtomicBool,
-    interval: Duration,
-) {
+fn detector_loop(table: &LockTable, xid_states: &XidStates, stop: &AtomicBool, interval: Duration) {
     while !stop.load(Ordering::Acquire) {
         thread::sleep(interval);
         if stop.load(Ordering::Acquire) {
@@ -980,10 +980,7 @@ fn detector_loop(
 /// Build a wait-for graph, detect cycles via DFS, mark the youngest
 /// (largest XID raw value) victim in each cycle, and wake all waiters
 /// on every `LockEntry` so victim threads can observe the flag promptly.
-fn detect_and_resolve(
-    table: &LockTable,
-    xid_states: &XidStates,
-) {
+fn detect_and_resolve(table: &LockTable, xid_states: &XidStates) {
     // Build the wait-for graph: edge (waiter → holder) for every pair
     // where the waiter's requested mode conflicts with the holder's mode.
     // We also record, for each waiter XID, which entry it is sleeping on

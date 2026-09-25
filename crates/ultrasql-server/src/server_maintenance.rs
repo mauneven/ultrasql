@@ -205,7 +205,8 @@ impl Server {
             let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
             let scan_snapshot = scan_txn.snapshot.clone();
             let analyze_opts = AnalyzeOptions::default();
-            let mut sample = AnalyzeSample::new(analyze_opts.sample_size, u64::from(entry.oid.raw()));
+            let mut sample =
+                AnalyzeSample::new(analyze_opts.sample_size, u64::from(entry.oid.raw()));
             let scan_result = self
                 .heap
                 .for_each_visible(
@@ -471,7 +472,10 @@ mod analyze_sample_tests {
             .iter()
             .map(|r| u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
             .collect();
-        assert!(values.windows(2).all(|w| w[0] < w[1]), "physical order kept");
+        assert!(
+            values.windows(2).all(|w| w[0] < w[1]),
+            "physical order kept"
+        );
         assert!(
             values.iter().filter(|v| **v >= 50_000).count() > 20,
             "the sample must reach the second half of the relation"

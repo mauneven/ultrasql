@@ -182,8 +182,7 @@ impl<L: PageLoader> HeapAccess<L> {
         if epoch.swept_clean_at.load(Ordering::Acquire) != freed {
             for block in 0..start {
                 let page_id = PageId::new(rel, BlockNumber::new(block));
-                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink)
-                {
+                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
                     Ok((tid, guard)) => {
                         Self::post_insert_fsm(&self.pool, tid.page, opts);
                         cursor.store(block, Ordering::Release);

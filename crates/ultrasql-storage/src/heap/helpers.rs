@@ -16,8 +16,8 @@ use crate::buffer_pool::{BufferPool, PageGuard, PageLoader, PageWrite};
 use crate::page::PageError;
 
 use super::{
-    DeleteOptions, FreeSpaceEpoch, HeapAccess, HeapError, HeapTuple, InsertOptions,
-    UpdateOptions, checked_tuple_space_needed,
+    DeleteOptions, FreeSpaceEpoch, HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions,
+    checked_tuple_space_needed,
 };
 
 impl<L: PageLoader> HeapAccess<L> {

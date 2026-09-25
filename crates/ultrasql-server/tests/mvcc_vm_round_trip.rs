@@ -236,9 +236,15 @@ async fn in_transaction_copy_clears_all_visible_page() {
         .await
         .expect("reader counts while COPY txn is open")
         .get(0);
-    assert_eq!(other, 3, "uncommitted COPY rows must be invisible to other sessions");
+    assert_eq!(
+        other, 3,
+        "uncommitted COPY rows must be invisible to other sessions"
+    );
 
-    writer.batch_execute("ROLLBACK").await.expect("rollback copy txn");
+    writer
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("rollback copy txn");
     let after: Vec<i32> = reader
         .query("SELECT a FROM copy_vm_t ORDER BY a", &[])
         .await
@@ -246,7 +252,11 @@ async fn in_transaction_copy_clears_all_visible_page() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(after, vec![1, 2, 3], "rolled-back COPY rows must stay invisible");
+    assert_eq!(
+        after,
+        vec![1, 2, 3],
+        "rolled-back COPY rows must stay invisible"
+    );
 
     drop(writer);
     shutdown(reader, server_handle).await;

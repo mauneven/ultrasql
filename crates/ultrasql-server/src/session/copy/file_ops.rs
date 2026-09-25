@@ -421,11 +421,7 @@ where
             payload_batch.push(payload);
             if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
                 add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
-                self.flush_copy_insert_batch(
-                    entry,
-                    routing.batch(payload_batch),
-                    txn,
-                )?;
+                self.flush_copy_insert_batch(entry, routing.batch(payload_batch), txn)?;
                 payload_batch.clear();
             }
         }
@@ -507,11 +503,7 @@ where
     ) -> Result<u64, ServerError> {
         if !payload_batch.is_empty() {
             add_copy_batch_rows(&mut rows_inserted, payload_batch.len(), "COPY FROM file")?;
-            self.flush_copy_insert_batch(
-                entry,
-                routing.batch(payload_batch),
-                insert.txn,
-            )?;
+            self.flush_copy_insert_batch(entry, routing.batch(payload_batch), insert.txn)?;
             payload_batch.clear();
         }
         if let Some(state) = reject_state {
