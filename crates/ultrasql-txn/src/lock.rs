@@ -271,8 +271,8 @@ struct Grant {
 
 /// Mutable state stored under the per-entry mutex.
 struct LockEntryState {
-    /// Current grant holders.
-    grants: Vec<Grant>,
+    /// Current grant holders. Row locks nearly always have one holder.
+    grants: SmallVec<[Grant; 1]>,
     /// FIFO wait queue.
     waiters: VecDeque<(Xid, LockMode)>,
     /// Set under this mutex when the entry is pruned from the table. An
@@ -294,7 +294,7 @@ impl LockEntry {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(LockEntryState {
-                grants: Vec::new(),
+                grants: SmallVec::new(),
                 waiters: VecDeque::new(),
                 detached: false,
             }),
@@ -614,12 +614,7 @@ impl LockManager {
 
             if !has_conflict(&state.grants, req.xid, req.mode) {
                 // Fast path: no conflict — grant immediately.
-                state.grants.push(Grant {
-                    xid: req.xid,
-                    mode: req.mode,
-                    owner,
-                });
-                xid_state.held.lock().push(req.tag);
+                push_grant(&mut state, &xid_state, req, owner);
                 // Clear any stale victim flag from a previous false-positive
                 // detection run.
                 self.clear_victim(req.xid);
@@ -671,12 +666,7 @@ impl LockManager {
                 // have been raised (PostgreSQL behaves the same way).
                 if !has_conflict(&state.grants, req.xid, req.mode) {
                     remove_waiter(&mut state.waiters, req.xid, req.mode);
-                    state.grants.push(Grant {
-                        xid: req.xid,
-                        mode: req.mode,
-                        owner,
-                    });
-                    xid_state.held.lock().push(req.tag);
+                    push_grant(&mut state, &xid_state, req, owner);
                     // Clear any stale victim flag (false positive from a
                     // detection run that resolved itself by the time we woke).
                     self.clear_victim(req.xid);
@@ -721,7 +711,7 @@ impl LockManager {
     fn try_acquire_with_owner(&self, req: LockRequest, owner: Xid) -> Result<bool, LockError> {
         let xid_state = self.ensure_xid_state(req.xid);
 
-        if self.is_victim(req.xid) {
+        if xid_state.is_victim() {
             return Err(LockError::Deadlock { victim: req.xid });
         }
 
@@ -745,13 +735,7 @@ impl LockManager {
                 return Ok(false);
             }
 
-            state.grants.push(Grant {
-                xid: req.xid,
-                mode: req.mode,
-                owner,
-            });
-            drop(state);
-            xid_state.held.lock().push(req.tag);
+            push_grant(&mut state, &xid_state, req, owner);
             return Ok(true);
         }
     }
@@ -804,16 +788,20 @@ impl LockManager {
             return;
         };
         let held = std::mem::take(&mut *xid_state.held.lock());
-        let affected: std::collections::HashSet<LockTag> = held.into_iter().collect();
-
-        for tag in affected {
-            if let Some(entry) = self.table.get(&tag).map(|e| Arc::clone(&e)) {
-                {
-                    let mut state = entry.inner.lock();
-                    state.grants.retain(|g| g.xid != xid);
+        for tag in held {
+            let mut shared = None;
+            self.table.remove_if(&tag, |_, entry| {
+                let mut state = entry.inner.lock();
+                state.grants.retain(|g| g.xid != xid);
+                if state.grants.is_empty() && state.waiters.is_empty() {
+                    state.detached = true;
+                    return true;
                 }
+                shared = Some(Arc::clone(entry));
+                false
+            });
+            if let Some(entry) = shared {
                 entry.waiters_changed.notify_all();
-                self.prune_entry_if_empty(tag);
             }
         }
     }
@@ -1158,6 +1146,20 @@ fn dfs_find_cycle(
 
 // ─── free-standing helpers ────────────────────────────────────────────────────
 
+/// Grant `req` on a locked entry, recording the tag for
+/// [`LockManager::release_all`] on `req.xid`'s first grant there.
+fn push_grant(state: &mut LockEntryState, xid_state: &DeadlockState, req: LockRequest, owner: Xid) {
+    let first_for_xid = !state.grants.iter().any(|g| g.xid == req.xid);
+    state.grants.push(Grant {
+        xid: req.xid,
+        mode: req.mode,
+        owner,
+    });
+    if first_for_xid {
+        xid_state.held.lock().push(req.tag);
+    }
+}
+
 /// Returns `true` if any existing grant in `grants` conflicts with
 /// `mode`.
 ///
@@ -1411,6 +1413,62 @@ mod tests {
         // XID 6's lock on tags[0] must survive.
         let snap = mgr.inspect(tags[0]).expect("entry should exist for xid 6");
         assert!(snap.grants.iter().any(|(x, _)| *x == xid(6)));
+    }
+
+    #[test]
+    fn release_all_drops_every_mode_one_xid_holds_on_a_tag() {
+        let mgr = LockManager::new();
+        let tag = tup(10, 0, 1);
+        assert!(mgr.try_acquire(req(5, tag, LockMode::RowShare)).unwrap());
+        assert!(mgr.try_acquire(req(5, tag, LockMode::Exclusive)).unwrap());
+
+        mgr.release_all(xid(5));
+
+        assert!(mgr.inspect(tag).is_none(), "the emptied entry is pruned");
+        assert!(
+            mgr.try_acquire(req(6, tag, LockMode::AccessExclusive))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn release_all_drops_a_lock_taken_again_after_a_single_release() {
+        let mgr = LockManager::new();
+        let tag = tup(10, 0, 2);
+        assert!(mgr.try_acquire(req(5, tag, LockMode::Exclusive)).unwrap());
+        mgr.release(xid(5), tag, LockMode::Exclusive);
+        assert!(mgr.try_acquire(req(5, tag, LockMode::Exclusive)).unwrap());
+
+        mgr.release_all(xid(5));
+
+        assert!(mgr.inspect(tag).is_none());
+        assert!(mgr.try_acquire(req(6, tag, LockMode::Exclusive)).unwrap());
+    }
+
+    #[test]
+    fn release_all_wakes_a_waiter_on_a_row_lock() {
+        let mgr = Arc::new(LockManager::new());
+        let tag = tup(10, 0, 3);
+        assert!(mgr.try_acquire(req(5, tag, LockMode::Exclusive)).unwrap());
+        let waiter = {
+            let mgr = Arc::clone(&mgr);
+            let wait = LockWait {
+                timeout: Some(Duration::from_secs(10)),
+                cancelled: None,
+            };
+            std::thread::spawn(move || {
+                mgr.acquire_with_wait(req(6, tag, LockMode::Exclusive), &wait)
+            })
+        };
+        while mgr.inspect(tag).is_some_and(|snap| snap.waiters.is_empty()) {
+            std::thread::yield_now();
+        }
+
+        mgr.release_all(xid(5));
+
+        waiter.join().unwrap().unwrap();
+        let snap = mgr.inspect(tag).expect("xid 6 holds the lock");
+        assert_eq!(snap.grants, vec![(xid(6), LockMode::Exclusive)]);
     }
 
     // ── release_subxact_locks frees by owner, keying conflict on top xid ──
