@@ -76,7 +76,8 @@ impl DictionaryColumn {
         I: IntoIterator<Item = Option<&'a str>>,
     {
         let mut dict: Vec<String> = Vec::new();
-        let mut map: HashMap<String, u32> = HashMap::new();
+        let mut map: HashMap<&'a str, u32, ahash::RandomState> =
+            HashMap::with_hasher(ahash::RandomState::new());
         let mut code_data: Vec<u32> = Vec::new();
         let mut null_positions: Vec<usize> = Vec::new();
 
@@ -96,7 +97,7 @@ impl DictionaryColumn {
                             }
                         })?;
                         dict.push(s.to_owned());
-                        map.insert(s.to_owned(), c);
+                        map.insert(s, c);
                         c
                     };
                     code_data.push(code);
@@ -261,43 +262,50 @@ pub fn encode_strings_auto<'a, I>(iter: I, policy: DictionaryEncodingPolicy) -> 
 where
     I: IntoIterator<Item = Option<&'a str>>,
 {
-    let rows: Vec<Option<String>> = iter.into_iter().map(|v| v.map(str::to_owned)).collect();
-    let dict = match DictionaryColumn::from_strings(rows.iter().map(|v| v.as_deref())) {
-        Ok(dict) => dict,
-        Err(_) => return StringEncoding::Raw(raw_string_column_from_rows(&rows)),
-    };
+    let rows: Vec<Option<&'a str>> = iter.into_iter().collect();
     let non_null_rows = rows.iter().filter(|v| v.is_some()).count();
-
+    if !cardinality_fits_policy(&rows, non_null_rows, policy) {
+        return StringEncoding::Raw(raw_string_column(&rows));
+    }
+    let dict = match DictionaryColumn::from_strings(rows.iter().copied()) {
+        Ok(dict) => dict,
+        Err(_) => return StringEncoding::Raw(raw_string_column(&rows)),
+    };
     if policy.should_dictionary_encode(rows.len(), non_null_rows, dict.dict.len()) {
         StringEncoding::Dictionary(dict)
     } else {
-        StringEncoding::Raw(raw_string_column_from_rows(&rows))
+        StringEncoding::Raw(raw_string_column(&rows))
     }
 }
 
-fn raw_string_column_from_rows(rows: &[Option<String>]) -> StringColumn {
-    if rows.iter().all(Option::is_some) {
-        return StringColumn::from_data(rows.iter().filter_map(Clone::clone));
+/// Count distinct values only until the policy's cardinality limit is
+/// exceeded, so high-cardinality batches stop hashing early.
+fn cardinality_fits_policy(
+    rows: &[Option<&str>],
+    non_null_rows: usize,
+    policy: DictionaryEncodingPolicy,
+) -> bool {
+    if rows.len() < policy.min_rows || non_null_rows == 0 {
+        return false;
     }
-
-    let mut nulls = Bitmap::new(rows.len(), true);
-    let mut values = Vec::with_capacity(rows.len());
-    for (i, v) in rows.iter().enumerate() {
-        match v {
-            Some(s) => values.push(s.clone()),
-            None => {
-                nulls.set(i, false);
-                values.push(String::new());
-            }
+    let percent_limit =
+        non_null_rows.saturating_mul(usize::from(policy.max_cardinality_percent)) / 100;
+    let limit = policy.max_distinct_values.min(percent_limit);
+    let mut seen: std::collections::HashSet<&str, ahash::RandomState> =
+        std::collections::HashSet::with_hasher(ahash::RandomState::new());
+    for value in rows.iter().flatten() {
+        if seen.insert(value) && seen.len() > limit {
+            return false;
         }
     }
-    match StringColumn::with_nulls(values, nulls) {
+    true
+}
+
+fn raw_string_column(rows: &[Option<&str>]) -> StringColumn {
+    match StringColumn::from_optional_strs(rows) {
         Ok(column) => column,
         Err(err) => {
-            debug_assert!(
-                false,
-                "raw dictionary fallback built mismatched string nulls: {err}"
-            );
+            debug_assert!(false, "raw string column construction failed: {err}");
             StringColumn::from_data(std::iter::empty::<String>())
         }
     }

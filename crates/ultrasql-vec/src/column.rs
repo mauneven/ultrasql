@@ -345,6 +345,28 @@ impl StringColumn {
         })
     }
 
+    /// Build a nullable UTF-8 column from borrowed values, `None` meaning
+    /// SQL NULL, without allocating a `String` per row.
+    pub fn from_optional_strs(rows: &[Option<&str>]) -> Result<Self, ColumnError> {
+        let (offsets, values, _) = build_string_buffers(rows.iter().map(|v| v.unwrap_or("")))?;
+        let nulls = if rows.iter().all(Option::is_some) {
+            None
+        } else {
+            let mut bitmap = Bitmap::new(rows.len(), true);
+            for (i, row) in rows.iter().enumerate() {
+                if row.is_none() {
+                    bitmap.set(i, false);
+                }
+            }
+            Some(bitmap)
+        };
+        Ok(Self {
+            offsets,
+            values,
+            nulls,
+        })
+    }
+
     /// Build a UTF-8 column from Arrow-style buffers.
     ///
     /// `offsets` must contain at least one value, start at zero, be
@@ -466,14 +488,16 @@ impl StringColumn {
     }
 }
 
-fn build_string_buffers<I: IntoIterator<Item = String>>(
-    rows: I,
-) -> Result<(Vec<u32>, Vec<u8>, usize), ColumnError> {
+fn build_string_buffers<I, S>(rows: I) -> Result<(Vec<u32>, Vec<u8>, usize), ColumnError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut offsets: Vec<u32> = vec![0];
     let mut values: Vec<u8> = Vec::new();
     let mut row_count = 0usize;
     for s in rows {
-        values.extend_from_slice(s.as_bytes());
+        values.extend_from_slice(s.as_ref().as_bytes());
         let offset = u32::try_from(values.len())
             .map_err(|_| ColumnError::Utf8ValuesTooLarge { len: values.len() })?;
         offsets.push(offset);
