@@ -200,7 +200,7 @@ pub struct BufferPoolRelationStats {
 /// The buffer pool itself.
 pub struct BufferPool<L: PageLoader> {
     frames: Vec<CachePadded<Frame>>,
-    page_table: DashMap<PageId, usize>,
+    page_table: DashMap<PageId, usize, ahash::RandomState>,
     /// Monotone per-relation high-water mark of every block number that has
     /// ever been resident. Maintained with one `fetch_max` on the page-table
     /// install path (misses only) so [`BufferPool::max_resident_block`] is
@@ -228,7 +228,7 @@ pub struct BufferPool<L: PageLoader> {
     /// Cumulative counters.
     counters: Counters,
     /// Cumulative counters keyed by relation id.
-    relation_counters: DashMap<RelationId, RelationCounters>,
+    relation_counters: DashMap<RelationId, RelationCounters, ahash::RandomState>,
     /// Shared B-tree operation latches keyed by index relation.
     ///
     /// B-tree handles are reopened from catalog metadata for independent
@@ -371,14 +371,14 @@ impl<L: PageLoader> BufferPool<L> {
             .collect();
         Self {
             frames,
-            page_table: DashMap::with_capacity(capacity),
+            page_table: DashMap::with_capacity_and_hasher(capacity, ahash::RandomState::new()),
             max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
             miss_lock: Mutex::new(()),
             wal_sink: None,
             counters: Counters::default(),
-            relation_counters: DashMap::new(),
+            relation_counters: DashMap::with_hasher(ahash::RandomState::new()),
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
             poisoned: AtomicBool::new(false),
@@ -411,14 +411,14 @@ impl<L: PageLoader> BufferPool<L> {
             .collect();
         Self {
             frames,
-            page_table: DashMap::with_capacity(capacity),
+            page_table: DashMap::with_capacity_and_hasher(capacity, ahash::RandomState::new()),
             max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
             miss_lock: Mutex::new(()),
             wal_sink: Some(wal),
             counters: Counters::default(),
-            relation_counters: DashMap::new(),
+            relation_counters: DashMap::with_hasher(ahash::RandomState::new()),
             btree_latches: Mutex::new(HashMap::new()),
             btree_block_allocators: Mutex::new(HashMap::new()),
             poisoned: AtomicBool::new(false),
@@ -993,7 +993,13 @@ impl<L: PageLoader> BufferPool<L> {
         }
     }
 
+    /// Count a cache hit for `relation`. Takes the shard's read lock on the
+    /// common path; only a relation's first access takes the write lock.
     fn record_relation_hit(&self, relation: RelationId) {
+        if let Some(counters) = self.relation_counters.get(&relation) {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.relation_counters
             .entry(relation)
             .or_default()
@@ -1001,7 +1007,12 @@ impl<L: PageLoader> BufferPool<L> {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a cache miss for `relation`, like [`Self::record_relation_hit`].
     fn record_relation_read(&self, relation: RelationId) {
+        if let Some(counters) = self.relation_counters.get(&relation) {
+            counters.reads.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.relation_counters
             .entry(relation)
             .or_default()
