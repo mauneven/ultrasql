@@ -126,7 +126,6 @@ where
             payload_batch: &mut payload_batch,
             reject_state: reject_state.as_mut(),
             path,
-            mark_all_visible: !session_mode,
             apply_defaults,
         });
         let rows = match stream_result {
@@ -326,7 +325,6 @@ where
                 apply_defaults: false,
             },
             insert.txn,
-            insert.mark_all_visible,
         )?;
         target.payload_batch.clear();
         Ok(())
@@ -347,13 +345,9 @@ where
             payload_batch,
             mut reject_state,
             path,
-            mark_all_visible,
             apply_defaults,
         } = args;
-        let insert = CopyInsertTxn {
-            txn,
-            mark_all_visible,
-        };
+        let insert = CopyInsertTxn { txn };
         let routing = CopyDefaultRouting {
             columns,
             stream_schema: schema,
@@ -431,7 +425,6 @@ where
                     entry,
                     routing.batch(payload_batch),
                     txn,
-                    mark_all_visible,
                 )?;
                 payload_batch.clear();
             }
@@ -518,7 +511,6 @@ where
                 entry,
                 routing.batch(payload_batch),
                 insert.txn,
-                insert.mark_all_visible,
             )?;
             payload_batch.clear();
         }

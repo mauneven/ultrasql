@@ -18,8 +18,7 @@
 //! The maintained path is taken only when the target table actually has a
 //! secondary/unique index or a CHECK/FK/EXCLUDE constraint
 //! ([`Session::copy_table_needs_maintained_insert`]); a plain table keeps
-//! the historical bulk fast path in [`Session::flush_copy_insert_batch`],
-//! including the autocommit `mark_all_visible` optimisation.
+//! the historical bulk fast path in [`Session::flush_copy_insert_batch`].
 //!
 //! ## Atomicity
 //!
@@ -68,9 +67,8 @@ where
     /// alone does not force the maintained path — it is enforced at decode
     /// (and re-enforced by the operator when the maintained path is taken).
     ///
-    /// `false` lets COPY keep the historical bulk fast path, including the
-    /// autocommit `mark_all_visible` visibility-map optimisation, with no
-    /// per-row overhead for an unconstrained table.
+    /// `false` lets COPY keep the historical bulk fast path, with no per-row
+    /// overhead for an unconstrained table.
     pub(in crate::session) fn copy_table_needs_maintained_insert(
         &self,
         entry: &TableEntry,

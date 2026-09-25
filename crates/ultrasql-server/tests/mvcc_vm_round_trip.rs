@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::SinkExt;
 use tokio_postgres::NoTls;
 use ultrasql_core::{BlockNumber, RelationId};
 use ultrasql_server::{Server, UNDO_GC_INTERVAL_COMMITS, bind_listener, serve_listener};
@@ -181,6 +183,72 @@ async fn maintenance_preserves_versions_for_live_repeatable_read_snapshot() {
             .collect::<Vec<_>>(),
         vec![(1, 11)]
     );
+
+    drop(writer);
+    shutdown(reader, server_handle).await;
+}
+
+#[tokio::test]
+async fn in_transaction_copy_clears_all_visible_page() {
+    let (server, writer, conn_str, _writer_conn, server_handle) = start_server_and_connect().await;
+    let (reader, reader_connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("reader connect");
+    let _reader_conn = tokio::spawn(async move {
+        if let Err(e) = reader_connection.await {
+            eprintln!("reader connection error: {e}");
+        }
+    });
+
+    writer
+        .batch_execute(
+            "CREATE TABLE copy_vm_t (a INT, b INT); \
+             INSERT INTO copy_vm_t VALUES (1, 1), (2, 2), (3, 3)",
+        )
+        .await
+        .expect("create and seed copy table");
+    let rel = relation_id(&server, "copy_vm_t");
+    force_maintenance(&server);
+    assert!(server.vm.is_all_visible(rel, BlockNumber::new(0)));
+
+    writer.batch_execute("BEGIN").await.expect("begin copy txn");
+    let sink = writer
+        .copy_in::<_, Bytes>("COPY copy_vm_t FROM STDIN")
+        .await
+        .expect("start COPY FROM STDIN");
+    futures::pin_mut!(sink);
+    sink.as_mut()
+        .send(Bytes::from_static(b"10\t10\n11\t11\n"))
+        .await
+        .expect("send COPY rows");
+    sink.finish().await.expect("finish COPY");
+    assert!(
+        !server.vm.is_all_visible(rel, BlockNumber::new(0)),
+        "an in-transaction COPY must clear the all-visible bit of the page it fills"
+    );
+
+    let own: i64 = writer
+        .query_one("SELECT count(*) FROM copy_vm_t", &[])
+        .await
+        .expect("writer counts own rows")
+        .get(0);
+    assert_eq!(own, 5, "the COPY transaction sees its own rows");
+    let other: i64 = reader
+        .query_one("SELECT count(*) FROM copy_vm_t", &[])
+        .await
+        .expect("reader counts while COPY txn is open")
+        .get(0);
+    assert_eq!(other, 3, "uncommitted COPY rows must be invisible to other sessions");
+
+    writer.batch_execute("ROLLBACK").await.expect("rollback copy txn");
+    let after: Vec<i32> = reader
+        .query("SELECT a FROM copy_vm_t ORDER BY a", &[])
+        .await
+        .expect("reader scans after rollback")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(after, vec![1, 2, 3], "rolled-back COPY rows must stay invisible");
 
     drop(writer);
     shutdown(reader, server_handle).await;

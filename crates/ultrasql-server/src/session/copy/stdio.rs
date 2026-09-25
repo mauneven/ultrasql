@@ -346,7 +346,6 @@ where
                                     apply_defaults,
                                 },
                                 &txn,
-                                !session_mode,
                             ) {
                                 let err = self.fail_or_rollback_copy_from(
                                     session_mode,
@@ -464,7 +463,6 @@ where
                     apply_defaults,
                 },
                 &txn,
-                !session_mode,
             ) {
                 return Err(self.fail_or_rollback_copy_from(
                     session_mode,
@@ -610,7 +608,6 @@ where
                 apply_defaults,
             },
             &txn,
-            !session_mode,
         ) {
             return Err(self.fail_or_rollback_copy_from(
                 session_mode,
@@ -668,24 +665,16 @@ where
 
     /// Insert one COPY batch under `txn`.
     ///
-    /// `mark_all_visible` controls the visibility-map bulk-load optimisation:
-    ///
-    /// - Autocommit COPY (`true`): the implicit txn commits the moment the COPY
-    ///   finishes, so freshly bulk-filled pages can be stamped all-visible — the
-    ///   historical COPY fast path, preserved byte-for-byte.
-    /// - In-session COPY (`false`): the rows are written under the still-open
-    ///   session xid (InProgress). Marking the page all-visible would let a scan
-    ///   skip the MVCC visibility check and SEE the uncommitted rows — and, worse,
-    ///   keep seeing them after a ROLLBACK aborts the xid. So we pass `vm: None`:
-    ///   the rows stay subject to normal MVCC visibility (own-write visible to
-    ///   this txn, invisible to others, gone on ROLLBACK). COMMIT does not need
-    ///   the all-visible bit; it is an optimisation a later VACUUM re-establishes.
+    /// Every batch clears the visibility-map bits of the pages it fills. A page
+    /// that vacuum had certified all-visible must lose that certification the
+    /// moment it receives rows from an in-progress transaction; otherwise a
+    /// VM-aware scan skips the MVCC check and exposes uncommitted rows to other
+    /// sessions, and keeps exposing them after a ROLLBACK.
     pub(in crate::session) fn flush_copy_insert_batch(
         &self,
         entry: &TableEntry,
         batch: CopyInsertBatch<'_>,
         txn: &Transaction,
-        mark_all_visible: bool,
     ) -> Result<(), ServerError> {
         let CopyInsertBatch {
             payloads,
@@ -713,10 +702,9 @@ where
         // A table with a secondary/unique index or a CHECK/FK/EXCLUDE
         // constraint must take the maintained INSERT path so the index is kept
         // current and the constraints are enforced (parity with INSERT). It
-        // never uses the all-visible bulk shortcut — the operator does normal
-        // MVCC inserts. The bulk fast path below (with its autocommit
-        // `mark_all_visible` optimisation) is preserved ONLY for an
-        // unconstrained, unindexed table.
+        // never uses the bulk shortcut — the operator does normal MVCC inserts.
+        // The bulk fast path below is preserved ONLY for an unconstrained,
+        // unindexed table.
         if self.copy_table_needs_maintained_insert(entry) {
             return self.flush_copy_insert_batch_maintained(entry, payloads, txn);
         }
@@ -730,7 +718,7 @@ where
             n_atts,
             wal,
             fsm: None,
-            vm: mark_all_visible.then(|| self.state.vm.as_ref()),
+            vm: Some(self.state.vm.as_ref()),
         };
         self.state
             .heap

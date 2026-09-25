@@ -180,7 +180,6 @@ where
                                     apply_defaults,
                                 },
                                 &txn,
-                                !session_mode,
                             )?;
                             payload_batch.clear();
                         }
@@ -201,7 +200,6 @@ where
                             apply_defaults,
                         },
                         &txn,
-                        !session_mode,
                     )?;
                     payload_batch.clear();
                 }

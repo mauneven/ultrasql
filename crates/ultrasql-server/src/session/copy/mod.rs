@@ -136,11 +136,6 @@ struct CopyTextFileStreamArgs<'a> {
     /// decoded NARROW and omitted-column defaults are applied downstream. See
     /// [`CopyInsertBatch`].
     apply_defaults: bool,
-    /// Whether freshly bulk-filled pages may be stamped all-visible. `true`
-    /// only for autocommit COPY (the implicit txn commits immediately); `false`
-    /// when riding the open session txn, whose uncommitted rows must stay
-    /// MVCC-governed so a ROLLBACK still discards them.
-    mark_all_visible: bool,
 }
 
 struct CopyRowDecodeContext<'a> {
@@ -159,15 +154,11 @@ struct CopyRowDecodeContext<'a> {
     apply_defaults: bool,
 }
 
-/// The transaction a COPY batch inserts under, plus whether freshly bulk-filled
-/// pages may be stamped all-visible (autocommit only — see
-/// [`Session::flush_copy_insert_batch`]). The two always travel together, so
-/// they ride in one bundle to keep the reject-row helpers under the argument
-/// budget.
+/// The transaction a COPY batch inserts under, bundled so the reject-row
+/// helpers stay under the argument budget.
 #[derive(Clone, Copy)]
 struct CopyInsertTxn<'a> {
     txn: &'a Transaction,
-    mark_all_visible: bool,
 }
 
 /// One decoded COPY FROM batch handed to [`Session::flush_copy_insert_batch`].
