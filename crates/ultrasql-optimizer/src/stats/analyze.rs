@@ -36,8 +36,9 @@ pub struct AnalyzeOptions {
     pub histogram_buckets: u16,
     /// How many most-common values to track per column. Defaults to 100.
     pub mcv_top_k: u16,
-    /// Target sample size. The caller must supply at most this many rows;
-    /// `run` accepts all rows it receives. Defaults to 30 000.
+    /// Target sample size. Callers scanning a relation should pass at most
+    /// this many rows to [`AnalyzeRunner::run_sample`]; `run` accepts all
+    /// rows it receives. Defaults to 30 000.
     pub sample_size: u64,
 }
 
@@ -87,6 +88,36 @@ impl AnalyzeRunner {
         table: &str,
         schema: &Schema,
         rows: impl Iterator<Item = Vec<Value>>,
+    ) -> Result<RelationStats, StatsError> {
+        self.run_inner(table, schema, rows, None)
+    }
+
+    /// Analyze a row sample drawn from a relation of `relation_rows` rows.
+    ///
+    /// Column statistics (null fraction, width, distinct estimate, MCVs,
+    /// histogram, correlation) come from the sample; `row_count` and
+    /// `page_count` describe the whole relation. The sample should keep the
+    /// rows' physical order, since correlation is measured against it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::run`].
+    pub fn run_sample(
+        &self,
+        table: &str,
+        schema: &Schema,
+        sample: impl Iterator<Item = Vec<Value>>,
+        relation_rows: u64,
+    ) -> Result<RelationStats, StatsError> {
+        self.run_inner(table, schema, sample, Some(relation_rows))
+    }
+
+    fn run_inner(
+        &self,
+        table: &str,
+        schema: &Schema,
+        rows: impl Iterator<Item = Vec<Value>>,
+        relation_rows: Option<u64>,
     ) -> Result<RelationStats, StatsError> {
         let ncols = schema.len();
 
@@ -185,11 +216,15 @@ impl AnalyzeRunner {
         // Estimate page count: assume 8 KiB pages, average row ~100 bytes.
         let avg_row_bytes: u64 = 100;
         let page_bytes: u64 = 8192;
-        let page_count = (total_rows * avg_row_bytes).div_ceil(page_bytes).max(1);
+        let row_count = relation_rows.unwrap_or(total_rows);
+        let page_count = row_count
+            .saturating_mul(avg_row_bytes)
+            .div_ceil(page_bytes)
+            .max(1);
 
         Ok(RelationStats {
             table: table.to_owned(),
-            row_count: total_rows,
+            row_count,
             page_count,
             columns,
         })
@@ -369,6 +404,31 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    /// A sample reports the relation's row count, not the sample size.
+    #[test]
+    fn run_sample_reports_relation_row_count() {
+        let runner = AnalyzeRunner::new(AnalyzeOptions::default());
+        let schema = Schema::new([Field::nullable("x", DataType::Int32)]).expect("ok");
+        let stats = runner
+            .run_sample(
+                "t",
+                &schema,
+                (0..8).map(|i| {
+                    if i % 2 == 0 {
+                        vec![Value::Null]
+                    } else {
+                        vec![Value::Int32(i)]
+                    }
+                }),
+                1_000_000,
+            )
+            .expect("ok");
+        assert_eq!(stats.row_count, 1_000_000);
+        assert_eq!(stats.page_count, 12_208);
+        let nf = stats.columns[0].null_frac;
+        assert!((nf - 0.5).abs() < 1e-9, "null_frac comes from the sample, got {nf}");
     }
 
     /// Null values are counted correctly in `null_frac`.

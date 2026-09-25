@@ -204,7 +204,8 @@ impl Server {
 
             let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
             let scan_snapshot = scan_txn.snapshot.clone();
-            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            let analyze_opts = AnalyzeOptions::default();
+            let mut sample = AnalyzeSample::new(analyze_opts.sample_size, u64::from(entry.oid.raw()));
             let scan_result = self
                 .heap
                 .for_each_visible(
@@ -213,7 +214,7 @@ impl Server {
                     &scan_snapshot,
                     self.txn_manager.as_ref(),
                     |_tid, _hdr, payload| {
-                        payloads.push(payload.to_vec());
+                        sample.offer(payload);
                         Ok(())
                     },
                 )
@@ -228,6 +229,8 @@ impl Server {
             self.workload_recorder
                 .update_analyze(pid, "computing statistics", block_count);
             let codec = RowCodec::new(entry.schema.clone());
+            let visible_rows = sample.seen();
+            let payloads = sample.into_physical_order();
             let mut rows: Vec<Vec<ultrasql_core::Value>> = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 match codec.decode(&payload) {
@@ -237,8 +240,8 @@ impl Server {
                     }
                 }
             }
-            let stats = AnalyzeRunner::new(AnalyzeOptions::default())
-                .run(folded, &entry.schema, rows.into_iter())
+            let stats = AnalyzeRunner::new(analyze_opts)
+                .run_sample(folded, &entry.schema, rows.into_iter(), visible_rows)
                 .map_err(|e| ServerError::Ddl(format!("ANALYZE statistics failed: {e}")))?;
             let mut stat_rows = Vec::with_capacity(stats.columns.len());
             for col in &stats.columns {
@@ -368,5 +371,101 @@ impl Server {
                 tracing::warn!(table = %table, error = %e, "autovacuum analyze failed");
             }
         }
+    }
+}
+
+/// Fixed-size uniform row sample for `ANALYZE` (reservoir sampling,
+/// Algorithm R).
+///
+/// Memory stays bounded by `capacity` payloads however large the relation
+/// is. Relations with at most `capacity` visible rows are kept whole, in scan
+/// order, so their statistics are exact. The generator is seeded from the
+/// relation so repeated runs over unchanged data pick the same rows.
+struct AnalyzeSample {
+    capacity: usize,
+    seen: u64,
+    rng_state: u64,
+    rows: Vec<(u64, Vec<u8>)>,
+}
+
+impl AnalyzeSample {
+    fn new(capacity: u64, seed: u64) -> Self {
+        Self {
+            capacity: usize::try_from(capacity).unwrap_or(usize::MAX),
+            seen: 0,
+            rng_state: seed ^ 0x9E37_79B9_7F4A_7C15,
+            rows: Vec::new(),
+        }
+    }
+
+    fn offer(&mut self, payload: &[u8]) {
+        let position = self.seen;
+        self.seen = self.seen.saturating_add(1);
+        if self.rows.len() < self.capacity {
+            self.rows.push((position, payload.to_vec()));
+            return;
+        }
+        let pick = self.next_random() % self.seen;
+        if let Ok(slot) = usize::try_from(pick)
+            && let Some(row) = self.rows.get_mut(slot)
+        {
+            *row = (position, payload.to_vec());
+        }
+    }
+
+    const fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    fn into_physical_order(mut self) -> Vec<Vec<u8>> {
+        self.rows.sort_unstable_by_key(|(position, _)| *position);
+        self.rows.into_iter().map(|(_, payload)| payload).collect()
+    }
+
+    /// SplitMix64.
+    fn next_random(&mut self) -> u64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+#[cfg(test)]
+mod analyze_sample_tests {
+    use super::AnalyzeSample;
+
+    #[test]
+    fn keeps_small_relations_whole_in_scan_order() {
+        let mut sample = AnalyzeSample::new(10, 7);
+        for i in 0_u8..5 {
+            sample.offer(&[i]);
+        }
+        assert_eq!(sample.seen(), 5);
+        assert_eq!(
+            sample.into_physical_order(),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn bounds_memory_and_keeps_physical_order_for_large_relations() {
+        let mut sample = AnalyzeSample::new(100, 7);
+        for i in 0_u32..100_000 {
+            sample.offer(&i.to_le_bytes());
+        }
+        assert_eq!(sample.seen(), 100_000);
+        let rows = sample.into_physical_order();
+        assert_eq!(rows.len(), 100);
+        let values: Vec<u32> = rows
+            .iter()
+            .map(|r| u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+            .collect();
+        assert!(values.windows(2).all(|w| w[0] < w[1]), "physical order kept");
+        assert!(
+            values.iter().filter(|v| **v >= 50_000).count() > 20,
+            "the sample must reach the second half of the relation"
+        );
     }
 }
