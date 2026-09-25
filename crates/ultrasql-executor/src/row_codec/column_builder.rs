@@ -325,7 +325,7 @@ fn text_column_from_parts(
     nulls: Option<Bitmap>,
 ) -> Result<Column, RowCodecError> {
     let n = offsets.len().saturating_sub(1);
-    let mut rows: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut rows: Vec<Option<&str>> = Vec::with_capacity(n);
     for i in 0..n {
         if nulls.as_ref().is_some_and(|bm| !bm.get(i)) {
             rows.push(None);
@@ -335,16 +335,13 @@ fn text_column_from_parts(
             if start > end || end > values.len() {
                 return Err(RowCodecError::BuilderInvariant("text offset bounds"));
             }
-            let s = String::from_utf8(values[start..end].to_vec())
-                .map_err(|error| RowCodecError::InvalidUtf8(error, "text builder"))?;
+            let s = std::str::from_utf8(&values[start..end])
+                .map_err(|error| RowCodecError::InvalidUtf8Slice(error, "text builder"))?;
             rows.push(Some(s));
         }
     }
     Ok(
-        match encode_strings_auto(
-            rows.iter().map(|v| v.as_deref()),
-            DictionaryEncodingPolicy::default(),
-        ) {
+        match encode_strings_auto(rows.iter().copied(), DictionaryEncodingPolicy::default()) {
             StringEncoding::Raw(c) => Column::Utf8(c),
             StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
         },
