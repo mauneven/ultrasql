@@ -211,6 +211,12 @@ pub struct BufferPool<L: PageLoader> {
     max_resident_blocks: DashMap<RelationId, AtomicU32>,
     loader: L,
     clock_hand: AtomicUsize,
+    /// Index of the first frame that has never held a page. Frames below it
+    /// are reused through the clock sweep. Advanced only under `miss_lock`.
+    next_unused_frame: AtomicUsize,
+    /// Frames examined while choosing a frame for a miss.
+    #[cfg(test)]
+    frame_probes: AtomicU64,
     /// Serializes miss installation so one `PageId` cannot be loaded
     /// into multiple frames concurrently.
     miss_lock: Mutex<()>,
@@ -375,6 +381,9 @@ impl<L: PageLoader> BufferPool<L> {
             max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
+            next_unused_frame: AtomicUsize::new(0),
+            #[cfg(test)]
+            frame_probes: AtomicU64::new(0),
             miss_lock: Mutex::new(()),
             wal_sink: None,
             counters: Counters::default(),
@@ -415,6 +424,9 @@ impl<L: PageLoader> BufferPool<L> {
             max_resident_blocks: DashMap::new(),
             loader,
             clock_hand: AtomicUsize::new(0),
+            next_unused_frame: AtomicUsize::new(0),
+            #[cfg(test)]
+            frame_probes: AtomicU64::new(0),
             miss_lock: Mutex::new(()),
             wal_sink: Some(wal),
             counters: Counters::default(),
@@ -1024,17 +1036,11 @@ impl<L: PageLoader> BufferPool<L> {
         self.page_table.get(&page_id).map(|e| *e)
     }
 
+    /// Reserve a frame for `new_page_id`: a never-used frame while any are
+    /// left, then a clock-sweep victim. Callers hold `miss_lock`.
     fn acquire_frame_for(&self, new_page_id: PageId) -> Result<usize, BufferPoolError> {
-        // First, look for a free frame.
-        for (idx, frame) in self.frames.iter().enumerate() {
-            if frame.pin_count.load(Ordering::Acquire) != 0 {
-                continue;
-            }
-            let mut page_id_slot = frame.page_id.lock();
-            if frame.pin_count.load(Ordering::Acquire) == 0 && page_id_slot.is_none() {
-                *page_id_slot = Some(new_page_id);
-                return Ok(idx);
-            }
+        if let Some(idx) = self.take_unused_frame(new_page_id) {
+            return Ok(idx);
         }
         // Otherwise, sweep the clock.
         let total = self.frames.len();
@@ -1042,6 +1048,8 @@ impl<L: PageLoader> BufferPool<L> {
         for _attempt in 0..(total * 4) {
             let hand = self.clock_hand.fetch_add(1, Ordering::AcqRel) % total;
             let frame = &self.frames[hand];
+            #[cfg(test)]
+            self.frame_probes.fetch_add(1, Ordering::Relaxed);
 
             if frame.pin_count.load(Ordering::Acquire) != 0 {
                 continue;
@@ -1084,6 +1092,22 @@ impl<L: PageLoader> BufferPool<L> {
             return Ok(hand);
         }
         Err(BufferPoolError::Exhausted)
+    }
+
+    /// Hand out the next frame that has never held a page, in O(1).
+    fn take_unused_frame(&self, new_page_id: PageId) -> Option<usize> {
+        loop {
+            let idx = self.next_unused_frame.load(Ordering::Relaxed);
+            let frame = self.frames.get(idx)?;
+            self.next_unused_frame.store(idx + 1, Ordering::Relaxed);
+            #[cfg(test)]
+            self.frame_probes.fetch_add(1, Ordering::Relaxed);
+            let mut page_id_slot = frame.page_id.lock();
+            if frame.pin_count.load(Ordering::Acquire) == 0 && page_id_slot.is_none() {
+                *page_id_slot = Some(new_page_id);
+                return Some(idx);
+            }
+        }
     }
 
     fn unpin(&self, frame_idx: usize, dirty: bool) {
@@ -1260,6 +1284,50 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.resident, 1);
         assert_eq!(stats.pinned, 1);
+    }
+
+    #[test]
+    fn misses_examine_a_bounded_number_of_frames_as_the_pool_fills_and_cycles() {
+        let capacity = 1024_u32;
+        let pool = Arc::new(BufferPool::new(
+            usize::try_from(capacity).unwrap(),
+            BlankLoader,
+        ));
+        for block in 0..capacity * 3 {
+            drop(pool.get_page(pid(block)).unwrap());
+        }
+        let probes = pool.frame_probes.load(Ordering::Relaxed);
+        assert!(
+            probes <= u64::from(capacity) * 6,
+            "{probes} frames examined for {} misses on a {capacity}-frame pool",
+            capacity * 3
+        );
+    }
+
+    #[test]
+    fn a_frame_released_by_a_failed_load_is_reused() {
+        struct FailFirst;
+        impl PageLoader for FailFirst {
+            fn load(&self, page_id: PageId) -> Result<Page> {
+                if page_id == pid(0) {
+                    return Err(ultrasql_core::Error::Corruption(
+                        "injected load failure".into(),
+                    ));
+                }
+                Ok(Page::new_heap())
+            }
+        }
+        let pool = Arc::new(BufferPool::new(2, FailFirst));
+        assert!(matches!(
+            pool.get_page(pid(0)),
+            Err(BufferPoolError::Loader(_))
+        ));
+        let _a = pool.get_page(pid(1)).unwrap();
+        let _b = pool.get_page(pid(2)).unwrap();
+        assert!(matches!(
+            pool.get_page(pid(3)),
+            Err(BufferPoolError::Exhausted)
+        ));
     }
 
     #[test]
