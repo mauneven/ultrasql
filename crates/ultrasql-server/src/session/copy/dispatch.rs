@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use ultrasql_catalog::CatalogSnapshot;
+use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     CopyDirection, CopyFormat as PlanCopyFormat, CopySource, LogicalPlan, bind,
@@ -15,8 +15,9 @@ use ultrasql_planner::{
 use ultrasql_txn::Transaction;
 
 use super::super::Session;
+use super::fs_io::projected_schema;
 use super::{CopyOptions, ServerCopyFormat, ServerError};
-use crate::{CombinedCatalog, TxnState};
+use crate::{CombinedCatalog, RuntimeRlsCommand, TxnState};
 
 impl<RW> Session<RW>
 where
@@ -364,20 +365,32 @@ where
             reject_table: reject_table.clone(),
         };
 
+        // Route through the overlay-aware snapshot so a COPY into a table this
+        // session created earlier in the same open transaction resolves it
+        // (self-yes); other sessions still read the unmodified committed
+        // snapshot (others-no).
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
+        // COPY TO needs SELECT and COPY FROM needs INSERT on the copied
+        // columns; a query target needs whatever its SELECT needs.
+        self.enforce_column_privileges(plan, &catalog_snapshot)?;
+
         if let Some(input) = input {
+            let secured =
+                self.apply_row_security(input, &catalog_snapshot, RuntimeRlsCommand::Select)?;
             return self
-                .copy_query_to_destination(input, source, schema, &opts, emit_ready_for_query)
+                .copy_query_to_destination(
+                    secured.as_ref().unwrap_or(input.as_ref()),
+                    source,
+                    schema,
+                    &opts,
+                    emit_ready_for_query,
+                )
                 .await;
         }
 
         let relation = relation
             .as_ref()
             .ok_or(ServerError::Unsupported("COPY table target missing"))?;
-        // Route through the overlay-aware snapshot so a COPY into a table this
-        // session created earlier in the same open transaction resolves it
-        // (self-yes); other sessions still read the unmodified committed
-        // snapshot (others-no).
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.effective_catalog_snapshot();
         let entry = catalog_snapshot
             .tables
             .get(relation)
@@ -385,6 +398,23 @@ where
                 ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(relation.clone()))
             })?
             .clone();
+
+        if self.enabled_row_security(entry.oid).is_some() {
+            if matches!(direction, CopyDirection::From) {
+                return Err(ServerError::Unsupported(
+                    "COPY FROM not supported with row-level security",
+                ));
+            }
+            let query = self.copy_relation_query_under_row_security(
+                relation,
+                &entry,
+                columns,
+                &catalog_snapshot,
+            )?;
+            return self
+                .copy_query_to_destination(&query, source, schema, &opts, emit_ready_for_query)
+                .await;
+        }
 
         match direction {
             CopyDirection::To => match source {
@@ -412,6 +442,27 @@ where
                 CopySource::Stdout => Err(ServerError::Unsupported("COPY FROM STDOUT is invalid")),
             },
         }
+    }
+
+    /// The query `COPY <table> TO` runs for a role subject to row-level
+    /// security: a policy-filtered scan of the copied columns, which is how
+    /// PostgreSQL applies RLS to COPY TO.
+    fn copy_relation_query_under_row_security(
+        &self,
+        relation: &str,
+        entry: &TableEntry,
+        columns: &[usize],
+        catalog_snapshot: &CatalogSnapshot,
+    ) -> Result<LogicalPlan, ServerError> {
+        let scan = LogicalPlan::Scan {
+            table: relation.to_owned(),
+            schema: projected_schema(entry, columns)?,
+            projection: (!columns.is_empty()).then(|| columns.to_vec()),
+        };
+        self.apply_row_security(&scan, catalog_snapshot, RuntimeRlsCommand::Select)?
+            .ok_or(ServerError::Unsupported(
+                "COPY TO could not apply row-level security",
+            ))
     }
 
     /// Gate for server-side file COPY (`COPY ... TO/FROM '<path>'`). These

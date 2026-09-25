@@ -155,6 +155,7 @@ fn command_tag(msgs: &[BackendMessage]) -> Option<String> {
 }
 
 mod basic;
+mod copy_privileges;
 mod coverage;
 mod ddl_alter;
 mod ddl_create;
