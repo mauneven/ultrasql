@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// Shared plan-cache key for `sql`: the statement text qualified by the
+/// catalog snapshot it was bound against and the `search_path` it was bound
+/// under, so no session is served a plan bound in another context.
+fn shared_plan_cache_key(
+    sql: &str,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    search_path: Option<&str>,
+) -> String {
+    format!(
+        "{:p}\u{1f}{}\u{1f}{sql}",
+        Arc::as_ptr(catalog_snapshot),
+        search_path.unwrap_or_default()
+    )
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -29,12 +44,14 @@ where
     /// the result.
     ///
     /// The optimised plan is cached in [`Server::plan_cache`] keyed on
-    /// the raw `sql` text. A cache hit skips the rule-rewrite loop and
-    /// returns the previously-optimised plan; a cache miss runs
-    /// [`ultrasql_optimizer::optimize`] against the bound plan and
-    /// stores the result. The cache is cleared whole-cloth by every DDL
-    /// path (see [`Self::plan_cache_invalidate`]), so concurrent DDL
-    /// cannot serve a stale plan.
+    /// the raw `sql` text together with the binding context: the catalog
+    /// snapshot the plan was bound against and the session's `search_path`
+    /// (see [`shared_plan_cache_key`]). A cache hit skips the rule-rewrite
+    /// loop and returns the previously-optimised plan; a cache miss runs
+    /// [`ultrasql_optimizer::optimize`] against the bound plan and stores
+    /// the result. The cache is also cleared whole-cloth by every DDL path
+    /// (see [`Self::plan_cache_invalidate`]); the snapshot in the key keeps
+    /// a plan bound just before a concurrent DDL from being served after it.
     ///
     /// # Catalog-overlay bypass (cross-session isolation)
     ///
@@ -91,7 +108,11 @@ where
             )
             .map_err(map_err);
         }
-        let key = PlanCacheKey::named(sql.to_owned());
+        let key = PlanCacheKey::named(shared_plan_cache_key(
+            sql,
+            catalog_snapshot,
+            self.session_settings.get("search_path").map(String::as_str),
+        ));
         let snapshot = Arc::clone(catalog_snapshot);
         // The closure is invoked only on cache miss; on a hit the cached
         // plan is returned and the plan we received here is dropped.

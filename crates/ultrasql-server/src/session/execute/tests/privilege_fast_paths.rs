@@ -254,3 +254,54 @@ fn cached_update_rebinds_after_drop_column_in_another_session() {
     );
     assert_eq!(count(&mut admin, "SELECT c FROM wide"), "50");
 }
+
+#[test]
+fn shared_plan_cache_respects_each_sessions_search_path() {
+    let server = shared_server();
+    let mut admin = session_as(&server, "ultrasql");
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE t (id int, v text)",
+        "CREATE TABLE app.t (id int, v text)",
+        "INSERT INTO t VALUES (1, 'public')",
+        "INSERT INTO app.t VALUES (1, 'app')",
+    ] {
+        run_ok(&mut admin, sql);
+    }
+    let sql = "SELECT v FROM t WHERE id > 0 ORDER BY v";
+
+    let mut in_app = session_as(&server, "ultrasql");
+    run_ok(&mut in_app, "SET search_path = app, public");
+    assert_eq!(count(&mut in_app, sql), "app");
+
+    let mut in_public = session_as(&server, "ultrasql");
+    assert_eq!(count(&mut in_public, sql), "public");
+}
+
+#[test]
+fn shared_plan_cache_ignores_plans_bound_before_concurrent_ddl() {
+    let server = shared_server();
+    let mut admin = session_as(&server, "ultrasql");
+    run_ok(&mut admin, "CREATE TABLE wide (a int, b int, c int)");
+    run_ok(&mut admin, "INSERT INTO wide VALUES (1, 2, 3)");
+    let sql = "SELECT b FROM wide ORDER BY b";
+
+    // A statement that bound against the old snapshot and reaches the
+    // optimizer only after another session's DDL has invalidated the cache.
+    let racer = session_as(&server, "ultrasql");
+    let old_snapshot = server.catalog_snapshot();
+    let combined = CombinedCatalog {
+        snapshot: &old_snapshot,
+        fallback: &server.catalog,
+        search_path: None,
+    };
+    let stmt = Parser::new(sql).parse_statement().expect("parse");
+    let bound_before_ddl = bind(&stmt, &combined).expect("bind");
+    run_ok(&mut admin, "ALTER TABLE wide DROP COLUMN a");
+    racer
+        .optimize_dml_plan(sql, bound_before_ddl, &old_snapshot)
+        .expect("optimize stale plan");
+
+    let mut reader = session_as(&server, "ultrasql");
+    assert_eq!(count(&mut reader, sql), "2");
+}
