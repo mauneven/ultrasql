@@ -17,7 +17,7 @@ use ultrasql_wal::record::RecordType;
 use crate::buffer_pool::PageLoader;
 use crate::wal_sink::WalSink;
 
-use super::node::{DescendStep, LeafProbe, NodeMeta, probe_leaf, read_leaf_entries, step_descend};
+use super::node::{DescendStep, LeafProbe, NodeMeta, probe_leaf, step_descend};
 use super::{BTree, BTreeError, Key};
 
 impl<L: PageLoader> BTree<L> {
@@ -66,20 +66,13 @@ impl<L: PageLoader> BTree<L> {
         let mut out = Vec::new();
         loop {
             let guard = self.pool.get_page_relieved(self.page_id(current))?;
-            let (entries, chase) = {
+            let chase = {
                 let r = guard.read();
                 let meta = NodeMeta::read_from(&r)?;
-                (
-                    read_leaf_entries(&r, meta.n_keys)?,
-                    super::node::should_chase_right(meta, raw_key),
-                )
+                super::node::push_leaf_values_for_key(&r, meta.n_keys, raw_key, &mut out)?;
+                super::node::should_chase_right(meta, raw_key)
             };
             drop(guard);
-            for entry in entries {
-                if entry.key == raw_key {
-                    out.push(entry.value);
-                }
-            }
             match chase {
                 Some(next) => current = BlockNumber::new(next),
                 None => break,

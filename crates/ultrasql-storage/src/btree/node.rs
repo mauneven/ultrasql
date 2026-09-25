@@ -175,20 +175,105 @@ pub(super) fn probe_leaf<L: PageLoader>(
     guard: &PageGuard<L>,
     key: i64,
 ) -> Result<LeafProbe, BTreeError> {
-    let entries;
-    {
-        let r = guard.read();
-        let meta = NodeMeta::read_from(&r)?;
-        if let Some(next) = should_chase_right(meta, key) {
-            drop(r);
-            return Ok(LeafProbe::ChaseRight(BlockNumber::new(next)));
-        }
-        entries = read_leaf_entries(&r, meta.n_keys)?;
+    let r = guard.read();
+    let meta = NodeMeta::read_from(&r)?;
+    if let Some(next) = should_chase_right(meta, key) {
         drop(r);
+        return Ok(LeafProbe::ChaseRight(BlockNumber::new(next)));
     }
-    Ok(entries
-        .binary_search_by_key(&key, |e| e.key)
-        .map_or(LeafProbe::Missing, |i| LeafProbe::Found(entries[i].value)))
+    let bytes = r.as_bytes();
+    let count = checked_leaf_count(meta.n_keys)?;
+    let first = partition_point(count, |i| Ok(leaf_key_at(bytes, i)? < key))?;
+    if first < count && leaf_key_at(bytes, first)? == key {
+        return Ok(LeafProbe::Found(leaf_value_at(bytes, first)?));
+    }
+    Ok(LeafProbe::Missing)
+}
+
+/// Append the value of every entry keyed `key` in a leaf page, found by
+/// binary search over the page bytes (entries are sorted by `(key, value)`).
+pub(super) fn push_leaf_values_for_key(
+    page: &Page,
+    count: u16,
+    key: i64,
+    out: &mut Vec<TupleId>,
+) -> Result<(), BTreeError> {
+    let bytes = page.as_bytes();
+    let count = checked_leaf_count(count)?;
+    let mut i = partition_point(count, |i| Ok(leaf_key_at(bytes, i)? < key))?;
+    while i < count && leaf_key_at(bytes, i)? == key {
+        out.push(leaf_value_at(bytes, i)?);
+        i += 1;
+    }
+    Ok(())
+}
+
+/// First index in `0..count` whose predicate is false, for a predicate that
+/// is true on a prefix of the range.
+fn partition_point(
+    count: usize,
+    mut is_before: impl FnMut(usize) -> Result<bool, BTreeError>,
+) -> Result<usize, BTreeError> {
+    let (mut lo, mut hi) = (0, count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if is_before(mid)? {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn checked_leaf_count(count: u16) -> Result<usize, BTreeError> {
+    let count = usize::from(count);
+    if let Some(last) = count.checked_sub(1) {
+        entry_start(last, LEAF_ENTRY_SIZE, "leaf entry out of range")?;
+    }
+    Ok(count)
+}
+
+fn checked_internal_count(count: u16) -> Result<usize, BTreeError> {
+    let count = usize::from(count);
+    let Some(last) = count.checked_sub(1) else {
+        return Err(BTreeError::MalformedNode("empty internal node"));
+    };
+    entry_start(last, INTERNAL_ENTRY_SIZE, "internal entry out of range")?;
+    Ok(count)
+}
+
+fn le_bytes_at<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], BTreeError> {
+    at.checked_add(N)
+        .and_then(|end| bytes.get(at..end))
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(BTreeError::MalformedNode("entry out of range"))
+}
+
+fn leaf_key_at(bytes: &[u8], index: usize) -> Result<i64, BTreeError> {
+    let off = entry_start(index, LEAF_ENTRY_SIZE, "leaf entry out of range")?;
+    Ok(i64::from_le_bytes(le_bytes_at(bytes, off)?))
+}
+
+fn leaf_value_at(bytes: &[u8], index: usize) -> Result<TupleId, BTreeError> {
+    let off = entry_start(index, LEAF_ENTRY_SIZE, "leaf entry out of range")?;
+    let rel = u32::from_le_bytes(le_bytes_at(bytes, off + 8)?);
+    let block = u32::from_le_bytes(le_bytes_at(bytes, off + 12)?);
+    let slot = u16::from_le_bytes(le_bytes_at(bytes, off + 16)?);
+    Ok(TupleId::new(
+        PageId::new(RelationId::new(rel), BlockNumber::new(block)),
+        slot,
+    ))
+}
+
+fn internal_key_at(bytes: &[u8], index: usize) -> Result<i64, BTreeError> {
+    let off = entry_start(index, INTERNAL_ENTRY_SIZE, "internal entry out of range")?;
+    Ok(i64::from_le_bytes(le_bytes_at(bytes, off)?))
+}
+
+fn internal_child_at(bytes: &[u8], index: usize) -> Result<u32, BTreeError> {
+    let off = entry_start(index, INTERNAL_ENTRY_SIZE, "internal entry out of range")?;
+    Ok(u32::from_le_bytes(le_bytes_at(bytes, off + 8)?))
 }
 
 // --- packed entries --------------------------------------------------------
@@ -406,19 +491,15 @@ pub(super) fn find_child_internal(
     meta: NodeMeta,
     key: i64,
 ) -> Result<BlockNumber, BTreeError> {
-    let entries = read_internal_entries(page, meta.n_keys)?;
-    if entries.is_empty() {
-        return Err(BTreeError::MalformedNode("empty internal node"));
-    }
+    let bytes = page.as_bytes();
+    let count = checked_internal_count(meta.n_keys)?;
     // Find the rightmost entry whose key is <= our search key. Duplicate
     // separators are legal for non-unique indexes whose same-key posting
-    // chain crosses leaf splits, so use `partition_point` instead of
-    // `binary_search_by_key`'s arbitrary duplicate hit.
+    // chain crosses leaf splits, so take the partition point rather than
+    // an arbitrary duplicate hit.
     // Entry 0 always has key = i64::MIN by construction.
-    let idx = entries
-        .partition_point(|entry| entry.key <= key)
-        .saturating_sub(1);
-    Ok(BlockNumber::new(entries[idx].child))
+    let idx = partition_point(count, |i| Ok(internal_key_at(bytes, i)? <= key))?.saturating_sub(1);
+    Ok(BlockNumber::new(internal_child_at(bytes, idx)?))
 }
 
 /// Like [`find_child_internal`] but biased to the leftmost child that could
@@ -441,15 +522,11 @@ pub(super) fn find_leftmost_child_internal(
     meta: NodeMeta,
     key: i64,
 ) -> Result<BlockNumber, BTreeError> {
-    let entries = read_internal_entries(page, meta.n_keys)?;
-    if entries.is_empty() {
-        return Err(BTreeError::MalformedNode("empty internal node"));
-    }
+    let bytes = page.as_bytes();
+    let count = checked_internal_count(meta.n_keys)?;
     // Child just left of the first separator `>= key`. Entry 0 always has
-    // key == i64::MIN, so `partition_point` is >= 1 whenever `key > i64::MIN`
+    // key == i64::MIN, so the partition point is >= 1 whenever `key > i64::MIN`
     // and the saturating_sub keeps us in range for `key == i64::MIN`.
-    let idx = entries
-        .partition_point(|entry| entry.key < key)
-        .saturating_sub(1);
-    Ok(BlockNumber::new(entries[idx].child))
+    let idx = partition_point(count, |i| Ok(internal_key_at(bytes, i)? < key))?.saturating_sub(1);
+    Ok(BlockNumber::new(internal_child_at(bytes, idx)?))
 }

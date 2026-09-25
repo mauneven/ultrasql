@@ -1054,3 +1054,83 @@ fn vacuum_removes_dead_entries() {
         );
     }
 }
+
+/// Deterministic SplitMix64 stream for the randomized model tests.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+#[test]
+fn point_probes_agree_with_a_model_under_duplicates_splits_and_deletes() {
+    use std::collections::BTreeMap;
+
+    for seed in [1_u64, 7, 42, 1234] {
+        let mut rng = SplitMix64(seed);
+        let mut tree = make_tree();
+        let mut model: BTreeMap<i64, Vec<TupleId>> = BTreeMap::new();
+        let key_span = 1 + rng.below(400);
+        let mut next_block = 0_u32;
+        for _ in 0..6000 {
+            let key = i64::try_from(rng.below(key_span)).unwrap() - 150;
+            if rng.below(5) == 0 {
+                let victim = model.get(&key).filter(|tids| !tids.is_empty()).map(|tids| {
+                    tids[usize::try_from(rng.below(u64::try_from(tids.len()).unwrap())).unwrap()]
+                });
+                if let Some(victim) = victim {
+                    assert!(
+                        tree.delete::<i64>(key, victim).unwrap(),
+                        "seed {seed}: delete ({key}, {victim:?})"
+                    );
+                    model.entry(key).or_default().retain(|t| *t != victim);
+                    continue;
+                }
+            }
+            next_block += 1;
+            let value = tid(next_block, u16::try_from(rng.below(64)).unwrap());
+            tree.insert_non_unique::<i64>(key, value, Xid::new(1), None)
+                .unwrap();
+            model.entry(key).or_default().push(value);
+        }
+
+        for key in -160_i64..=i64::try_from(key_span).unwrap() - 140 {
+            let mut expected = model.get(&key).cloned().unwrap_or_default();
+            expected.sort();
+            let mut found = tree.lookup_all::<i64>(key).unwrap();
+            found.sort();
+            assert_eq!(found, expected, "seed {seed}: lookup_all({key})");
+            match tree.lookup::<i64>(key).unwrap() {
+                Some(hit) => assert!(
+                    expected.contains(&hit),
+                    "seed {seed}: lookup({key}) returned {hit:?} not in the index"
+                ),
+                None => assert!(
+                    expected.is_empty(),
+                    "seed {seed}: lookup({key}) missed {} entries",
+                    expected.len()
+                ),
+            }
+        }
+
+        let scanned: Vec<i64> = tree
+            .range_scan::<i64>(i64::MIN, None)
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        let modelled: Vec<i64> = model
+            .iter()
+            .flat_map(|(key, tids)| std::iter::repeat_n(*key, tids.len()))
+            .collect();
+        assert_eq!(scanned, modelled, "seed {seed}: full range scan");
+    }
+}
