@@ -279,7 +279,7 @@ impl<L: PageLoader> BTree<L> {
         // view used by DML and index scans.
         let next = pool
             .max_resident_block(rel)
-            .map_or(root_block, |block| block)
+            .unwrap_or(root_block)
             .raw()
             .saturating_add(1);
         let op_latch = pool.btree_latch(rel);

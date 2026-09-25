@@ -335,7 +335,6 @@ const fn bits_to_status(bits: u8) -> XidStatus {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{PageId, Result};
-    use ultrasql_mvcc::XidStatusOracle as _;
 
     use super::*;
     use crate::buffer_pool::BufferPool;
