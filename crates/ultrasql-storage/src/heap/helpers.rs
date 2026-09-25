@@ -6,7 +6,7 @@
 //! 600-line ceiling without changing semantics.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::TupleHeader;
@@ -16,8 +16,8 @@ use crate::buffer_pool::{BufferPool, PageGuard, PageLoader, PageWrite};
 use crate::page::PageError;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UpdateOptions,
-    checked_tuple_space_needed,
+    DeleteOptions, FreeSpaceEpoch, HeapAccess, HeapError, HeapTuple, InsertOptions,
+    UpdateOptions, checked_tuple_space_needed,
 };
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -54,6 +54,27 @@ impl<L: PageLoader> HeapAccess<L> {
                 counter
             }
         }
+    }
+
+    /// Get or create the free-space epoch for `rel`.
+    pub(super) fn free_space_epoch_for(&self, rel: RelationId) -> Arc<FreeSpaceEpoch> {
+        if let Some(existing) = self.free_space_epochs.get(&rel) {
+            return Arc::clone(&existing);
+        }
+        Arc::clone(
+            self.free_space_epochs
+                .entry(rel)
+                .or_insert_with(|| Arc::new(FreeSpaceEpoch::new()))
+                .value(),
+        )
+    }
+
+    /// Record that pages of `rel` may have gained free space, so the next
+    /// insert that finds the tail full sweeps the earlier pages again.
+    pub(super) fn note_space_freed(&self, rel: RelationId) {
+        self.free_space_epoch_for(rel)
+            .freed
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     /// Get or create the insertion cursor for `rel`. The cursor stores

@@ -173,22 +173,27 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
 
-        // Cursor was past the first page with room. Sweep from block 0
-        // up to `start` so this method remains semantically equivalent
-        // to "try every page before extending". This branch only fires
-        // when the cursor is stale (older inserts deleted on a page
-        // before the tail, or concurrent extension).
-        for block in 0..start {
-            let page_id = PageId::new(rel, BlockNumber::new(block));
-            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink) {
-                Ok((tid, guard)) => {
-                    Self::post_insert_fsm(&self.pool, tid.page, opts);
-                    cursor.store(block, Ordering::Release);
-                    return Ok((tid, guard));
+        // Sweep the pages before the cursor for room, but only when space
+        // may have been freed since the last sweep that found none. Without
+        // this gate every extension of a full relation re-read every page,
+        // which made row-at-a-time inserts and non-HOT updates O(pages).
+        let epoch = self.free_space_epoch_for(rel);
+        let freed = epoch.freed.load(Ordering::Acquire);
+        if epoch.swept_clean_at.load(Ordering::Acquire) != freed {
+            for block in 0..start {
+                let page_id = PageId::new(rel, BlockNumber::new(block));
+                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size, fpw_sink)
+                {
+                    Ok((tid, guard)) => {
+                        Self::post_insert_fsm(&self.pool, tid.page, opts);
+                        cursor.store(block, Ordering::Release);
+                        return Ok((tid, guard));
+                    }
+                    Err(HeapError::Page(PageError::NoSpace { .. })) => {}
+                    Err(other) => return Err(other),
                 }
-                Err(HeapError::Page(PageError::NoSpace { .. })) => {}
-                Err(other) => return Err(other),
             }
+            epoch.swept_clean_at.store(freed, Ordering::Release);
         }
 
         // No room anywhere. Grow.

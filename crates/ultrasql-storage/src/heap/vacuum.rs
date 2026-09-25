@@ -195,6 +195,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 page.delete_tuple(*slot)?;
             }
             page.compact()?;
+            self.note_space_freed(rel);
             stats.tuples_reclaimed = next_tuples_reclaimed;
             stats.pages_compacted = next_pages_compacted;
         }

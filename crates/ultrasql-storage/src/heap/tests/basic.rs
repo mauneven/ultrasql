@@ -835,3 +835,49 @@ fn bulk_load_does_not_publish_uncommitted_pages_all_visible() {
         "the caller's transaction has not committed or been certified"
     );
 }
+
+#[test]
+fn row_at_a_time_inserts_read_a_linear_number_of_pages() {
+    let heap = make_heap(256);
+    let payload = [5_u8; 400];
+    while heap.block_count(rel()) < 200 {
+        heap.insert(rel(), &payload, opts(100)).unwrap();
+    }
+    let rows_per_page = 19_u64;
+    let rows = u64::from(heap.block_count(rel())) * rows_per_page;
+    let stats = heap.pool.relation_stats(rel());
+    let page_reads = stats.reads + stats.hits;
+    assert!(
+        page_reads < rows * 3,
+        "{page_reads} page reads for ~{rows} single-row inserts: the free-space sweep ran on every extension"
+    );
+}
+
+#[test]
+fn insert_reuses_space_freed_by_vacuum_on_an_earlier_page() {
+    let heap = make_heap(64);
+    let payload = [6_u8; 400];
+    let mut tids = Vec::new();
+    while heap.block_count(rel()) < 4 {
+        tids.push(heap.insert(rel(), &payload, opts(100)).unwrap());
+    }
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+    let victim = tids[0];
+    heap.delete(victim, del_opts(200, 0)).unwrap();
+    let stats = heap.vacuum_heap(rel(), Xid::new(300), &oracle).unwrap();
+    assert_eq!(stats.tuples_reclaimed, 1);
+
+    let blocks_before = heap.block_count(rel());
+    loop {
+        let tid = heap.insert(rel(), &payload, opts(400)).unwrap();
+        if tid.page == victim.page {
+            break;
+        }
+        assert!(
+            heap.block_count(rel()) <= blocks_before + 1,
+            "once the tail is full, inserts must reuse the space vacuum freed instead of extending"
+        );
+    }
+}

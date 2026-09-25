@@ -59,6 +59,27 @@ use crate::wal_sink::{WalSink, WalSinkError};
 /// like a regular `Vec<u8>`, so the slow path is unchanged.
 pub type UpdatePayload = SmallVec<[u8; 16]>;
 
+/// Counts page-space releases for one relation and remembers the count at
+/// which a full free-space sweep last found no room.
+///
+/// Both start so that the first insert after construction (or restart) may
+/// sweep once. The only consequence of a missed release is that an insert
+/// extends the relation instead of reusing space, never a wrong result.
+#[derive(Debug)]
+pub(crate) struct FreeSpaceEpoch {
+    freed: AtomicU64,
+    swept_clean_at: AtomicU64,
+}
+
+impl FreeSpaceEpoch {
+    fn new() -> Self {
+        Self {
+            freed: AtomicU64::new(1),
+            swept_clean_at: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Errors raised by the heap access method.
 #[derive(Debug, thiserror::Error)]
 pub enum HeapError {
@@ -378,6 +399,10 @@ pub struct HeapAccess<L: PageLoader> {
     /// the hint. The cursor is an `Arc<AtomicU32>` so reads/writes are
     /// lock-free and shared safely across threads.
     insert_cursor: DashMap<RelationId, Arc<AtomicU32>>,
+    /// Per-relation record of freed page space, so an insert that finds the
+    /// tail page full only sweeps the earlier pages when some of them may
+    /// have gained room since the last sweep came up empty.
+    free_space_epochs: DashMap<RelationId, Arc<FreeSpaceEpoch>>,
     /// Raw LSN (as `u64`) of the most recent checkpoint. Shared with the
     /// checkpointer so both can read and update it under the same `Arc`.
     ///
@@ -1230,6 +1255,7 @@ impl<L: PageLoader> HeapAccess<L> {
             pool,
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
+            free_space_epochs: DashMap::new(),
             last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
             replay_visibility_map: parking_lot::RwLock::new(None),
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
@@ -1253,6 +1279,7 @@ impl<L: PageLoader> HeapAccess<L> {
             pool,
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
+            free_space_epochs: DashMap::new(),
             last_checkpoint_lsn,
             replay_visibility_map: parking_lot::RwLock::new(None),
             column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
