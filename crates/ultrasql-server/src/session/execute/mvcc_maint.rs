@@ -69,20 +69,22 @@ where
         }
     }
 
-    /// `true` iff `owner`'s static DML checks were already cached.
+    /// `true` iff `owner`'s static DML checks were already cached for the
+    /// current role.
     ///
     /// `owner` is the pointer-stable `stmt_cache` `Arc` driving this
     /// execution (or `None` for the cold / view-rewrite paths, which never
-    /// cache). A hit requires both an address match *and* [`Arc::ptr_eq`]
-    /// against the stored `Arc`, so a recycled heap address belonging to a
-    /// different plan can never be mistaken for a cached one.
+    /// cache). A hit requires an address match, [`Arc::ptr_eq`] against the
+    /// stored `Arc` (so a recycled heap address belonging to a different plan
+    /// can never be mistaken for a cached one), and the same `current_user`
+    /// the checks passed for.
     pub(crate) fn fast_dml_prechecked(&self, owner: Option<&Arc<LogicalPlan>>) -> bool {
         owner.is_some_and(|arc| {
             Self::prechecked_fast_dml_key(arc).is_some_and(|key| {
                 self.prechecked_fast_dml
                     .borrow()
                     .get(&key)
-                    .is_some_and(|cached| Arc::ptr_eq(cached, arc))
+                    .is_some_and(|cached| cached.covers(arc, &self.current_user))
             })
         })
     }

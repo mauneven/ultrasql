@@ -83,6 +83,28 @@ impl CachedBoundPlan {
     }
 }
 
+/// A `prechecked_fast_dml` entry: the cached plan whose static DML checks
+/// passed, and the role they passed for.
+#[derive(Debug)]
+pub(crate) struct PrecheckedFastDml {
+    plan: Arc<LogicalPlan>,
+    role: String,
+}
+
+impl PrecheckedFastDml {
+    pub(crate) fn new(plan: Arc<LogicalPlan>, role: &str) -> Self {
+        Self {
+            plan,
+            role: role.to_owned(),
+        }
+    }
+
+    /// `true` when this entry vouches for `plan` executed as `role`.
+    pub(crate) fn covers(&self, plan: &Arc<LogicalPlan>, role: &str) -> bool {
+        Arc::ptr_eq(&self.plan, plan) && self.role == role
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FastInsertInt32PairSql<'a> {
     table: &'a str,

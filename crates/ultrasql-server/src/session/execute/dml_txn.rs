@@ -142,10 +142,11 @@ where
                 // Store the `Arc`, not just `key`: the strong reference pins
                 // the allocation so its address can't be recycled, and the
                 // value is what `fast_dml_prechecked` verifies with
-                // `Arc::ptr_eq`.
-                self.prechecked_fast_dml
-                    .borrow_mut()
-                    .insert(key, Arc::clone(arc));
+                // `Arc::ptr_eq`, together with the role the checks ran as.
+                self.prechecked_fast_dml.borrow_mut().insert(
+                    key,
+                    PrecheckedFastDml::new(Arc::clone(arc), &self.current_user),
+                );
             }
         }
 

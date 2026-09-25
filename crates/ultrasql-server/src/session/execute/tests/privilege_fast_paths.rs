@@ -180,6 +180,23 @@ fn cached_delete_rechecks_privileges_after_revoke_in_another_session() {
 }
 
 #[test]
+fn cached_delete_rechecks_privileges_after_set_role() {
+    let (server, mut admin) = server_with_alice();
+    run_ok(&mut admin, "CREATE TABLE pairs (id int, val int)");
+    clear_row_security_metadata(&server);
+
+    let delete = "DELETE FROM pairs WHERE id >= 0";
+    prime_cached_delete(&mut admin, delete);
+    run_ok(&mut admin, "INSERT INTO pairs VALUES (1, 10), (2, 20)");
+
+    run_ok(&mut admin, "SET ROLE alice");
+    let err = run_err(&mut admin, delete);
+    assert_insufficient_privilege(&err, "cached DELETE after SET ROLE");
+    run_ok(&mut admin, "RESET ROLE");
+    assert_eq!(count(&mut admin, "SELECT count(*) FROM pairs"), "2");
+}
+
+#[test]
 fn cached_delete_applies_row_security_enabled_by_another_session() {
     let (server, mut admin) = server_with_alice();
     run_ok(&mut admin, "CREATE TABLE pairs (a int, b int)");

@@ -22,10 +22,10 @@ fn fast_dml_precheck_cache_keys_on_arc_identity_not_heap_address() {
     // Simulate `cached` having passed its static DML checks, exactly as
     // `run_dml_or_select` does on the stable path (pin the `Arc`).
     let key = S::prechecked_fast_dml_key(&cached).expect("delete plan is cache-eligible");
-    session
-        .prechecked_fast_dml
-        .borrow_mut()
-        .insert(key, Arc::clone(&cached));
+    session.prechecked_fast_dml.borrow_mut().insert(
+        key,
+        PrecheckedFastDml::new(Arc::clone(&cached), &session.current_user),
+    );
 
     // The genuinely-cached `Arc` hits; the distinct sibling does not.
     assert!(session.fast_dml_prechecked(Some(&cached)));
@@ -41,10 +41,10 @@ fn fast_dml_precheck_cache_keys_on_arc_identity_not_heap_address() {
         key, collision_key,
         "distinct live Arcs must occupy distinct addresses",
     );
-    session
-        .prechecked_fast_dml
-        .borrow_mut()
-        .insert(collision_key, Arc::clone(&cached));
+    session.prechecked_fast_dml.borrow_mut().insert(
+        collision_key,
+        PrecheckedFastDml::new(Arc::clone(&cached), &session.current_user),
+    );
     assert!(
         !session.fast_dml_prechecked(Some(&other)),
         "address collision with a distinct plan must not be a false cache hit",

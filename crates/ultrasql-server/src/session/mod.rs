@@ -118,11 +118,12 @@ pub(crate) struct Session<RW> {
     ///
     /// This is intentionally narrower than `stmt_cache`: entries are added
     /// only for simple fused DML shapes with no row-security rewrite and no
-    /// materialized-view source guard. `plan_cache_invalidate` clears it
-    /// alongside `stmt_cache`, so role, privilege, RLS, or DDL changes force
-    /// the next execution back through the full checks.
+    /// materialized-view source guard. An entry holds only for the role it
+    /// was checked as, so `SET ROLE` forces a full re-check; privilege, RLS,
+    /// or DDL changes in any session advance the shared plan-cache
+    /// generation, which drops the map (see `plan_cache_generation`).
     pub(super) prechecked_fast_dml:
-        std::cell::RefCell<std::collections::HashMap<usize, Arc<ultrasql_planner::LogicalPlan>>>,
+        std::cell::RefCell<std::collections::HashMap<usize, execute::PrecheckedFastDml>>,
     /// Per-session split cache for repeated multi-statement Simple Query text.
     ///
     /// The hot mixed benchmark sends the same `INSERT; UPDATE; SELECT` batch
