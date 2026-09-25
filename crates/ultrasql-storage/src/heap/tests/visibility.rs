@@ -434,6 +434,48 @@ fn vacuum_mark_all_visible_certifies_only_old_committed_pages() {
 }
 
 #[test]
+fn vacuum_mark_all_visible_recertifies_only_pages_written_since_last_pass() {
+    let heap = make_heap(16);
+    let payload = [7_u8; 1000];
+    let mut tids = Vec::new();
+    while heap.block_count(rel()) < 2 {
+        tids.push(heap.insert(rel(), &payload, opts(100)).unwrap());
+    }
+    let first_page_tid = tids[0];
+    assert_eq!(first_page_tid.page.block, BlockNumber::new(0));
+
+    let vm = crate::vm::VisibilityMap::new();
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(100));
+    let marked = heap
+        .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(200), &oracle, &vm)
+        .unwrap();
+    assert_eq!(marked, 2);
+
+    heap.delete(
+        first_page_tid,
+        DeleteOptions {
+            xmax: Xid::new(300),
+            cmax: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: Some(&vm),
+        },
+    )
+    .unwrap();
+    oracle.set_aborted(Xid::new(300));
+    assert!(!vm.is_all_visible(rel(), BlockNumber::new(0)));
+    assert!(vm.is_all_visible(rel(), BlockNumber::new(1)));
+
+    let marked = heap
+        .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(400), &oracle, &vm)
+        .unwrap();
+    assert_eq!(marked, 1, "only the page written since the last pass is re-certified");
+    assert!(vm.is_all_visible(rel(), BlockNumber::new(0)));
+    assert!(vm.is_all_visible(rel(), BlockNumber::new(1)));
+}
+
+#[test]
 fn update_many_non_hot_fallback_clears_destination_page_vm() {
     let heap = make_heap(16);
     let payload = [3_u8; 1000];

@@ -215,6 +215,13 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Pages that fail certification have their VM bits cleared so a stale
     /// VM entry cannot make future scans skip MVCC checks incorrectly.
     ///
+    /// Pages already marked all-visible are skipped without being read: every
+    /// heap writer clears the page's VM bits under the exclusive page latch
+    /// before it mutates the page, and the vacuum horizon only moves forward,
+    /// so a bit that is still set remains correct. This keeps each pass
+    /// proportional to the pages written since the previous pass instead of to
+    /// the size of the relation.
+    ///
     /// # Errors
     ///
     /// Returns [`HeapError`] when a page cannot be pinned.
@@ -232,6 +239,9 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut marked: u32 = 0;
         for block in 0..block_count {
             let block_number = BlockNumber::new(block);
+            if vm.is_all_visible(rel, block_number) {
+                continue;
+            }
             let page_id = PageId::new(rel, block_number);
             let guard = self.get_page_relieved(page_id)?;
             let page = guard.read();
