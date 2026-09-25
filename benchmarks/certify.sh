@@ -52,13 +52,52 @@ record_suite() {
     printf '%s\t%s\t%s\n' "$suite" "$status" "$code" >>"$status_file"
 }
 
+# Run "$@" (a command or shell function) and stop it after
+# CERTIFY_SUITE_TIMEOUT_S seconds (0 or unset: no limit). The suite runs in
+# its own process group so the servers it started are stopped with it. A
+# suite stopped this way returns 124, like timeout(1).
+run_with_suite_timeout() {
+    local limit="${CERTIFY_SUITE_TIMEOUT_S:-0}"
+    if [[ "$limit" -le 0 ]]; then
+        "$@"
+        return
+    fi
+    local marker
+    marker="$(mktemp)"
+    rm -f "$marker"
+    set -m
+    ("$@") &
+    local pid=$!
+    (
+        sleep "$limit"
+        if kill -0 "$pid" 2>/dev/null; then
+            : >"$marker"
+            echo "certify.sh: suite exceeded ${limit}s; stopping it" >&2
+            kill -TERM -- "-$pid" 2>/dev/null
+            sleep 30
+            kill -KILL -- "-$pid" 2>/dev/null
+        fi
+    ) &
+    local watchdog=$!
+    set +m
+    local code=0
+    wait "$pid" || code=$?
+    kill -- "-$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+    if [[ -e "$marker" ]]; then
+        rm -f "$marker"
+        return 124
+    fi
+    return "$code"
+}
+
 run_suite() {
     local suite="$1"
     shift
 
     echo "=== certification suite: $suite profile=$profile ==="
     set +e
-    "$@"
+    run_with_suite_timeout "$@"
     local code=$?
     set -e
 

@@ -79,11 +79,15 @@ jobs:
         run: cargo bench --workspace --no-run
       - name: run benches
         # Keep noise floor low: pin to a single thread per bench.
+        # `shell: bash` adds `-o pipefail`, so a failing bench is not hidden
+        # by `tee`. `--benches` limits the run to the criterion targets; lib
+        # test harnesses reject criterion's `--save-baseline` flag.
+        shell: bash
         env:
           RAYON_NUM_THREADS: 1
         run: |
           mkdir -p bench-out
-          cargo bench --workspace -- --save-baseline pr 2>&1 | tee bench-out/run.log
+          cargo bench --workspace --benches -- --save-baseline pr 2>&1 | tee bench-out/run.log
       - name: upload criterion artifacts
         env:
           OS_LABEL: ${{ matrix.os }}
@@ -109,6 +113,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: run full certification matrix
+        # Bound every suite so one slow or stuck suite is recorded as failed
+        # (exit 124) instead of letting the job hit its timeout and cancel
+        # the suites after it.
+        env:
+          CERTIFY_SUITE_TIMEOUT_S: "480"
         run: benchmarks/certify.sh full
       - name: upload certification artifacts
         if: always()
@@ -142,7 +151,7 @@ jobs:
           brew update
           brew install duckdb sqlite postgresql@14 clickhouse
           python3 -m venv "$RUNNER_TEMP/clickhouse-driver-venv"
-          "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver duckdb
+          "$RUNNER_TEMP/clickhouse-driver-venv/bin/python" -m pip install --disable-pip-version-check clickhouse-driver duckdb 'psycopg[binary]'
           echo "$RUNNER_TEMP/clickhouse-driver-venv/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix postgresql@14)/bin" >> "$GITHUB_PATH"
       - name: build current ultrasqld
