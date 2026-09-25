@@ -104,12 +104,18 @@ where
 
         // Parse + bind cache lookup. The cache stores fully bound
         // [`LogicalPlan`] values keyed by the trimmed SQL text. A hit
-        // skips both `Parser::parse_statement` and `bind(...)`. The
-        // cache is flushed by every DDL hook (see
-        // [`Self::plan_cache_invalidate`]) so a catalog change cannot
-        // resurrect a stale binding.
+        // skips both `Parser::parse_statement` and `bind(...)`. An entry
+        // only hits against the catalog snapshot it was bound against, and
+        // any session's invalidation drops the whole cache, so a catalog
+        // change cannot resurrect a stale binding.
         let cache_key = trimmed; // already trimmed at function entry
-        let cached_plan = self.stmt_cache.borrow().get(cache_key).cloned();
+        self.discard_stale_session_plans();
+        let cached_plan = self
+            .stmt_cache
+            .borrow()
+            .get(cache_key)
+            .and_then(|entry| entry.plan_for(&catalog_snapshot))
+            .cloned();
         if let Some(plan_arc) = cached_plan {
             if matches!(self.txn_state, TxnState::Failed(_)) {
                 return Err(ServerError::TransactionAborted);
@@ -243,9 +249,10 @@ where
                 | LogicalPlan::FunctionScan { .. }
         );
         if cacheable {
-            self.stmt_cache
-                .borrow_mut()
-                .insert(cache_key.to_string(), Arc::new(plan.clone()));
+            self.stmt_cache.borrow_mut().insert(
+                cache_key.to_string(),
+                CachedBoundPlan::new(Arc::new(plan.clone()), &catalog_snapshot),
+            );
         }
 
         // Transaction-control statements own the session's TxnState.

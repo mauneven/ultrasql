@@ -58,6 +58,31 @@ pub(crate) struct CreateStatisticsSpec {
     columns: Vec<String>,
 }
 
+/// A per-session `stmt_cache` entry: a bound plan and the catalog snapshot
+/// it was bound against.
+#[derive(Debug)]
+pub(crate) struct CachedBoundPlan {
+    plan: Arc<LogicalPlan>,
+    /// Weak, so an entry does not keep a replaced snapshot's maps alive. The
+    /// allocation itself stays pinned, so a new snapshot can never reuse its
+    /// address and alias this entry.
+    snapshot: std::sync::Weak<CatalogSnapshot>,
+}
+
+impl CachedBoundPlan {
+    pub(crate) fn new(plan: Arc<LogicalPlan>, snapshot: &Arc<CatalogSnapshot>) -> Self {
+        Self {
+            plan,
+            snapshot: Arc::downgrade(snapshot),
+        }
+    }
+
+    /// The cached plan, if it was bound against exactly `snapshot`.
+    pub(crate) fn plan_for(&self, snapshot: &Arc<CatalogSnapshot>) -> Option<&Arc<LogicalPlan>> {
+        std::ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(snapshot)).then_some(&self.plan)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FastInsertInt32PairSql<'a> {
     table: &'a str,

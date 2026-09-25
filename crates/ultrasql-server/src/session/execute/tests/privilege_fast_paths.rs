@@ -145,3 +145,95 @@ fn fast_insert_values_participates_in_serializable_conflict_detection() {
     );
     assert_eq!(count(&mut admin, "SELECT count(*) FROM ssi_pairs"), "1");
 }
+
+/// Drop the per-table owner/RLS runtime entries so the fused-DELETE precheck
+/// cache is admissible (it is only used while no table carries RLS metadata).
+fn clear_row_security_metadata(server: &Server) {
+    server.row_security.clear();
+}
+
+fn prime_cached_delete(session: &mut TestSession, sql: &str) {
+    run_ok(session, sql);
+    run_ok(session, sql);
+    assert!(
+        !session.prechecked_fast_dml.borrow().is_empty(),
+        "the second run must populate the fused-DELETE precheck cache"
+    );
+}
+
+#[test]
+fn cached_delete_rechecks_privileges_after_revoke_in_another_session() {
+    let (server, mut admin) = server_with_alice();
+    run_ok(&mut admin, "CREATE TABLE pairs (a int, b int)");
+    run_ok(&mut admin, "GRANT SELECT, DELETE ON TABLE pairs TO alice");
+    clear_row_security_metadata(&server);
+
+    let mut alice = session_as(&server, "alice");
+    let delete = "DELETE FROM pairs WHERE a = 1000";
+    prime_cached_delete(&mut alice, delete);
+
+    run_ok(&mut admin, "REVOKE DELETE ON TABLE pairs FROM alice");
+    run_ok(&mut admin, "INSERT INTO pairs VALUES (1000, 1)");
+    let err = run_err(&mut alice, delete);
+    assert_insufficient_privilege(&err, "cached DELETE after REVOKE");
+    assert_eq!(count(&mut admin, "SELECT count(*) FROM pairs"), "1");
+}
+
+#[test]
+fn cached_delete_applies_row_security_enabled_by_another_session() {
+    let (server, mut admin) = server_with_alice();
+    run_ok(&mut admin, "CREATE TABLE pairs (a int, b int)");
+    run_ok(&mut admin, "GRANT SELECT, DELETE ON TABLE pairs TO alice");
+    clear_row_security_metadata(&server);
+
+    let mut alice = session_as(&server, "alice");
+    let delete = "DELETE FROM pairs WHERE a >= 0";
+    prime_cached_delete(&mut alice, delete);
+
+    run_ok(&mut admin, "ALTER TABLE pairs ENABLE ROW LEVEL SECURITY");
+    run_ok(&mut admin, "INSERT INTO pairs VALUES (1000, 1), (1001, 2)");
+    let result = run_ok(&mut alice, delete);
+    assert_eq!(
+        command_tag(result),
+        "DELETE 0",
+        "RLS with no policy hides every row from a non-owner"
+    );
+    assert_eq!(count(&mut admin, "SELECT count(*) FROM pairs"), "2");
+}
+
+#[test]
+fn cached_select_rebinds_after_drop_column_in_another_session() {
+    let server = shared_server();
+    let mut admin = session_as(&server, "ultrasql");
+    run_ok(&mut admin, "CREATE TABLE wide (a int, b int, c int)");
+    run_ok(&mut admin, "INSERT INTO wide VALUES (1, 2, 3)");
+
+    let mut reader = session_as(&server, "ultrasql");
+    assert_eq!(count(&mut reader, "SELECT b FROM wide"), "2");
+    assert_eq!(count(&mut reader, "SELECT b FROM wide"), "2");
+
+    run_ok(&mut admin, "ALTER TABLE wide DROP COLUMN a");
+    assert_eq!(count(&mut reader, "SELECT b FROM wide"), "2");
+}
+
+#[test]
+fn cached_update_rebinds_after_drop_column_in_another_session() {
+    let server = shared_server();
+    let mut admin = session_as(&server, "ultrasql");
+    run_ok(&mut admin, "CREATE TABLE wide (a int, b int, c int)");
+    run_ok(&mut admin, "INSERT INTO wide VALUES (1, 5, 50)");
+
+    let mut writer = session_as(&server, "ultrasql");
+    let update = "UPDATE wide SET b = b + 1 WHERE a = 5";
+    run_ok(&mut writer, update);
+    run_ok(&mut writer, update);
+
+    run_ok(&mut admin, "ALTER TABLE wide DROP COLUMN a");
+    let err = run_err(&mut writer, update);
+    assert_eq!(
+        err.sqlstate(),
+        "42703",
+        "stale UPDATE must re-bind and fail on the dropped column: {err}"
+    );
+    assert_eq!(count(&mut admin, "SELECT c FROM wide"), "50");
+}

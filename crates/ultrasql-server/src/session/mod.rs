@@ -89,15 +89,21 @@ pub(crate) struct Session<RW> {
     /// owned plan for the optimizer.
     ///
     /// A hit skips both passes on the hot path; a cold statement
-    /// still pays them once. The cache is flushed by every DDL hook
-    /// that already invalidates the optimizer's `PlanCache` (see
-    /// `plan_cache_invalidate`), so a catalog change can never
-    /// resurrect a stale plan.
+    /// still pays them once. An entry is reused only against the very
+    /// catalog snapshot it was bound against, and the whole cache is
+    /// dropped whenever any session invalidates the shared `PlanCache`
+    /// (see `plan_cache_generation`), so DDL in another session can never
+    /// resurrect a stale binding.
     ///
     /// Interior mutability lets the `&self` DDL dispatchers reset the
     /// cache without rippling `&mut self` across the session API.
     pub(super) stmt_cache:
-        std::cell::RefCell<std::collections::HashMap<String, Arc<ultrasql_planner::LogicalPlan>>>,
+        std::cell::RefCell<std::collections::HashMap<String, execute::CachedBoundPlan>>,
+    /// `PlanCache::generation` that `stmt_cache` and `prechecked_fast_dml`
+    /// were last validated against. Every DDL, privilege, role, or RLS change
+    /// in any session advances the shared generation; a mismatch drops both
+    /// session caches before the next lookup.
+    pub(super) plan_cache_generation: std::cell::Cell<u64>,
     /// Logical plans whose static DML safety checks already passed.
     ///
     /// Identity is the cached [`Arc<LogicalPlan>`](ultrasql_planner::LogicalPlan)
@@ -256,6 +262,7 @@ where
         // Statement-logging GUCs likewise start at the server-config
         // defaults and are runtime-settable per session.
         let logging_defaults = state.logging_config();
+        let plan_cache_generation = state.plan_cache.generation();
         Self {
             // Start plaintext; a client `SSLRequest` upgrades it in place when
             // the server has a TLS config (see `startup`).
@@ -284,6 +291,7 @@ where
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            plan_cache_generation: std::cell::Cell::new(plan_cache_generation),
             prechecked_fast_dml: std::cell::RefCell::new(std::collections::HashMap::new()),
             simple_batch_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),

@@ -46,6 +46,8 @@
 //! across threads without an outer `Mutex`. Individual entries are updated
 //! through short critical sections inside `DashMap::entry`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use dashmap::DashMap;
 use ultrasql_core::Value;
 use ultrasql_planner::LogicalPlan;
@@ -162,6 +164,8 @@ impl Default for PlanCacheConfig {
 pub struct PlanCache {
     entries: DashMap<PlanCacheKey, PlanCacheEntry>,
     config: PlanCacheConfig,
+    /// Bumped by every invalidation; see [`PlanCache::generation`].
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for PlanCache {
@@ -176,6 +180,7 @@ impl std::fmt::Debug for PlanCache {
         f.debug_struct("PlanCache")
             .field("entries", &self.entries.len())
             .field("config", &self.config)
+            .field("generation", &self.generation())
             .finish()
     }
 }
@@ -187,7 +192,19 @@ impl PlanCache {
         Self {
             entries: DashMap::new(),
             config,
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// Invalidation counter: advances every time entries are invalidated.
+    ///
+    /// Callers that keep their own caches derived from the same catalog
+    /// state (for example per-connection bound plans) compare this value to
+    /// the one they recorded to learn that another connection changed the
+    /// catalog, privileges, or row-security policies since.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Look up or create a cached plan for `key`.
@@ -296,11 +313,13 @@ impl PlanCache {
     /// Useful for invalidating plans after `ANALYZE` or DDL changes.
     pub fn invalidate(&self, predicate: impl Fn(&PlanCacheKey) -> bool) {
         self.entries.retain(|k, _| !predicate(k));
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Remove all cached entries.
     pub fn invalidate_all(&self) {
         self.entries.clear();
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Number of entries currently in the cache.
@@ -538,6 +557,27 @@ mod tests {
         assert_eq!(cache.len(), 5);
         cache.invalidate_all();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn every_invalidation_advances_the_generation() {
+        let cache = PlanCache::new(PlanCacheConfig::default());
+        let key = PlanCacheKey::named("stmt");
+        let start = cache.generation();
+        cache
+            .get_or_plan(&key, &[], always_ok_planner(empty_plan()))
+            .expect("ok");
+        assert_eq!(cache.generation(), start, "planning does not invalidate");
+        cache.invalidate_all();
+        assert_eq!(cache.generation(), start + 1);
+        cache.invalidate_all();
+        assert_eq!(
+            cache.generation(),
+            start + 2,
+            "an empty cache still advances"
+        );
+        cache.invalidate(|_| false);
+        assert_eq!(cache.generation(), start + 3);
     }
 
     // -----------------------------------------------------------------------

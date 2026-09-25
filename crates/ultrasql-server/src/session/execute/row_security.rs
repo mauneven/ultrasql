@@ -221,6 +221,21 @@ where
         self.simple_batch_cache.borrow_mut().clear();
     }
 
+    /// Drop this session's bound-plan and DML-precheck caches when any
+    /// session has invalidated the shared plan cache since they were filled.
+    ///
+    /// Every DDL, GRANT/REVOKE, role, and row-security change goes through
+    /// [`Self::plan_cache_invalidate`] in the issuing session, which advances
+    /// the shared generation; this is how the other sessions notice.
+    pub(crate) fn discard_stale_session_plans(&self) {
+        let generation = self.state.plan_cache.generation();
+        if self.plan_cache_generation.get() != generation {
+            self.stmt_cache.borrow_mut().clear();
+            self.prechecked_fast_dml.borrow_mut().clear();
+            self.plan_cache_generation.set(generation);
+        }
+    }
+
     /// Apply row-level security to `plan`, returning the policy-wrapped plan
     /// (`Some`) or `None` when no rewrite was needed.
     ///
