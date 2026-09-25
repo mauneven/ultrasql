@@ -109,14 +109,16 @@ impl Server {
     }
 
     /// Record a successful commit and, every
-    /// [`UNDO_GC_INTERVAL_COMMITS`] commits, run maintenance:
-    /// undo-log GC plus one pending auto-analyze task.
+    /// [`UNDO_GC_INTERVAL_COMMITS`] commits, schedule one maintenance pass
+    /// ([`Self::run_commit_maintenance`]).
     ///
-    /// Bump-and-check is one atomic add plus a modulo; the heavier
-    /// maintenance work is deferred out of the per-commit fast path.
-    /// Errors from the maintenance pass are logged and swallowed so a
-    /// transient failure cannot mask the underlying commit's success.
-    pub fn note_commit_for_gc(&self) {
+    /// The committing session only pays one atomic add. The pass itself runs
+    /// on the Tokio blocking pool, so a client never waits for vacuum or
+    /// ANALYZE work before it receives its `CommandComplete`. At most one pass
+    /// is queued or running at a time; commits that arrive while a pass is in
+    /// flight are covered by it or by the next trigger. Without a Tokio runtime
+    /// the pass runs inline, as before.
+    pub fn note_commit_for_gc(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
         let n = self
             .vacuum_commit_counter
@@ -125,6 +127,33 @@ impl Server {
         if n % UNDO_GC_INTERVAL_COMMITS != 0 {
             return;
         }
+        if self
+            .commit_maintenance_in_flight
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let server = Arc::clone(self);
+                handle.spawn_blocking(move || {
+                    let _in_flight = CommitMaintenanceInFlight(&server);
+                    server.run_commit_maintenance();
+                });
+            }
+            Err(_) => {
+                let _in_flight = CommitMaintenanceInFlight(self);
+                self.run_commit_maintenance();
+            }
+        }
+    }
+
+    /// Run one commit-triggered maintenance pass: undo-log GC, visibility-map
+    /// certification, SSI garbage collection, and one pending auto-analyze.
+    ///
+    /// Errors are logged and swallowed so a transient failure cannot mask the
+    /// success of the commits that triggered the pass.
+    pub fn run_commit_maintenance(&self) {
         // A repeatable-read/serializable snapshot can remain live after every
         // transaction visible to `oldest_in_progress()` has finished.  Undo
         // trimming and heap/VM vacuum must therefore use the snapshot-aware
@@ -693,6 +722,7 @@ impl Server {
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            commit_maintenance_in_flight: std::sync::atomic::AtomicBool::new(false),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
             domain_constraints: Arc::new(dashmap::DashMap::new()),
@@ -782,5 +812,17 @@ impl Server {
         self.data_dir
             .as_ref()
             .map(|dir| dir.join("pg_domain_runtime.meta"))
+    }
+}
+
+/// Clears [`Server::commit_maintenance_in_flight`] when a maintenance pass
+/// ends, including when it unwinds, so a panic cannot stop later passes.
+struct CommitMaintenanceInFlight<'a>(&'a Server);
+
+impl Drop for CommitMaintenanceInFlight<'_> {
+    fn drop(&mut self) {
+        self.0
+            .commit_maintenance_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }

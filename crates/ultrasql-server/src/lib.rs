@@ -358,12 +358,14 @@ pub struct Server {
     ///
     /// Every successful commit (explicit `COMMIT` or autocommit) calls
     /// [`Server::note_commit_for_gc`], which bumps this counter and,
-    /// every [`UNDO_GC_INTERVAL_COMMITS`] commits, fires
-    /// [`HeapAccess::vacuum_undo_log`] with the txn manager's current
-    /// snapshot-aware `vacuum_horizon()`. Trimming on a counter rather than per
-    /// commit keeps the hot path cheap (one atomic add) and amortises
-    /// the GC walk across many small transactions.
+    /// every [`UNDO_GC_INTERVAL_COMMITS`] commits, schedules
+    /// [`Server::run_commit_maintenance`] off the committing session. Trimming
+    /// on a counter rather than per commit keeps the hot path cheap (one atomic
+    /// add) and amortises the GC walk across many small transactions.
     pub vacuum_commit_counter: std::sync::atomic::AtomicU64,
+    /// `true` while a commit-triggered maintenance pass is queued or running,
+    /// so bursts of commits schedule at most one pass at a time.
+    pub commit_maintenance_in_flight: std::sync::atomic::AtomicBool,
     /// Runtime relation statistics populated by manual `ANALYZE`, by
     /// autovacuum-triggered analyze runs, and on WAL-backed restart from
     /// durable `pg_statistic` rows.

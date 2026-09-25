@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::SinkExt;
 use tokio_postgres::NoTls;
 use ultrasql_core::{BlockNumber, RelationId};
-use ultrasql_server::{Server, UNDO_GC_INTERVAL_COMMITS, bind_listener, serve_listener};
+use ultrasql_server::{Server, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
     Arc<Server>,
@@ -61,9 +61,7 @@ fn relation_id(server: &Server, table: &str) -> RelationId {
 }
 
 fn force_maintenance(server: &Server) {
-    for _ in 0..UNDO_GC_INTERVAL_COMMITS {
-        server.note_commit_for_gc();
-    }
+    server.run_commit_maintenance();
 }
 
 #[tokio::test]

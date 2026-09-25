@@ -200,6 +200,7 @@ impl Server {
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            commit_maintenance_in_flight: std::sync::atomic::AtomicBool::new(false),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
             domain_constraints: Arc::new(dashmap::DashMap::new()),
