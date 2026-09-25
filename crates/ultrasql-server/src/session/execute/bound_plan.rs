@@ -357,9 +357,17 @@ where
         if matches!(self.txn_state, TxnState::Failed(_)) {
             return Err(ServerError::TransactionAborted);
         }
+        // SERIALIZABLE needs the general path's write-conflict registration
+        // against concurrent SIREAD locks (`run_plan_in_txn`).
+        if let TxnState::InTransaction(txn) = &self.txn_state
+            && txn.isolation == IsolationLevel::Serializable
+        {
+            return Ok(None);
+        }
 
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
+                self.enforce_fast_insert_privileges(&table_key, entry, catalog_snapshot)?;
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
                 let rows = match self.fast_insert_int32_pair_rows(entry, &parsed.rows, &txn) {
                     Ok(rows) => rows,
@@ -412,6 +420,12 @@ where
                     self.txn_state = TxnState::Failed(txn);
                     return Err(ServerError::ReadOnlyTransaction("INSERT"));
                 }
+                if let Err(err) =
+                    self.enforce_fast_insert_privileges(&table_key, entry, catalog_snapshot)
+                {
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(err);
+                }
                 self.state.txn_manager.refresh_snapshot(&mut txn);
                 let outcome = self
                     .fast_insert_int32_pair_rows(entry, &parsed.rows, &txn)
@@ -443,23 +457,53 @@ where
         }
     }
 
+    /// Resolve the fast-path INSERT target the way the binder does, through
+    /// `search_path`. `None` sends the statement to the general path: the
+    /// name resolves to a sample, virtual, or otherwise non-snapshot relation.
     fn lookup_fast_insert_table<'a>(
         &self,
         table_name: &str,
         catalog_snapshot: &'a CatalogSnapshot,
     ) -> Option<&'a TableEntry> {
-        if let Some(entry) = catalog_snapshot.tables.get(table_name) {
-            return Some(entry);
+        let combined = CombinedCatalog {
+            snapshot: catalog_snapshot,
+            fallback: &self.state.catalog,
+            search_path: self.session_settings.get("search_path").map(String::as_str),
+        };
+        let meta = ultrasql_planner::Catalog::lookup_table(&combined, table_name)?;
+        let entry = catalog_snapshot
+            .tables
+            .get(&ultrasql_catalog::table_lookup_key(
+                &meta.schema_name,
+                table_name,
+            ))?;
+        (entry.schema_name.eq_ignore_ascii_case(&meta.schema_name) && entry.schema == meta.schema)
+            .then_some(entry)
+    }
+
+    /// Apply the general path's INSERT privilege checks (schema USAGE plus
+    /// INSERT on every column) to a fast-path `INSERT ... VALUES`.
+    fn enforce_fast_insert_privileges(
+        &self,
+        table_key: &str,
+        entry: &TableEntry,
+        catalog_snapshot: &CatalogSnapshot,
+    ) -> Result<(), ServerError> {
+        if self.privilege_bypass() {
+            return Ok(());
         }
-        for schema_name in crate::search_path_schema_names(
-            self.session_settings.get("search_path").map(String::as_str),
-        ) {
-            let table_key = ultrasql_catalog::table_lookup_key(&schema_name, table_name);
-            if let Some(entry) = catalog_snapshot.tables.get(&table_key) {
-                return Some(entry);
-            }
-        }
-        None
+        let insert = LogicalPlan::Insert {
+            table: table_key.to_owned(),
+            columns: (0..entry.schema.len()).collect(),
+            source: Box::new(LogicalPlan::Values {
+                rows: Vec::new(),
+                schema: entry.schema.clone(),
+            }),
+            on_conflict: None,
+            returning: Vec::new(),
+            schema: Schema::empty(),
+        };
+        self.enforce_column_privileges(&insert, catalog_snapshot)
     }
 
     fn fast_insert_int32_pair_rows(

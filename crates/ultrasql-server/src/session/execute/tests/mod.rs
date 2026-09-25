@@ -2,6 +2,7 @@
 
 mod parsers;
 mod plan_txn;
+mod privilege_fast_paths;
 
 use std::sync::Arc;
 

@@ -195,7 +195,9 @@ where
             .filter(|entry| entry.schema_name.eq_ignore_ascii_case(schema))
     }
 
-    fn privilege_bypass(&self) -> bool {
+    /// `true` when the current role skips table and column privilege checks
+    /// (a superuser).
+    pub(crate) fn privilege_bypass(&self) -> bool {
         self.state
             .role_catalog
             .lookup_role(&self.current_user)
