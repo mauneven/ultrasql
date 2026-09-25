@@ -5,7 +5,6 @@ use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::Parser;
 use ultrasql_parser::ast::BinaryOp;
 
-use super::super::*;
 use super::*;
 use crate::LogicalIndexMethod;
 use crate::catalog::InMemoryCatalog;
