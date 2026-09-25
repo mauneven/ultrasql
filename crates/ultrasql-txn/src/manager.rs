@@ -331,7 +331,7 @@ pub struct TransactionManager {
     /// commit / abort. Vacuum may later promote entries to `Frozen`;
     /// that transition is owned by the vacuum subsystem and is not
     /// performed here.
-    clog: DashMap<Xid, XidStatus>,
+    clog: DashMap<Xid, XidStatus, ahash::RandomState>,
     /// Hot-path mirror of every XID currently in
     /// [`XidStatus::InProgress`]. Updated atomically with `clog`: insert
     /// on `begin`, remove on `terminate`. Holds a `BTreeSet` so
@@ -360,7 +360,7 @@ pub struct TransactionManager {
     /// indirection suffices: a `RELEASE`d-but-parent-open subxid stays
     /// invisible to other backends, and the parent's single commit/abort is
     /// the only observable boundary.
-    subxid_parent: DashMap<Xid, Xid>,
+    subxid_parent: DashMap<Xid, Xid, ahash::RandomState>,
     /// Optional SSI conflict tracker. Present only when the server is
     /// configured to support [`IsolationLevel::Serializable`] isolation.
     /// `None` causes Serializable to alias `RepeatableRead` (the pre-v0.4
@@ -397,10 +397,10 @@ impl TransactionManager {
     pub fn new() -> Self {
         Self {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
-            clog: DashMap::new(),
+            clog: DashMap::with_hasher(ahash::RandomState::new()),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             snapshot_xmins: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-            subxid_parent: DashMap::new(),
+            subxid_parent: DashMap::with_hasher(ahash::RandomState::new()),
             ssi: None,
             lock_manager: Arc::new(LockManager::new()),
             xact_commit: AtomicU64::new(0),
@@ -418,10 +418,10 @@ impl TransactionManager {
     pub fn new_with_ssi(ssi: Arc<SsiManager>) -> Self {
         Self {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
-            clog: DashMap::new(),
+            clog: DashMap::with_hasher(ahash::RandomState::new()),
             in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             snapshot_xmins: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-            subxid_parent: DashMap::new(),
+            subxid_parent: DashMap::with_hasher(ahash::RandomState::new()),
             ssi: Some(ssi),
             lock_manager: Arc::new(LockManager::new()),
             xact_commit: AtomicU64::new(0),
@@ -953,18 +953,16 @@ impl TransactionManager {
     /// returns the value the next [`Self::begin`] will hand out — that
     /// is, the high-water XID itself (equivalent to PostgreSQL's
     /// `latestCompletedXid + 1`).
+    ///
+    /// Reads the first key of the `in_progress` mirror, which holds exactly
+    /// the CLOG's `InProgress` XIDs, so the cost does not grow with the
+    /// number of transactions the CLOG has ever recorded.
     pub fn oldest_in_progress(&self) -> Xid {
-        let mut oldest: Option<Xid> = None;
-        for entry in &self.clog {
-            if matches!(*entry.value(), XidStatus::InProgress) {
-                let xid = *entry.key();
-                oldest = Some(match oldest {
-                    Some(cur) if cur <= xid => cur,
-                    _ => xid,
-                });
-            }
-        }
-        oldest.unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
+        let active = self.in_progress.lock();
+        active
+            .first()
+            .copied()
+            .unwrap_or_else(|| Xid::new(self.next_xid.load(Ordering::Acquire)))
     }
 
     /// Vacuum horizon: no slot whose deleter's XID is at or above this

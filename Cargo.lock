@@ -3724,6 +3724,7 @@ dependencies = [
 name = "ultrasql-txn"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "criterion",
  "crossbeam",
  "dashmap",
