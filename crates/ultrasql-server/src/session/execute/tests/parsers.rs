@@ -69,6 +69,30 @@ fn logical_replication_and_guc_parsers_cover_success_and_errors() {
     assert_eq!(parse_statement_timeout_ms(" 250 ").expect("timeout"), 250);
     assert!(parse_statement_timeout_ms("-1").is_err());
     assert!(parse_statement_timeout_ms("abc").is_err());
+}
+
+#[test]
+fn millisecond_gucs_accept_postgres_time_units() {
+    for (value, ms) in [
+        ("3s", 3_000),
+        ("3 s", 3_000),
+        ("250ms", 250),
+        ("1.5s", 1_500),
+        ("2min", 120_000),
+        ("1h", 3_600_000),
+        ("1d", 86_400_000),
+        ("1500us", 2),
+        ("0", 0),
+        ("2147483647", 2_147_483_647),
+    ] {
+        assert_eq!(parse_ms_guc(value, "invalid").expect(value), ms, "{value}");
+    }
+    for value in ["", ".", "3 sec", "3S", "1.2.3", "-5s", "25d", "2147483648"] {
+        assert!(
+            parse_ms_guc(value, "invalid").is_err(),
+            "{value:?} must be rejected"
+        );
+    }
 
     // work_mem: a bare integer is kilobytes; explicit units override.
     assert_eq!(

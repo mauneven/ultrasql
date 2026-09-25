@@ -371,17 +371,51 @@ fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
 }
 
 /// Parse a non-negative millisecond GUC value (`statement_timeout`,
-/// `lock_timeout`); `0` means disabled.
+/// `lock_timeout`); `0` means disabled. Like PostgreSQL, a bare number is
+/// milliseconds, a unit (`us`, `ms`, `s`, `min`, `h`, `d`) may follow, a
+/// fraction is rounded to the nearest millisecond, and the result must fit
+/// in a 32-bit signed integer.
 fn parse_ms_guc(value: &str, invalid: &'static str) -> Result<u64, ServerError> {
     let trimmed = value.trim();
-    if let Some(stripped) = trimmed.strip_prefix('-') {
-        if !stripped.is_empty() {
-            return Err(ServerError::Unsupported(invalid));
-        }
+    let number_end = trimmed
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(number_end);
+    let unit_us: u128 = match unit.trim() {
+        "us" => 1,
+        "" | "ms" => 1_000,
+        "s" => 1_000_000,
+        "min" => 60_000_000,
+        "h" => 3_600_000_000,
+        "d" => 86_400_000_000,
+        _ => return Err(ServerError::Unsupported(invalid)),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() || fraction.len() > 9 || fraction.contains('.') {
+        return Err(ServerError::Unsupported(invalid));
     }
-    trimmed
-        .parse::<u64>()
-        .map_err(|_| ServerError::Unsupported(invalid))
+    let parse_digits = |digits: &str| -> Result<u128, ServerError> {
+        if digits.is_empty() {
+            return Ok(0);
+        }
+        digits
+            .parse::<u128>()
+            .map_err(|_| ServerError::Unsupported(invalid))
+    };
+    let scale =
+        10_u128.pow(u32::try_from(fraction.len()).map_err(|_| ServerError::Unsupported(invalid))?);
+    let whole_digits = parse_digits(whole)?;
+    let fraction_digits = parse_digits(fraction)?;
+    let total_us = whole_digits
+        .checked_mul(unit_us)
+        .zip(fraction_digits.checked_mul(unit_us))
+        .and_then(|(whole_us, fraction_us)| whole_us.checked_add(fraction_us / scale))
+        .ok_or(ServerError::Unsupported(invalid))?;
+    let ms = (total_us + 500) / 1_000;
+    if ms > u128::from(i32::MAX.unsigned_abs()) {
+        return Err(ServerError::Unsupported(invalid));
+    }
+    u64::try_from(ms).map_err(|_| ServerError::Unsupported(invalid))
 }
 
 /// Parse a `SET log_statement` value: the four PostgreSQL statement
