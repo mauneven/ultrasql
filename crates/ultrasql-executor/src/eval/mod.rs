@@ -508,7 +508,7 @@ mod functions_misc;
 mod functions_pg;
 mod functions_string;
 mod functions_text;
-mod like;
+pub(crate) mod like;
 mod operators;
 mod regex_cache;
 mod textsearch;

@@ -9,7 +9,8 @@
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::bitmap::Bitmap;
-use ultrasql_vec::column::{Column, NumericColumn};
+use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
+use ultrasql_vec::dict::DictionaryColumn;
 use ultrasql_vec::kernels::{CmpOp, cmp_i32_scalar, cmp_i64_scalar, compare_i32, compare_i64};
 
 use super::FastPredicate;
@@ -96,6 +97,9 @@ pub(super) fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
     else {
         return None;
     };
+    if let Some(like) = match_column_like(*op, left, right) {
+        return Some(like);
+    }
     let cmp = binary_op_to_cmp(*op)?;
     // Case 1: `column <op> literal`
     if let (ScalarExpr::Column { index, .. }, ScalarExpr::Literal { value, .. }) =
@@ -279,5 +283,192 @@ fn merge_numeric_validity<T>(left: &NumericColumn<T>, right: &NumericColumn<T>) 
             }
             Some(merged)
         }
+    }
+}
+
+/// Match `column [NOT] LIKE 'literal'` whose pattern uses only `%`.
+fn match_column_like(op: BinaryOp, left: &ScalarExpr, right: &ScalarExpr) -> Option<FastPredicate> {
+    let negated = match op {
+        BinaryOp::Like => false,
+        BinaryOp::NotLike => true,
+        _ => return None,
+    };
+    let (ScalarExpr::Column { index, .. }, ScalarExpr::Literal { value, .. }) = (left, right)
+    else {
+        return None;
+    };
+    let Value::Text(pattern) = value else {
+        return None;
+    };
+    Some(FastPredicate::ColumnLike {
+        index: *index,
+        pattern: PercentLikePattern::compile(pattern)?,
+        negated,
+    })
+}
+
+/// A case-sensitive `LIKE` pattern whose only wildcard is `%`, stored as
+/// the literal runs between the wildcards. Backslash escapes the next
+/// character, as in [`crate::eval::like`]. Patterns containing `_` are not
+/// represented and keep using the general evaluator.
+#[derive(Clone, Debug)]
+pub(super) struct PercentLikePattern {
+    /// Literal runs; `parts.len()` is one more than the number of `%`.
+    parts: Vec<String>,
+}
+
+impl PercentLikePattern {
+    pub(super) fn compile(pattern: &str) -> Option<Self> {
+        let mut parts = vec![String::new()];
+        let mut chars = pattern.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '%' => parts.push(String::new()),
+                '_' => return None,
+                '\\' => parts.last_mut()?.push(chars.next().unwrap_or('\\')),
+                other => parts.last_mut()?.push(other),
+            }
+        }
+        Some(Self { parts })
+    }
+
+    pub(super) fn matches(&self, haystack: &str) -> bool {
+        let (Some(first), Some(last)) = (self.parts.first(), self.parts.last()) else {
+            return false;
+        };
+        if self.parts.len() == 1 {
+            return haystack == first;
+        }
+        if haystack.len() < first.len() + last.len()
+            || !haystack.starts_with(first.as_str())
+            || !haystack.ends_with(last.as_str())
+        {
+            return false;
+        }
+        let mut pos = first.len();
+        let end = haystack.len() - last.len();
+        for middle in &self.parts[1..self.parts.len() - 1] {
+            if middle.is_empty() {
+                continue;
+            }
+            let Some(found) = haystack
+                .get(pos..end)
+                .and_then(|window| window.find(middle.as_str()))
+            else {
+                return false;
+            };
+            pos += found + middle.len();
+        }
+        true
+    }
+}
+
+/// Evaluate `[NOT] LIKE` over a string column. NULL rows get a 0 bit, as
+/// SQL's three-valued logic filters them out either way. Dictionary
+/// columns evaluate the pattern once per distinct value.
+pub(super) fn like_mask(
+    column: &Column,
+    pattern: &PercentLikePattern,
+    negated: bool,
+) -> Option<Bitmap> {
+    match column {
+        Column::Utf8(strings) => Some(like_mask_strings(strings, pattern, negated)),
+        Column::DictionaryUtf8(dict) => Some(like_mask_dictionary(dict, pattern, negated)),
+        _ => None,
+    }
+}
+
+fn like_mask_strings(column: &StringColumn, pattern: &PercentLikePattern, negated: bool) -> Bitmap {
+    let rows = column.len();
+    let mut mask = Bitmap::new(rows, false);
+    for row in 0..rows {
+        if column.nulls().is_some_and(|nulls| !nulls.get(row)) {
+            continue;
+        }
+        if let Some(value) = column.try_value(row)
+            && pattern.matches(value) != negated
+        {
+            mask.set(row, true);
+        }
+    }
+    mask
+}
+
+fn like_mask_dictionary(
+    column: &DictionaryColumn,
+    pattern: &PercentLikePattern,
+    negated: bool,
+) -> Bitmap {
+    let passes: Vec<bool> = column
+        .dict
+        .iter()
+        .map(|value| pattern.matches(value) != negated)
+        .collect();
+    let codes = column.codes.data();
+    let mut mask = Bitmap::new(codes.len(), false);
+    for (row, code) in codes.iter().enumerate() {
+        if column.codes.nulls().is_some_and(|nulls| !nulls.get(row)) {
+            continue;
+        }
+        let pass = usize::try_from(*code)
+            .ok()
+            .and_then(|code| passes.get(code))
+            .copied()
+            .unwrap_or(false);
+        if pass {
+            mask.set(row, true);
+        }
+    }
+    mask
+}
+
+#[cfg(test)]
+mod like_fast_path_tests {
+    use super::PercentLikePattern;
+    use crate::eval::like::like_match;
+
+    fn strings_over(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for ch in alphabet {
+                    let mut s = prefix.clone();
+                    s.push(*ch);
+                    next.push(s);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    #[test]
+    fn percent_patterns_agree_with_the_general_like_evaluator() {
+        let patterns = strings_over(&['a', 'b', '%', '\\'], 5);
+        let haystacks = strings_over(&['a', 'b', '%', 'é'], 4);
+        let mut checked = 0_usize;
+        for pattern in &patterns {
+            let Some(compiled) = PercentLikePattern::compile(pattern) else {
+                continue;
+            };
+            for haystack in &haystacks {
+                assert_eq!(
+                    compiled.matches(haystack),
+                    like_match(haystack, pattern, false),
+                    "pattern {pattern:?} haystack {haystack:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100_000);
+    }
+
+    #[test]
+    fn underscore_patterns_use_the_general_evaluator() {
+        assert!(PercentLikePattern::compile("a_b").is_none());
+        assert!(PercentLikePattern::compile("a\\_b").is_some());
     }
 }

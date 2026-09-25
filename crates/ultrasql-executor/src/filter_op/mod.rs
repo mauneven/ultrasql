@@ -32,7 +32,7 @@ mod select;
 mod tests;
 
 use num_traits::ToPrimitive;
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
@@ -44,8 +44,8 @@ use crate::seq_scan::build_batch;
 use crate::{ExecError, Operator, eval_error_to_exec_error};
 
 use self::fast_path::{
-    MaskCombine, cmp_columns_to_mask, combine_masks, const_mask_i32,
-    estimate_predicate_selectivity, match_fast_predicate,
+    MaskCombine, PercentLikePattern, cmp_columns_to_mask, combine_masks, const_mask_i32,
+    estimate_predicate_selectivity, like_mask, match_fast_predicate,
 };
 use self::select::build_empty_batch;
 
@@ -94,6 +94,13 @@ enum FastPredicate {
         left_index: usize,
         right_index: usize,
         op: CmpOp,
+    },
+    /// `column [NOT] LIKE 'pattern'` on a TEXT column, where `%` is the
+    /// pattern's only wildcard.
+    ColumnLike {
+        index: usize,
+        pattern: PercentLikePattern,
+        negated: bool,
     },
 }
 
@@ -221,6 +228,19 @@ impl Filter {
                 let left_type = &self.schema.field_at(*left_index).data_type;
                 let right_type = &self.schema.field_at(*right_index).data_type;
                 cmp_columns_to_mask(left_col, right_col, left_type, right_type, *op)
+            }
+            FastPredicate::ColumnLike {
+                index,
+                pattern,
+                negated,
+            } => {
+                if !matches!(
+                    self.schema.field_at(*index).data_type,
+                    DataType::Text { .. }
+                ) {
+                    return None;
+                }
+                like_mask(cols.get(*index)?, pattern, *negated)
             }
         }
     }

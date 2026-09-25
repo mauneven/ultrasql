@@ -445,3 +445,76 @@ fn vectorized_literal_on_left_is_flipped() {
     let want: Vec<i64> = data.iter().copied().filter(|&v| v < 100).collect();
     assert_eq!(got, want);
 }
+
+fn like_pred(op: BinaryOp, pattern: &str) -> ScalarExpr {
+    ScalarExpr::Binary {
+        op,
+        left: Box::new(ScalarExpr::Column {
+            name: "note".into(),
+            index: 1,
+            data_type: DataType::Text { max_len: None },
+        }),
+        right: Box::new(ScalarExpr::Literal {
+            value: Value::Text(pattern.to_owned()),
+            data_type: DataType::Text { max_len: None },
+        }),
+        data_type: DataType::Bool,
+    }
+}
+
+fn run_like_filter(note_column: Column, rows: usize, pred: ScalarExpr) -> Vec<i32> {
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("note", DataType::Text { max_len: None }),
+    ])
+    .expect("schema ok");
+    let ids: Vec<i32> = (0..i32::try_from(rows).expect("rows fit i32")).collect();
+    let batch =
+        Batch::new([Column::Int32(NumericColumn::from_data(ids)), note_column]).expect("batch ok");
+    let scan = MemTableScan::new(schema, vec![batch]);
+    let mut filter = Filter::new(Box::new(scan), pred);
+    let mut out = Vec::new();
+    while let Some(batch) = filter.next_batch().unwrap() {
+        match &batch.columns()[0] {
+            Column::Int32(c) => out.extend_from_slice(c.data()),
+            other => panic!("unexpected column type: {other:?}"),
+        }
+    }
+    out
+}
+
+/// `LIKE` / `NOT LIKE` on a TEXT column with NULLs: the vectorised mask
+/// must match SQL semantics (NULL rows never pass, even under NOT LIKE),
+/// for both raw and dictionary-encoded string columns.
+#[test]
+fn vectorized_like_matches_sql_semantics_on_raw_and_dictionary_columns() {
+    let values = [
+        Some("row-9"),
+        None,
+        Some("row-19"),
+        Some("row-90"),
+        Some("xrow-9"),
+        None,
+    ];
+    let raw = || Column::Utf8(StringColumn::from_optional_strs(&values).expect("raw column"));
+    let dict = || {
+        Column::DictionaryUtf8(
+            ultrasql_vec::dict::DictionaryColumn::from_strings(values.iter().copied())
+                .expect("dictionary column"),
+        )
+    };
+    for make in [&raw as &dyn Fn() -> Column, &dict] {
+        assert_eq!(
+            run_like_filter(make(), values.len(), like_pred(BinaryOp::Like, "row-9%")),
+            vec![0, 3]
+        );
+        assert_eq!(
+            run_like_filter(make(), values.len(), like_pred(BinaryOp::NotLike, "row-9%")),
+            vec![2, 4]
+        );
+        assert_eq!(
+            run_like_filter(make(), values.len(), like_pred(BinaryOp::Like, "%9")),
+            vec![0, 2, 4]
+        );
+    }
+}
